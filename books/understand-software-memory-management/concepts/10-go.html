@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Go — Where Does the Memory Go?</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" href="../index.html"><span class="gly">▤</span> Where Does the <b>Memory</b> Go?</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html#contents">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <div class="spread">
+    <section class="leaf left">
+      <p class="kicker">Concept 10 · <span class="lang-badge b-go">GO</span></p>
+      <h1>Go — Concurrent GC &amp; Escape Analysis</h1>
+      <p class="lede">Go is garbage-collected like Java, but it made a sharp, opinionated choice: above all else, <strong>keep the pauses tiny</strong>. It would rather do a little extra collecting work than ever freeze your goroutines for long. The result is a collector tuned for servers juggling thousands of concurrent connections.</p>
+
+      <p>Go's collector is a <strong>concurrent, tri-color mark-and-sweep</strong>. "Tri-color" is just the bookkeeping from Concept 05 made precise — every object is white (unvisited), gray (reached, but its children not yet scanned), or black (fully scanned):</p>
+
+      <div class="diagram">
+        <svg viewBox="0 0 320 130" role="img" aria-label="Tri-color marking">
+          <circle cx="55" cy="65" r="22" fill="#fff" stroke="#8c97a4"/>
+          <text x="55" y="69" text-anchor="middle" font-size="9" fill="#4d5b6b" font-family="monospace">white</text>
+          <text x="55" y="105" text-anchor="middle" font-size="8" fill="#8c97a4" font-family="monospace">maybe dead</text>
+          <circle cx="160" cy="65" r="22" fill="#d9d2c2" stroke="#4d5b6b"/>
+          <text x="160" y="69" text-anchor="middle" font-size="9" fill="#243140" font-family="monospace">gray</text>
+          <text x="160" y="105" text-anchor="middle" font-size="8" fill="#8c97a4" font-family="monospace">reached, scanning</text>
+          <circle cx="265" cy="65" r="22" fill="#243140" stroke="#243140"/>
+          <text x="265" y="69" text-anchor="middle" font-size="9" fill="#fff" font-family="monospace">black</text>
+          <text x="265" y="105" text-anchor="middle" font-size="8" fill="#8c97a4" font-family="monospace">alive, done</text>
+          <line x1="78" y1="65" x2="135" y2="65" stroke="#8c97a4" stroke-width="1.4" marker-end="url(#a)"/>
+          <line x1="184" y1="65" x2="240" y2="65" stroke="#8c97a4" stroke-width="1.4" marker-end="url(#a)"/>
+          <defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L7,4 L0,8" fill="#8c97a4"/></marker></defs>
+        </svg>
+        <span class="cap">Objects flow white → gray → black as marking proceeds. When no gray remain, every white object is garbage.</span>
+      </div>
+
+      <p>The clever part: nearly all of this marking happens <em>while your program keeps running</em>. To stay correct when your code mutates pointers mid-collection, Go uses a <strong>hybrid write barrier</strong> — a tiny bit of code on pointer writes that keeps the tri-color invariant intact. The stop-the-world windows are reduced to sub-millisecond bookends, not the whole collection.</p>
+
+      <div class="callout key">
+        <span class="ic">★</span>
+        <div><span class="lab">The design priority</span>
+        <p>Go deliberately is <em>not</em> generational (historically) and not the highest-throughput collector. It trades some efficiency for consistently <strong>low latency</strong> — short, predictable pauses — because that's what network services need most.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="leaf right">
+      <h2>Escape analysis — the compiler keeps GC off the hook</h2>
+      <p>Here's Go's quiet brilliance, and it ties straight back to Concepts 02 and 03. Before anything reaches the collector, the <em>compiler</em> asks of every value: does a pointer to this <strong>escape</strong> the function that made it? If not — if it dies when the function returns — put it on the <strong>stack</strong>, free and automatic, never troubling the GC at all. Only values that genuinely outlive their function "escape" to the heap.</p>
+
+      <pre><span class="cap">Go — see what escapes</span><code><span class="cm">// go build -gcflags='-m'</span>
+<span class="kw">func</span> <span class="fn">stays</span>() <span class="ty">int</span> {
+    x := <span class="num">42</span>      <span class="cm">// stays on the stack</span>
+    <span class="kw">return</span> x
+}
+<span class="kw">func</span> <span class="fn">escapes</span>() *<span class="ty">int</span> {
+    x := <span class="num">42</span>      <span class="cm">// "moved to heap: x"</span>
+    <span class="kw">return</span> &amp;x     <span class="cm">// pointer outlives the frame</span>
+}</code></pre>
+
+      <div class="callout why">
+        <span class="ic">◆</span>
+        <div><span class="lab">Why this matters</span>
+        <p>The cheapest garbage is the kind that's never created. By proving values can live on the stack, the compiler keeps huge amounts of short-lived data <em>out</em> of the heap entirely — so the GC has dramatically less to chase. Remember <code>broken()</code> from Concept 02? In Go that's safe: returning <code>&amp;x</code> just makes <code>x</code> escape to the heap automatically.</p>
+        </div>
+      </div>
+
+      <h2>One knob: GOGC</h2>
+      <p>Go keeps tuning refreshingly simple. The main dial is <code>GOGC</code> (default 100): collect once the heap has grown by that percentage since the last collection. Raise it to trade memory for fewer collections; lower it to trade CPU for a smaller footprint. (<code>GOMEMLIMIT</code> adds a soft ceiling.)</p>
+
+      <div class="callout note">
+        <span class="ic">▣</span>
+        <div><span class="lab">As of 2026</span>
+        <p>Go 1.24 added a standard <code>weak</code> package for weak references (caches that don't pin memory). Go 1.26 introduced <strong>"Green Tea" GC</strong>, a redesigned, more memory-aware collector — the project's biggest GC change in years, improving locality and scalability on modern hardware.</p>
+        </div>
+      </div>
+
+      <div class="cols">
+        <div class="card good">
+          <h4>What you gain</h4>
+          <p>GC safety with <em>tiny</em> pauses, plus a compiler that quietly keeps most allocations off the heap. Great fit for high-concurrency servers.</p>
+        </div>
+        <div class="card bad">
+          <h4>What you pay</h4>
+          <p>Lower peak throughput than a throughput-tuned collector, and higher memory use than manual/Rust — you give the heap slack so collections stay rare.</p>
+        </div>
+      </div>
+
+      <p>Five languages, five answers to one question. Time to lay them on a single table and decide how to choose. Turn the page.</p>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p>Go runtime GC docs &amp; design notes; Go 1.24 release notes (<code>weak</code> package); Go 1.26 release notes (Green Tea GC).</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<nav class="pager">
+  <a class="prev" href="09-python.html">‹ <span class="dir">Prev</span><span class="ttl">Python</span></a>
+  <a class="contents" href="../index.html">▤ Contents</a>
+  <a class="next" href="11-comparison.html"><span class="dir">Next ›</span><span class="ttl">One Table</span></a>
+</nav>
+</body>
+</html>

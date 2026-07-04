@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Precision &amp; Quantization — Custom LLM Models</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">◧</span> Custom <b>·</b> LLMs</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 05 · Memory</p>
+      <h1>Precision &amp; Quantization</h1>
+      <p class="lede">A weight is just a number. How many bits you spend storing each one decides whether a model fits on your GPU — or doesn't. Quantization is the lever, and it's the difference between "needs an H100" and "runs on my laptop."</p>
+
+      <p class="serif-drop">We ended the last chapter with a memory budget. Weights are the biggest line item, and their size is simply <code>parameters × bytes-per-parameter</code>. The parameter count is fixed by the model you chose. The bytes-per-parameter is <em>yours to negotiate</em> — that negotiation is called quantization.</p>
+
+      <h2>The precision ladder</h2>
+      <table>
+        <thead><tr><th>Format</th><th>Bytes/param</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><strong>FP32</strong></td><td>4</td><td>Full precision. Rarely needed for inference.</td></tr>
+          <tr><td><strong>FP16</strong></td><td>2</td><td>Half precision. 5-bit exponent, 10-bit mantissa.</td></tr>
+          <tr><td><strong>BF16</strong></td><td>2</td><td>Same range as FP32, less mantissa. The modern default.</td></tr>
+          <tr><td><strong>FP8</strong></td><td>1</td><td>Two flavours: E4M3 (precision) and E5M2 (range).</td></tr>
+          <tr><td><strong>INT8</strong></td><td>1</td><td>8-bit integer. Usually near-lossless.</td></tr>
+          <tr><td><strong>INT4</strong></td><td>0.5</td><td>~¼ of FP16. The workhorse of local inference.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">Do the multiplication</span>
+        <p>A 7B model: <strong>~14 GB</strong> in FP16, <strong>~3.5 GB</strong> in INT4. Llama-3-8B: ~16 GB → ~4 GB. The same weights, one-quarter the memory. That's the whole reason quantization is everywhere.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 1</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>FP16 vs BF16 — a five-second aside</h2>
+      <p>Both are 16 bits, both are "half precision," but they split those bits differently. <strong>BF16</strong> keeps FP32's full exponent (its <em>range</em>) and sacrifices mantissa (its <em>precision</em>); <strong>FP16</strong> does the reverse. For deep learning, range matters more than fine precision, so BF16 rarely overflows and has become the default on modern GPUs. When you see <code>bnb_4bit_compute_dtype=bfloat16</code> in Chapter 7, this is why.</p>
+
+      <h2>Weight-only quantization: keep the smarts, shrink the storage</h2>
+      <p>The trick that makes 4-bit <em>work</em> is <strong>weight-only</strong> quantization: store the weights in 4 bits, but dequantize them back to 16-bit on the fly for the actual math (activations stay in fp16/bf16). You get the memory win without wrecking accuracy — because the sensitive arithmetic still happens in higher precision.</p>
+
+      <div class="callout note">
+        <span class="ic">📉</span>
+        <div><span class="lab">The quality curve</span>
+        <p><strong>8-bit</strong> (INT8/FP8): usually near-lossless. <strong>4-bit</strong> (the methods opposite): ~4× smaller with typically small quality loss. <strong>Below 4-bit</strong> (3-bit, 2-bit): degradation grows and gets model- and task-dependent. 4-bit is the sweet spot most people live at.</p>
+        </div>
+      </div>
+
+      <div class="callout why">
+        <span class="ic">🧠</span>
+        <div><span class="lab">Not all weights are equal</span>
+        <p>The clever methods all exploit one fact: a small fraction of weights matter far more than the rest. Protect those, quantize the rest hard. Different methods just <em>find</em> the important ones differently — via the Hessian, via activations, via per-block bit budgets.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 2</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="04-kv-cache.html"><span class="dir">← Prev</span><span class="ttl">The KV Cache</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="06-fine-tuning.html"><span class="dir">Next →</span><span class="ttl">LoRA &amp; QLoRA</span></a>
+    </nav>
+  </section>
+
+  <section class="spread" style="margin-top:1.4rem">
+    <div class="leaf leaf-left">
+      <h2>The four methods you'll actually meet</h2>
+      <div class="cols">
+        <div class="card good">
+          <h4>GPTQ</h4>
+          <p>Post-training, layer-by-layer, uses approximate second-order (Hessian) info to minimize error. Typically 4-bit, group-wise. GPU-oriented, strong accuracy.</p>
+        </div>
+        <div class="card good">
+          <h4>AWQ</h4>
+          <p><em>Activation-aware.</em> Finds the ~1% of salient weight channels via activation magnitude and protects them. INT4/INT3, hardware-friendly kernels; often matches or beats GPTQ. (MLSys 2024 best paper.)</p>
+        </div>
+        <div class="card good">
+          <h4>GGUF (llama.cpp)</h4>
+          <p>A file <em>format</em> with many quant levels (Q2_K…Q8_0). "k-quants" mix bit budgets per block; <code>Q4_K_M</code> is the common default. CPU + GPU-offload; the format Ollama uses.</p>
+        </div>
+        <div class="card good">
+          <h4>NF4 (bitsandbytes)</h4>
+          <p>4-bit "NormalFloat," optimal for normally-distributed weights, from the QLoRA paper. Plus double-quantization. Fine-tuning-first — this is what makes QLoRA fit (Ch. 6).</p>
+        </div>
+      </div>
+
+      <div class="callout note">
+        <span class="ic">🧭</span>
+        <div><span class="lab">Which one, when</span>
+        <p><strong>Serving on a GPU</strong> → AWQ or GPTQ (works with vLLM/TGI). <strong>Laptop / CPU / Apple Silicon</strong> → GGUF via Ollama or llama.cpp. <strong>Fine-tuning a big model on a small GPU</strong> → NF4 (QLoRA). They solve overlapping problems from different starting points.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 3</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>The complete serving memory budget</h2>
+      <p>Now you can assemble the whole picture. Total GPU memory to serve a model is:</p>
+      <div class="formula">
+        GPU_mem ≈ <span class="hl">weights</span> (params × bytes) <br>
+        &nbsp;&nbsp;&nbsp;&nbsp;+ <span class="hl">KV cache</span> (Ch. 4 formula, × batch × context) <br>
+        &nbsp;&nbsp;&nbsp;&nbsp;+ <span class="hl">overhead</span> (activations, CUDA context, buffers)
+      </div>
+
+      <p>Every dial you have moves one of those terms. Quantize the weights → first term shrinks, freeing room for the second → more concurrent users on the same card. This is the through-line from here to the end of the book.</p>
+
+      <div class="callout bot">
+        <span class="ic">🧪</span>
+        <div><span class="lab">Acme check-in</span>
+        <p>Acme's Qwen-8B at fp16 needs ~16 GB just for weights — nearly all of a 24 GB GPU, leaving little for KV cache. Quantize to 4-bit (AWQ) and weights drop to ~5 GB, leaving <strong>~18 GB</strong> for cache — room for many more concurrent tickets, on the exact same hardware. Same model, quadruple the seats.</p>
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <span class="ic">⚠️</span>
+        <div><span class="lab">Free lunch has a bill</span>
+        <p>Quantization is lossy. For a customer-facing draft, validate that the 4-bit model still writes acceptable replies before you ship it. Measure, don't assume — 4-bit is <em>usually</em> fine, not <em>always</em>.</p>
+        </div>
+      </div>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p><a href="https://arxiv.org/abs/2306.00978">Lin et&nbsp;al., AWQ (2023)</a> · <a href="https://arxiv.org/abs/2305.14314">Dettmers et&nbsp;al., QLoRA / NF4 (2023)</a> · <a href="https://huggingface.co/blog/4bit-transformers-bitsandbytes">HF · 4-bit &amp; bitsandbytes</a> · <a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md">llama.cpp · quantize (GGUF k-quants)</a>.</p>
+      </div>
+
+      <span class="folio">· 4</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="04-kv-cache.html"><span class="dir">← Prev</span><span class="ttl">The KV Cache</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="06-fine-tuning.html"><span class="dir">Next →</span><span class="ttl">LoRA &amp; QLoRA</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

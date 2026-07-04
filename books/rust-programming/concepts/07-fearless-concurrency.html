@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fearless Concurrency — Rust: Fearless Systems Programming</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" href="../index.html"><span class="ferris">🦀</span> Rust: <b>Fearless</b> Systems</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="page">
+  <p class="kicker">Concept 07 · The Payoff</p>
+  <h1>Fearless Concurrency</h1>
+  <p class="lede">This is the chapter the whole book has been building toward. The very same ownership and borrowing rules that felt strict in chapter 1 turn out to make multithreaded bugs <em>impossible to compile</em>. Rust calls it fearless concurrency, and the name is earned.</p>
+
+  <h2>Why concurrency is so terrifying everywhere else</h2>
+  <p>Threads share memory. Two threads, one piece of data, at least one of them writing, no coordination — that's a <strong>data race</strong>, and it's a nightmare: the bug appears once in ten thousand runs, never in the debugger, never on your machine, only in production at peak traffic. Decades of tooling — sanitizers, race detectors, code review rituals — exist just to chase these ghosts after the fact.</p>
+  <p>Now look back at chapter 2's golden rule: <em>many readers XOR one writer, never both at once.</em> Read it again with threads in mind. That rule <strong>is</strong> the definition of "no data race." Rust already enforces it at compile time for single-threaded aliasing — it simply extends the very same check across threads. The bug class doesn't get caught earlier; it stops being expressible.</p>
+
+  <div class="callout key">
+    <span class="ic">🔑</span>
+    <div><span class="lab">Two traits do the heavy lifting</span>
+    <p>The compiler reasons about thread safety with two marker traits it applies automatically:</p>
+    <p><strong><code>Send</code></strong> — a type is safe to <em>transfer ownership of</em> to another thread.<br>
+       <strong><code>Sync</code></strong> — a type is safe to <em>share by reference</em> (<code>&amp;T</code>) across threads.</p>
+    <p>Almost everything is <code>Send + Sync</code> automatically. The types that aren't — like <code>Rc&lt;T&gt;</code>, whose reference count isn't atomic — are <em>rejected by the compiler</em> the moment you try to send them across a thread boundary. You don't annotate this; you just can't compile the unsafe thing.</p>
+    </div>
+  </div>
+
+  <h2>Spawning threads, and the move that makes it safe</h2>
+  <pre><span class="cap">rust</span><code><span class="kw">use</span> std::thread;
+
+<span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="kw">let</span> data = <span class="mac">vec!</span>[<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>];
+
+    <span class="kw">let</span> handle = thread::<span class="fn">spawn</span>(<span class="kw">move</span> || {     <span class="cm">// `move` gives the closure ownership of `data`</span>
+        <span class="mac">println!</span>(<span class="str">"from thread: {data:?}"</span>);
+    });
+
+    handle.<span class="fn">join</span>().<span class="fn">unwrap</span>();              <span class="cm">// wait for the thread to finish</span>
+}</code></pre>
+  <p>Why <code>move</code>? Because the new thread might outlive <code>main</code>'s stack frame. If the closure merely <em>borrowed</em> <code>data</code>, that borrow could dangle the instant <code>main</code> returned — and chapter 2 already taught the compiler to forbid dangling references. So it <em>requires</em> you to move ownership in. Same lifetime rule, now keeping threads honest.</p>
+
+  <h2>Sharing state: Arc + Mutex</h2>
+  <p>Sometimes threads genuinely must share one piece of mutable state — a counter, a cache. Rust makes you build it out of two honest pieces, and the type you end up with is provably correct:</p>
+  <ul>
+    <li><strong><code>Mutex&lt;T&gt;</code></strong> — a lock. To touch the <code>T</code> you must call <code>.lock()</code>, which hands you a guard. While you hold the guard, you have <em>exclusive</em> access; when it drops, the lock releases (RAII again — you can't forget to unlock).</li>
+    <li><strong><code>Arc&lt;T&gt;</code></strong> — an <em>atomically</em> reference-counted handle, so multiple threads can each own a share of the same allocation. (It's <code>Rc</code>'s thread-safe twin from chapter 3.)</li>
+  </ul>
+  <pre><span class="cap">rust · ten threads, one counter</span><code><span class="kw">use</span> std::sync::{<span class="ty">Arc</span>, <span class="ty">Mutex</span>};
+<span class="kw">use</span> std::thread;
+
+<span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="kw">let</span> counter = <span class="ty">Arc</span>::<span class="fn">new</span>(<span class="ty">Mutex</span>::<span class="fn">new</span>(<span class="num">0</span>));
+    <span class="kw">let</span> <span class="kw">mut</span> handles = <span class="mac">vec!</span>[];
+
+    <span class="kw">for</span> _ <span class="kw">in</span> <span class="num">0</span>..<span class="num">10</span> {
+        <span class="kw">let</span> counter = <span class="ty">Arc</span>::<span class="fn">clone</span>(&amp;counter); <span class="cm">// bump the refcount, hand a share to the thread</span>
+        handles.<span class="fn">push</span>(thread::<span class="fn">spawn</span>(<span class="kw">move</span> || {
+            <span class="kw">let</span> <span class="kw">mut</span> n = counter.<span class="fn">lock</span>().<span class="fn">unwrap</span>(); <span class="cm">// acquire the lock → exclusive access</span>
+            *n += <span class="num">1</span>;
+        })); <span class="cm">// guard drops here → lock auto-released</span>
+    }
+    <span class="kw">for</span> h <span class="kw">in</span> handles { h.<span class="fn">join</span>().<span class="fn">unwrap</span>(); }
+
+    <span class="mac">println!</span>(<span class="str">"total = {}"</span>, *counter.<span class="fn">lock</span>().<span class="fn">unwrap</span>()); <span class="cm">// always 10 — never a race</span>
+}</code></pre>
+
+  <div class="callout why">
+    <span class="ic">💡</span>
+    <div><span class="lab">The type system did the proof</span>
+    <p>Try to skip the <code>Mutex</code> and share a raw counter — won't compile (no synchronized access). Try to use <code>Rc</code> instead of <code>Arc</code> — won't compile (<code>Rc</code> isn't <code>Send</code>). Try to read the value without locking — won't compile (the data is <em>inside</em> the <code>Mutex</code>; the only door in is <code>.lock()</code>). Every wrong version is a build error. The one that compiles is the one that's correct. That is what "fearless" means: you refactor threaded code aggressively because if it builds, it doesn't have a data race.</p>
+    </div>
+  </div>
+
+  <h2>The other style: message passing</h2>
+  <p>Shared state isn't the only model. Often the cleaner design is "don't communicate by sharing memory; share memory by communicating." Rust ships channels for exactly this — threads send values to each other, and ownership <em>moves</em> through the channel:</p>
+  <pre><span class="cap">rust</span><code><span class="kw">use</span> std::sync::mpsc;     <span class="cm">// "multiple producer, single consumer"</span>
+<span class="kw">use</span> std::thread;
+
+<span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="kw">let</span> (tx, rx) = mpsc::<span class="fn">channel</span>();
+    thread::<span class="fn">spawn</span>(<span class="kw">move</span> || {
+        tx.<span class="fn">send</span>(<span class="ty">String</span>::<span class="fn">from</span>(<span class="str">"hi from the worker"</span>)).<span class="fn">unwrap</span>();
+        <span class="cm">// after send, the String is GONE from this thread — ownership moved</span>
+    });
+    <span class="kw">let</span> msg = rx.<span class="fn">recv</span>().<span class="fn">unwrap</span>(); <span class="cm">// blocks until a value arrives</span>
+    <span class="mac">println!</span>(<span class="str">"main got: {msg}"</span>);
+}</code></pre>
+  <p>Because <code>send</code> moves the value, there's no shared mutable state to race over at all — the data is only ever owned by one thread at a time. Ownership turns a concurrency discipline into a compiler-checked guarantee.</p>
+
+  <div class="callout note">
+    <span class="ic">🧭</span>
+    <div><span class="lab">And then there's async</span>
+    <p>For workloads that are I/O-bound — thousands of network connections mostly waiting — OS threads are too heavy. Rust's <code>async</code>/<code>.await</code> lets you write thousands of concurrent <em>tasks</em> on a handful of threads, scheduled by a runtime like <strong>Tokio</strong>. The 2024 edition matured this further with <em>async closures</em> (<code>async || { … }</code>) and the <code>AsyncFn</code> trait family. The mental model is the same — futures are values, ownership and <code>Send</code> still govern what may cross task boundaries — just cooperatively scheduled instead of pre-emptively.</p>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <span class="ic">⚠️</span>
+    <div><span class="lab">One thing Rust does NOT prevent</span>
+    <p>Be honest about the boundary: Rust eliminates <em>data races</em>, not <em>deadlocks</em>. If thread A locks mutex 1 then waits for mutex 2, while thread B locks mutex 2 then waits for mutex 1, you'll hang — and the compiler won't catch it, because each individual lock is perfectly valid. Lock ordering and avoiding held-locks-across-<code>.await</code> are still on you. "Fearless" means race-free, not logic-bug-free.</p>
+    </div>
+  </div>
+
+  <h2>The thirty-second version</h2>
+  <ul>
+    <li>The borrow rule (readers XOR writer) <em>is</em> the no-data-race rule — Rust extends it across threads at compile time.</li>
+    <li><code>Send</code> = safe to move to another thread; <code>Sync</code> = safe to share by reference. Auto-derived; unsafe types are rejected.</li>
+    <li><code>thread::spawn(move || …)</code> moves owned data into a thread so nothing can dangle.</li>
+    <li>Share mutable state with <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>: atomic shared ownership + a lock whose guard auto-releases.</li>
+    <li>Or pass ownership through channels (<code>mpsc</code>); for massive I/O concurrency, use <code>async</code>/<code>.await</code> on a runtime like Tokio.</li>
+    <li>Rust prevents data races — <strong>not</strong> deadlocks. Mind your lock ordering.</li>
+  </ul>
+
+  <div class="sources">
+    <h3>Sources</h3>
+    <p>The Rust Programming Language, ch. 16 “Fearless Concurrency” &amp; ch. 17 (Async); std <code>std::sync</code>, <code>std::thread</code>, <code>std::sync::mpsc</code> docs; “Announcing Rust 1.85.0 and Rust 2024” (async closures). Verified against stable Rust 1.96 / 2024 edition.</p>
+  </div>
+
+  <nav class="pager">
+    <a class="prev" href="06-generics-iterators-closures.html"><span class="dir">← Prev</span><span class="ttl">Generics, Iterators &amp; Closures</span></a>
+    <a class="contents" href="../index.html"><span class="dir">Contents</span>🦀</a>
+    <a class="next" href="08-cargo-ecosystem.html"><span class="dir">Next →</span><span class="ttl">Cargo, Crates &amp; the Ecosystem</span></a>
+  </nav>
+</main>
+</body>
+</html>

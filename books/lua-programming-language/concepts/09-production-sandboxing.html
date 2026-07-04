@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sandboxing in Production — Lua Field Guide</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <p class="kicker">Chapter Nine</p>
+    <h2>Sandboxing in Production</h2>
+    <p class="lead">Running other people's code is a privilege you grant carefully. The good news: between Luerl and the BEAM you get three independent layers of containment. The job is to turn all three on.</p>
+
+    <h3>Layer 1 — a sandboxed VM by default</h3>
+    <p><code>Lua.new/0</code> already removes the dangerous standard libraries. <code>io</code>, <code>os</code>, <code>package</code>, and <code>require</code> are sandboxed out of the box, so a script can't read files, shell out, or load native code.</p>
+
+    <pre><code class="elixir"># default: dangerous libs already removed
+lua = Lua.new()
+
+# tighten or loosen explicitly
+Lua.new(sandboxed: [[:os, :exit]])   # sandbox just os.exit
+Lua.new(sandboxed: [])               # DANGER: nothing sandboxed
+Lua.sandbox(lua, [:os, :exit])       # sandbox after the fact</code></pre>
+
+    <div class="callout warn">
+      <span class="lbl">Never pass <code>sandboxed: []</code> for untrusted code</span>
+      <p>That re-arms <code>os.execute</code>, file I/O, and dynamic loading. Use it only for code <em>you</em> wrote and trust. For anything user-supplied, keep the defaults and add to the deny-list, never empty it.</p>
+    </div>
+
+    <h3>Layer 2 — the BEAM process boundary</h3>
+    <p>This is the advantage native Lua can't match. Because a Luerl VM is just an Erlang term, you run each evaluation inside its own short-lived, supervised process — then cap its <strong>wall-clock time</strong> and <strong>heap size</strong>. A runaway <code>while true do end</code> dies without touching your app.</p>
+
+    <pre><code class="elixir">def run_guarded(src, timeout_ms \\ 1_000) do
+  task =
+    Task.async(fn -&gt;
+      # cap memory: kill the process if its heap exceeds the limit
+      Process.flag(:max_heap_size, %{size: 50_000, kill: true})
+      Lua.eval!(Lua.new(), src)
+    end)
+
+  case Task.yield(task, timeout_ms) || Task.shutdown(task) do
+    {:ok, {result, _lua}} -&gt; {:ok, result}
+    nil -&gt; {:error, :timeout}        # script ran too long; killed
+  end
+end</code></pre>
+
+    <div class="callout key">
+      <span class="lbl">Key idea</span>
+      <p>On the BEAM, "stop a misbehaving script" is just "kill a process." Timeouts, memory ceilings, and crash isolation come from the runtime you already trust to run your whole app. That's the single biggest reason to embed Lua here rather than in a C host.</p>
+    </div>
+
+    <h3>Layer 3 — a curated API surface</h3>
+    <p>Sandboxing removes capabilities; your API adds back exactly the safe ones. Every door is one you chose: a <code>deflua</code> function or an <code>ash_lua</code> action, each enforcing its own checks. Keep secrets in <code>put_private</code> (Chapter Six), keep authority in the actor/tenant (Chapter Seven), and the script's whole world is the surface you designed.</p>
+
+    <h3>Limits worth setting</h3>
+    <table>
+      <thead><tr><th>Risk</th><th>Guard</th></tr></thead>
+      <tbody>
+        <tr><td>Infinite loop</td><td><code>Task.shutdown</code> after a timeout</td></tr>
+        <tr><td>Memory blow-up</td><td><code>:max_heap_size</code> process flag</td></tr>
+        <tr><td>File / shell / network</td><td>default sandbox (don't re-enable)</td></tr>
+        <tr><td>Huge DB reads</td><td>default page sizes on Ash actions</td></tr>
+        <tr><td>Privilege escalation</td><td>actor/tenant fixed by the host</td></tr>
+        <tr><td>Syntax errors at runtime</td><td><code>~LUA[...]c</code> / <code>Lua.parse_chunk/1</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Know the trade-offs</h3>
+    <ul>
+      <li><strong>Luerl is not C-Lua.</strong> It implements Lua 5.x semantics in Erlang, so it's slower than the reference interpreter and trails the very newest 5.5 features. For glue logic and rules that's irrelevant; for tight numeric loops, do the heavy lifting in Elixir and call <em>out</em> from Lua.</li>
+      <li><strong>Marshalling has a cost.</strong> Converting big tables across the boundary isn't free. Pass identifiers, not megabytes; let Ash fetch what's needed inside the call.</li>
+      <li><strong>Sandboxes need review.</strong> A capability you expose is a capability scripts have. Treat <code>deflua</code> functions and exposed actions like a public API — because to your users, they are.</li>
+    </ul>
+
+    <div class="callout note">
+      <span class="lbl">A sensible default recipe</span>
+      <p>Default <code>Lua.new()</code> + one BEAM process per run + a 1-second timeout + a heap cap + an explicitly curated API + (for data) <code>ash_lua</code> with a fixed actor. That stack safely runs untrusted, user-authored scripts in a multi-tenant SaaS — which is exactly where we came in.</p>
+    </div>
+
+    <p class="footnote">Sources: <code>lua</code> library sandboxing docs; Luerl design notes; Erlang/OTP process flags (<code>max_heap_size</code>).</p>
+  </article>
+  <div class="book-spine"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-interesting-use-cases.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

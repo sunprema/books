@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token-Level Memory Experts — MeKi in Elixir</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">MK</span> MeKi <b>·</b> in Elixir</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 03 · Retrieval</p>
+      <h1>Token-Level Memory Experts</h1>
+      <p class="lede">An “expert” in MeKi is not a network you route to. It is a <em>vector you look up</em> — one per token id, per layer. Two such vectors, fused.</p>
+
+      <p class="serif-drop">Mixture-of-Experts picks, for each token, a few sub-networks to run. MeKi does something simpler and cheaper: for each token it reads a single dedicated knowledge vector straight out of a table. The token id <em>is</em> the address. No router, no learned gating over experts, no branching — just memory.</p>
+
+      <p>Two complementary tables produce that vector. The first is <strong>static memory</strong>: a plain, trainable embedding table for layer <span class="v">l</span>,</p>
+      <div class="eq">
+        <span class="v">M</span><span class="sup">l</span> ∈ ℝ<span class="sup">|V|×d<span class="sub">mem</span></span>,&nbsp;&nbsp;
+        <span class="v">m</span><span class="sub">static</span>(x<span class="sub">t</span>) = <span class="v">M</span><span class="sup">l</span>[x<span class="sub">t</span>]
+      </div>
+      <p>where <span class="v">|V|</span> is the vocabulary size and <span class="v">d<span class="sub">mem</span></span> is a <em>small</em> memory dimension — 128 or 256, far below the model width <span class="v">d<span class="sub">model</span></span>. This table learns per-token, per-layer priors directly in its own little space.</p>
+
+      <div class="callout note">
+        <span class="ic">🗂️</span>
+        <div><span class="lab">Why "expert"?</span>
+        <p>Because each row carries knowledge specialized to one token at one depth. The vocabulary <em>is</em> the set of experts, and the lookup activates exactly one of them — the sparsest routing imaginable, with no routing cost.</p>
+        </div>
+      </div>
+      <span class="folio">5 ·</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <p>The second table is <strong>dynamic memory</strong>. During training only, MeKi feeds the model's <em>global word embedding</em> <span class="v">E<span class="sub">global</span></span> through a small non-linear projection <span class="v">G</span><span class="sup">l</span> (a SwiGLU), synthesizing a layer-specific feature from the shared semantic space:</p>
+      <div class="eq">
+        <span class="v">m</span><span class="sub">dyn</span>(x<span class="sub">t</span>) = <span class="v">G</span><span class="sup">l</span>( <span class="v">E<span class="sub">global</span></span>[x<span class="sub">t</span>] )
+      </div>
+
+      <p>The final expert vector fuses the two, stabilized by RMSNorm and two learnable scalars:</p>
+      <div class="eq">
+        <span class="v">e</span><span class="sup">l</span><span class="sub">t</span> = α<span class="sup">l</span> · RMSNorm( <span class="v">m</span><span class="sub">static</span>(x<span class="sub">t</span>) + β<span class="sup">l</span> · <span class="v">m</span><span class="sub">dyn</span>(x<span class="sub">t</span>) )
+      </div>
+      <p>Read the knobs: <strong>β<span class="sup">l</span></strong> sets the per-layer blend between learned static priors and projected dynamic features; <strong>α<span class="sup">l</span></strong> sets how strongly this layer injects knowledge at all. Both are scalars, both are learned.</p>
+
+      <p>In Nx, the lookups are one call each — gather rows by id with <code>Nx.take/2</code>:</p>
+      <pre><span class="cap">elixir · iex</span><code><span class="cm"># M_l :: {vocab, d_mem}   token_ids :: {batch, seq}</span>
+<span class="kw">iex&gt;</span> m_static = <span class="ty">Nx</span>.<span class="fn">take</span>(m_l, token_ids)
+<span class="cm">#=&gt; tensor shape {batch, seq, d_mem}</span>
+
+<span class="cm"># dynamic side (training): project the global embedding rows</span>
+<span class="kw">iex&gt;</span> e_rows  = <span class="ty">Nx</span>.<span class="fn">take</span>(e_global, token_ids)  <span class="cm"># {b, s, d_model}</span>
+<span class="kw">iex&gt;</span> m_dyn   = <span class="ty">MeKi.SwiGLU</span>.<span class="fn">forward</span>(e_rows, g_params)</code></pre>
+
+      <p>Do both tables really earn their keep? The ablation says yes. On the 0.6B model, <em>static-only</em> lifts the average benchmark score from 53.0 to 54.8, <em>dynamic-only</em> lands in the same neighborhood, and combining them beats each by a further <strong>+0.7 / +0.8</strong> — evidence the two carry complementary information. We will see in Chapter 5 that the dynamic side costs <em>nothing</em> at inference, because it gets folded away entirely.</p>
+
+      <div class="callout why">
+        <span class="ic">🧠</span>
+        <div><span class="lab">The shape that matters</span>
+        <p>Everything so far lives in the cramped <span class="v">d<span class="sub">mem</span></span> space (e.g. 256), not the wide <span class="v">d<span class="sub">model</span></span> space (e.g. 2048). That is what keeps both the table and the upcoming gate cheap.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 6</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="02-transformer-slot.html"><span class="dir">← Prev</span><span class="ttl">The Transformer Slot</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>▦</a>
+      <a class="next" rel="next" href="04-knowledge-injection.html"><span class="dir">Next →</span><span class="ttl">Knowledge Injection</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

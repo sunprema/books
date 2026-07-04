@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheatsheet — How GPUs Work</title>
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="index.html">HOW <span class="zap">GPUs</span> WORK</a>
+  <span class="bb-chapter">The Cheatsheet</span>
+  <a href="index.html">Contents</a>
+  <a href="cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker">Quick Reference</p>
+    <h1>The <span class="hl">Cheatsheet</span></h1>
+    <p>The whole book, compressed for exam week. <span class="sticker green">30-second version</span>
+    <em>GPUs = throughput machines: thousands of simple cores run one small program over
+    huge independent data, in lockstep warps of 32, hiding memory latency with spare
+    threads — and the real bottleneck is almost always memory, not math.</em></p>
+
+    <div class="cheat-card">
+      <h2>The vocabulary</h2>
+      <table>
+        <tr><th>Term</th><th>Meaning</th></tr>
+        <tr><td class="mono">kernel</td><td>function launched across many GPU threads (the loop body, minus the loop)</td></tr>
+        <tr><td class="mono">thread</td><td>one execution of the kernel; handles one element</td></tr>
+        <tr><td class="mono">warp</td><td>32 threads executing in lockstep (SIMT); the hardware's real unit of work</td></tr>
+        <tr><td class="mono">block</td><td>≤1,024 threads on one SM; can share memory &amp; __syncthreads()</td></tr>
+        <tr><td class="mono">grid</td><td>all blocks of a launch; blocks must be independent → scales to any GPU</td></tr>
+        <tr><td class="mono">SM</td><td>Streaming Multiprocessor — the "factory" (cores + Tensor Cores + shared mem + warp schedulers)</td></tr>
+        <tr><td class="mono">occupancy</td><td>fraction of an SM's warp slots filled — fuel for latency hiding</td></tr>
+        <tr><td class="mono">divergence</td><td>warp threads taking different branches → paths serialized → idle lanes</td></tr>
+        <tr><td class="mono">coalescing</td><td>neighboring threads reading neighboring addresses → few memory transactions</td></tr>
+        <tr><td class="mono">HBM</td><td>stacked high-bandwidth DRAM next to the die (data-center); GDDR = gaming equivalent</td></tr>
+        <tr><td class="mono">Tensor Core</td><td>unit computing D = A×B + C on whole matrix tiles per clock</td></tr>
+        <tr><td class="mono">arithmetic intensity</td><td>math ops per byte moved — decides memory- vs compute-bound (roofline)</td></tr>
+        <tr><td class="mono">KV cache</td><td>per-token attention state kept in GPU memory during LLM generation</td></tr>
+      </table>
+    </div>
+
+    <div class="cheat-card">
+      <h2>The memory pyramid (H100-era ballparks)</h2>
+      <table>
+        <tr><th>Level</th><th>Size</th><th>Latency</th><th>Scope</th></tr>
+        <tr><td>Registers</td><td class="mono">~256 KB/SM</td><td class="mono">~1 cy</td><td>per thread</td></tr>
+        <tr><td>Shared / L1</td><td class="mono">~228 KB/SM</td><td class="mono">~20–30 cy</td><td>per block</td></tr>
+        <tr><td>L2</td><td class="mono">50–96 MB</td><td class="mono">~200 cy</td><td>whole chip</td></tr>
+        <tr><td>HBM/GDDR</td><td class="mono">24–192 GB</td><td class="mono">~400–800 cy</td><td>whole chip</td></tr>
+      </table>
+      <ul>
+        <li>Fast-kernel recipe: coalesce global reads → stage tiles in shared memory → reuse many times.</li>
+        <li>Break-even on H100 ≈ <strong>~300 math ops per byte</strong>. Below it, FLOPS don't matter.</li>
+      </ul>
+    </div>
+
+    <div class="cheat-card">
+      <h2>CUDA in six lines</h2>
+      <pre class="code" style="margin:0"><code><span class="k">__global__</span> <span class="t">void</span> <span class="f">add</span>(<span class="t">float</span>* a, <span class="t">float</span>* b, <span class="t">float</span>* c, <span class="t">int</span> n) {
+    <span class="t">int</span> i = blockIdx.x * blockDim.x + threadIdx.x;
+    <span class="k">if</span> (i &lt; n) c[i] = a[i] + b[i];
+}
+<span class="c">// launch: grid covers N, 256 threads/block</span>
+add&lt;&lt;&lt;(N+<span class="n">255</span>)/<span class="n">256</span>, <span class="n">256</span>&gt;&gt;&gt;(a, b, c, N);</code></pre>
+      <ul>
+        <li>Flow: <span class="mono">cudaMalloc → cudaMemcpy(H→D) → kernel → cudaMemcpy(D→H)</span>. Move data once, work a lot.</li>
+        <li>Loops <em>inside</em> a thread are fine; the loop <em>over the data</em> becomes the grid.</li>
+      </ul>
+    </div>
+
+    <div class="cheat-card">
+      <h2>Precision menu (Tensor Core era)</h2>
+      <table>
+        <tr><th>Format</th><th>Bits</th><th>Use</th></tr>
+        <tr><td class="mono">FP32</td><td class="mono">32</td><td>science, accumulators, master weights</td></tr>
+        <tr><td class="mono">TF32</td><td class="mono">19</td><td>free training speedup on Ampere+ matmuls</td></tr>
+        <tr><td class="mono">FP16 / BF16</td><td class="mono">16</td><td>standard training compute (BF16 = FP32's range, less detail)</td></tr>
+        <tr><td class="mono">FP8</td><td class="mono">8</td><td>frontier training + fast inference (Hopper+)</td></tr>
+        <tr><td class="mono">FP4 / INT4</td><td class="mono">4</td><td>quantized inference (Blackwell hardware)</td></tr>
+      </table>
+      <ul>
+        <li>Rule: multiply small, <strong>accumulate big</strong>. Each halving ≈ 2× speed, ½ memory.</li>
+        <li>Spec-sheet trap: "with sparsity" doubles the marketing number.</li>
+      </ul>
+    </div>
+
+    <div class="cheat-card">
+      <h2>LLM speed napkin math</h2>
+      <ul>
+        <li><strong>Decode tokens/sec ≤ bandwidth ÷ model bytes.</strong> 70B @ 8-bit on H100: 3350/70 ≈ 48 tok/s.</li>
+        <li><strong>Prefill</strong> = batch of prompt tokens = compute-bound (Tensor Cores). <strong>Decode</strong> = one token at a time = memory-bound.</li>
+        <li>Fixes: batching (reuse each weight-load), quantization (fewer bytes), speculative decoding (verify 5 guesses per load), FlashAttention (keep attention on-chip).</li>
+        <li>Buying for local LLMs? Rank specs: <strong>1. memory capacity, 2. memory bandwidth, 3. FLOPS.</strong></li>
+      </ul>
+    </div>
+
+    <div class="cheat-card">
+      <h2>"Will it be fast on a GPU?" checklist</h2>
+      <ul>
+        <li>☑ Same operation over many elements?</li>
+        <li>☑ Elements independent (no step-N-needs-N−1 chains)?</li>
+        <li>☑ Enough work — tens of thousands of threads minimum?</li>
+        <li>☑ Data can stay on the GPU (copies amortized)?</li>
+        <li>☑ Neighboring threads touch neighboring memory?</li>
+        <li>☑ Branches mostly agree within a warp?</li>
+        <li>Any ☒ → profile before celebrating; two ☒ → maybe keep it on the CPU.</li>
+      </ul>
+    </div>
+
+    <div class="cheat-card">
+      <h2>Numbers worth knowing (2026)</h2>
+      <table>
+        <tr><th>Thing</th><th>Number</th></tr>
+        <tr><td>Threads per warp</td><td class="mono">32 (NVIDIA; AMD wavefront 32/64)</td></tr>
+        <tr><td>Max threads per block</td><td class="mono">1,024</td></tr>
+        <tr><td>H100: SMs / cores / HBM</td><td class="mono">132 / 16,896 / 80 GB @ 3.35 TB/s</td></tr>
+        <tr><td>RTX 5090: cores / VRAM</td><td class="mono">21,760 / 32 GB GDDR7 @ 1.79 TB/s</td></tr>
+        <tr><td>B200: transistors / memory</td><td class="mono">208 B (2 dies) / ~180 GB HBM3e @ ~8 TB/s</td></tr>
+        <tr><td>NVLink 5 per GPU</td><td class="mono">1.8 TB/s · NVL72 rack = 72 GPUs, one domain</td></tr>
+        <tr><td>PCIe 5 ×16</td><td class="mono">~64 GB/s — the moat around the GPU</td></tr>
+        <tr><td>Frontier cluster</td><td class="mono">100,000+ GPUs, 100+ MW</td></tr>
+      </table>
+    </div>
+
+    <div class="cheat-card">
+      <h2>Timeline in one breath</h2>
+      <ul>
+        <li><strong>1999</strong> GeForce 256, "the first GPU" · <strong>2006–07</strong> unified shaders + CUDA — GPUs go general</li>
+        <li><strong>2012</strong> AlexNet on 2 gaming cards — deep learning ignites · <strong>2017</strong> Tensor Cores (Volta) + Transformers</li>
+        <li><strong>2018</strong> RT cores — ray tracing · <strong>2020</strong> A100 · <strong>2022</strong> H100 + FP8 — the LLM workhorse</li>
+        <li><strong>2024–26</strong> Blackwell: chiplets, FP4, NVL72 racks, AI factories, petaflop desktops</li>
+      </ul>
+    </div>
+
+    <p class="sources"><span class="src-tag">Full book</span>
+      Details &amp; sources live in the chapters — this page is the compressed version.
+      Start anywhere; Chapter 8 explains why your chatbot types at the speed it does.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="concepts/10-getting-hands-on.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="index.html">Contents</a>
+  <span class="book-pageno"></span>
+</nav>
+<script src="assets/book.js"></script>
+</body>
+</html>

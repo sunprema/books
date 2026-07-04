@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · GPUs & LLMs — How GPUs Work</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">HOW <span class="zap">GPUs</span> WORK</a>
+  <span class="bb-chapter">08 · GPUs &amp; LLMs: Feeding the Token Machine</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker">Chapter 08 · The Main Event</p>
+    <h1>GPUs &amp; LLMs: <span class="hl">Feeding the Token Machine</span></h1>
+
+    <p class="lede">You ask an AI assistant a question. Somewhere, a rack of GPUs
+    wakes up. What happens next is the single best application of everything in this
+    book — warps, memory walls, Tensor Cores, arithmetic intensity — so let's trace
+    it end to end. Fair warning: the punchline is not "the GPU does a lot of math."
+    The punchline is that generating text is mostly a <em>memory-moving</em> job,
+    and it changes how the entire AI industry builds hardware.</p>
+
+    <h2>What an LLM does, mechanically</h2>
+    <p>Strip away the mystique and a large language model is: <strong>a stack of giant
+    matrices</strong> (the "weights" — for a 70B-parameter model, 70 billion numbers)
+    plus a loop: turn the text so far into vectors, multiply through the stack
+    (~80 layers of attention + feed-forward blocks), get a probability for every
+    possible next token, pick one, append it, repeat. Every word an LLM has ever said
+    to you came out of that loop — one matrix-multiply gauntlet per token.</p>
+
+    <h2>Two phases, opposite personalities</h2>
+    <p>Serving a request has two phases, and they stress the GPU in <em>opposite</em>
+    ways. This distinction is the key to all modern inference engineering:</p>
+    <ul>
+      <li><strong>Prefill</strong> — reading your prompt. All 500 prompt tokens can be
+      processed <em>at once</em>: a fat batch of matrix work, thousands of rows deep.
+      High arithmetic intensity, Tensor Cores blazing —
+      <span class="term">compute-bound</span>. This phase is why there's a pause before
+      the first word appears.</li>
+      <li><strong>Decode</strong> — writing the answer. Tokens come out <em>one at a
+      time</em> (each depends on the last — remember JSON parsing from Chapter 2?). To
+      produce ONE token, the GPU must stream <strong>all 70 billion weights</strong>
+      from HBM through the cores… to do just one multiply-add per weight with them.
+      One op per byte-ish. Chapter 5 told you the break-even is ~300 ops per byte.
+      Decode is <em>hundreds of times</em> below it —
+      <span class="term">memory-bound</span>, catastrophically.</li>
+    </ul>
+
+    <div class="callout key">
+      <span class="co-tag">The Napkin Math</span>
+      <p>Decode speed ≈ <strong>memory bandwidth ÷ model size</strong>. A 70B model in
+      8-bit = 70 GB of weights. On an H100 (3.35 TB/s): 3350 ÷ 70 ≈ <strong>48 tokens/sec,
+      ceiling</strong> — regardless of its 2,000 TFLOPS! The math units could go ~300×
+      faster; they're starving. This one equation explains why AI chips race to add
+      memory bandwidth, why models get quantized to 4-bit, and why your local LLM's
+      speed tracks your RAM bandwidth, not your FLOPS.</p>
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 760 250" role="img" aria-label="Roofline chart: performance vs arithmetic intensity, decode in memory-bound region, prefill near compute roof">
+        <g font-family="-apple-system,Arial" font-size="12" fill="#241f18">
+          <!-- axes -->
+          <line x1="70" y1="200" x2="720" y2="200" stroke="#241f18" stroke-width="2"/>
+          <line x1="70" y1="200" x2="70" y2="30" stroke="#241f18" stroke-width="2"/>
+          <text x="395" y="232" text-anchor="middle" font-size="11">arithmetic intensity (math ops per byte moved) →</text>
+          <text x="40" y="115" text-anchor="middle" font-size="11" transform="rotate(-90 40 115)">speed →</text>
+          <!-- roofline: slanted then flat -->
+          <line x1="70" y1="195" x2="430" y2="55" stroke="#6d4fd8" stroke-width="3"/>
+          <line x1="430" y1="55" x2="710" y2="55" stroke="#76b900" stroke-width="3"/>
+          <text x="200" y="105" font-size="11" fill="#6d4fd8" transform="rotate(-21 200 105)" font-weight="700">memory-bound: bandwidth is the wall</text>
+          <text x="560" y="45" font-size="11" fill="#46760a" font-weight="700">compute-bound: FLOPS is the wall</text>
+          <!-- ridge -->
+          <line x1="430" y1="55" x2="430" y2="200" stroke="#ddd2ba" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <text x="430" y="216" text-anchor="middle" font-size="10" fill="#6f6654">~300 ops/byte (H100 FP16)</text>
+          <!-- points -->
+          <circle cx="115" cy="178" r="9" fill="#d6407a" stroke="#241f18" stroke-width="2"/>
+          <text x="115" y="163" text-anchor="middle" font-size="11" font-weight="800">decode, batch 1</text>
+          <circle cx="300" cy="108" r="9" fill="#e09b00" stroke="#241f18" stroke-width="2"/>
+          <text x="300" y="93" text-anchor="middle" font-size="11" font-weight="800">decode, batched</text>
+          <circle cx="530" cy="55" r="9" fill="#76b900" stroke="#241f18" stroke-width="2"/>
+          <text x="530" y="83" text-anchor="middle" font-size="11" font-weight="800">prefill</text>
+          <!-- arrow batch -->
+          <path d="M130 172 Q 210 150 285 116" stroke="#e09b00" stroke-width="1.5" fill="none" stroke-dasharray="5 3"/>
+          <text x="195" y="145" font-size="10" fill="#e09b00">batching →</text>
+        </g>
+      </svg>
+      <figcaption><strong>The roofline chart</strong> — performance-engineering's
+      favorite picture. Your speed is capped by whichever roof you're under. Decode at
+      batch 1 sits deep in memory-bound territory; the fix is moving <em>right</em>:
+      serve many users per weight-load.</figcaption>
+    </figure>
+
+    <h2>How the industry fights the memory wall</h2>
+    <p>Every big inference trick you've heard of is an attack on that one equation:</p>
+    <ul>
+      <li><strong>Batching.</strong> If 64 users' requests decode together, the GPU
+      loads the 70 GB of weights <em>once</em> and does 64 tokens' worth of math with
+      it — 64× the arithmetic intensity. Individual latency barely changes; total
+      throughput explodes. This is why AI APIs are cheap and getting cheaper.</li>
+      <li><strong>Quantization.</strong> Weights in 4-bit instead of 16-bit = 4× fewer
+      bytes to stream = up to ~4× more tokens/sec, from the same silicon. (Chapter 7's
+      FP4 hardware exists precisely for this.)</li>
+      <li><strong>The KV cache.</strong> Attention lets each new token "look back" at
+      every previous one. Recomputing that would be quadratic madness, so per-token
+      attention data gets cached in GPU memory. Gotcha: it's huge — long chats can eat
+      tens of GB — and it's the main reason long-context conversations are expensive.
+      When a provider "compacts" your chat, they're managing this cache.</li>
+      <li><strong>Speculative decoding.</strong> A tiny cheap model guesses 5 tokens
+      ahead; the big model verifies all 5 <em>in one batched pass</em> (verification
+      batches like prefill!). Guesses right → 5 tokens for ~1 weight-load.</li>
+      <li><strong>FlashAttention.</strong> Rewrites attention as a tiled,
+      shared-memory-resident kernel (Chapter 5's whiteboard trick) so the big
+      attention matrix never touches HBM at all.</li>
+    </ul>
+
+    <h2>And training? Opposite world</h2>
+    <p>Training is decode's mirror image: enormous batches (millions of tokens per
+    step), so arithmetic intensity is sky-high and the job is gloriously
+    <strong>compute-bound</strong> — Tensor Cores at full sprint for months. The catch
+    is scale: a frontier model needs ~10²⁵–10²⁶ FLOPs of training, which is why it's
+    done on <em>tens of thousands</em> of GPUs at once, and why a training cluster
+    costs more than a skyscraper. (How you make 10,000 GPUs act like one computer is
+    Chapter 9.) Memory still bites here too — storing gradients + optimizer state
+    triples the weight memory, hence tricks like sharding them across the fleet.</p>
+
+    <figure class="img-slot" data-img-slot="token-buffet"
+            data-img-file="assets/img/token-buffet.png" style="--img-aspect:16 / 9">
+      <img class="img-real" src="../assets/img/token-buffet.png"
+           alt="Cartoon: to serve one tiny word, a robot waiter must wheel out the entire 70-billion-book library past the table"
+           width="1280" height="720"
+           onerror="this.closest('.img-slot').classList.add('img-missing')">
+      <div class="img-drop"><div class="img-drop-inner">
+        <strong>Image needed</strong>
+        <p class="img-prompt">A funny zine-style cartoon restaurant scene, hand-drawn ink with
+        flat colors (electric green, violet, pink on cream paper): a customer robot has ordered
+        one single tiny word on a plate (a little glowing token labeled "the"). To deliver it,
+        an exhausted waiter robot must push a colossal library cart stacked impossibly high
+        with 70 billion books (labeled "WEIGHTS") past the table — for EVERY word. Behind him,
+        a manager robot points at a sign reading "BATCHING: seat 64 customers per cart trip!"
+        where dozens of happy customers share one giant cart delivery. Exaggerated, playful,
+        no other small text. Target size ~1280×720px, 16:9 landscape; composed for a small
+        on-page figure, subject centred with safe margins — it is letterboxed into a 16:9
+        box, so keep nothing important near the edges.</p>
+        <button type="button" class="img-copy">Copy prompt</button>
+        <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+      </div></div>
+      <figcaption><strong>Decode, dramatized.</strong> One token = one full trip past
+      all 70 billion weights. Batching amortizes the cart trip across many customers.</figcaption>
+    </figure>
+
+    <h2>Why AI agents multiply all of this</h2>
+    <p>A chatbot answers you once. An <strong>agent</strong> — the kind that researches,
+    writes code, runs tools, checks its work — loops: think, act, read results, think
+    again. One user task can mean dozens of LLM calls with long, growing contexts
+    (all that tool output lands in the prompt). Agents therefore hammer exactly the
+    expensive parts: prefill (re-reading big contexts) and KV cache (keeping them
+    alive). Multiply by millions of users, and you get the great GPU land-rush of the
+    2020s: the constraint on AI right now isn't ideas — it's <em>tokens per second per
+    watt</em>, which is to say, it's this chapter.</p>
+
+    <div class="callout warn">
+      <span class="co-tag">Gotcha</span>
+      <p>Don't buy (or rent) GPUs by TFLOPS alone. For chat-style inference, the
+      spec that predicts tokens/sec is <strong>memory bandwidth</strong> (and having
+      enough VRAM to hold the model + KV cache at all). For training or serving
+      giant batches, FLOPS and interconnect matter more. "Which GPU is best?" always
+      starts with "which roof are you under?"</p>
+    </div>
+
+    <p>One GPU, we've established, is not enough — a frontier model doesn't even
+    <em>fit</em> on one. Time to see how GPUs hold hands: NVLink, clusters, and
+    computers the size of buildings.</p>
+
+    <p class="sources"><span class="src-tag">Sources</span>
+      "LLM Inference Unveiled: Survey and Roofline Model Insights" (arxiv.org/abs/2402.16363) ·
+      "Mind the Memory Gap: GPU Bottlenecks in Large-Batch LLM Inference" (arxiv.org/abs/2503.08311) ·
+      Dao et al., "FlashAttention" (arxiv.org/abs/2205.14135) ·
+      NVIDIA H100 specifications (nvidia.com)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-tensor-cores.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="09-scaling-out.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

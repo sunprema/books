@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Re-Parameterization Trick — MeKi in Elixir</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">MK</span> MeKi <b>·</b> in Elixir</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 05 · The Magic</p>
+      <h1>The Re-Parameterization Trick</h1>
+      <p class="lede">MeKi trains with an expensive non-linear projection and infers without it. The bridge is a single observation about what is, and isn't, constant after training.</p>
+
+      <p class="serif-drop">Recall the expert vector from Chapter 3, the version with both memories fused:</p>
+      <div class="eq">
+        <span class="v">e</span><span class="sup">l</span><span class="sub">t</span> = α<span class="sup">l</span> · RMSNorm( <span class="v">M</span><span class="sup">l</span>[x<span class="sub">t</span>] + β<span class="sup">l</span> · <span class="v">G</span><span class="sup">l</span>(<span class="v">E<span class="sub">global</span></span>[x<span class="sub">t</span>]) )
+      </div>
+
+      <p>Now look hard at the dynamic term. The projection <span class="v">G</span><span class="sup">l</span> is applied only to <span class="v">E<span class="sub">global</span></span> — the word embedding table. After training, <em>every input to <span class="v">G</span><span class="sup">l</span> is a frozen constant.</em> The scalars α<span class="sup">l</span>, β<span class="sup">l</span> are frozen. <span class="v">M</span><span class="sup">l</span> is frozen. So the whole right-hand side, for every one of the <span class="v">|V|</span> possible token ids, can be <strong>computed once, offline, and stored</strong>.</p>
+
+      <div class="callout why">
+        <span class="ic">💡</span>
+        <div><span class="lab">The one idea</span>
+        <p>A function of a constant <em>is</em> a constant. The SwiGLU only ever sees fixed embeddings, so its output is a fixed table — there is no reason to recompute it at every token, on every device, forever.</p>
+        </div>
+      </div>
+      <span class="folio">9 ·</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <p>So we bake a new table. Define the <strong>re-parameterized memory</strong>:</p>
+      <div class="eq">
+        <span class="v">M̃</span><span class="sup">l</span> = α<span class="sup">l</span> · RMSNorm( <span class="v">M</span><span class="sup">l</span> + β<span class="sup">l</span> · <span class="v">G</span><span class="sup">l</span>(<span class="v">E<span class="sub">global</span></span>) )&nbsp;&nbsp;∈ ℝ<span class="sup">|V|×d<span class="sub">mem</span></span>
+      </div>
+      <p>Computed row by row across the whole vocabulary, <em>once</em>, at export time. At inference the entire expert reduces to a bare lookup — the SwiGLU is gone:</p>
+      <div class="eq">
+        <span class="v">ẽ</span><span class="sup">l</span><span class="sub">t</span> = <span class="v">M̃</span><span class="sup">l</span>[x<span class="sub">t</span>]
+      </div>
+      <p>followed by the same lightweight gate from Chapter 4. The inference path, in full:</p>
+      <div class="eq">
+        <span class="v">g</span> = σ(<span class="v">W</span><span class="sub">gate</span> <span class="v">h</span>),&nbsp;
+        <span class="v">v</span> = <span class="v">ẽ</span> + <span class="v">g</span>,&nbsp;
+        <span class="v">y</span> = RMSNorm(<span class="v">W</span><span class="sub">out</span> <span class="v">v</span>)
+      </div>
+
+      <p>This is the move that makes MeKi <em>free</em>. The heavy SwiGLU adds <span class="v">O(d²<span class="sub">model</span>)</span> FLOPs per token during training, but contributes <strong>zero</strong> at inference — it has been absorbed into a table that sits in ROM. Stranger still (Chapter 8): making <span class="v">G</span><span class="sup">l</span> <em>more</em> expensive during training improves the final model, even though none of those FLOPs survive to deployment.</p>
+
+      <pre><span class="cap">elixir · fold once at export</span><code><span class="cm"># All inputs are frozen post-training constants.</span>
+<span class="kw">defn</span> <span class="fn">reparameterize</span>(m_l, e_global, g_params, alpha, beta) <span class="kw">do</span>
+  m_dyn = <span class="ty">MeKi.SwiGLU</span>.<span class="fn">forward</span>(e_global, g_params)  <span class="cm"># {|V|, d_mem}</span>
+  (m_l + beta * m_dyn)
+  |&gt; <span class="ty">MeKi.Norm</span>.<span class="fn">rms_norm</span>()
+  |&gt; <span class="ty">Nx</span>.<span class="fn">multiply</span>(alpha)                       <span class="cm"># M̃_l, ready for ROM</span>
+<span class="kw">end</span></code></pre>
+
+      <div class="callout key">
+        <span class="ic">📦</span>
+        <div><span class="lab">Two models, one weight set</span>
+        <p>MeKi is the same network in two costumes: a <strong>training</strong> form with a learnable projection, and an <strong>inference</strong> form that is a lookup table plus two thin matrices. Re-parameterization is the wardrobe change — and it changes the cost, not the math.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 10</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="04-knowledge-injection.html"><span class="dir">← Prev</span><span class="ttl">Knowledge Injection</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>▦</a>
+      <a class="next" rel="next" href="06-building-in-elixir.html"><span class="dir">Next →</span><span class="ttl">Building MeKi in Nx &amp; Axon</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

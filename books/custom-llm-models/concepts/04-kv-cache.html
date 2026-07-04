@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The KV Cache — Custom LLM Models</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">◧</span> Custom <b>·</b> LLMs</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 04 · The Big Idea</p>
+      <h1>The KV Cache</h1>
+      <p class="lede">This is the single most important implementation detail in LLM serving. Understand it and you can predict memory, batch size, and cost. You asked to grasp it — here it is, in full.</p>
+
+      <p class="serif-drop">Recall the generation loop from Chapter 2: we kept feeding the <em>whole</em> token list back in and using only the last row of output. Let's count the waste. To generate token number <em>n</em>, attention needs the Key and Value vectors of all <em>n−1</em> tokens before it. Without a cache, we'd recompute every one of them, at every step — that's O(n²) work across the sequence for something we already calculated.</p>
+
+      <p>But here's the saving grace: because attention is <em>causal</em>, a past token's Key and Value <strong>never change</strong>. Token 5's K and V are the same whether we're generating token 6 or token 600. So compute them once, store them, and reuse them. That store is the <strong>KV cache</strong>.</p>
+
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">What the cache does</span>
+        <p>It trades <em>compute</em> for <em>memory</em>. Each decode step now computes Q/K/V for only the <strong>one new token</strong> and attends against the cached K/V of all the old ones — <strong>O(n) per step</strong> instead of O(n²). Generation goes from quadratic to linear. The price: you must hold every token's K and V in GPU memory, for every layer, for the whole sequence.</p>
+        </div>
+      </div>
+
+      <div class="diagram">
+        <svg viewBox="0 0 380 128" role="img" aria-label="A filing cabinet of stored Key and Value vectors for tokens 1 to 5; when generating token 6, only its own K and V are computed and appended, and it attends against all cached entries.">
+          <text x="110" y="14" text-anchor="middle" font-family="monospace" font-size="8" fill="#0a6e8c">KV cache (per layer)</text>
+          <g font-family="monospace" font-size="7">
+            <rect x="20" y="22" width="34" height="26" rx="4" fill="#e4f2f6" stroke="#0e93b8"/><text x="37" y="38" text-anchor="middle" fill="#0a6e8c">t1</text>
+            <rect x="58" y="22" width="34" height="26" rx="4" fill="#e4f2f6" stroke="#0e93b8"/><text x="75" y="38" text-anchor="middle" fill="#0a6e8c">t2</text>
+            <rect x="96" y="22" width="34" height="26" rx="4" fill="#e4f2f6" stroke="#0e93b8"/><text x="113" y="38" text-anchor="middle" fill="#0a6e8c">t3</text>
+            <rect x="134" y="22" width="34" height="26" rx="4" fill="#e4f2f6" stroke="#0e93b8"/><text x="151" y="38" text-anchor="middle" fill="#0a6e8c">t4</text>
+            <rect x="172" y="22" width="34" height="26" rx="4" fill="#e4f2f6" stroke="#0e93b8"/><text x="189" y="38" text-anchor="middle" fill="#0a6e8c">t5</text>
+            <rect x="210" y="22" width="34" height="26" rx="4" fill="#e6f5ec" stroke="#1f9d57" stroke-dasharray="3 2"/><text x="227" y="38" text-anchor="middle" fill="#1f9d57">t6</text>
+          </g>
+          <text x="132" y="62" text-anchor="middle" font-family="monospace" font-size="7" fill="#868ca6">stored once, reused every step ↑</text>
+          <rect x="255" y="20" width="106" height="52" rx="8" fill="#e7e3fb" stroke="#5b4bd6"/>
+          <text x="308" y="40" text-anchor="middle" font-family="monospace" font-size="7.5" fill="#3d2fae">generate t6:</text>
+          <text x="308" y="54" text-anchor="middle" font-family="monospace" font-size="7.5" fill="#3d2fae">compute only its</text>
+          <text x="308" y="66" text-anchor="middle" font-family="monospace" font-size="7.5" fill="#3d2fae">K,V — append</text>
+          <text x="190" y="92" text-anchor="middle" font-family="monospace" font-size="8" fill="#b3660c">O(n²) recompute  →  O(n) per step</text>
+          <text x="190" y="110" text-anchor="middle" font-family="monospace" font-size="8" fill="#868ca6">…times num_layers, times batch_size. It adds up fast.</text>
+        </svg>
+        <span class="cap">The cache is a growing filing cabinet of K/V — one drawer per layer, one folder per token.</span>
+      </div>
+
+      <span class="folio">· 1</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>The one formula in this book</h2>
+      <p>How much memory does the cache eat? Exactly this:</p>
+
+      <div class="formula">
+        kv_bytes = <span class="hl">2</span> · layers · kv_heads · head_dim · dtype_bytes · seq_len · batch
+      </div>
+
+      <table>
+        <tbody>
+          <tr><td><code>2</code></td><td>one <strong>K</strong> and one <strong>V</strong> per position</td></tr>
+          <tr><td><code>layers</code></td><td>each transformer layer keeps its own cache</td></tr>
+          <tr><td><code>kv_heads</code></td><td>number of <em>key/value</em> heads (fewer than query heads, thanks to GQA — next page)</td></tr>
+          <tr><td><code>head_dim</code></td><td>hidden_size ÷ attention_heads</td></tr>
+          <tr><td><code>dtype_bytes</code></td><td>2 for fp16/bf16, 1 for fp8/int8</td></tr>
+          <tr><td><code>seq_len</code></td><td>tokens cached so far (prompt + generated)</td></tr>
+          <tr><td><code>batch</code></td><td>concurrent sequences</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout note">
+        <span class="ic">📌</span>
+        <div><span class="lab">Read the formula like a budget</span>
+        <p>Two terms are fixed by the model (<code>layers</code>, <code>kv_heads</code>, <code>head_dim</code>). Two you choose at serve time (<code>seq_len</code> = context length, <code>batch</code> = concurrency). One you can shrink with tricks (<code>dtype_bytes</code>, via a quantized KV cache). Serving is the art of spending the leftover VRAM — after weights — on <code>seq_len × batch</code>.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 2</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="03-prefill-and-decode.html"><span class="dir">← Prev</span><span class="ttl">Prefill &amp; Decode</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="05-quantization.html"><span class="dir">Next →</span><span class="ttl">Quantization</span></a>
+    </nav>
+  </section>
+
+  <section class="spread" style="margin-top:1.4rem">
+    <div class="leaf leaf-left">
+      <h2>Work it out: Llama-3-8B, by hand</h2>
+      <p>Let's make it real with a model whose config we can look up. Llama-3-8B has <strong>32 layers</strong>, hidden size <strong>4096</strong>, <strong>32</strong> attention (query) heads, but only <strong>8</strong> KV heads (that's GQA), so <code>head_dim = 4096 / 32 = 128</code>. In fp16, <code>dtype_bytes = 2</code>.</p>
+
+      <p><strong>Per token</strong>, across all layers, for one sequence:</p>
+      <div class="formula">
+        2 · 32 · 8 · 128 · 2 = <span class="hl">131,072 bytes</span> = 128 KiB / token
+      </div>
+
+      <p>Multiply by sequence length:</p>
+      <ul class="spec">
+        <li><span class="k">at 4,096 tokens</span><span class="v">≈ 512 MiB</span></li>
+        <li><span class="k">at 8,192 tokens</span><span class="v">≈ 1 GiB</span></li>
+      </ul>
+
+      <p>That's per sequence. Serve 16 concurrent 8K conversations and the cache alone wants <strong>16 GiB</strong> — as much as the 16&nbsp;GB of weights. Now you see why "how many users can I serve?" is really "how much KV cache fits?"</p>
+
+      <div class="callout warn">
+        <span class="ic">⚠️</span>
+        <div><span class="lab">If it used full attention…</span>
+        <p>With 32 KV heads instead of 8, that per-token figure would be 512 KiB and the 8K cache would be <strong>4 GiB per sequence</strong> — 4× worse. GQA is doing a lot of quiet work here.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 3</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>GQA: the reason the cache isn't ruinous</h2>
+      <p>Standard <em>multi-head attention</em> (MHA) gives every query head its own Key/Value head — maximal cache. The opposite extreme, <em>multi-query attention</em> (MQA), makes <strong>all</strong> query heads share a <em>single</em> K/V head — tiny cache, but it can hurt quality.</p>
+
+      <p><strong>Grouped-query attention (GQA)</strong> splits the difference: query heads are divided into groups, and each group shares one K/V head. Llama-3-8B has 32 query heads sharing 8 K/V heads — a group size of 4, so a <strong>4× smaller</strong> cache. The GQA paper reports it lands "close to multi-head quality with speed comparable to multi-query."</p>
+
+      <div class="formula">
+        cache reduction = attention_heads ÷ kv_heads
+        <br>Llama-3-8B: 32 ÷ 8 = <span class="hl">4×</span> &nbsp;·&nbsp; Llama-3-70B: 64 ÷ 8 = <span class="hl">8×</span>
+      </div>
+
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">The modern default</span>
+        <p>Llama 3, Qwen2.5, Mistral, Gemma, DeepSeek — all use GQA. When you fine-tune one of these, you inherit its (already efficient) attention structure. You don't design this; you just benefit from it, and now you can <em>predict</em> its memory.</p>
+        </div>
+      </div>
+
+      <div class="callout bot">
+        <span class="ic">🧪</span>
+        <div><span class="lab">Acme check-in</span>
+        <p>Say Acme picks Qwen-8B and budgets 8K context per ticket. Weights ≈ 16&nbsp;GB (fp16); a 24&nbsp;GB GPU leaves ~8&nbsp;GB for cache ≈ 8 concurrent tickets. Want more concurrency on the same card? Two levers: shrink the weights (quantize — Chapter 5) and let the server pack the cache tightly (PagedAttention — Chapter 8).</p>
+        </div>
+      </div>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p><a href="https://arxiv.org/abs/2305.13245">Ainslie et&nbsp;al., GQA (2023)</a> · <a href="https://huggingface.co/blog/not-lain/kv-caching">HuggingFace · KV caching</a> · Llama-3-8B config (32 layers / 4096 / 32 heads / 8 KV heads / head_dim 128).</p>
+      </div>
+
+      <span class="folio">· 4</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="03-prefill-and-decode.html"><span class="dir">← Prev</span><span class="ttl">Prefill &amp; Decode</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="05-quantization.html"><span class="dir">Next →</span><span class="ttl">Quantization</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

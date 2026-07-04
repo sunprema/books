@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Worked Fine-Tune — Custom LLM Models</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">◧</span> Custom <b>·</b> LLMs</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 07 · Hands-On</p>
+      <h1>A Worked Fine-Tune</h1>
+      <p class="lede">Enough theory. Let's QLoRA-fine-tune Qwen into Acme's Support Copilot, start to finish, on one 24 GB GPU. Every step below is a real API you can run.</p>
+
+      <h2>Step 1 — Shape the data as chat</h2>
+      <p>SFT data is <em>(prompt, response)</em> pairs. The modern format is a list of chat <strong>messages</strong> — a system instruction, the user's ticket, and the ideal assistant reply. One training example:</p>
+
+      <pre><span class="cap">jsonl · one Acme training row</span><code>{<span class="at">"messages"</span>: [
+  {<span class="at">"role"</span>: <span class="str">"system"</span>,
+   <span class="at">"content"</span>: <span class="str">"You are Acme's support assistant. Reply calmly and</span>
+<span class="str">              tag the ticket."</span>},
+  {<span class="at">"role"</span>: <span class="str">"user"</span>,
+   <span class="at">"content"</span>: <span class="str">"I was charged twice this month!"</span>},
+  {<span class="at">"role"</span>: <span class="str">"assistant"</span>,
+   <span class="at">"content"</span>: <span class="str">"I'm sorry for the scare — I can see the duplicate</span>
+<span class="str">              charge and I've refunded it... [tag: billing]"</span>}
+]}</code></pre>
+
+      <div class="callout warn">
+        <span class="ic">⚠️</span>
+        <div><span class="lab">Chat templates are not optional</span>
+        <p>Every model formats conversations with its <em>own</em> special tokens — Qwen uses ChatML (<code>&lt;|im_start|&gt;…&lt;|im_end|&gt;</code>); Llama&nbsp;3 uses <code>&lt;|start_header_id|&gt;…&lt;|eot_id|&gt;</code>. Train with the <em>wrong</em> template and you get a quietly broken model. The good news: TRL applies the model's template automatically when you hand it conversational data. Mismatched templates are the #1 cause of botched fine-tunes.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 1</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>Step 2 — Configure the 4-bit base and the adapters</h2>
+      <p>Two config objects carry everything from Chapter 6: <code>BitsAndBytesConfig</code> puts the base in 4-bit NF4, and <code>LoraConfig</code> defines the adapters.</p>
+
+      <pre><span class="cap">python · QLoRA configs</span><code><span class="kw">import</span> torch
+<span class="kw">from</span> transformers <span class="kw">import</span> BitsAndBytesConfig
+<span class="kw">from</span> peft <span class="kw">import</span> LoraConfig
+
+<span class="cm"># frozen base weights in 4-bit NF4 (QLoRA)</span>
+bnb = <span class="ty">BitsAndBytesConfig</span>(
+    load_in_4bit=<span class="kw">True</span>,
+    bnb_4bit_quant_type=<span class="str">"nf4"</span>,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=<span class="kw">True</span>,
+)
+
+<span class="cm"># trainable low-rank adapters (bf16) on top</span>
+lora = <span class="ty">LoraConfig</span>(
+    r=<span class="num">16</span>,
+    lora_alpha=<span class="num">32</span>,          <span class="cm"># effective scale = alpha / r</span>
+    lora_dropout=<span class="num">0.05</span>,
+    bias=<span class="str">"none"</span>,
+    task_type=<span class="str">"CAUSAL_LM"</span>,
+    target_modules=[<span class="str">"q_proj"</span>, <span class="str">"k_proj"</span>, <span class="str">"v_proj"</span>, <span class="str">"o_proj"</span>,
+                    <span class="str">"gate_proj"</span>, <span class="str">"up_proj"</span>, <span class="str">"down_proj"</span>],
+)</code></pre>
+
+      <div class="callout note">
+        <span class="ic">🔧</span>
+        <div><span class="lab">Reading the knobs</span>
+        <p><code>r=16</code> with <code>alpha=32</code> gives an effective scale of 2 — a common, sane starting point. The <code>target_modules</code> list attaches adapters to both attention and MLP projections, which tends to learn richer behaviour than attention-only.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 2</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="06-fine-tuning.html"><span class="dir">← Prev</span><span class="ttl">LoRA &amp; QLoRA</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="08-inference-servers.html"><span class="dir">Next →</span><span class="ttl">Inference Servers</span></a>
+    </nav>
+  </section>
+
+  <section class="spread" style="margin-top:1.4rem">
+    <div class="leaf leaf-left">
+      <h2>Step 3 — Train with TRL's SFTTrainer</h2>
+      <p><code>SFTTrainer</code> wires the model, the dataset, and the LoRA config together. Pass the adapters via <code>peft_config</code> and it wraps the model for you — no manual <code>get_peft_model</code>.</p>
+
+      <pre><span class="cap">python · the training run</span><code><span class="kw">from</span> datasets <span class="kw">import</span> load_dataset
+<span class="kw">from</span> trl <span class="kw">import</span> SFTTrainer, SFTConfig
+
+model_id = <span class="str">"Qwen/Qwen3-8B"</span>
+data = <span class="fn">load_dataset</span>(<span class="str">"json"</span>,
+    data_files=<span class="str">"acme_tickets.jsonl"</span>, split=<span class="str">"train"</span>)
+
+trainer = <span class="ty">SFTTrainer</span>(
+    model=model_id,
+    train_dataset=data,
+    peft_config=lora,
+    args=<span class="ty">SFTConfig</span>(
+        output_dir=<span class="str">"acme-copilot"</span>,
+        model_init_kwargs={<span class="str">"quantization_config"</span>: bnb,
+                           <span class="str">"dtype"</span>: torch.bfloat16},
+        per_device_train_batch_size=<span class="num">2</span>,
+        gradient_accumulation_steps=<span class="num">8</span>,
+        learning_rate=<span class="num">1e-4</span>,   <span class="cm"># adapters like a higher LR</span>
+        num_train_epochs=<span class="num">1</span>,
+        max_length=<span class="num">2048</span>,
+        packing=<span class="kw">True</span>,
+        <span class="cm"># assistant_only_loss=True  # train on replies only</span>
+    ),
+)
+trainer.train()</code></pre>
+
+      <div class="callout warn">
+        <span class="ic">⚠️</span>
+        <div><span class="lab">These APIs move fast</span>
+        <p>This targets the current TRL (note it's <code>max_length</code>, not the old <code>max_seq_length</code>; hyperparameters live on <code>SFTConfig</code>). <strong>Pin your versions</strong> and re-check field names against the installed library — the shape is stable, the exact names drift.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 3</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>Step 4 — Merge for serving</h2>
+      <p>Training leaves you with a small adapter. To serve it as a normal model, fold <code>ΔW</code> back into the base with <code>merge_and_unload()</code> and save standard weights:</p>
+
+      <pre><span class="cap">python · bake the adapter in</span><code><span class="kw">from</span> peft <span class="kw">import</span> AutoPeftModelForCausalLM
+
+merged = (<span class="ty">AutoPeftModelForCausalLM</span>
+          .<span class="fn">from_pretrained</span>(<span class="str">"acme-copilot"</span>)
+          .<span class="fn">merge_and_unload</span>())
+merged.<span class="fn">save_pretrained</span>(<span class="str">"acme-copilot-merged"</span>)
+<span class="cm"># now a plain HF model — feed it to vLLM, TGI, or GGUF</span></code></pre>
+
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">Merge, or don't — your call</span>
+        <p><strong>Merge</strong> → one self-contained model, simplest to serve and quantize. <strong>Don't merge</strong> → keep the tiny adapter and load it at serve time (vLLM's <code>--enable-lora</code>, Ch. 8), which lets you hot-swap many adapters on one base. Acme has one behaviour, so we merge.</p>
+        </div>
+      </div>
+
+      <div class="callout note">
+        <span class="ic">⚡</span>
+        <div><span class="lab">Don't want to hand-roll it?</span>
+        <p><strong>Unsloth</strong> wraps this exact stack with hand-tuned kernels — up to ~2× faster training and big VRAM savings, with ready Colab notebooks. <strong>Axolotl</strong> drives the whole run from a YAML config, no Python. Both sit on top of TRL/PEFT/bitsandbytes; learn the primitives here, reach for these for speed.</p>
+        </div>
+      </div>
+
+      <div class="callout bot">
+        <span class="ic">🧪</span>
+        <div><span class="lab">Acme now has a model</span>
+        <p><code>acme-copilot-merged/</code> is a real Qwen that drafts in Acme's voice and tags tickets. It exists as files on disk. The last job: serve it — fast, for everyone at once.</p>
+        </div>
+      </div>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p><a href="https://huggingface.co/docs/trl/sft_trainer">HF · TRL SFTTrainer</a> · <a href="https://huggingface.co/docs/peft">HF · PEFT</a> · <a href="https://github.com/unslothai/unsloth">Unsloth</a> · <a href="https://github.com/axolotl-ai-cloud/axolotl">Axolotl</a>.</p>
+      </div>
+
+      <span class="folio">· 4</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="06-fine-tuning.html"><span class="dir">← Prev</span><span class="ttl">LoRA &amp; QLoRA</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="08-inference-servers.html"><span class="dir">Next →</span><span class="ttl">Inference Servers</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

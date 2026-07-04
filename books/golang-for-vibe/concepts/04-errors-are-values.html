@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Errors Are Just Values — Golang for Vibe Coders</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" href="../index.html"><span class="goph">🐹</span> Go for <b>Vibe</b> Coders</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="page">
+  <p class="kicker">Concept 04 · Idioms</p>
+  <h1>Errors Are Just Values</h1>
+  <p class="lede">Newcomers groan at Go's error handling — "so verbose!" — and miss that the verbosity <em>is</em> the feature. Let's see why handling failure in the open is exactly what a vibe coder wants.</p>
+
+  <h2>First, the thing Go refuses to do</h2>
+  <p>In a lot of languages, when something fails you <em>throw an exception</em>. It flies up the call stack, invisible, until some <code>catch</code> somewhere — maybe — grabs it. The seductive part: your happy-path code looks clean. The treacherous part: you cannot tell, by reading a function call, whether it might blow up and unwind your program. The control flow is <em>hidden</em>. For code you're trying to verify at a glance, hidden control flow is the enemy.</p>
+  <p>Go made a stark choice: <strong>no exceptions for ordinary errors.</strong> Instead, a function that can fail simply returns an error as an ordinary value, right alongside its result. Failure isn't a trapdoor in the floor — it's a thing handed to you, in your hand, that you must look at.</p>
+
+  <h2>The pattern you'll see ten thousand times</h2>
+  <pre><span class="cap">go</span><code>f, err := os.<span class="fn">Open</span>(<span class="str">"config.json"</span>)
+<span class="kw">if</span> err != <span class="kw">nil</span> {
+    <span class="kw">return</span> err          <span class="cm">// can't open it — say so, and stop</span>
+}
+<span class="kw">defer</span> f.<span class="fn">Close</span>()         <span class="cm">// (more on defer below)</span>
+
+<span class="cm">// ...only here, past the check, do we know f is good...</span></code></pre>
+  <p>That little block — call something, get <code>val, err</code>, then immediately <code>if err != nil</code> — is the rhythm of all Go code. Yes, you'll write it a lot. But look at what it buys: every place a thing can go wrong is <em>visible, named, and right next to the call</em>. There are no surprises hiding up the stack. When you skim AI-generated Go, the error checks are sign-posts saying "here is exactly what this code worried about." That's a reviewer's dream.</p>
+
+  <div class="callout why">
+    <span class="ic">💡</span>
+    <div><span class="lab">But isn't all that boilerplate noise?</span>
+    <p>It feels like noise until you've debugged the alternative. The Go designers' bet — and Rob Pike's famous line, "errors are values" — is that <em>making failure explicit and ordinary</em> means you actually think about each failure instead of vaguely hoping a <code>catch</code> upstairs handles everything. For a vibe coder it's even better: the pattern is so uniform that an agent reproduces it perfectly, and you can audit error handling just by scanning for <code>if err != nil</code>.</p>
+    </div>
+  </div>
+
+  <h2>What an <code>error</code> actually is</h2>
+  <p>No magic here — and that's the point. <code>error</code> is just a built-in interface with a single method:</p>
+  <pre><span class="cap">go · the entire definition</span><code><span class="kw">type</span> <span class="ty">error</span> <span class="kw">interface</span> {
+    <span class="fn">Error</span>() <span class="ty">string</span>
+}</code></pre>
+  <p>Anything with an <code>Error() string</code> method <em>is</em> an error. The value <code>nil</code> means "no error." Most of the time you create one with <code>fmt.Errorf</code>, and crucially you <strong>wrap</strong> lower-level errors with <code>%w</code> to add context while preserving the original:</p>
+  <pre><span class="cap">go · wrapping adds context without losing the cause</span><code><span class="kw">func</span> <span class="fn">loadConfig</span>(path <span class="ty">string</span>) (<span class="ty">Config</span>, <span class="ty">error</span>) {
+    data, err := os.<span class="fn">ReadFile</span>(path)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="cm">// %w wraps the original error so callers can still inspect it</span>
+        <span class="kw">return</span> <span class="ty">Config</span>{}, <span class="fn">fmt</span>.<span class="fn">Errorf</span>(<span class="str">"loading config %s: %w"</span>, path, err)
+    }
+    <span class="cm">// ...parse data...</span>
+}</code></pre>
+  <p>Now an error reads like a breadcrumb trail: <code>loading config app.json: open app.json: no such file or directory</code>. You see <em>what</em> failed and <em>where</em>, top to bottom. Callers who care can dig into the wrapped cause with <code>errors.Is</code> (does this match a known error?) or <code>errors.As</code> (is this a specific error type?).</p>
+
+  <h2><code>defer</code>: cleanup that can't be forgotten</h2>
+  <p>You saw <code>defer f.Close()</code> above. <code>defer</code> schedules a call to run when the surrounding function returns — <em>no matter how</em> it returns. It's how Go guarantees cleanup without exceptions.</p>
+  <pre><span class="cap">go</span><code><span class="kw">func</span> <span class="fn">process</span>() <span class="ty">error</span> {
+    f, err := os.<span class="fn">Open</span>(<span class="str">"data.txt"</span>)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="kw">return</span> err
+    }
+    <span class="kw">defer</span> f.<span class="fn">Close</span>()    <span class="cm">// runs on EVERY return path below — you can't forget it</span>
+
+    <span class="cm">// ...lots of code with many possible returns...</span>
+    <span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+  <p>Put the <code>defer</code> right after you acquire a resource and you've made the cleanup impossible to leak, even if a dozen error-returns sit between acquire and close. Files, network connections, mutex unlocks, database rows — same pattern every time.</p>
+
+  <div class="callout warn">
+    <span class="ic">⚠️</span>
+    <div><span class="lab">"But Go has <code>panic</code> — isn't that an exception?"</span>
+    <p>It has <code>panic</code>/<code>recover</code>, yes — but they're for <em>truly unexpected</em>, programmer-error situations (an impossible state, an index out of range), not for ordinary failures like "file not found" or "bad user input." The idiom is firm: <strong>return errors for things you expect can happen; panic only for bugs.</strong> If you catch an agent reaching for <code>panic</code> to handle a normal failure, that's a code smell — send it back to return an error.</p>
+    </div>
+  </div>
+
+  <div class="callout key">
+    <span class="ic">🔑</span>
+    <div><span class="lab">Key idea</span>
+    <p>In Go, failure is <strong>data, not a trapdoor</strong>. Functions return <code>(result, error)</code>; you check <code>if err != nil</code> immediately; you wrap with <code>%w</code> to add context; you <code>defer</code> cleanup so it can't leak. Control flow stays visible and local — which is exactly what makes machine-written Go easy to trust.</p>
+    </div>
+  </div>
+
+  <h2>The thirty-second version</h2>
+  <ul>
+    <li>No exceptions for ordinary errors — a fallible function returns <code>(value, error)</code>.</li>
+    <li>The universal rhythm: <code>v, err := do(); if err != nil { return err }</code>.</li>
+    <li><code>error</code> is just an interface with <code>Error() string</code>; <code>nil</code> means success.</li>
+    <li>Wrap with <code>fmt.Errorf("context: %w", err)</code>; inspect with <code>errors.Is</code> / <code>errors.As</code>.</li>
+    <li><code>defer</code> guarantees cleanup on every return path. <code>panic</code> is for bugs, not for expected failures.</li>
+  </ul>
+
+  <div class="sources">
+    <h3>Sources</h3>
+    <p>Go blog, “Errors are values” (Rob Pike) and “Working with Errors in Go 1.13”; <code>errors</code> and <code>fmt</code> package docs; Effective Go (defer, panic/recover). Verified against Go 1.26.</p>
+  </div>
+
+  <nav class="pager">
+    <a class="prev" href="03-goroutines-channels.html"><span class="dir">← Prev</span><span class="ttl">Goroutines &amp; Channels</span></a>
+    <a class="contents" href="../index.html"><span class="dir">Contents</span>🐹</a>
+    <a class="next" href="05-structs-interfaces.html"><span class="dir">Next →</span><span class="ttl">Structs, Methods &amp; Interfaces</span></a>
+  </nav>
+</main>
+</body>
+</html>

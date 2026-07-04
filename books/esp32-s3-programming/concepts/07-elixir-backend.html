@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Elixir Backend — ESP32-S3 Programming</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" href="../index.html"><span class="chip">S3</span> ESP32-S3 <b>·</b> Rust &amp; Elixir</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 07 · Backend</p>
+      <h1>The Elixir Backend</h1>
+      <p class="lede">The devices are out in the world, publishing. Now we build the brain that listens — and there's a beautiful reason you chose <strong>Elixir</strong> for it.</p>
+
+      <p class="serif-drop">Imagine ten thousand little radios all chirping at once. Most languages handle that by sweating: thread pools, callback spaghetti, careful locking. The BEAM — the virtual machine Elixir runs on — was built for telephone switches in the 1980s, where "tens of thousands of simultaneous conversations that must never drop" was the <em>everyday</em> problem. IoT is the same shape of problem wearing new clothes. That's not a coincidence you're exploiting; it's a perfect fit.</p>
+
+      <h2>Why the BEAM loves IoT</h2>
+      <ul>
+        <li><strong>Cheap processes.</strong> You can spawn a lightweight process <em>per device</em> — 50,000 of them — each holding that device's state. Not OS threads; BEAM processes, grams not kilograms.</li>
+        <li><strong>Supervision.</strong> If one device's handler crashes, a supervisor restarts just that one. The other 49,999 never notice. "Let it crash" is a feature.</li>
+        <li><strong>Soft real-time.</strong> The scheduler is preemptive and fair, so one chatty device can't starve the rest.</li>
+      </ul>
+
+      <div class="callout warn">
+        <span class="ic">⚠️</span>
+        <div><span class="lab">The boundary, made crisp</span>
+        <p>Elixir runs on your <strong>server</strong>, not on the ESP32. The chip is too small for the BEAM. (<strong>Nerves</strong> brings Elixir to Linux boards like a Raspberry&nbsp;Pi — a different class of device.) The S3 reaches Elixir <em>over the network</em>, via the broker.</p>
+        </div>
+      </div>
+      <span class="folio">25 ·</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>The backend, drawn</h2>
+      <div class="diagram">
+        <svg viewBox="0 0 440 230" role="img" aria-label="Elixir backend architecture">
+          <!-- broker in -->
+          <rect x="16" y="100" width="70" height="34" rx="6" fill="#e7f4f3" stroke="#0d7d77"/>
+          <text x="51" y="121" text-anchor="middle" font-family="monospace" font-size="8.5" fill="#2a2620">broker</text>
+          <!-- tortoise -->
+          <rect x="120" y="100" width="92" height="34" rx="6" fill="#fceae8" stroke="#e7352c"/>
+          <text x="166" y="116" text-anchor="middle" font-family="monospace" font-size="8.5" fill="#2a2620">tortoise311</text>
+          <text x="166" y="128" text-anchor="middle" font-family="monospace" font-size="7.5" fill="#b3231c">MQTT client</text>
+          <!-- pubsub -->
+          <rect x="244" y="100" width="84" height="34" rx="6" fill="#fbf3dd" stroke="#c08a1e"/>
+          <text x="286" y="116" text-anchor="middle" font-family="monospace" font-size="8.5" fill="#2a2620">PubSub</text>
+          <text x="286" y="128" text-anchor="middle" font-family="monospace" font-size="7.5" fill="#8a6a14">broadcast</text>
+          <!-- consumers -->
+          <rect x="360" y="46" width="68" height="30" rx="6" fill="#fdfaf3" stroke="#e7352c"/>
+          <text x="394" y="65" text-anchor="middle" font-family="monospace" font-size="8" fill="#2a2620">LiveView</text>
+          <rect x="360" y="100" width="68" height="30" rx="6" fill="#fdfaf3" stroke="#0d7d77"/>
+          <text x="394" y="119" text-anchor="middle" font-family="monospace" font-size="8" fill="#2a2620">Ecto/DB</text>
+          <rect x="360" y="154" width="68" height="30" rx="6" fill="#fdfaf3" stroke="#c08a1e"/>
+          <text x="394" y="173" text-anchor="middle" font-family="monospace" font-size="8" fill="#2a2620">alerts</text>
+          <!-- arrows -->
+          <g stroke="#b87333" stroke-width="1.6" fill="none">
+            <line x1="86" y1="117" x2="118" y2="117"/>
+            <line x1="212" y1="117" x2="242" y2="117"/>
+            <path d="M328,112 C345,100 345,70 358,62"/>
+            <line x1="328" y1="117" x2="358" y2="116"/>
+            <path d="M328,124 C345,140 345,162 358,168"/>
+          </g>
+          <text x="166" y="166" text-anchor="middle" font-family="monospace" font-size="7.5" fill="#6b6253">one Elixir/Phoenix app (OTP)</text>
+        </svg>
+        <span class="cap">Broker → MQTT client → PubSub fans each reading out to a live dashboard, the database, and alerting.</span>
+      </div>
+      <p>The flow reads left to right: the broker hands messages to <strong>tortoise311</strong> (an Elixir MQTT client), which decodes them and shouts them onto <strong>Phoenix.PubSub</strong>. Anything that cares — a live chart, a storage writer, an alert rule — subscribes. Adding a new consumer never touches the device code.</p>
+      <span class="folio">· 26</span>
+    </div>
+  </section>
+
+  <section class="spread" style="margin-top:1.4rem">
+    <div class="leaf leaf-left">
+      <h2>Subscribing to the fleet</h2>
+      <p>Here's a <code>tortoise311</code> connection that subscribes to <em>every</em> device's readings with a wildcard topic, and a handler that re-broadcasts each one over PubSub:</p>
+      <pre><span class="cap">lib/iot/mqtt.ex</span><code><span class="kw">def</span> <span class="fn">start_link</span>(_opts) <span class="kw">do</span>
+  <span class="ty">Tortoise311.Connection</span>.<span class="fn">start_link</span>(
+    client_id: <span class="at">:backend</span>,
+    server: {<span class="ty">Tortoise311.Transport.Tcp</span>,
+             host: <span class="str">"localhost"</span>, port: <span class="num">1883</span>},
+    handler: {<span class="ty">Iot.MqttHandler</span>, []},
+    subscriptions: [{<span class="str">"sensors/+/temp"</span>, <span class="num">1</span>}]  <span class="cm"># + = any node</span>
+  )
+<span class="kw">end</span></code></pre>
+      <pre><span class="cap">lib/iot/mqtt_handler.ex</span><code><span class="kw">defmodule</span> <span class="ty">Iot.MqttHandler</span> <span class="kw">do</span>
+  <span class="kw">use</span> <span class="ty">Tortoise311.Handler</span>
+
+  <span class="kw">def</span> <span class="fn">handle_message</span>(topic, payload, state) <span class="kw">do</span>
+    [<span class="str">"sensors"</span>, node, <span class="str">"temp"</span>] = topic
+    %{<span class="str">"c"</span> =&gt; celsius} = <span class="ty">Jason</span>.<span class="fn">decode!</span>(payload)
+
+    <span class="ty">Phoenix.PubSub</span>.<span class="fn">broadcast</span>(
+      <span class="ty">Iot.PubSub</span>, <span class="str">"readings"</span>,
+      {<span class="at">:reading</span>, node, celsius}
+    )
+    {<span class="at">:ok</span>, state}
+  <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">The wildcard is the magic</span>
+        <p>Subscribing to <code>sensors/+/temp</code> means one piece of code receives readings from <em>every</em> node — present and future. Deploy a thousand more S3s tomorrow and this handler doesn't change a line.</p>
+        </div>
+      </div>
+      <span class="folio">27 ·</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>A live dashboard for free</h2>
+      <p>Because the reading is already on PubSub, a <strong>Phoenix LiveView</strong> page just subscribes and re-renders itself whenever data arrives — no JavaScript, no polling, real-time in the browser:</p>
+      <pre><span class="cap">lib/iot_web/live/dashboard.ex</span><code><span class="kw">def</span> <span class="fn">mount</span>(_p, _s, socket) <span class="kw">do</span>
+  <span class="kw">if</span> connected?(socket),
+    <span class="kw">do</span>: <span class="ty">Phoenix.PubSub</span>.<span class="fn">subscribe</span>(<span class="ty">Iot.PubSub</span>, <span class="str">"readings"</span>)
+
+  {<span class="at">:ok</span>, <span class="fn">assign</span>(socket, readings: %{})}
+<span class="kw">end</span>
+
+<span class="kw">def</span> <span class="fn">handle_info</span>({<span class="at">:reading</span>, node, c}, socket) <span class="kw">do</span>
+  <span class="cm"># pushes a fresh value into the live page</span>
+  {<span class="at">:noreply</span>,
+   <span class="fn">update</span>(socket, <span class="at">:readings</span>, &amp;<span class="ty">Map</span>.<span class="fn">put</span>(&amp;1, node, c))}
+<span class="kw">end</span></code></pre>
+      <div class="callout why">
+        <span class="ic">🍎</span>
+        <div><span class="lab">Feel how little code this is</span>
+        <p>Three small modules and you have a real-time, multi-device dashboard that scales to thousands of nodes. That's not because we're clever — it's because the BEAM was <em>built</em> for exactly this shape of problem. You picked the right brain.</p>
+        </div>
+      </div>
+      <div class="callout note">
+        <span class="ic">🪦</span>
+        <div><span class="lab">Presence, via Last Will</span>
+        <p>Have each device set an MQTT <strong>Last Will</strong> on <code>sensors/&lt;id&gt;/status = offline</code>. The broker publishes it automatically if the node drops — your handler flips a dot from green to grey with zero device-side effort.</p>
+        </div>
+      </div>
+      <div class="sources">
+        <h3>Sources</h3>
+        <p><code>tortoise311</code> hexdocs (smartrent); Phoenix &amp; Phoenix.PubSub / LiveView docs; EMQ, “MQTT for Elixir”; Nerves Project docs.</p>
+      </div>
+      <span class="folio">· 28</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" href="06-wifi-mqtt.html"><span class="dir">← Prev</span><span class="ttl">Wi-Fi, MQTT &amp; the World</span></a>
+      <a class="contents" href="../index.html"><span class="dir">Contents</span>◉</a>
+      <a class="next" href="08-end-to-end.html"><span class="dir">Next →</span><span class="ttl">End-to-End Blueprint</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

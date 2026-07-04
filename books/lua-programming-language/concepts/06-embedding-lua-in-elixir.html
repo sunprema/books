@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Embedding Lua in Elixir — Lua Field Guide</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <p class="kicker">Chapter Six</p>
+    <h2>Embedding Lua in Elixir</h2>
+    <p class="lead">Here's where the two languages meet. The <code>lua</code> library (by Tristan Pratt) is an ergonomic wrapper over <strong>Luerl</strong> — a pure-Erlang Lua VM. No NIFs, no C: a Lua state is just an Elixir term you evaluate, copy, and pass between processes.</p>
+
+    <pre><code class="elixir"># mix.exs
+def deps do
+  [{:lua, "~> 0.4"}]
+end</code></pre>
+
+    <h3>Evaluate a script</h3>
+    <p><code>Lua.new/0</code> builds a fresh, <strong>sandboxed</strong> VM. <code>eval!/2</code> runs a chunk and returns <code>{results, new_state}</code> — results is a list, because Lua functions return multiple values.</p>
+
+    <pre><code class="elixir">iex&gt; {[4], _lua} = Lua.eval!(Lua.new(), "return 2 + 2")
+iex&gt; {[6, 7], _} = Lua.eval!(Lua.new(), "return 6, 7")</code></pre>
+
+    <div class="callout note">
+      <span class="lbl">Compile once with the ~LUA sigil</span>
+      <p>Parsing Lua text on every call is wasteful. The <code>~LUA</code> sigil with the <code>c</code> modifier pre-compiles the chunk at <em>Elixir</em> compile time, so there's no runtime parse:</p>
+    </div>
+
+    <pre><code class="elixir">import Lua, only: [sigil_LUA: 2]
+{[4], _} = Lua.eval!(~LUA[return 2 + 2]c)   # validated at compile time</code></pre>
+
+    <h3>Passing values in and out</h3>
+    <p><code>set!/3</code> puts an Elixir value at a (possibly nested) Lua path; <code>get!/3</code> reads one back. This is your data bridge.</p>
+
+    <pre><code class="elixir">lua =
+  Lua.new()
+  |&gt; Lua.set!([:user], %{"name" =&gt; "Ada", "tier" =&gt; "pro"})
+  |&gt; Lua.set!([:limits, :max], 100)     # nested table path
+
+{[msg], _} =
+  Lua.eval!(lua, ~LUA[return user.name .. " can use " .. limits.max]c)
+# msg = "Ada can use 100"
+
+# read a Lua global back into Elixir
+lua = Lua.set!(Lua.new(), [:greeting], "hi")
+"hi" = Lua.get!(lua, [:greeting])</code></pre>
+
+    <div class="callout warn">
+      <span class="lbl">Mind the table/list rule from Chapter Three</span>
+      <p>Elixir maps with string keys become Lua tables; Elixir lists become 1-based Lua sequences. Coming back, a dense sequence decodes to a list and a mixed table to a list of <code>{key, value}</code> tuples. Keep arrays dense and objects string-keyed to avoid surprises.</p>
+    </div>
+
+    <h3>Exposing Elixir functions to Lua</h3>
+    <p>The real power: let scripts call <em>your</em> code. The quick way is an anonymous function via <code>set!</code>. It receives the Lua args as a list and must return a list.</p>
+
+    <pre><code class="elixir">lua = Lua.set!(Lua.new(), [:sum], fn args -&gt; [Enum.sum(args)] end)
+{[10], _} = Lua.eval!(lua, "return sum(1, 2, 3, 4)")
+
+# need to mutate Lua state? take a second arg and return {results, state}
+lua = Lua.set!(Lua.new(), [:remember], fn args, state -&gt;
+  {[], Lua.set!(state, [:count], Enum.count(args))}
+end)</code></pre>
+
+    <h3>Organized APIs with <code>deflua</code></h3>
+    <p>For a real surface area, define a module with <code>use Lua.API</code> and the <code>deflua</code> macro, then <code>load_api/2</code> it. A <code>scope</code> namespaces the functions into a Lua table.</p>
+
+    <pre><code class="elixir">defmodule MyApp.LuaKit do
+  use Lua.API, scope: "kit"
+
+  deflua double(v), do: 2 * v
+
+  # `state` gives you the VM — here we call a built-in Lua function
+  deflua shout(text), state do
+    Lua.call_function!(state, [:string, :upper], [text])
+  end
+end
+
+lua = Lua.load_api(Lua.new(), MyApp.LuaKit)
+{[10], _}     = Lua.eval!(lua, ~LUA[return kit.double(5)]c)
+{["HEY"], _}  = Lua.eval!(lua, ~LUA[return kit.shout("hey")]c)</code></pre>
+
+    <h3>Secrets the script must never see: private state</h3>
+    <p>You often need an API key or the current user <em>inside</em> your Elixir functions, but those values must stay invisible to the Lua code. Use private storage — it travels with the VM but isn't reachable from Lua.</p>
+
+    <pre><code class="elixir">lua = Lua.put_private(Lua.new(), :api_key, "sk-secret")
+
+defmodule MyApp.Weather do
+  use Lua.API, scope: "weather"
+  deflua fetch(city), state do
+    key = Lua.get_private!(state, :api_key)   # available to Elixir only
+    [MyApp.WeatherClient.get(city, key)]
+  end
+end</code></pre>
+
+    <div class="callout key">
+      <span class="lbl">Key idea</span>
+      <p>The VM is the whole boundary. The script sees exactly the globals you <code>set!</code> and the functions you <code>load_api</code> — nothing else. Keys, the database, the network: all reachable from your Elixir functions, none reachable from Lua. That asymmetry is the entire security model, and it's why this pairing is so comfortable.</p>
+    </div>
+
+    <p class="footnote">Source: <code>lua</code> Elixir library docs (lua.hexdocs.pm). Underlying VM: Luerl (github.com/rvirding/luerl).</p>
+  </article>
+  <div class="book-spine"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-coroutines.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-ash-lua.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

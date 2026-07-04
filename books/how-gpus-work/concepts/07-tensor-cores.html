@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Tensor Cores — How GPUs Work</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">HOW <span class="zap">GPUs</span> WORK</a>
+  <span class="bb-chapter">07 · Tensor Cores &amp; the Precision Game</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker">Chapter 07 · The AI Hardware</p>
+    <h1>Tensor Cores &amp; the <span class="hl">Precision Game</span></h1>
+
+    <p class="lede">In 2017, NVIDIA looked at what AI workloads actually do all day —
+    multiply matrices, multiply matrices, occasionally multiply matrices — and made a
+    very GPU move: they built a circuit that does <em>nothing else</em>. The
+    <strong>Tensor Core</strong> doesn't process numbers one multiply at a time; it
+    devours whole small matrices per clock cycle. Understand it, plus one sneaky idea
+    called <em>mixed precision</em>, and you'll know why AI GPUs advertise absurd
+    numbers like "20 petaFLOPS."</p>
+
+    <h2>From scalar to matrix bites</h2>
+    <p>A regular CUDA core computes, per cycle, roughly one fused multiply-add:
+    <code>d = a × b + c</code>, on single numbers. A Tensor Core executes an entire
+    <strong>matrix multiply-accumulate</strong> as one hardware operation:</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 760 220" role="img" aria-label="Tensor core operation D = A times B plus C on small matrices">
+        <g font-family="ui-monospace,Menlo,monospace" font-size="13" fill="#241f18">
+          <!-- D -->
+          <g stroke="#241f18" stroke-width="1.2">
+            <rect x="40" y="60" width="88" height="88" fill="#d6407a" opacity=".85" rx="6"/>
+            <path d="M62 60 V148 M84 60 V148 M106 60 V148 M40 82 H128 M40 104 H128 M40 126 H128" stroke-width=".7" opacity=".6"/>
+          </g>
+          <text x="84" y="180" text-anchor="middle" font-weight="bold">D (result)</text>
+          <text x="152" y="110" font-size="20" font-weight="bold">=</text>
+          <!-- A -->
+          <g stroke="#241f18" stroke-width="1.2">
+            <rect x="185" y="60" width="88" height="88" fill="#76b900" opacity=".9" rx="6"/>
+            <path d="M207 60 V148 M229 60 V148 M251 60 V148 M185 82 H273 M185 104 H273 M185 126 H273" stroke-width=".7" opacity=".6"/>
+          </g>
+          <text x="229" y="180" text-anchor="middle" font-weight="bold">A</text>
+          <text x="296" y="110" font-size="20" font-weight="bold">×</text>
+          <!-- B -->
+          <g stroke="#241f18" stroke-width="1.2">
+            <rect x="325" y="60" width="88" height="88" fill="#76b900" opacity=".9" rx="6"/>
+            <path d="M347 60 V148 M369 60 V148 M391 60 V148 M325 82 H413 M325 104 H413 M325 126 H413" stroke-width=".7" opacity=".6"/>
+          </g>
+          <text x="369" y="180" text-anchor="middle" font-weight="bold">B</text>
+          <text x="436" y="110" font-size="20" font-weight="bold">+</text>
+          <!-- C -->
+          <g stroke="#241f18" stroke-width="1.2">
+            <rect x="465" y="60" width="88" height="88" fill="#e9d9a8" rx="6"/>
+            <path d="M487 60 V148 M509 60 V148 M531 60 V148 M465 82 H553 M465 104 H553 M465 126 H553" stroke-width=".7" opacity=".6"/>
+          </g>
+          <text x="509" y="180" text-anchor="middle" font-weight="bold">C (running total)</text>
+          <!-- annotation -->
+          <g font-family="-apple-system,Arial" font-size="11" fill="#46760a">
+            <text x="620" y="80" font-weight="800">ONE hardware</text>
+            <text x="620" y="96" font-weight="800">instruction.</text>
+            <text x="620" y="120" fill="#6f6654">A 4×4 version = 64</text>
+            <text x="620" y="136" fill="#6f6654">multiplies + 64 adds</text>
+            <text x="620" y="152" fill="#6f6654">per Tensor Core,</text>
+            <text x="620" y="168" fill="#6f6654">per clock cycle.</text>
+          </g>
+          <text x="380" y="210" text-anchor="middle" font-family="-apple-system,Arial" font-size="11" fill="#6f6654">Big matrices are chewed through as thousands of these tiles — Chapter 5's tiling idea, cast in silicon.</text>
+        </g>
+      </svg>
+      <figcaption><strong>D = A×B + C.</strong> The accumulator C is the clever bit:
+      tile results pile up <em>inside</em> the core, without round-trips to memory.
+      A warp drives its SM's Tensor Cores cooperatively, feeding tiles from shared
+      memory.</figcaption>
+    </figure>
+
+    <p>Why does one instruction matter so much? Two reasons. First, <strong>density</strong>:
+    a multiply circuit hard-wired into a fixed matrix pattern needs far less area and
+    power than the same math built from independent, individually-scheduled cores — so
+    you can pack in enormously more of it. Second, <strong>data reuse</strong>: inside
+    the matrix unit, every loaded value is used many times by wiring alone, no cache
+    lookups, no register traffic. It's Chapter 5's whole sermon — reuse beats
+    bandwidth — implemented in copper.</p>
+
+    <h2>The precision game</h2>
+    <p>Now the second idea, the one that multiplied AI performance again and again
+    without changing the clock speed: <strong>use smaller numbers</strong>.</p>
+    <p>Scientific computing uses 32- or 64-bit floating point, because simulations
+    compound tiny errors into catastrophes. But neural networks turned out to be
+    shockingly forgiving — they're smoothed, averaged, error-tolerant statistical
+    machines. A weight of <code>0.73146</code> versus <code>0.73</code>? The model
+    shrugs. And halving the bits per number is a triple win: <strong>2× less memory
+    used, 2× less bandwidth needed, ~2× more math per second</strong> (smaller
+    multipliers → more of them fit).</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 760 240" role="img" aria-label="Number formats FP32, FP16, FP8, FP4 shown as shrinking bit bars">
+        <g font-family="ui-monospace,Menlo,monospace" font-size="12" fill="#241f18">
+          <g font-family="-apple-system,Arial" font-weight="800" font-size="13">
+            <text x="20" y="45">FP32</text><text x="20" y="95">FP16</text><text x="20" y="145">FP8</text><text x="20" y="195">FP4</text>
+          </g>
+          <!-- FP32: 1+8+23 -->
+          <rect x="80" y="28" width="16" height="24" fill="#d6407a" stroke="#241f18"/>
+          <rect x="96" y="28" width="128" height="24" fill="#6d4fd8" stroke="#241f18"/>
+          <rect x="224" y="28" width="368" height="24" fill="#76b900" stroke="#241f18"/>
+          <text x="610" y="45" font-size="11" fill="#6f6654">sign · 8 exp · 23 mantissa — science grade</text>
+          <!-- FP16: 1+5+10 -->
+          <rect x="80" y="78" width="16" height="24" fill="#d6407a" stroke="#241f18"/>
+          <rect x="96" y="78" width="80" height="24" fill="#6d4fd8" stroke="#241f18"/>
+          <rect x="176" y="78" width="160" height="24" fill="#76b900" stroke="#241f18"/>
+          <text x="355" y="95" font-size="11" fill="#6f6654">half the bits → ~2× everything (Volta, 2017)</text>
+          <!-- FP8: 1+4+3 -->
+          <rect x="80" y="128" width="16" height="24" fill="#d6407a" stroke="#241f18"/>
+          <rect x="96" y="128" width="64" height="24" fill="#6d4fd8" stroke="#241f18"/>
+          <rect x="160" y="128" width="48" height="24" fill="#76b900" stroke="#241f18"/>
+          <text x="228" y="145" font-size="11" fill="#6f6654">8 bits total → trains trillion-param models (Hopper, 2022)</text>
+          <!-- FP4 -->
+          <rect x="80" y="178" width="16" height="24" fill="#d6407a" stroke="#241f18"/>
+          <rect x="96" y="178" width="32" height="24" fill="#6d4fd8" stroke="#241f18"/>
+          <rect x="128" y="178" width="16" height="24" fill="#76b900" stroke="#241f18"/>
+          <text x="165" y="195" font-size="11" fill="#6f6654">4 bits: sixteen possible values! → inference at silly speed (Blackwell, 2024–25)</text>
+          <text x="380" y="228" text-anchor="middle" font-family="-apple-system,Arial" font-size="11" fill="#6f6654">■ sign  ■ exponent (range)  ■ mantissa (detail) — each halving ≈ doubles throughput and halves memory</text>
+        </g>
+      </svg>
+      <figcaption><strong>The incredible shrinking number.</strong> An FP4 number has
+      sixteen possible values — and 70-billion-parameter models still talk fluently in
+      it, with care.</figcaption>
+    </figure>
+
+    <div class="callout note">
+      <span class="co-tag">The Safety Net</span>
+      <p>The trick is <strong>mixed</strong> precision, not just <em>low</em> precision:
+      multiply in FP16/FP8/FP4, but <strong>accumulate the running sum in higher
+      precision</strong> (adding thousands of tiny products is where error snowballs),
+      and keep a master FP32 copy of weights during training. Hopper's "Transformer
+      Engine" even reshuffles scaling per layer, per step, automatically. You get small-number
+      speed with big-number stability — the whole game is knowing <em>where</em>
+      precision matters.</p>
+    </div>
+
+    <h2>What this buys, in real numbers</h2>
+    <table>
+      <tr><th>GPU (year)</th><th>Tensor generation</th><th>Headline math</th></tr>
+      <tr><td>V100 (2017)</td><td>1st gen — FP16</td><td class="mono">125 TFLOPS</td></tr>
+      <tr><td>A100 (2020)</td><td>3rd gen — +BF16/TF32</td><td class="mono">312 TFLOPS FP16</td></tr>
+      <tr><td>H100 (2022)</td><td>4th gen — +FP8</td><td class="mono">~2,000 TFLOPS FP8</td></tr>
+      <tr><td>B200 (2024–25)</td><td>5th gen — +FP4/FP6</td><td class="mono">~9,000 TFLOPS FP4</td></tr>
+    </table>
+    <p>~70× in eight years, while regular FP32 performance grew maybe 6×. That gap
+    <em>is</em> the Tensor Core + precision story. (Spec-sheet asterisk: vendors often
+    quote "with sparsity" numbers — the hardware can skip zeroed-out weights for up to
+    2× more — so always check whether a headline FLOPS figure says dense or sparse.)</p>
+
+    <figure class="img-slot" data-img-slot="tensor-forklift"
+            data-img-file="assets/img/tensor-forklift.png" style="--img-aspect:16 / 9">
+      <img class="img-real" src="../assets/img/tensor-forklift.png"
+           alt="Cartoon warehouse: workers carrying single numbers vs a forklift moving whole pallets of matrices"
+           width="1280" height="720"
+           onerror="this.closest('.img-slot').classList.add('img-missing')">
+      <div class="img-drop"><div class="img-drop-inner">
+        <strong>Image needed</strong>
+        <p class="img-prompt">A funny zine-style cartoon warehouse scene, hand-drawn ink with
+        flat colors (electric green, violet, pink on cream paper). Left: a line of sweaty
+        little robot workers labeled "CUDA CORES" each carrying one tiny numbered box at a
+        time, forming a long queue. Right: a massive gleaming forklift labeled "TENSOR CORE"
+        smugly lifting an entire pallet stacked as a neat 4×4 grid of boxes in one go, driver
+        robot wearing sunglasses. A supervisor clipboard-robot's jaw drops. In the corner, a
+        tiny shelf labeled "FP4" holds comically minuscule boxes while a worker squints at
+        them with a magnifying glass. Exaggerated, playful, no small unreadable text. Target
+        size ~1280×720px, 16:9 landscape; composed for a small on-page figure, subject centred
+        with safe margins — it is letterboxed into a 16:9 box, so keep nothing important near
+        the edges.</p>
+        <button type="button" class="img-copy">Copy prompt</button>
+        <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+      </div></div>
+      <figcaption><strong>Scalar vs matrix hauling.</strong> Same warehouse, same boxes —
+      one pallet at a time changes everything. Shrinking the boxes (FP4) helps too.</figcaption>
+    </figure>
+
+    <div class="callout warn">
+      <span class="co-tag">Gotcha</span>
+      <p>Tensor Cores only fire when the problem <em>is</em> a matrix multiply of the
+      right shape and type — frameworks like PyTorch route <code>matmul</code>/conv
+      layers there via libraries like cuBLAS and cuDNN. Elementwise ops, weird shapes,
+      or FP32-only code fall back to plain CUDA cores at a fraction of the headline
+      speed. When someone's "H100 benchmark" runs 20× below spec, the answer is
+      usually: nothing they ran ever touched the Tensor Cores.</p>
+    </div>
+
+    <div class="callout key">
+      <span class="co-tag">Key Idea</span>
+      <p>The GPU keeps climbing an abstraction ladder of "what's the unit of work?"
+      Pixels → threads → warps → <strong>whole matrix tiles</strong>. Each rung trades
+      generality for staggering efficiency at the thing everyone actually does. Tensor
+      Cores are the reason "GPU" and "AI chip" became synonyms.</p>
+    </div>
+
+    <p>So one GPU can do quadrillions of operations per second. And yet — a single
+    ChatGPT-class model doesn't fit on one, and answers still take seconds. Why? The
+    answer lives back in Chapter 5's memory mountain, and it's the best story in this
+    book. Next: what actually happens when you ask an LLM a question.</p>
+
+    <p class="sources"><span class="src-tag">Sources</span>
+      NVIDIA, "Train With Mixed Precision" guide (docs.nvidia.com) ·
+      NVIDIA H100/Blackwell architecture whitepapers (nvidia.com) ·
+      Exxact, "Comparing Blackwell vs Hopper" (exxactcorp.com) ·
+      Micikevicius et al., "Mixed Precision Training" (arxiv.org/abs/1710.03740)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="06-graphics-pipeline.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="08-gpus-and-llms.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

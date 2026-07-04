@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inference: Prefill &amp; Decode — Custom LLM Models</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">◧</span> Custom <b>·</b> LLMs</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 03 · Inference</p>
+      <h1>Inference: Prefill &amp; Decode</h1>
+      <p class="lede">Running a model to answer a prompt happens in two phases with opposite personalities. Confuse them and every performance decision you make will be wrong.</p>
+
+      <p class="serif-drop">When you send a prompt, the model does not start generating immediately in one uniform process. It splits the work in two. First it reads your entire prompt; then it writes the answer one token at a time. These are called <strong>prefill</strong> and <strong>decode</strong>, and the whole art of fast serving comes from understanding that they stress completely different parts of the GPU.</p>
+
+      <h2>Prefill: reading the prompt, all at once</h2>
+      <p>In <strong>prefill</strong>, the model processes <em>every prompt token in parallel</em> in a single forward pass, and stashes the Key/Value tensors for each (that's the KV cache being born — Chapter 4). Because all the tokens go through together, the GPU does big matrix-by-matrix multiplies where each loaded weight is reused across many tokens.</p>
+
+      <div class="callout note">
+        <span class="ic">⚙️</span>
+        <div><span class="lab">Prefill is compute-bound</span>
+        <p>High <em>arithmetic intensity</em> — lots of FLOPs per byte read from memory — so prefill saturates the GPU's math units. This is the phase that sets <strong>TTFT</strong> (time to first token). Longer prompt ⇒ more prefill work ⇒ higher TTFT.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 1</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>Decode: writing the answer, one token at a time</h2>
+      <p>Once the prompt is digested, the model enters <strong>decode</strong>: generate a token, append it, generate the next, and so on. Each step is a forward pass over a <em>single</em> new token (it reuses the cached K/V of everything before it). One token in, one token out, hundreds of times.</p>
+
+      <div class="callout warn">
+        <span class="ic">🚚</span>
+        <div><span class="lab">Decode is memory-bound</span>
+        <p>To produce one token, the GPU must stream <em>all</em> the model's weights <strong>and</strong> the whole KV cache out of memory — then does comparatively tiny math with them. Low arithmetic intensity: the compute units sit half-idle, waiting on memory bandwidth. This phase sets <strong>ITL / TPOT</strong> (inter-token latency / time per output token).</p>
+        </div>
+      </div>
+
+      <div class="diagram">
+        <svg viewBox="0 0 380 150" role="img" aria-label="Two bars. Prefill: all prompt tokens processed together in one wide step, compute-bound, produces TTFT. Decode: many narrow one-token steps, memory-bound, each produces one output token.">
+          <text x="86" y="16" text-anchor="middle" font-family="monospace" font-size="9" fill="#3d2fae">PREFILL (parallel)</text>
+          <rect x="16" y="24" width="140" height="34" rx="6" fill="#e7e3fb" stroke="#5b4bd6"/>
+          <g font-family="monospace" font-size="7" fill="#3d2fae">
+            <rect x="22" y="30" width="20" height="22" rx="3" fill="#fff" stroke="#5b4bd6"/>
+            <rect x="46" y="30" width="20" height="22" rx="3" fill="#fff" stroke="#5b4bd6"/>
+            <rect x="70" y="30" width="20" height="22" rx="3" fill="#fff" stroke="#5b4bd6"/>
+            <rect x="94" y="30" width="20" height="22" rx="3" fill="#fff" stroke="#5b4bd6"/>
+            <rect x="118" y="30" width="20" height="22" rx="3" fill="#fff" stroke="#5b4bd6"/>
+          </g>
+          <text x="86" y="72" text-anchor="middle" font-family="monospace" font-size="7" fill="#b3660c">compute-bound → TTFT</text>
+
+          <text x="290" y="16" text-anchor="middle" font-family="monospace" font-size="9" fill="#0a6e8c">DECODE (sequential)</text>
+          <g>
+            <rect x="196" y="24" width="22" height="34" rx="4" fill="#e4f2f6" stroke="#0e93b8"/>
+            <rect x="226" y="24" width="22" height="34" rx="4" fill="#e4f2f6" stroke="#0e93b8"/>
+            <rect x="256" y="24" width="22" height="34" rx="4" fill="#e4f2f6" stroke="#0e93b8"/>
+            <rect x="286" y="24" width="22" height="34" rx="4" fill="#e4f2f6" stroke="#0e93b8"/>
+            <rect x="316" y="24" width="22" height="34" rx="4" fill="#e6f5ec" stroke="#1f9d57"/>
+          </g>
+          <g stroke="#99a0c0" stroke-width="1.2">
+            <line x1="218" y1="41" x2="226" y2="41"/><line x1="248" y1="41" x2="256" y2="41"/>
+            <line x1="278" y1="41" x2="286" y2="41"/><line x1="308" y1="41" x2="316" y2="41"/>
+          </g>
+          <text x="267" y="72" text-anchor="middle" font-family="monospace" font-size="7" fill="#b3660c">memory-bound → per-token</text>
+          <text x="190" y="108" text-anchor="middle" font-family="monospace" font-size="8" fill="#868ca6">One wide step, then many narrow ones. Different bottlenecks.</text>
+          <text x="190" y="126" text-anchor="middle" font-family="monospace" font-size="8" fill="#868ca6">This is why answers stream out token-by-token.</text>
+        </svg>
+        <span class="cap">Prefill fills the cache in parallel; decode drains memory one token per step.</span>
+      </div>
+
+      <span class="folio">· 2</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="02-how-llms-work.html"><span class="dir">← Prev</span><span class="ttl">What a Model Is</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="04-kv-cache.html"><span class="dir">Next →</span><span class="ttl">The KV Cache</span></a>
+    </nav>
+  </section>
+
+  <section class="spread" style="margin-top:1.4rem">
+    <div class="leaf leaf-left">
+      <h2>Why "memory-bound" is the fact that runs your GPU bill</h2>
+      <p>Here is the intuition worth internalizing. During decode with a single request, producing one token multiplies your input against <em>every</em> weight matrix — reading gigabytes of weights to do a modest amount of arithmetic. The weights get reused only as many times as your <em>batch size</em>. Batch of one? Each weight is read, used once, discarded. The GPU's math units starve while the memory bus works flat out.</p>
+
+      <p>The fix writes itself: <strong>process many requests together</strong>. If 32 users' tokens ride through the same weight-load, each weight earns its keep 32× over. Total tokens-per-second climbs dramatically while any single user barely notices. That is the entire economic argument for an inference server — and the reason Chapters 8–9 exist.</p>
+
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">Throughput vs. latency, in one breath</span>
+        <p><strong>Latency</strong> is how fast <em>one</em> answer arrives (TTFT + per-token time). <strong>Throughput</strong> is how many tokens/sec you serve across <em>everyone</em>. Batching raises throughput, sometimes at the cost of a little latency. Nearly every serving knob is a dial between these two.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 3</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>The three numbers people actually measure</h2>
+      <table>
+        <thead><tr><th>Metric</th><th>Set by</th><th>Means</th></tr></thead>
+        <tbody>
+          <tr><td><strong>TTFT</strong></td><td>prefill</td><td>Time to first token — how long until the answer starts. Grows with prompt length.</td></tr>
+          <tr><td><strong>ITL / TPOT</strong></td><td>decode</td><td>Time per output token — how fast it streams once started.</td></tr>
+          <tr><td><strong>Throughput</strong></td><td>batching</td><td>Total tokens/sec across all requests. The utilization number.</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:0.8rem;color:var(--ink-faint);font-family:var(--mono)">NVIDIA defines TPOT as the average time between consecutive output tokens.</p>
+
+      <div class="callout why">
+        <span class="ic">🧩</span>
+        <div><span class="lab">Modern trick: chunked prefill</span>
+        <p>Because prefill is compute-bound and decode is memory-bound, servers like vLLM can <em>interleave</em> them — slicing a long prefill into chunks and running them alongside decode steps of other requests, so the compute units and the memory bus stay busy at the same time. You don't configure this by hand; it's why the numbers are good out of the box.</p>
+        </div>
+      </div>
+
+      <div class="callout bot">
+        <span class="ic">🧪</span>
+        <div><span class="lab">Acme check-in</span>
+        <p>A support ticket thread is a <em>long prompt</em> (all the back-and-forth) and a <em>short answer</em> (a draft reply + a tag). So Acme's workload is prefill-heavy — TTFT matters, and shared boilerplate across tickets is an opportunity (hold that thought for prefix caching in Ch. 8).</p>
+        </div>
+      </div>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p><a href="https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/">NVIDIA · LLM benchmarking fundamentals</a> (TTFT, ITL/TPOT, throughput) · <a href="https://docs.vllm.ai/en/latest/">vLLM docs</a> (chunked prefill).</p>
+      </div>
+
+      <span class="folio">· 4</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="02-how-llms-work.html"><span class="dir">← Prev</span><span class="ttl">What a Model Is</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="04-kv-cache.html"><span class="dir">Next →</span><span class="ttl">The KV Cache</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

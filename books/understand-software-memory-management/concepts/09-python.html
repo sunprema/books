@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python — Where Does the Memory Go?</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" href="../index.html"><span class="gly">▤</span> Where Does the <b>Memory</b> Go?</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html#contents">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <div class="spread">
+    <section class="leaf left">
+      <p class="kicker">Concept 09 · <span class="lang-badge b-py">PYTHON</span></p>
+      <h1>Python — Counting References (+ Cycles)</h1>
+      <p class="lede">Python (the standard CPython) took the <em>refcounting</em> road from Concept 05 — and then, because refcounting alone leaks cycles, bolted a tracing collector on top to sweep them up. Two collectors, working as a team. It's a wonderful case study in why no single technique is enough.</p>
+
+      <p>Every Python object carries a hidden field: <code>ob_refcnt</code>, its reference count. Bind it to a name, pass it to a function, stick it in a list — the count goes up. Let a name go out of scope or <code>del</code> it — the count goes down. Hit zero and the object is freed <em>immediately</em>, right then, no waiting.</p>
+
+      <pre><span class="cap">Python — watch the count</span><code><span class="kw">import</span> sys
+x = [<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>]
+sys.<span class="fn">getrefcount</span>(x)   <span class="cm"># 2 (x, plus the arg itself)</span>
+y = x
+sys.<span class="fn">getrefcount</span>(x)   <span class="cm"># 3</span>
+<span class="kw">del</span> y
+sys.<span class="fn">getrefcount</span>(x)   <span class="cm"># 2 — back down</span></code></pre>
+
+      <div class="callout key">
+        <span class="ic">★</span>
+        <div><span class="lab">The upside: prompt &amp; predictable</span>
+        <p>Because objects die the instant their count hits zero, cleanup is immediate and incremental — no big pause to scan the whole heap. A file handle closes the moment the last reference drops. Memory usage stays tight. This is refcounting's gift.</p>
+        </div>
+      </div>
+
+      <h2>The cycle problem, made concrete</h2>
+      <pre><span class="cap">Python — a cycle refcounting can't free</span><code>a = {}
+b = {}
+a[<span class="str">'b'</span>] = b   <span class="cm"># a → b</span>
+b[<span class="str">'a'</span>] = a   <span class="cm"># b → a  (a cycle!)</span>
+<span class="kw">del</span> a, b      <span class="cm"># outside refs gone…</span>
+<span class="cm"># …but each still holds the other at count 1.</span>
+<span class="cm"># Refcount alone: leaked forever.</span></code></pre>
+      <p>This is the exact blind spot we predicted. Their counts never reach zero because they prop each other up. So CPython runs a <strong>second</strong> collector.</p>
+    </section>
+
+    <section class="leaf right">
+      <h2>The cycle detector: tracing, generational</h2>
+      <p>Layered on top of refcounting is a tracing garbage collector (the <code>gc</code> module) whose <em>only</em> job is to find unreachable cycles. It periodically examines container objects, computes whether a group is reachable from outside, and if a cluster only points at itself, reclaims it. And — you guessed it — it's <strong>generational</strong>, with three generations, collecting the youngest most often.</p>
+
+      <div class="diagram">
+        <svg viewBox="0 0 320 140" role="img" aria-label="Python's two collaborating collectors">
+          <rect x="15" y="35" width="135" height="75" rx="6" fill="#e7f0e2" stroke="#2c7a73"/>
+          <text x="82" y="58" text-anchor="middle" font-size="10" fill="#2c7a73" font-family="monospace">refcounting</text>
+          <text x="82" y="76" text-anchor="middle" font-size="8" fill="#4d5b6b" font-family="monospace">frees the 99%</text>
+          <text x="82" y="90" text-anchor="middle" font-size="8" fill="#4d5b6b" font-family="monospace">instantly</text>
+          <rect x="170" y="35" width="135" height="75" rx="6" fill="#e9f1fa" stroke="#2b6cb0"/>
+          <text x="237" y="58" text-anchor="middle" font-size="10" fill="#234e7d" font-family="monospace">cycle GC</text>
+          <text x="237" y="76" text-anchor="middle" font-size="8" fill="#4d5b6b" font-family="monospace">sweeps the</text>
+          <text x="237" y="90" text-anchor="middle" font-size="8" fill="#4d5b6b" font-family="monospace">leftover cycles</text>
+          <line x1="150" y1="72" x2="170" y2="72" stroke="#8c97a4" stroke-width="1.2" stroke-dasharray="3 2"/>
+          <text x="160" y="128" text-anchor="middle" font-size="8" fill="#8c97a4" font-family="monospace">together = complete</text>
+        </svg>
+        <span class="cap">Refcounting does the bulk, promptly; the tracing collector mops up what cycles leave behind.</span>
+      </div>
+
+      <h2>The GIL — and its slow-motion exit</h2>
+      <div class="callout why">
+        <span class="ic">◆</span>
+        <div><span class="lab">Why the Global Interpreter Lock existed</span>
+        <p>Those refcounts are touched constantly. If two threads bumped the same count at once, it would corrupt. The cheap historical fix: a single <strong>GIL</strong> letting only one thread run Python bytecode at a time. Simple and safe — but it meant pure-Python code couldn't use multiple cores.</p>
+        </div>
+      </div>
+
+      <div class="callout note">
+        <span class="ic">▣</span>
+        <div><span class="lab">As of 2026 (CPython 3.13 → 3.14)</span>
+        <p>The <strong>free-threaded</strong> build (PEP 703) finally makes the GIL optional. To keep refcounts safe without it, 3.13 introduced <em>biased reference counting</em> (the owning thread uses fast non-atomic updates); 3.14 added a thread-safe <em>incremental</em> GC and cut the single-thread penalty to ~5–10%. It's maturing fast but still stabilizing for production.</p>
+        </div>
+      </div>
+
+      <div class="cols">
+        <div class="card good">
+          <h4>What you gain</h4>
+          <p>Effortless productivity, prompt cleanup, and a hands-off memory model great for scripting and glue.</p>
+        </div>
+        <div class="card bad">
+          <h4>What you pay</h4>
+          <p>Per-object overhead (every object carries a count + header), refcount churn, and — historically — the GIL capping CPU parallelism.</p>
+        </div>
+      </div>
+
+      <p>Python proves the thesis of this book: cleanly combine two imperfect collectors and you get a practical whole. Now the last language — one that's GC'd like Java but tuned for a very different goal: keeping pauses tiny while running thousands of concurrent things. Go.</p>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p>CPython internals &amp; <code>gc</code> module docs; PEP 703 (free-threading); Python 3.13/3.14 release notes.</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<nav class="pager">
+  <a class="prev" href="08-java.html">‹ <span class="dir">Prev</span><span class="ttl">Java &amp; the JVM</span></a>
+  <a class="contents" href="../index.html">▤ Contents</a>
+  <a class="next" href="10-go.html"><span class="dir">Next ›</span><span class="ttl">Go</span></a>
+</nav>
+</body>
+</html>

@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · When One GPU Isn't Enough — How GPUs Work</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">HOW <span class="zap">GPUs</span> WORK</a>
+  <span class="bb-chapter">09 · When One GPU Isn't Enough: Clusters &amp; AI Factories</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker">Chapter 09 · Scaling Out</p>
+    <h1>When One GPU Isn't Enough: <span class="hl">Clusters &amp; AI Factories</span></h1>
+
+    <p class="lede">Everything so far happened inside one chip. But a frontier LLM
+    doesn't fit on one chip — the weights alone can exceed any single GPU's memory,
+    and the training math would take one GPU <em>centuries</em>. So the industry's
+    answer to "the GPU is a parallel computer" was, naturally: <em>make a parallel
+    computer out of parallel computers.</em> Welcome to the world where the unit of
+    computing is not a chip or a server, but a building.</p>
+
+    <h2>The wiring problem</h2>
+    <p>Splitting a neural network across GPUs means GPUs must constantly swap partial
+    results — activations flowing forward, gradients flowing back. Regular networking
+    (even fast Ethernet at ~10–50 GB/s) is a soda straw next to HBM's terabytes per
+    second; naive scaling would leave every GPU idle, waiting for the network. The fix
+    comes in tiers, each about an order of magnitude slower than the last:</p>
+
+    <table>
+      <tr><th>Link</th><th>Connects</th><th>Ballpark speed</th></tr>
+      <tr><td>HBM (on-package)</td><td>a GPU to its own memory</td><td class="mono">3–8 TB/s</td></tr>
+      <tr><td>NVLink 5</td><td>GPUs inside a server/rack</td><td class="mono">1.8 TB/s per GPU</td></tr>
+      <tr><td>InfiniBand / RoCE</td><td>servers across the datacenter</td><td class="mono">~50–100 GB/s per NIC</td></tr>
+      <tr><td>PCIe 5</td><td>GPU ↔ its host CPU</td><td class="mono">~64 GB/s</td></tr>
+    </table>
+
+    <p><span class="term">NVLink</span> is the star: a dedicated GPU-to-GPU connection
+    that skips the CPU and PCIe entirely. Through <span class="term">NVSwitch</span>
+    chips, every GPU in a rack talks to every other at full speed, and one GPU can even
+    read another's memory directly. NVIDIA's flagship rack, the
+    <strong>GB200 NVL72</strong>, wires <strong>72 Blackwell GPUs</strong> (plus 36
+    Grace CPUs) into a single NVLink domain — one giant 72-headed GPU with tens of
+    terabytes of pooled fast memory, drinking ~120 kW. That rack, not the chip, is the
+    unit AI labs now shop for.</p>
+
+    <h2>Slicing the model: the three parallelisms</h2>
+    <p>Given N GPUs, how do you divide an LLM among them? Three cuts, usually combined:</p>
+    <ul>
+      <li><strong>Data parallel</strong> — every GPU holds a full copy of the model,
+      each trains on different examples, and they average their gradients each step.
+      Simple, scales wide; but the sync ("all-reduce") crosses the network every step,
+      and each GPU must fit the whole model.</li>
+      <li><strong>Tensor parallel</strong> — slice the <em>matrices themselves</em>:
+      each GPU holds a stripe of every weight matrix and computes its slice of every
+      multiply. Needs constant chatter mid-layer → only viable inside the NVLink
+      domain. This is how models too big for one GPU get served at all.</li>
+      <li><strong>Pipeline parallel</strong> — deal out the <em>layers</em>: GPU 1
+      takes layers 1–20, GPU 2 takes 21–40… Activations flow down the line like an
+      assembly line, with micro-batches keeping every station busy.</li>
+    </ul>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 760 240" role="img" aria-label="Three parallelism strategies: data, tensor, pipeline">
+        <g font-family="-apple-system,Arial" font-size="11" fill="#241f18">
+          <!-- data parallel -->
+          <text x="140" y="25" text-anchor="middle" font-weight="800" font-size="13">Data parallel</text>
+          <g stroke="#241f18" stroke-width="1.5">
+            <rect x="55" y="40" width="70" height="90" rx="8" fill="#e9f3d3"/>
+            <rect x="155" y="40" width="70" height="90" rx="8" fill="#e9f3d3"/>
+          </g>
+          <g fill="#76b900" stroke="#241f18" stroke-width=".8">
+            <rect x="67" y="52" width="46" height="14"/><rect x="67" y="70" width="46" height="14"/><rect x="67" y="88" width="46" height="14"/><rect x="67" y="106" width="46" height="14"/>
+            <rect x="167" y="52" width="46" height="14"/><rect x="167" y="70" width="46" height="14"/><rect x="167" y="88" width="46" height="14"/><rect x="167" y="106" width="46" height="14"/>
+          </g>
+          <text x="90" y="150" text-anchor="middle" font-size="10">full model</text>
+          <text x="190" y="150" text-anchor="middle" font-size="10">full model</text>
+          <text x="90" y="165" text-anchor="middle" font-size="10" fill="#6f6654">batch A</text>
+          <text x="190" y="165" text-anchor="middle" font-size="10" fill="#6f6654">batch B</text>
+          <path d="M125 85 H155 M130 79 L125 85 L130 91 M150 79 L155 85 L150 91" stroke="#d6407a" stroke-width="1.5" fill="none"/>
+          <text x="140" y="190" text-anchor="middle" font-size="10" fill="#d6407a">sync gradients each step</text>
+
+          <!-- tensor parallel -->
+          <text x="390" y="25" text-anchor="middle" font-weight="800" font-size="13">Tensor parallel</text>
+          <g stroke="#241f18" stroke-width="1.5">
+            <rect x="305" y="40" width="70" height="90" rx="8" fill="#efe9fb"/>
+            <rect x="405" y="40" width="70" height="90" rx="8" fill="#efe9fb"/>
+          </g>
+          <!-- each layer split into halves -->
+          <g stroke="#241f18" stroke-width=".8">
+            <rect x="317" y="52" width="23" height="14" fill="#6d4fd8"/><rect x="317" y="70" width="23" height="14" fill="#6d4fd8"/><rect x="317" y="88" width="23" height="14" fill="#6d4fd8"/><rect x="317" y="106" width="23" height="14" fill="#6d4fd8"/>
+            <rect x="440" y="52" width="23" height="14" fill="#6d4fd8"/><rect x="440" y="70" width="23" height="14" fill="#6d4fd8"/><rect x="440" y="88" width="23" height="14" fill="#6d4fd8"/><rect x="440" y="106" width="23" height="14" fill="#6d4fd8"/>
+            <rect x="342" y="52" width="23" height="14" fill="#fff"/><rect x="342" y="70" width="23" height="14" fill="#fff"/><rect x="342" y="88" width="23" height="14" fill="#fff"/><rect x="342" y="106" width="23" height="14" fill="#fff"/>
+            <rect x="417" y="52" width="23" height="14" fill="#fff"/><rect x="417" y="70" width="23" height="14" fill="#fff"/><rect x="417" y="88" width="23" height="14" fill="#fff"/><rect x="417" y="106" width="23" height="14" fill="#fff"/>
+          </g>
+          <text x="340" y="150" text-anchor="middle" font-size="10">left half of</text>
+          <text x="340" y="163" text-anchor="middle" font-size="10">every matrix</text>
+          <text x="440" y="150" text-anchor="middle" font-size="10">right half of</text>
+          <text x="440" y="163" text-anchor="middle" font-size="10">every matrix</text>
+          <path d="M375 85 H405 M380 79 L375 85 L380 91 M400 79 L405 85 L400 91" stroke="#d6407a" stroke-width="1.5" fill="none"/>
+          <text x="390" y="190" text-anchor="middle" font-size="10" fill="#d6407a">chat constantly — NVLink territory</text>
+
+          <!-- pipeline parallel -->
+          <text x="632" y="25" text-anchor="middle" font-weight="800" font-size="13">Pipeline parallel</text>
+          <g stroke="#241f18" stroke-width="1.5">
+            <rect x="547" y="40" width="70" height="90" rx="8" fill="#fdeef4"/>
+            <rect x="647" y="40" width="70" height="90" rx="8" fill="#fdeef4"/>
+          </g>
+          <g stroke="#241f18" stroke-width=".8">
+            <rect x="559" y="52" width="46" height="14" fill="#d6407a"/><rect x="559" y="70" width="46" height="14" fill="#d6407a"/>
+            <rect x="559" y="88" width="46" height="14" fill="#fff"/><rect x="559" y="106" width="46" height="14" fill="#fff"/>
+            <rect x="659" y="52" width="46" height="14" fill="#fff"/><rect x="659" y="70" width="46" height="14" fill="#fff"/>
+            <rect x="659" y="88" width="46" height="14" fill="#d6407a"/><rect x="659" y="106" width="46" height="14" fill="#d6407a"/>
+          </g>
+          <text x="582" y="150" text-anchor="middle" font-size="10">layers 1–40</text>
+          <text x="682" y="150" text-anchor="middle" font-size="10">layers 41–80</text>
+          <path d="M617 85 H647 M642 79 L647 85 L642 91" stroke="#d6407a" stroke-width="1.5" fill="none"/>
+          <text x="632" y="190" text-anchor="middle" font-size="10" fill="#d6407a">activations flow down the line</text>
+
+          <text x="380" y="225" text-anchor="middle" font-size="11" fill="#6f6654">Real frontier training uses all three at once — e.g. tensor-parallel inside a rack, pipeline across racks, data-parallel across the hall.</text>
+        </g>
+      </svg>
+      <figcaption><strong>Three ways to cut a model.</strong> Choose by bandwidth:
+      the chattier the cut, the faster the wire it needs.</figcaption>
+    </figure>
+
+    <div class="callout warn">
+      <span class="co-tag">Gotcha</span>
+      <p><strong>Amdahl's law never sleeps.</strong> Perfect 2× scaling from 2× GPUs is
+      a fantasy; every cut adds communication overhead, and one slow GPU (or one dropped
+      network packet) can stall ten thousand others at a synchronization barrier. At
+      frontier scale, <em>hardware failures are routine</em> — a months-long training
+      run is engineered around GPUs dying mid-job, with constant checkpointing and
+      hot spares. Distributed training is as much systems engineering as ML.</p>
+    </div>
+
+    <h2>The AI factory</h2>
+    <p>Zoom all the way out. A frontier training cluster in 2025–26 is
+    <strong>100,000+ GPUs</strong>: thousands of NVL-class racks, an InfiniBand/Ethernet
+    fabric with more internal bandwidth than the public internet's backbone, and a power
+    draw of <strong>100+ megawatts</strong> — a small city. xAI's "Colossus" famously
+    stood up 100,000 H100s in 122 days; hyperscalers now announce gigawatt-scale
+    campuses. NVIDIA's term for these — "AI factories" — is honest: raw data goes in,
+    a multi-terabyte file of weights comes out, and the electricity bill is the cost
+    of goods.</p>
+
+    <div class="statrow">
+      <div class="stat"><div class="lbl">One H100</div><div class="bignum">~1 PF</div>meaningful FP8 compute, 700 W</div>
+      <div class="stat"><div class="lbl">One NVL72 rack</div><div class="bignum">72 GPUs</div>one NVLink domain, ~120 kW</div>
+      <div class="stat"><div class="lbl">One AI factory</div><div class="bignum">100k+</div>GPUs, 100+ MW, $ billions</div>
+    </div>
+
+    <figure class="img-slot" data-img-slot="gpu-choir"
+            data-img-file="assets/img/gpu-choir.png" style="--img-aspect:16 / 9">
+      <img class="img-real" src="../assets/img/gpu-choir.png"
+           alt="Cartoon choir of thousands of GPU chips singing in harmony, conducted by a network switch"
+           width="1280" height="720"
+           onerror="this.closest('.img-slot').classList.add('img-missing')">
+      <div class="img-drop"><div class="img-drop-inner">
+        <strong>Image needed</strong>
+        <p class="img-prompt">A funny zine-style cartoon, hand-drawn ink with flat colors
+        (electric green, violet, pink on cream paper): a vast concert hall where thousands of
+        identical little GPU chip characters in choir robes sing in perfect harmony on risers
+        stretching to the horizon, connected to each other by glowing green cables like shared
+        headphone wires labeled "NVLINK". A dramatic conductor robot labeled "SWITCH" waves a
+        baton on the podium. In the front row, one GPU has fainted and is being carried off by
+        two stagehands while an understudy GPU leaps in mid-note (the failure joke). A power
+        meter on the wall reads comically "1 SMALL CITY". Exaggerated, playful, no other small
+        text. Target size ~1280×720px, 16:9 landscape; composed for a small on-page figure,
+        subject centred with safe margins — it is letterboxed into a 16:9 box, so keep nothing
+        important near the edges.</p>
+        <button type="button" class="img-copy">Copy prompt</button>
+        <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+      </div></div>
+      <figcaption><strong>100,000 voices, one song.</strong> The whole choir must stay in
+      sync — and the show goes on even when a singer faints mid-aria.</figcaption>
+    </figure>
+
+    <div class="callout key">
+      <span class="co-tag">Key Idea</span>
+      <p>Scaling is fractal — it's the same story at every altitude. Inside an SM: many
+      cores, hide the latency. Inside a chip: many SMs, share the L2. Inside a rack:
+      many chips, NVLink. Inside a building: many racks, InfiniBand. At each level you
+      get <em>more parallel workers</em> and pay <em>a slower connection between
+      them</em> — so at each level, winning means the same thing it meant in Chapter 5:
+      keep the work local, and overlap communication with compute.</p>
+    </div>
+
+    <p>That's the whole machine, from one warp to one hundred thousand GPUs. Last
+    question, and it's the practical one: what does all this mean for <em>you</em>,
+    a student with a laptop and curiosity? Good news — this is the best time in
+    history to get your hands on GPU power. Final chapter.</p>
+
+    <p class="sources"><span class="src-tag">Sources</span>
+      NVIDIA, GB200 NVL72 &amp; NVLink product pages (nvidia.com) ·
+      Civo, "Comparing NVIDIA's B200 and H100" (civo.com) ·
+      CUDO Compute, "NVIDIA's Blackwell architecture" (cudocompute.com) ·
+      public reporting on xAI Colossus (2024–25)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="08-gpus-and-llms.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="10-getting-hands-on.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

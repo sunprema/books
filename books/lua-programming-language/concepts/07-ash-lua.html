@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lua &amp; Ash — Lua Field Guide</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <p class="kicker">Chapter Seven</p>
+    <h2>Lua &amp; Ash: Scripting Your Domain</h2>
+    <p class="lead"><strong>Ash</strong> models your application as resources and actions, with authorization, validation, and multitenancy baked in. <code>ash_lua</code> exposes that domain to Lua scripts — so a script can create, read, update, and delete records <em>through the exact same policies</em> your app already enforces.</p>
+
+    <pre><code class="elixir"># mix.exs, then: mix igniter.install ash_lua
+{:ash_lua, "~> 0.1.0"}</code></pre>
+
+    <h3>Opt a domain and its resources in</h3>
+    <p>Add the <code>AshLua.Domain</code> extension to the domain and <code>AshLua.Resource</code> to each resource you want reachable. By default everything nests as <code>domain.resource.action</code>; you can rename the Lua tables.</p>
+
+    <pre><code class="elixir">defmodule MyApp.Accounts do
+  use Ash.Domain, otp_app: :my_app, extensions: [AshLua.Domain]
+
+  lua do
+    name "accounts"      # the Lua table name (optional)
+  end
+
+  resources do
+    resource MyApp.Accounts.User
+  end
+end
+
+defmodule MyApp.Accounts.User do
+  use Ash.Resource, domain: MyApp.Accounts, extensions: [AshLua.Resource]
+  lua do
+    name "user"
+  end
+end</code></pre>
+
+    <h3>Run a script — with the actor attached</h3>
+    <p><code>AshLua.eval!/2</code> evaluates Lua and threads an <code>actor</code>, <code>tenant</code>, and <code>context</code> through <em>every</em> Ash call the script makes. Crucially, those are read-only from Lua: the script cannot promote itself to another user.</p>
+
+    <pre><code class="elixir">{[user_id], _lua} =
+  AshLua.eval!(
+    """
+    local user, err = accounts.user.create({
+      name = "Zach",
+      email = "z@example.com",
+      fields = { "id" }
+    })
+    assert(err == nil)
+    return user.id
+    """,
+    otp_app: :my_app,
+    actor: current_user      # enforced on every call below
+  )</code></pre>
+
+    <h3>The result/err convention</h3>
+    <p>Every call returns <code>(result, err)</code>. On success <code>err</code> is <code>nil</code>; on failure <code>result</code> is <code>nil</code> and <code>err</code> is a table with a <code>message</code>. Wrap with <code>assert()</code> to raise, or branch explicitly.</p>
+
+    <pre><code class="lua">local user, err = accounts.user.create({ name = "Zach" })
+if err then
+  print("failed: " .. err.message)
+else
+  print("created " .. user.id)
+end
+
+-- assert() raises on the (nil, err) shape — concise when you want fail-fast
+local post = assert(posts.post.create({ title = "Hello", fields = {"id"} }))</code></pre>
+
+    <h3>Reads: filter, sort, paginate, aggregate</h3>
+    <pre><code class="lua">-- a filtered, sorted, limited list with selected fields
+local results = assert(posts.post.read({
+  filter = { published = true },
+  sort   = "-created_at",
+  limit  = 10,
+  offset = 20,
+  fields = { "title", { author = { "name" } } }   -- nested relationship
+}))
+
+-- aggregates use the same call
+local total = assert(posts.post.read({ operation = "count" }))
+local avg   = assert(posts.comment.read({ operation = { "avg", "rating" } }))</code></pre>
+
+    <div class="callout note">
+      <span class="lbl">Fields are opt-in</span>
+      <p>By default a call returns only primary keys. Ask for what you need with <code>fields</code> — stored attributes, calculations (even with <code>args</code>), and nested relationships. That keeps payloads tight and avoids leaking columns a script shouldn't see.</p>
+    </div>
+
+    <h3>Update &amp; delete</h3>
+    <pre><code class="lua">local updated = assert(posts.post.update({
+  id = post.id, title = "Hello again", fields = { "title" }
+}))
+assert(posts.post.destroy({ id = post.id }))</code></pre>
+
+    <div class="callout key">
+      <span class="lbl">Why this is the safe way to script a database</span>
+      <p>The script never sees a connection string or a raw query. It calls <em>named actions</em>, and Ash runs them as the supplied actor and tenant — so your policies, validations, and tenant scoping all still apply. The host (your Elixir code) is the <strong>sole source of authority</strong>; the actor/tenant/context cannot be read or changed from Lua. This is the database-grade version of Chapter Six's boundary.</p>
+    </div>
+
+    <h3>Discoverability for your users</h3>
+    <p><code>AshLua.Docs</code> generates a callable list and per-call markdown straight from your domains — perfect for an in-app "what can I script?" reference.</p>
+
+    <pre><code class="elixir">AshLua.Docs.list_callables(otp_app: :my_app)
+# =&gt; ["accounts.user.create", "accounts.user.read", ...]
+{:ok, md} = AshLua.Docs.callable_doc([otp_app: :my_app], "accounts.user.create")</code></pre>
+
+    <div class="callout warn">
+      <span class="lbl">Still apply limits</span>
+      <p><code>ash_lua</code> governs <em>authorization</em>, not <em>resource use</em>. A script can still write an infinite loop or a 100k-row read. Run it under the time/step/memory guards from the next chapter, and design actions with sensible default page sizes.</p>
+    </div>
+
+    <p class="footnote">Source: ash_lua "Getting Started" tutorial, v0.1.0 (github.com/ash-project/ash_lua).</p>
+  </article>
+  <div class="book-spine"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-embedding-lua-in-elixir.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-interesting-use-cases.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

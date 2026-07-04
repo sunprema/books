@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Re-Parameterize &amp; Serve — MeKi in Elixir</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">MK</span> MeKi <b>·</b> in Elixir</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 07 · Deploy</p>
+      <h1>Re-Parameterize &amp; Serve</h1>
+      <p class="lede">Training is done; the SwiGLU has served its purpose. Now we fold it into a table, build the lookup-only block, and stand up an inference server.</p>
+
+      <p class="serif-drop">After training you hold a parameter map: <code>m_l</code>, the SwiGLU weights <code>w_g/w_u/w_d</code>, the gates <code>w_gate/w_out</code>, and the scalars. The export step from Chapter 5 walks each layer and bakes <span class="v">M̃</span><span class="sup">l</span> once:</p>
+      <pre><span class="cap">elixir · export/reparameterize</span><code><span class="kw">def</span> <span class="fn">reparameterize_layer</span>(p, e_global) <span class="kw">do</span>
+  m_tilde =
+    <span class="ty">MeKi.NN</span>.<span class="fn">swiglu</span>(e_global, p.w_g, p.w_u, p.w_d)
+    |&gt; <span class="ty">Nx</span>.<span class="fn">multiply</span>(p.beta)
+    |&gt; <span class="ty">Nx</span>.<span class="fn">add</span>(p.m_l)
+    |&gt; <span class="ty">MeKi.NN</span>.<span class="fn">rms_norm</span>()
+    |&gt; <span class="ty">Nx</span>.<span class="fn">multiply</span>(p.alpha)        <span class="cm"># {|V|, d_mem}</span>
+
+  <span class="cm"># ship only what inference needs</span>
+  %{m_tilde: m_tilde, w_gate: p.w_gate, w_out: p.w_out}
+<span class="kw">end</span></code></pre>
+
+      <p>The <strong>inference</strong> block is now a shadow of the training one — no embedding, no SwiGLU, no α/β. Just a lookup and the gate:</p>
+      <pre><span class="cap">elixir · inference forward</span><code><span class="kw">defn</span> <span class="fn">meki_infer</span>(h, tok, m_tilde, w_gate, w_out) <span class="kw">do</span>
+  e = <span class="ty">Nx</span>.<span class="fn">take</span>(m_tilde, tok)             <span class="cm"># ROM lookup</span>
+  g = <span class="ty">Nx</span>.<span class="fn">sigmoid</span>(<span class="ty">Nx</span>.<span class="fn">dot</span>(h, w_gate))
+  <span class="ty">MeKi.NN</span>.<span class="fn">rms_norm</span>(<span class="ty">Nx</span>.<span class="fn">dot</span>(e + g, w_out))
+<span class="kw">end</span></code></pre>
+      <span class="folio">15 ·</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <figure
+        class="img-slot"
+        data-img-slot="train-to-rom"
+        data-img-file="assets/img/train-to-rom.png"
+      >
+        <img
+          class="img-real"
+          src="../assets/img/train-to-rom.png"
+          alt="A training-time block with a non-linear projector collapsing into a single static ROM table for inference"
+          onerror="this.closest('.img-slot').classList.add('img-missing')"
+        />
+        <div class="img-drop">
+          <div class="img-drop-inner">
+            <strong>Illustration (optional)</strong>
+            <p class="img-prompt">A clean two-panel editorial tech illustration, flat vector with soft glow. Left panel labelled with a busy training-time block: a small neural projector (interlocking gears and a branching SwiGLU shape) feeding a memory grid, lots of indigo arithmetic. Right panel: the gears have dissolved into a single calm amber lookup table of glowing memory cells in ROM, with one bright row being read out — same output, no machinery. A curved arrow folds the left panel into the right. Cool slate-and-indigo palette with warm amber ROM highlights, generous whitespace, no real text baked in.</p>
+            <button type="button" class="img-copy">Copy prompt</button>
+            <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+          </div>
+        </div>
+        <figcaption>The projector folds away; only a static lookup table survives into inference.</figcaption>
+      </figure>
+
+      <h2>What lives where</h2>
+      <p>Per token, MeKi moves only <code>d_mem × L</code> values out of ROM — for a 28-layer model at <code>d_mem = 256</code>, that is <strong>7,168 values ≈ 14&nbsp;KB</strong> in float16. Against UFS&nbsp;4.0's ~4.2&nbsp;GB/s of mostly-idle read bandwidth, the table can be <em>prefetched by token id</em> while the NPU is busy with attention and the FFN. The active-parameter footprint in RAM is identical to the dense baseline — the extra capacity is sitting in storage.</p>
+
+      <div class="callout note">
+        <span class="ic">🚚</span>
+        <div><span class="lab">On the BEAM</span>
+        <p>Elixir won't run on the phone's NPU, but it is an excellent <em>host</em> for the server-side or desktop deployment: wrap the model in <code>Nx.Serving</code> and you get automatic request batching, back-pressure, and distribution for free.</p>
+        </div>
+      </div>
+
+      <pre><span class="cap">elixir · serve it</span><code>serving =
+  <span class="ty">Nx.Serving</span>.<span class="fn">new</span>(fn opts -&gt;
+    <span class="ty">Nx.Defn</span>.<span class="fn">jit</span>(&amp;<span class="ty">MeKi.Model</span>.<span class="fn">decode_step</span>/<span class="num">2</span>, opts)
+  <span class="kw">end</span>)
+  |&gt; <span class="ty">Nx.Serving</span>.<span class="fn">batch_size</span>(<span class="num">16</span>)
+  |&gt; <span class="ty">Nx.Serving</span>.<span class="fn">client_preprocessing</span>(&amp;tokenize/<span class="num">1</span>)
+
+<span class="cm"># in the supervision tree:</span>
+{<span class="ty">Nx.Serving</span>, serving: serving, name: <span class="ty">MeKi.Serving</span>}
+
+<span class="cm"># anywhere in the app — concurrent callers are batched:</span>
+<span class="ty">Nx.Serving</span>.<span class="fn">batched_run</span>(<span class="ty">MeKi.Serving</span>, prompt)</code></pre>
+
+      <span class="folio">· 16</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="06-building-in-elixir.html"><span class="dir">← Prev</span><span class="ttl">Building MeKi in Nx &amp; Axon</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>▦</a>
+      <a class="next" rel="next" href="08-evidence.html"><span class="dir">Next →</span><span class="ttl">Why It Works: The Evidence</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+</body>
+</html>

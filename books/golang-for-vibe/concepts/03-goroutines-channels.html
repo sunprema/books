@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Goroutines &amp; Channels — Golang for Vibe Coders</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" href="../index.html"><span class="goph">🐹</span> Go for <b>Vibe</b> Coders</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="page">
+  <p class="kicker">Concept 03 · Concurrency</p>
+  <h1>Goroutines &amp; Channels</h1>
+  <p class="lede">This is Go's party trick: doing thousands of things at once without your brain melting. Let's build the intuition from a single physical question — what is a thread, really?</p>
+
+  <h2>The problem, made physical</h2>
+  <p>Picture a restaurant kitchen. A naïve cook does one ticket start-to-finish before touching the next: chop, simmer twenty minutes <em>standing there watching the pot</em>, plate, repeat. Absurd — most of the time is spent <em>waiting</em>, doing nothing. A real cook starts the soup, and while it simmers, chops the salad for another order. The work that <em>blocks</em> (waiting on the pot, the oven, the network) overlaps with other work. That overlap is concurrency, and almost all server work — waiting on databases, disks, other servers — is mostly waiting.</p>
+  <p>The old way to get this overlap was operating-system threads. But an OS thread is expensive: it grabs a megabyte or two of stack and the kernel has to babysit it. Spin up ten thousand and you've drowned the machine. So everyone built awkward workarounds — callbacks, async/await coloring, event loops — to fake concurrency without paying for threads.</p>
+
+  <h2>Goroutines: threads, but almost free</h2>
+  <p>Go's answer is the <strong>goroutine</strong>: a function running concurrently, managed by Go's own runtime rather than the OS. The whole trick is the price tag. A goroutine starts with about a <strong>2&nbsp;KB</strong> stack — a thousand times smaller than an OS thread — and grows only if it needs to. The Go runtime quietly multiplexes thousands of goroutines onto a handful of real OS threads. So launching a hundred thousand of them is genuinely fine.</p>
+  <p>And the syntax is the punchline. To run something concurrently, you put the word <code>go</code> in front of it:</p>
+  <pre><span class="cap">go</span><code><span class="kw">func</span> <span class="fn">fetch</span>(url <span class="ty">string</span>) {
+    <span class="cm">// ... do the slow network call ...</span>
+}
+
+<span class="kw">func</span> <span class="fn">main</span>() {
+    <span class="kw">go</span> <span class="fn">fetch</span>(<span class="str">"https://a.example"</span>)   <span class="cm">// runs concurrently, doesn't block</span>
+    <span class="kw">go</span> <span class="fn">fetch</span>(<span class="str">"https://b.example"</span>)   <span class="cm">// so does this one</span>
+    <span class="cm">// main keeps going immediately...</span>
+}</code></pre>
+  <p>That's it. <code>go fetch(...)</code> means "start this running and don't wait for it." No thread pool to configure, no async keyword to thread through your whole call stack. The word <code>go</code> is the feature.</p>
+
+  <div class="callout warn">
+    <span class="ic">⚠️</span>
+    <div><span class="lab">The catch you just created</span>
+    <p>In that example <code>main</code> launches two goroutines and then… reaches its end and exits, killing the whole program before either fetch finishes. A goroutine is not a promise the program will wait for it. So we need a way to <em>coordinate</em> — to say "wait until the soup is done." That's the other half of the story.</p>
+    </div>
+  </div>
+
+  <h2>Channels: how goroutines talk safely</h2>
+  <p>Here's the deepest idea in Go concurrency, and it's worth slowing down for. In most languages, threads share memory and you bolt on locks to stop them from stepping on each other — and getting those locks right is famously where the 3&nbsp;a.m. bugs live. Go's motto turns it around:</p>
+  <div class="callout key">
+    <span class="ic">🔑</span>
+    <div><span class="lab">The Go proverb</span>
+    <p>"Do not communicate by sharing memory; instead, <strong>share memory by communicating.</strong>" Rather than several goroutines poking the same variable behind locks, one goroutine <em>hands</em> a value to another down a pipe. At any moment the value has one clear owner. The pipe is called a <strong>channel</strong>.</p>
+    </div>
+  </div>
+  <p>A channel is a typed conduit. You send with <code>ch &lt;- v</code> and receive with <code>v := &lt;-ch</code>. The magic property: a receive <em>blocks</em> until something is sent, and a send blocks until someone receives. So a channel doesn't just pass data — it <em>synchronizes</em>. It's the pot timer and the hand-off, in one.</p>
+  <pre><span class="cap">go · fetch N URLs concurrently, collect results</span><code><span class="kw">func</span> <span class="fn">main</span>() {
+    urls := []<span class="ty">string</span>{<span class="str">"a"</span>, <span class="str">"b"</span>, <span class="str">"c"</span>}
+    results := <span class="bi">make</span>(<span class="kw">chan</span> <span class="ty">string</span>)        <span class="cm">// a channel of strings</span>
+
+    <span class="kw">for</span> _, u := <span class="kw">range</span> urls {
+        <span class="kw">go</span> <span class="kw">func</span>(url <span class="ty">string</span>) {
+            <span class="cm">// ...slow work...</span>
+            results &lt;- <span class="str">"done: "</span> + url     <span class="cm">// send result into the channel</span>
+        }(u)
+    }
+
+    <span class="kw">for</span> range urls {                    <span class="cm">// receive exactly len(urls) results</span>
+        <span class="fn">fmt</span>.<span class="fn">Println</span>(&lt;-results)            <span class="cm">// blocks until a value arrives</span>
+    }
+}</code></pre>
+  <p>Read what happened: three goroutines run their slow work <em>at the same time</em>, each drops its answer into <code>results</code>, and <code>main</code> calmly collects three values. The total wall-clock time is roughly the time of the <em>slowest single</em> fetch, not the sum of all three. That's the whole win, and there's not a lock in sight.</p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 470 200" role="img" aria-label="Goroutines sending into a channel">
+      <defs>
+        <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#00add8"/>
+        </marker>
+      </defs>
+      <!-- goroutines -->
+      <rect x="18" y="20" width="120" height="34" rx="8" fill="#0f1c22" stroke="#b56cff"/>
+      <text x="30" y="42" fill="#b56cff" font-family="monospace" font-size="12">goroutine A</text>
+      <rect x="18" y="80" width="120" height="34" rx="8" fill="#0f1c22" stroke="#b56cff"/>
+      <text x="30" y="102" fill="#b56cff" font-family="monospace" font-size="12">goroutine B</text>
+      <rect x="18" y="140" width="120" height="34" rx="8" fill="#0f1c22" stroke="#b56cff"/>
+      <text x="30" y="162" fill="#b56cff" font-family="monospace" font-size="12">goroutine C</text>
+      <!-- channel -->
+      <rect x="230" y="78" width="70" height="40" rx="6" fill="#16282f" stroke="#00add8"/>
+      <text x="244" y="103" fill="#4fd6f0" font-family="monospace" font-size="12">chan</text>
+      <line x1="138" y1="37"  x2="228" y2="90"  stroke="#00add8" marker-end="url(#ar)"/>
+      <line x1="138" y1="97"  x2="228" y2="98"  stroke="#00add8" marker-end="url(#ar)"/>
+      <line x1="138" y1="157" x2="228" y2="106" stroke="#00add8" marker-end="url(#ar)"/>
+      <!-- main -->
+      <rect x="370" y="78" width="82" height="40" rx="8" fill="#0f1c22" stroke="#f2c14e"/>
+      <text x="384" y="103" fill="#f2c14e" font-family="monospace" font-size="12">main</text>
+      <line x1="300" y1="98" x2="368" y2="98" stroke="#00add8" marker-end="url(#ar)"/>
+    </svg>
+    <span class="cap">Many goroutines send into one channel; main receives. The channel both moves data and synchronizes.</span>
+  </div>
+
+  <h2>Two everyday helpers</h2>
+  <p>Channels are the foundation, but for two common chores Go's standard <code>sync</code> package gives you blunt tools — and an agent will reach for these constantly:</p>
+  <ul>
+    <li><strong><code>sync.WaitGroup</code></strong> — "wait for N goroutines to all finish." <code>wg.Add(n)</code>, each goroutine calls <code>wg.Done()</code>, and <code>wg.Wait()</code> blocks until the count hits zero. This is the clean fix for the "main exits too early" bug above.</li>
+    <li><strong><code>context.Context</code></strong> — the standard way to say "stop now" or "give up after 5 seconds." You pass a <code>ctx</code> down through your calls; cancel it (or let its timeout fire) and every goroutine watching it can bail out. Essential for network code, and the backbone of cancellation in real Go services.</li>
+  </ul>
+
+  <div class="callout note">
+    <span class="ic">🧭</span>
+    <div><span class="lab">For the vibe coder: name the pattern, not the plumbing</span>
+    <p>You rarely need to hand-write this machinery. The leverage is in <em>asking precisely</em>: "fetch these URLs concurrently with a <code>WaitGroup</code>, collect results on a channel, and cancel everything if a <code>context</code> deadline of 5s is exceeded." Those four nouns — goroutine, channel, WaitGroup, context — are the vocabulary that turns a vague "do it in parallel" into code the agent can write correctly. And Go ships a built-in <strong>race detector</strong>: run your tests with <code>go test -race</code> and it will flag concurrent-access bugs at runtime. Always tell the agent to run it.</p>
+    </div>
+  </div>
+
+  <h2>The thirty-second version</h2>
+  <ul>
+    <li>A <strong>goroutine</strong> is a near-free concurrent function — start one with <code>go f()</code>. You can have hundreds of thousands.</li>
+    <li>The runtime multiplexes them onto a few OS threads; each starts at ~2&nbsp;KB.</li>
+    <li>A <strong>channel</strong> (<code>make(chan T)</code>) passes typed values between goroutines <em>and</em> synchronizes them — send/receive block until matched.</li>
+    <li>"Share memory by communicating" — hand values down channels instead of sharing variables behind locks.</li>
+    <li>Use <code>sync.WaitGroup</code> to wait for goroutines, <code>context.Context</code> to cancel/timeout, and <code>go test -race</code> to catch data races.</li>
+  </ul>
+
+  <div class="sources">
+    <h3>Sources</h3>
+    <p>“A Tour of Go: Concurrency”, “Effective Go”, and the <code>sync</code>/<code>context</code> package docs (go.dev); Go blog, “Share Memory By Communicating.” Goroutine stack size per the Go runtime. Verified against Go 1.26.</p>
+  </div>
+
+  <nav class="pager">
+    <a class="prev" href="02-mental-model.html"><span class="dir">← Prev</span><span class="ttl">The Five-Minute Mental Model</span></a>
+    <a class="contents" href="../index.html"><span class="dir">Contents</span>🐹</a>
+    <a class="next" href="04-errors-are-values.html"><span class="dir">Next →</span><span class="ttl">Errors Are Just Values</span></a>
+  </nav>
+</main>
+</body>
+</html>
