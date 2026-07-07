@@ -12,6 +12,11 @@
   if (!leaf || !vp) return;
   var i = 0, total = 1, spread = 1;
 
+  // Same 900px breakpoint as book.css. Below it there's no spread to
+  // paginate — layout()/render() go inert and next()/prev() fall through to
+  // plain file-to-file navigation.
+  function mobile() { return !window.matchMedia('(min-width: 901px)').matches; }
+
   function contentRight() {
     // Rightmost content edge relative to the leaf's own left edge. Both rects
     // carry the current translateX equally, so the difference is invariant.
@@ -25,6 +30,16 @@
   }
 
   function layout() {
+    if (mobile()) {
+      // Let the CSS breakpoint's natural flow take over — clear any inline
+      // column/transform styles a wider layout() left behind (e.g. resize
+      // across the breakpoint) and collapse to a single "page".
+      leaf.style.columnGap = ''; leaf.style.columnWidth = ''; leaf.style.transform = '';
+      total = 1; i = 0;
+      var n0 = document.querySelector('.book-pageno');
+      if (n0) n0.textContent = '';
+      return;
+    }
     var W = vp.clientWidth, gap = Math.round(W * 0.08), colW = (W - gap) / 2;
     leaf.style.columnGap = gap + 'px';
     leaf.style.columnWidth = colW + 'px';
@@ -35,6 +50,7 @@
     render();
   }
   function render() {
+    if (mobile()) return; // natural document flow — nothing to translate
     leaf.style.transform = 'translateX(' + (-i * spread) + 'px)';
     var n = document.querySelector('.book-pageno');
     if (n) n.textContent = (i + 1) + ' / ' + total;
