@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Borrow Checker's Mind: NLL and Beyond — Rust Lifetimes</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="book-title">Rust Lifetimes</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <h1><span class="ch-no">Chapter 10</span>The Borrow Checker's Mind: NLL and Beyond</h1>
+
+    <p class="lede">We've spent nine chapters obeying the borrow checker. In
+    this last one, we sit down at its bench: how it reasoned in 2015, the
+    upgrade that made it humane (non-lexical lifetimes), the successor being
+    forged (Polonius), and the advanced corners — HRTBs and the 2024-edition
+    capture rules — where its reasoning shows through the syntax.</p>
+
+    <h2>Act I — lexical lifetimes: the brace was the law</h2>
+
+    <p>Rust 1.0's checker used <em>lexical</em> lifetimes: a borrow lasted from
+    creation to the end of its enclosing scope — the closing brace — whether or
+    not you ever touched it again. Simple to implement, miserable to live
+    with:</p>
+
+<pre><code><span class="kw">let</span> <span class="kw">mut</span> map = <span class="ty">HashMap</span>::<span class="fn">new</span>();
+<span class="kw">match</span> map.<span class="fn">get_mut</span>(&amp;key) {         <span class="co">// borrow began here…</span>
+    <span class="ty">Some</span>(v) =&gt; *v += <span class="nm">1</span>,
+    <span class="ty">None</span> =&gt; { map.<span class="fn">insert</span>(key, <span class="nm">1</span>); }  <span class="co">// ✗ 2015: map still “borrowed”</span>
+}                                   <span class="co">// …lexically, until here</span></code></pre>
+
+    <p>Every seasoned Rustacean of that era learned the workarounds: extra
+    blocks to force borrows to end, contorted control flow, the occasional
+    sacrificial <code>clone()</code>. The checker wasn't wrong, exactly — it
+    was <em>coarse</em>. It measured loans by the brace, not by use.</p>
+
+    <h2>Act II — NLL: loans end at last use</h2>
+
+    <p>The 2018 edition shipped <strong>non-lexical lifetimes</strong> (fully
+    default for all editions by Rust 1.63, August 2022). The insight: stop
+    computing lifetimes on the source code's block structure, and compute them
+    on the <em>control-flow graph</em> — the compiler's map of every path
+    execution can take. A borrow's region became: the set of program points
+    from creation through its <strong>last use along each path</strong>.</p>
+
+<pre><code><span class="kw">let</span> <span class="kw">mut</span> s = <span class="ty">String</span>::<span class="fn">from</span>(<span class="st">"hello"</span>);
+<span class="kw">let</span> r1 = &amp;s;
+<span class="kw">let</span> r2 = &amp;s;
+<span class="fn">println!</span>(<span class="st">"{r1} {r2}"</span>);    <span class="co">// last use — r1, r2's loans END here</span>
+<span class="kw">let</span> r3 = &amp;<span class="kw">mut</span> s;          <span class="co">// ✓ fine since 1.31 — no live overlap</span>
+r3.<span class="fn">push_str</span>(<span class="st">" world"</span>);</code></pre>
+
+    <p>Under lexical rules this was three overlapping brace-long loans — an
+    error. Under NLL, <code>r1</code> and <code>r2</code> are already dead when
+    <code>r3</code> is born. The rules of chapter 4 didn't change; the
+    <em>measurement</em> of a loan's span got honest. That one refinement
+    retired most of the folk-workarounds overnight.</p>
+
+    <div class="callout key">
+      <span class="co-label">The Key Idea</span>
+      <p>The modern checker asks, at every program point, for every loan:
+      <em>“is this borrow <strong>live</strong> — could it still be used from
+      here?”</em> Conflicts only matter between <em>live</em> loans. When you
+      read a borrow error today, find the “borrow later used here” note: that
+      use is what's keeping the loan alive. Delete or move the use and the
+      loan shrinks.</p>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 760 260" role="img" aria-label="Control-flow graph where a borrow is live on one branch and dead on the other">
+        <style>
+          .tA{ font:600 12.5px "Avenir Next","Helvetica Neue",sans-serif; fill:#2b2620; }
+          .sA{ font:11.5px "Avenir Next","Helvetica Neue",sans-serif; fill:#5c5347; }
+          .mA{ font:12px ui-monospace,Menlo,monospace; fill:#2b2620; }
+          .nd{ fill:#fbf8f1; stroke:#d9cdb8; stroke-width:1.6; }
+        </style>
+        <defs>
+          <marker id="arrA" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+            <polygon points="0,0 9,4 0,8" fill="#5c5347"/>
+          </marker>
+        </defs>
+        <rect x="290" y="16" width="180" height="40" rx="9" class="nd"/>
+        <text x="306" y="41" class="mA">let r = &amp;mut map;</text>
+        <line x1="380" y1="56" x2="380" y2="84" stroke="#5c5347" stroke-width="1.7" marker-end="url(#arrA)"/>
+        <rect x="290" y="88" width="180" height="40" rx="9" class="nd"/>
+        <text x="330" y="113" class="mA">match …</text>
+        <line x1="330" y1="128" x2="200" y2="162" stroke="#b7410e" stroke-width="1.9" marker-end="url(#arrA)"/>
+        <line x1="430" y1="128" x2="560" y2="162" stroke="#3f7d2e" stroke-width="1.9" marker-end="url(#arrA)"/>
+        <rect x="90" y="166" width="220" height="40" rx="9" fill="#f7e5dc" stroke="#b7410e" stroke-width="1.8"/>
+        <text x="106" y="191" class="mA">Some(v) ⇒ use r    </text>
+        <text x="90" y="230" class="sA" fill="#b7410e">loan LIVE on this path</text>
+        <rect x="460" y="166" width="220" height="40" rx="9" fill="#eaf3e6" stroke="#3f7d2e" stroke-width="1.8"/>
+        <text x="476" y="191" class="mA">None ⇒ map.insert…</text>
+        <text x="460" y="230" class="sA" fill="#3f7d2e">loan DEAD here → mutation OK</text>
+      </svg>
+      <figcaption>NLL reasons per control-flow path: the same loan can be live on one branch and finished on another.</figcaption>
+    </figure>
+
+    <h2>Act III — Polonius: from “where valid” to “who's owed what”</h2>
+
+    <p>Even NLL has famous blind spots. The best-known is “problem case #3,”
+    returning a borrow from a loop-with-fallback:</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">get_or_insert</span>&lt;<span class="lt">'m</span>&gt;(map: &amp;<span class="lt">'m</span> <span class="kw">mut</span> <span class="ty">Map</span>) -&gt; &amp;<span class="lt">'m</span> <span class="ty">Value</span> {
+    <span class="kw">if</span> <span class="kw">let</span> <span class="ty">Some</span>(v) = map.<span class="fn">get</span>(&amp;key) {
+        <span class="kw">return</span> v;              <span class="co">// borrow escapes on THIS path only…</span>
+    }
+    map.<span class="fn">insert</span>(key, <span class="ty">Value</span>::<span class="fn">new</span>());  <span class="co">// ✗ NLL: “map still borrowed”</span>
+    map.<span class="fn">get</span>(&amp;key).<span class="fn">unwrap</span>()
+}</code></pre>
+
+    <p>Any human can see the first borrow only matters if we returned. NLL
+    can't: because the borrow flows into the return value, its region gets
+    stretched to cover the whole call — including the path where it was never
+    returned at all. The workaround (restructure to look up twice, or use the
+    entry API) works, but the rejection is a false alarm.</p>
+
+    <p><strong>Polonius</strong> is the next-generation analysis built to fix
+    exactly this class. It flips the question. NLL computes, top-down,
+    <em>“where is each lifetime valid?”</em> Polonius instead tracks
+    <em>origins</em> — for each reference, <em>which loans might it contain?</em> —
+    and only flags an action if it invalidates a loan some still-live reference
+    actually depends on, on that path. As of mid-2026 it remains experimental
+    (<code>-Z polonius</code> on nightly; the team's stated goal is an initial
+    stabilization of the NLL-compatible subset), so treat it as a lens, not a
+    tool: <em>thinking in loans-and-origins is already the most accurate mental
+    model of what the checker owes you.</em></p>
+
+    <div class="callout note">
+      <span class="co-label">Note</span>
+      <p>Practical takeaway while Polonius bakes: when you hit a false alarm
+      like the one above, reach (in order) for restructuring the control flow,
+      the <code>entry</code>-style API that does the branch inside the library,
+      or an early-computed value. These aren't defeats — they're the same
+      proof, written where today's checker can read it.</p>
+    </div>
+
+    <h2>The advanced corners, briefly</h2>
+
+    <h3>HRTBs: “for any lifetime you like”</h3>
+
+    <p>Sometimes a bound must hold not for one caller-chosen region but for
+    <em>every possible one</em>. That's a <em>higher-ranked trait bound</em>,
+    written with <code><span class="kw">for</span>&lt;<span class="lt">'a</span>&gt;</code>:</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">apply_to_lines</span>&lt;F&gt;(text: &amp;<span class="ty">str</span>, f: F)
+<span class="kw">where</span>
+    F: <span class="kw">for</span>&lt;<span class="lt">'a</span>&gt; <span class="ty">Fn</span>(&amp;<span class="lt">'a</span> <span class="ty">str</span>) -&gt; &amp;<span class="lt">'a</span> <span class="ty">str</span>,
+{ … }</code></pre>
+
+    <p>Read <code><span class="kw">for</span>&lt;<span class="lt">'a</span>&gt;</code>
+    as “for all regions <code><span class="lt">'a</span></code>”: the closure
+    must handle a borrow of <em>any</em> span — including ones that don't exist
+    yet when the closure is created, like each loop iteration's fresh slice.
+    You've used HRTBs unknowingly all along: elided
+    <code>fn(&amp;str) -&gt; &amp;str</code> pointer types and closure bounds
+    desugar to them.</p>
+
+    <h3>The 2024 edition: what does <code>impl Trait</code> capture?</h3>
+
+    <p>One genuinely new rule to file. A function returning
+    <code><span class="kw">impl</span> <span class="ty">Trait</span></code> hides a
+    concrete type — but if that type borrows from a parameter, the caller's
+    checker must know. Which lifetimes does the opaque type <em>capture</em>?
+    In the 2024 edition, the answer became: <strong>all in-scope generic and
+    lifetime parameters, by default</strong> (earlier editions captured
+    lifetimes only when explicitly mentioned). When that default is too
+    grabby — the return doesn't actually borrow from everything — you release
+    lifetimes with the <code>use&lt;…&gt;</code> syntax:</p>
+
+<pre><code><span class="co">// 2024: captures 'a by default — the caller must assume borrowing:</span>
+<span class="kw">fn</span> <span class="fn">nums</span>&lt;<span class="lt">'a</span>&gt;(xs: &amp;<span class="lt">'a</span> [<span class="ty">i32</span>]) -&gt; <span class="kw">impl</span> <span class="ty">Iterator</span>&lt;Item = <span class="ty">i32</span>&gt; { … }
+
+<span class="co">// explicitly capture nothing — result is independent of xs:</span>
+<span class="kw">fn</span> <span class="fn">nums</span>&lt;<span class="lt">'a</span>&gt;(xs: &amp;<span class="lt">'a</span> [<span class="ty">i32</span>]) -&gt; <span class="kw">impl</span> <span class="ty">Iterator</span>&lt;Item = <span class="ty">i32</span>&gt; + <span class="kw">use</span>&lt;&gt; {
+    xs.<span class="fn">to_vec</span>().<span class="fn">into_iter</span>()   <span class="co">// owns its data, borrows nothing</span>
+}</code></pre>
+
+    <p>If a borrow error points at an <code>impl Trait</code> return and you
+    never wrote a lifetime — this is where to look.</p>
+
+    <h2>So what did we actually gain — from the whole book?</h2>
+
+    <p>Let's close the shop. Memory is a workbench and a storeroom, and Rust's
+    answer to “who frees?” is the owner's closing brace (chapters 2–3).
+    Borrows are loans under two rules — shared XOR mutable, and never outlive
+    the data (chapter 4). A lifetime is a region of code; annotations describe
+    relationships and change nothing (chapter 5). Functions declare which
+    inputs their outputs borrow from; elision writes the obvious cases for you
+    (chapters 6–7). Types that hold borrows are borrows (chapter 8).
+    <code><span class="lt">'static</span></code> means self-contained more often
+    than it means forever (chapter 9). And the checker enforcing all of it
+    measures loans by liveness on the control-flow graph, getting sharper with
+    every generation (this chapter).</p>
+
+    <p>The next time the borrow checker says no, you won't hear a riddle.
+    You'll hear a colleague pointing at two bars on a timeline that don't fit —
+    and you'll know which one to move. That's the whole craft: not fighting
+    the checker, but seeing what it sees, a half-second sooner.</p>
+
+    <div class="challenges">
+      <h3>Challenges</h3>
+      <ol>
+        <li>Take the <code>match map.get_mut(…)</code> example and confirm it
+        compiles on current stable Rust. Then find a variant that still
+        doesn't (hint: make both arms touch <code>map</code> while the guard's
+        borrow flows into a variable used after the match).</li>
+        <li>Rewrite <code>get_or_insert</code> with the
+        <code>entry</code> API so it borrows only once. Why does moving the
+        branch <em>inside</em> the map's API dissolve the problem?</li>
+        <li>Write a function whose closure parameter genuinely needs
+        <code>for&lt;<span class="lt">'a</span>&gt;</code>, and then weaken it to a
+        single caller-chosen <code><span class="lt">'a</span></code> and observe
+        what stops compiling.</li>
+      </ol>
+    </div>
+
+    <div class="sources">
+      <ul>
+        <li>Sources: <a href="https://blog.rust-lang.org/2022/08/05/nll-by-default/">Rust Blog — NLL fully stable (1.63)</a> ·
+        <a href="https://rust-lang.github.io/rfcs/2094-nll.html">RFC 2094 — Non-lexical lifetimes</a> ·
+        <a href="https://rust-lang.github.io/compiler-team/working-groups/polonius/">Polonius working group</a> ·
+        <a href="https://doc.rust-lang.org/edition-guide/rust-2024/rpit-lifetime-capture.html">Edition Guide — RPIT lifetime capture (2024)</a></li>
+      </ul>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="09-static.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="../cheatsheet.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lifetimes in Structs and Methods — Rust Lifetimes</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="book-title">Rust Lifetimes</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <h1><span class="ch-no">Chapter 08</span>Lifetimes in Structs and Methods</h1>
+
+    <p class="lede">Sooner or later you'll want a type that <em>holds</em> a
+    reference — a parser over its input, a view into a buffer. The moment a
+    struct contains a borrow, the struct itself becomes a borrow, and
+    everything we know about loan periods applies to whole values.</p>
+
+    <h2>A struct that borrows</h2>
+
+    <p>The Rust Book's example is small and perfect. Suppose we want to keep
+    the first sentence of a novel around, without copying it:</p>
+
+<pre><code><span class="kw">struct</span> <span class="ty">ImportantExcerpt</span>&lt;<span class="lt">'a</span>&gt; {
+    part: &amp;<span class="lt">'a</span> <span class="ty">str</span>,
+}
+
+<span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="kw">let</span> novel = <span class="ty">String</span>::<span class="fn">from</span>(<span class="st">"Call me Ishmael. Some years ago..."</span>);
+    <span class="kw">let</span> first_sentence = novel.<span class="fn">split</span>(<span class="st">'.'</span>).<span class="fn">next</span>().<span class="fn">unwrap</span>();
+    <span class="kw">let</span> i = <span class="ty">ImportantExcerpt</span> { part: first_sentence };
+}</code></pre>
+
+    <p>Why is <code>&lt;<span class="lt">'a</span>&gt;</code> mandatory here when
+    functions got away with elision? Because a struct definition is a
+    <em>contract about storage</em>, not a local computation. Whoever holds an
+    <code><span class="ty">ImportantExcerpt</span></code> holds, transitively, a
+    borrow of some string — and the type system needs that fact to travel with
+    the value wherever it goes: into vectors, across function calls, into other
+    structs. The lifetime parameter is how the fact travels.</p>
+
+    <div class="callout key">
+      <span class="co-label">The Key Idea</span>
+      <p>Read <code><span class="ty">ImportantExcerpt</span>&lt;<span class="lt">'a</span>&gt;</code>
+      as: “a value that must not outlive region
+      <code><span class="lt">'a</span></code>, because it contains a reference
+      only valid there.” <strong>A struct holding a borrow <em>is</em> a
+      borrow</strong> — bigger and better dressed, but bound by the same loan
+      period as its most short-lived field.</p>
+    </div>
+
+    <p>The compiler enforces exactly what it enforced for plain references —
+    the excerpt can't outlive the novel:</p>
+
+<pre><code><span class="kw">let</span> i;
+{
+    <span class="kw">let</span> novel = <span class="ty">String</span>::<span class="fn">from</span>(<span class="st">"Call me Ishmael..."</span>);
+    <span class="kw">let</span> first_sentence = novel.<span class="fn">split</span>(<span class="st">'.'</span>).<span class="fn">next</span>().<span class="fn">unwrap</span>();
+    i = <span class="ty">ImportantExcerpt</span> { part: first_sentence };
+}                          <span class="co">// ✗ novel dropped while `i.part` still borrows it</span>
+<span class="fn">println!</span>(<span class="st">"{}"</span>, i.part);    <span class="co">//   E0597: `novel` does not live long enough</span></code></pre>
+
+    <h2>Borrow or own? The design decision</h2>
+
+    <p>Before reaching for a lifetime parameter, ask the workshop question:
+    should this type <em>borrow</em> the data or <em>own</em> it? Both are one
+    line:</p>
+
+<pre><code><span class="kw">struct</span> <span class="ty">Borrowing</span>&lt;<span class="lt">'a</span>&gt; { part: &amp;<span class="lt">'a</span> <span class="ty">str</span> }   <span class="co">// zero-copy, but tethered</span>
+<span class="kw">struct</span> <span class="ty">Owning</span>            { part: <span class="ty">String</span> }   <span class="co">// independent, but copies</span></code></pre>
+
+    <table>
+      <thead><tr><th></th><th>Borrowing (<code>&amp;<span class="lt">'a</span> str</code>)</th><th>Owning (<code>String</code>)</th></tr></thead>
+      <tbody>
+        <tr><td>Cost</td><td>Free — points into existing data</td><td>Allocates and copies</td></tr>
+        <tr><td>Mobility</td><td>Tethered to the source's scope</td><td>Goes anywhere, lives freely</td></tr>
+        <tr><td>Best for</td><td>Short-lived views: parsers, iterators, search results</td><td>Long-lived data: configs, caches, anything stored</td></tr>
+        <tr><td>API impact</td><td>Lifetime parameter spreads to every containing type</td><td>None</td></tr>
+      </tbody>
+    </table>
+
+    <p>That last row is the one experience teaches. A lifetime parameter is
+    <em>infectious</em>: put <code><span class="ty">Borrowing</span>&lt;<span class="lt">'a</span>&gt;</code>
+    inside another struct, and that struct needs
+    <code>&lt;<span class="lt">'a</span>&gt;</code> too, and so on up the tree.
+    For hot paths and view types, that's a price worth paying — zero-copy
+    parsing is a Rust superpower. For a type you'll stash in a
+    <code>HashMap</code> and forget about, own the data and keep your
+    signatures clean. Neither answer is “more Rust”; matching the tool to the
+    job is.</p>
+
+    <h2>Methods on borrowing types</h2>
+
+    <p>Writing an <code>impl</code> for a lifetime-carrying type means
+    declaring the parameter after <code>impl</code> and using it after the type
+    name — it's a generic parameter, same as <code>T</code>:</p>
+
+<pre><code><span class="kw">impl</span>&lt;<span class="lt">'a</span>&gt; <span class="ty">ImportantExcerpt</span>&lt;<span class="lt">'a</span>&gt; {
+    <span class="kw">fn</span> <span class="fn">announce_and_return_part</span>(&amp;<span class="kw">self</span>, announcement: &amp;<span class="ty">str</span>) -&gt; &amp;<span class="ty">str</span> {
+        <span class="fn">println!</span>(<span class="st">"Attention please: {announcement}"</span>);
+        <span class="kw">self</span>.part
+    }
+}</code></pre>
+
+    <p>Look at that method: two reference parameters, no annotations, compiles
+    fine. You can name the reason now — elision Rule 3. <code>self</code>'s
+    lifetime flows to the output. And here's a subtlety worth savoring: the
+    rule tied the return to <code>&amp;<span class="kw">self</span></code>'s
+    borrow, but <code>self.part</code> is actually good for
+    <code><span class="lt">'a</span></code> — the excerpt's whole region, which
+    outlives any particular <code>&amp;self</code> borrow. The elided signature
+    is <em>correct but conservative</em>. If a caller ever needs the looser
+    truth, say it explicitly:</p>
+
+<pre><code><span class="kw">impl</span>&lt;<span class="lt">'a</span>&gt; <span class="ty">ImportantExcerpt</span>&lt;<span class="lt">'a</span>&gt; {
+    <span class="co">// the part outlives this borrow of self — return the 'a truth:</span>
+    <span class="kw">fn</span> <span class="fn">part</span>(&amp;<span class="kw">self</span>) -&gt; &amp;<span class="lt">'a</span> <span class="ty">str</span> {
+        <span class="kw">self</span>.part
+    }
+}</code></pre>
+
+    <p>With the elided version, this fails; with
+    <code>-&gt; &amp;<span class="lt">'a</span> str</code>, it works:</p>
+
+<pre><code><span class="kw">let</span> part;
+{
+    <span class="kw">let</span> i2 = <span class="ty">ImportantExcerpt</span> { part: first_sentence };
+    part = i2.<span class="fn">part</span>();
+}                        <span class="co">// i2 (the struct) is gone…</span>
+<span class="fn">println!</span>(<span class="st">"{part}"</span>);      <span class="co">// ✓ …but the novel isn't, and part borrows the NOVEL</span></code></pre>
+
+    <p>This is the chapter's deepest lesson: the struct is a
+    <em>middleman</em> borrow. The data's true owner is the novel;
+    <code><span class="lt">'a</span></code> tracks that original loan, and a
+    method can hand out the original slip rather than a copy tied to the
+    middleman's own borrow.</p>
+
+    <figure>
+      <svg viewBox="0 0 760 250" role="img" aria-label="Nested intervals: the novel's long region contains the excerpt's region, which contains a temporary self borrow">
+        <style>
+          .t8{ font:600 13px "Avenir Next","Helvetica Neue",sans-serif; fill:#2b2620; }
+          .s8{ font:12px "Avenir Next","Helvetica Neue",sans-serif; fill:#5c5347; }
+          .m8{ font:12.5px ui-monospace,Menlo,monospace; fill:#2b2620; }
+        </style>
+        <text x="40" y="40" class="m8">novel: String ('a)</text>
+        <rect x="240" y="24" width="480" height="26" rx="7" fill="#1f6f6b" opacity="0.85"/>
+        <text x="40" y="100" class="m8">i: ImportantExcerpt&lt;'a&gt;</text>
+        <rect x="280" y="84" width="300" height="26" rx="7" fill="#b7410e" opacity="0.85"/>
+        <text x="40" y="160" class="m8">&amp;self borrow in a call</text>
+        <rect x="330" y="144" width="90" height="26" rx="7" fill="#a07d2a" opacity="0.9"/>
+        <text x="240" y="212" class="s8">each bar must fit inside the one above it — and a method may return</text>
+        <text x="240" y="230" class="s8">a reference pegged to ANY enclosing bar, if the signature says which</text>
+      </svg>
+      <figcaption>Three nested loans: the novel's region, the excerpt's region, one method call's <code>&amp;self</code> borrow.</figcaption>
+    </figure>
+
+    <div class="callout warn">
+      <span class="co-label">Common Trap</span>
+      <p>The self-referential struct: “I'll store the <code>String</code>
+      <em>and</em> a <code>&amp;str</code> slice into it, in the same struct.”
+      Safe Rust forbids it — moving the struct would move the
+      <code>String</code>'s stack handle and invalidate any interior pointer's
+      <em>provenance</em> story, and no lifetime name can describe “borrows
+      from a sibling field.” Store indices (<code>usize</code> ranges) instead
+      and slice on demand, or keep owner and view in separate types. (Crates
+      like <code>ouroboros</code> exist for the rare genuine need; reach for
+      them last.)</p>
+    </div>
+
+    <h2>So what did we actually gain?</h2>
+
+    <p>Types can borrow, and when they do, the lifetime parameter carries the
+    loan period through the type system: struct-holding-a-borrow <em>is</em> a
+    borrow; the parameter is infectious; own-vs-borrow is a design decision
+    about mobility versus copies. Methods get Rule 3's conservative default,
+    and you can return the looser <code><span class="lt">'a</span></code> truth
+    when callers need it. One lifetime keeps appearing in error messages
+    without ever being declared. Time to meet
+    <code><span class="lt">'static</span></code>.</p>
+
+    <div class="challenges">
+      <h3>Challenges</h3>
+      <ol>
+        <li>Add a second field <code>title: &amp;<span class="lt">'a</span> str</code>
+        to <code>ImportantExcerpt</code> borrowed from a <em>different</em>
+        string. What does one shared <code><span class="lt">'a</span></code>
+        force on callers? Split it into <code><span class="lt">'a</span></code>
+        and <code><span class="lt">'t</span></code> and describe what loosened.</li>
+        <li>Write a zero-copy <code>Csv&lt;<span class="lt">'a</span>&gt;</code>
+        that wraps an input <code>&amp;<span class="lt">'a</span> str</code> and
+        yields <code>&amp;<span class="lt">'a</span> str</code> fields. Then write
+        the owning version. Which would you want in a config loader? In a
+        10&nbsp;GB log processor?</li>
+        <li>Explain why <code>fn part(&amp;self) -&gt; &amp;<span class="lt">'a</span> str</code>
+        compiles — what outlives what, so the return is justified?</li>
+      </ol>
+    </div>
+
+    <div class="sources">
+      <ul>
+        <li>Source: <a href="https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html">The Rust Book, ch. 10.3 — struct lifetime annotations</a></li>
+      </ul>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-elision.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="09-static.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
