@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Task &amp; Agent — Elixir OTP</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Elixir OTP<span class="dot">.</span></span>
+  <span class="chip">07 · Task &amp; Agent</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 07 · The Lighter Tools</p>
+    <h1>Task &amp; Agent</h1>
+    <p class="dek">Not every job deserves a whole GenServer.</p>
+
+    <p class="lead">A GenServer is wonderfully general, and generality has a cost: for simple jobs it's
+    ceremony. If all you want is to <em>run some work concurrently</em>, reach for <code>Task</code>.
+    If all you want is to <em>hold a bit of shared state</em>, reach for <code>Agent</code>. Both are
+    GenServers underneath — same isolation, same supervision — with a tiny API shaped to one job.
+    Knowing when to drop down to them keeps your code honest.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p><strong>Task</strong> = concurrency without state: spin off work, optionally wait for its
+      result. <strong>Agent</strong> = state without behaviour: a value other processes can read and
+      update safely. Reach for a full <strong>GenServer</strong> only when you need both — stateful
+      logic that reacts to many kinds of messages over time.</p>
+    </div>
+
+    <h2>Task: run it alongside</h2>
+    <p>The classic use is fan-out: kick off several slow things at once and gather the results. Each
+    <code>Task.async</code> runs the function in its own process; <code>Task.await</code> blocks
+    until it's done (using a monitor, so a crash surfaces as a clean error, not a hang).</p>
+
+    <pre><span class="cap">fan out, then gather</span><code><span class="co"># fire three requests concurrently...</span>
+tasks =
+  [<span class="str">"/a"</span>, <span class="str">"/b"</span>, <span class="str">"/c"</span>]
+  |&gt; <span class="mod">Enum</span>.<span class="fn">map</span>(<span class="k">fn</span> path -&gt; <span class="mod">Task</span>.<span class="fn">async</span>(<span class="k">fn</span> -&gt; <span class="fn">fetch</span>(path) <span class="k">end</span>) <span class="k">end</span>)
+
+<span class="co"># ...then wait for all of them (total time ≈ the slowest one, not the sum)</span>
+results = <span class="mod">Enum</span>.<span class="fn">map</span>(tasks, &amp;<span class="mod">Task</span>.<span class="fn">await</span>(&amp;<span class="num">1</span>, <span class="num">10_000</span>))</code></pre>
+
+    <p>For processing a big collection concurrently with a bounded number of workers, there's a
+    purpose-built tool — <code>Task.async_stream</code> — which caps concurrency for you so you don't
+    launch a million tasks at once:</p>
+
+    <pre><span class="cap">bounded concurrency over a collection</span><code>urls
+|&gt; <span class="mod">Task</span>.<span class="fn">async_stream</span>(&amp;<span class="fn">fetch</span>/<span class="num">1</span>, max_concurrency: <span class="num">20</span>, timeout: <span class="num">10_000</span>)
+|&gt; <span class="mod">Enum</span>.<span class="fn">to_list</span>()
+<span class="co">#=&gt; [ok: result1, ok: result2, exit: :timeout, ...]</span></code></pre>
+
+    <div class="callout note">
+      <span class="tag">Supervise your fire-and-forget work</span>
+      <p>For background work whose result you'll never await, don't just <code>Task.start</code> and
+      forget — run it under a <code>Task.Supervisor</code> so a crash is caught and logged rather than
+      silently lost, and so the BEAM shuts the work down cleanly. Add <code>{Task.Supervisor, name:
+      MyApp.TaskSup}</code> to your tree and use <code>Task.Supervisor.start_child/2</code>.</p>
+    </div>
+
+    <h2>Agent: shared state, no boilerplate</h2>
+    <p>An Agent wraps a single value behind a process. You hand it an anonymous function to read or
+    update that value; the Agent runs your function <em>in its own process</em>, so concurrent access
+    is serialized and safe — same guarantee as a GenServer's mailbox, none of the callbacks.</p>
+
+    <pre><span class="cap">a counter, the easy way</span><code>{<span class="at">:ok</span>, _} = <span class="mod">Agent</span>.<span class="fn">start_link</span>(<span class="k">fn</span> -&gt; <span class="num">0</span> <span class="k">end</span>, name: <span class="mod">Counter</span>)
+
+<span class="mod">Agent</span>.<span class="fn">update</span>(<span class="mod">Counter</span>, <span class="k">fn</span> n -&gt; n + <span class="num">1</span> <span class="k">end</span>)   <span class="co"># mutate</span>
+<span class="mod">Agent</span>.<span class="fn">get</span>(<span class="mod">Counter</span>, <span class="k">fn</span> n -&gt; n <span class="k">end</span>)         <span class="co">#=&gt; 1  (read)</span>
+<span class="mod">Agent</span>.<span class="fn">get_and_update</span>(<span class="mod">Counter</span>, <span class="k">fn</span> n -&gt; {n, n + <span class="num">1</span>} <span class="k">end</span>) <span class="co">#=&gt; 1, now holds 2</span></code></pre>
+
+    <div class="callout warn">
+      <span class="tag">Keep the fun small — it runs in the Agent</span>
+      <p>The function you pass to an Agent executes <em>inside the Agent's process</em>, one at a time.
+      Do heavy computation in there and you serialize every other reader and writer behind it. Compute
+      in the caller; use the Agent only to store and swap the finished value. When the logic grows
+      past "get / update," that's your signal to graduate to a real GenServer.</p>
+    </div>
+
+    <h2>Choosing between the three</h2>
+    <table>
+      <tr><th>You want to…</th><th>Reach for</th></tr>
+      <tr><td>Run work concurrently, maybe await a result</td><td><code>Task</code></td></tr>
+      <tr><td>Process a big collection with capped concurrency</td><td><code>Task.async_stream</code></td></tr>
+      <tr><td>Hold a value many processes read/update</td><td><code>Agent</code></td></tr>
+      <tr><td>React to many message types, keep evolving state, run timers</td><td><code>GenServer</code></td></tr>
+      <tr><td>Start/stop a fluctuating set of the above</td><td><code>DynamicSupervisor</code></td></tr>
+    </table>
+
+    <div class="reflect">So what did we actually gain? <b>The right size of tool.</b> OTP isn't
+    "everything is a GenServer" — it's a small kit where each tool is a GenServer specialized down to
+    one job. Using <code>Task</code> for concurrency and <code>Agent</code> for state keeps your
+    intent obvious at a glance, and leaves the full GenServer for when a component genuinely has a
+    life of its own.</div>
+
+    <h3>Challenges</h3>
+    <ol class="challenges">
+      <li>Rewrite Chapter 03's <code>Stack</code> as an <code>Agent</code>. What did you lose? (Hint:
+      where would you put <code>handle_info</code> for a timer?)</li>
+      <li>Use <code>Task.async_stream</code> with <code>max_concurrency: 1</code>, then <code>50</code>.
+      Time both over a list of sleepy functions.</li>
+      <li>Start a <code>Task.Supervisor</code>, launch a child that raises, and show that the caller
+      survives and the crash is logged.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Elixir hexdocs, <code>Task</code> (<code>async/1</code>,
+    <code>await/2</code>, <code>async_stream/3</code>), <code>Task.Supervisor</code>,
+    <code>Agent</code> (<code>get/2</code>, <code>update/2</code>, <code>get_and_update/2</code>).</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="06-registry.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="08-applications.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · DynamicSupervisor — Elixir OTP</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Elixir OTP<span class="dot">.</span></span>
+  <span class="chip">05 · DynamicSupervisor</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 05 · Children on Demand</p>
+    <h1>DynamicSupervisor</h1>
+    <p class="dek">When you don't know your children until the system is running.</p>
+
+    <p class="lead">The supervisor in Chapter 04 knows its children up front — you list them in
+    <code>init/1</code> and they start in order at boot. But so much of real work is
+    <em>unpredictable</em>: one process per connected user, per game room, per uploaded file, per
+    background job. You can't list those; they don't exist until someone shows up. That's exactly
+    the gap <code>DynamicSupervisor</code> fills.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p>A <code>DynamicSupervisor</code> starts with <em>no</em> children and grows them at runtime
+      with <code>start_child/2</code>. It still gives you supervision — crash isolation, restarts,
+      shutdown — but for a fluctuating population of identical-shaped workers. Its only strategy is
+      <code>:one_for_one</code>, because dynamic children are independent by definition.</p>
+    </div>
+
+    <h2>Set it up, then feed it</h2>
+    <p>You start one DynamicSupervisor (usually in your app's static tree) and from then on just ask
+    it to start children whenever you need one.</p>
+
+    <pre><span class="cap">in your application's supervision tree</span><code>children = [
+  {<span class="mod">DynamicSupervisor</span>, name: <span class="mod">MyApp.WorkerSup</span>, strategy: <span class="at">:one_for_one</span>}
+]
+<span class="mod">Supervisor</span>.<span class="fn">start_link</span>(children, strategy: <span class="at">:one_for_one</span>)</code></pre>
+
+    <pre><span class="cap">start a worker whenever a user connects</span><code><span class="k">def</span> <span class="fn">connect</span>(user_id) <span class="k">do</span>
+  spec = {<span class="mod">MyApp.Session</span>, user_id}
+  <span class="mod">DynamicSupervisor</span>.<span class="fn">start_child</span>(<span class="mod">MyApp.WorkerSup</span>, spec)
+  <span class="co">#=&gt; {:ok, #PID&lt;0.312.0&gt;}</span>
+<span class="k">end</span></code></pre>
+
+    <p>Each started child is a fully supervised process. If a <code>Session</code> crashes, the
+    DynamicSupervisor restarts just that one — the other thousands of sessions never feel it. When a
+    user disconnects, you terminate that child and it's gone. The population breathes with your load.</p>
+
+    <div class="callout note">
+      <span class="tag">Prefer :temporary for dynamic children</span>
+      <p>For per-connection or per-job workers you often want <code>restart: :temporary</code> in the
+      child's spec — if a session dies, it usually shouldn't silently respawn without the user
+      reconnecting. Reach for <code>:permanent</code> only when the worker truly must always exist.
+      This is a spec on the <em>child</em>, not the supervisor.</p>
+    </div>
+
+    <h2>A module-based DynamicSupervisor</h2>
+    <p>As with everything in OTP, you can wrap it in a module to give it a home and a clean API:</p>
+
+    <pre><span class="cap">lib/my_app/worker_sup.ex</span><code><span class="k">defmodule</span> <span class="mod">MyApp.WorkerSup</span> <span class="k">do</span>
+  <span class="k">use</span> <span class="mod">DynamicSupervisor</span>
+
+  <span class="k">def</span> <span class="fn">start_link</span>(init_arg) <span class="k">do</span>
+    <span class="mod">DynamicSupervisor</span>.<span class="fn">start_link</span>(<span class="mod">__MODULE__</span>, init_arg, name: <span class="mod">__MODULE__</span>)
+  <span class="k">end</span>
+
+  <span class="k">def</span> <span class="fn">start_session</span>(user_id) <span class="k">do</span>
+    <span class="mod">DynamicSupervisor</span>.<span class="fn">start_child</span>(<span class="mod">__MODULE__</span>, {<span class="mod">MyApp.Session</span>, user_id})
+  <span class="k">end</span>
+
+  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">init</span>(_init_arg) <span class="k">do</span>
+    <span class="mod">DynamicSupervisor</span>.<span class="fn">init</span>(strategy: <span class="at">:one_for_one</span>, max_children: <span class="num">10_000</span>)
+  <span class="k">end</span>
+<span class="k">end</span></code></pre>
+
+    <div class="callout warn">
+      <span class="tag">Cap the population</span>
+      <p>An unbounded dynamic supervisor is an unbounded resource commitment. Set
+      <code>max_children</code> so a flood of connections can't exhaust the node — beyond the cap,
+      <code>start_child/2</code> returns <code>{:error, :max_children}</code> and you can shed load
+      gracefully instead of falling over. For very high throughput, shard across several dynamic
+      supervisors with <code>PartitionSupervisor</code> so one process isn't the sole gatekeeper.</p>
+    </div>
+
+    <div class="reflect">So what did we actually gain? Supervision that <b>scales with reality</b>. Static
+    supervisors model the fixed spine of your system; DynamicSupervisor models the parts that ebb and
+    flow. Together they let a single node run millions of independently-supervised little machines —
+    which is exactly how Elixir systems hold up so many concurrent users on so little hardware.</div>
+
+    <p>There's one loose end. We can <em>start</em> a session for user 42, but if a message for user
+    42 arrives later, how do we find that specific PID among thousands? We need a phone book. That's
+    the next chapter.</p>
+
+    <h3>Challenges</h3>
+    <ol class="challenges">
+      <li>Start 5 sessions, then <code>DynamicSupervisor.count_children/1</code>. Terminate one with
+      <code>terminate_child/2</code> and count again.</li>
+      <li>Give <code>Session</code> a <code>restart: :temporary</code> spec and make it crash. Confirm
+      it stays dead. Switch to <code>:permanent</code> and watch it respawn.</li>
+      <li>Set <code>max_children: 3</code> and try to start a fourth. Handle the
+      <code>{:error, :max_children}</code> return like a real load-shedding path would.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Elixir hexdocs, <code>DynamicSupervisor</code> —
+    <code>start_child/2</code>, <code>init/1</code>, <code>max_children</code>,
+    <code>PartitionSupervisor</code>.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="04-supervisors.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="06-registry.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Processes — Elixir OTP</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Elixir OTP<span class="dot">.</span></span>
+  <span class="chip">01 · Processes</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 01 · The Actor Model</p>
+    <h1>Processes</h1>
+    <p class="dek">Everything in OTP is a process. Let's earn that sentence.</p>
+
+    <p class="lead">Here's the whole trick of Elixir concurrency in one line: instead of many threads
+    sharing one blob of memory and fighting over locks, you get millions of tiny, cheap,
+    <em>completely isolated</em> processes that never share a single byte — they only send each
+    other messages. Get comfortable with that one idea and OTP stops looking like magic and starts
+    looking inevitable.</p>
+
+    <p>These are not operating-system processes. A BEAM process (the BEAM is the Erlang virtual
+    machine Elixir runs on) starts at a few hundred bytes and spawns in microseconds. A busy system
+    runs hundreds of thousands of them at once, each with its own tiny heap and its own mailbox. The
+    scheduler slices them across your CPU cores for you. You will make a <em>lot</em> of these.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p>A process has private state and a <strong>mailbox</strong>. It cannot reach into another
+      process's memory — the only way to affect it is to <strong>send it a message</strong>, which
+      lands in its mailbox. No shared memory means no data races, no mutexes, no torn reads. This is
+      the <em>actor model</em>, and it's the ground floor everything else in this book stands on.</p>
+    </div>
+
+    <h2>Watch it happen</h2>
+    <p>Below is a tiny BEAM: five isolated processes, each drawn with its own mailbox slots
+    underneath it. Watch messages fly between them and queue up on arrival — a <span style="color:#6b3fa0;font-weight:600">call</span>
+    is a message whose sender waits for a reply; a <span style="color:#c8781f;font-weight:600">cast</span>
+    is fire-and-forget. Nobody touches anyone else's state. They just mail letters.</p>
+
+    <figure class="canvas-figure">
+      <div class="canvas-wrap">
+        <canvas data-anim="actors" width="820" height="500"
+          aria-label="Animated diagram: five isolated processes exchanging messages that queue in each process's private mailbox."></canvas>
+        <span class="canvas-hint">isolated processes · private mailboxes</span>
+      </div>
+      <figcaption>Each node is a process with a private mailbox (the row of slots). Messages arrive,
+      queue, and get handled one at a time — a process only ever does one thing at a moment, which is
+      exactly why its state needs no locks. (Animates offline; pauses when off-screen.)</figcaption>
+    </figure>
+
+    <h2>Design: three verbs</h2>
+    <p>The entire primitive layer is three functions. <code>spawn</code> starts a process running a
+    function and hands you back its <em>PID</em> (process identifier). <code>send</code> drops a
+    message into a PID's mailbox. <code>receive</code> pulls the next matching message out of your
+    own mailbox, blocking until one arrives.</p>
+
+    <pre><span class="cap">iex — the three primitives</span><code><span class="co"># spawn returns a PID immediately; the function runs concurrently.</span>
+pid = <span class="fn">spawn</span>(<span class="k">fn</span> -&gt;
+  <span class="k">receive</span> <span class="k">do</span>
+    {<span class="at">:hello</span>, sender} -&gt; <span class="fn">send</span>(sender, <span class="at">:hi_back</span>)
+    other                -&gt; <span class="mod">IO</span>.<span class="fn">puts</span>(<span class="str">"got: #{inspect(other)}"</span>)
+  <span class="k">end</span>
+<span class="k">end</span>)
+
+<span class="fn">send</span>(pid, {<span class="at">:hello</span>, <span class="fn">self</span>()})   <span class="co"># self() is *our* PID, so it can reply to us</span>
+
+<span class="k">receive</span> <span class="k">do</span>
+  <span class="at">:hi_back</span> -&gt; <span class="mod">IO</span>.<span class="fn">puts</span>(<span class="str">"it replied!"</span>)
+<span class="k">after</span>
+  <span class="num">1_000</span> -&gt; <span class="mod">IO</span>.<span class="fn">puts</span>(<span class="str">"gave up waiting"</span>)  <span class="co"># receive can time out</span>
+<span class="k">end</span></code></pre>
+
+    <p>Notice the shape already: we send our own <code>self()</code> along <em>inside</em> the
+    message so the other process knows where to reply. That "who do I answer?" bookkeeping is so
+    common that <code>GenServer</code> (Chapter 03) will do it for us. But it's just this,
+    underneath.</p>
+
+    <h3>Why a mailbox, and not a shared variable?</h3>
+    <p>Because a mailbox serializes access <em>for free</em>. A process handles one message at a
+    time, top to bottom, so its state is only ever touched by one line of code at one instant.
+    You get the safety of a lock without ever writing a lock. The cost is that talking to another
+    process means a message hop — but on the BEAM those hops are astonishingly cheap, and buying
+    correctness with them is one of the great trades in systems programming.</p>
+
+    <div class="callout note">
+      <span class="tag">Selective receive</span>
+      <p><code>receive</code> scans the mailbox for the <em>first message that matches a pattern</em>,
+      leaving the rest in place. That means you can wait for one specific reply while other messages
+      pile up harmlessly behind it — a small superpower we'll lean on constantly.</p>
+    </div>
+
+    <h2>Implementation: a process that remembers</h2>
+    <p>A process keeps state by looping and passing the new state to itself on each turn. Here's a
+    counter with no library at all — just recursion and a mailbox:</p>
+
+    <pre><span class="cap">a hand-rolled stateful process</span><code><span class="k">defmodule</span> <span class="mod">Counter</span> <span class="k">do</span>
+  <span class="k">def</span> <span class="fn">start</span>(n), <span class="k">do</span>: <span class="fn">spawn</span>(<span class="k">fn</span> -&gt; <span class="fn">loop</span>(n) <span class="k">end</span>)
+
+  <span class="k">defp</span> <span class="fn">loop</span>(n) <span class="k">do</span>
+    <span class="k">receive</span> <span class="k">do</span>
+      {<span class="at">:inc</span>, by}      -&gt; <span class="fn">loop</span>(n + by)          <span class="co"># new state = the next loop</span>
+      {<span class="at">:get</span>, from}    -&gt; <span class="fn">send</span>(from, n); <span class="fn">loop</span>(n)
+      <span class="at">:stop</span>            -&gt; <span class="at">:ok</span>                    <span class="co"># stop looping = process ends</span>
+    <span class="k">end</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre>
+
+    <p>Look at what state <em>is</em> here: it's just the argument <code>n</code> to the next call of
+    <code>loop/1</code>. There's no mutable variable anywhere. The "memory" of the process is a
+    tail-recursive loop that keeps handing the updated value forward. Every stateful server you write
+    for the rest of this book is a dressed-up version of exactly this loop — and in Chapter 03 we'll
+    let <code>GenServer</code> write the loop so we only fill in the interesting parts.</p>
+
+    <div class="reflect">So what did we actually gain? A unit of concurrency so cheap we stop
+    rationing it. Instead of asking "can I afford another thread?", we model each connection, each
+    job, each user session as <b>its own process</b> — isolated, crash-contained, and scheduled for
+    us. The rest of OTP is just good manners layered on top of this.</div>
+
+    <div class="callout warn">
+      <span class="tag">Mind the mailbox</span>
+      <p>The one thing a process can't do is keep up forever with more messages than it can handle —
+      an unbounded mailbox is a memory leak with a slow fuse. When we reach <code>GenServer</code>
+      we'll talk about back-pressure: preferring <code>call</code> (which makes the sender wait) over
+      <code>cast</code> when the sender is outrunning the server.</p>
+    </div>
+
+    <h3>Challenges</h3>
+    <ol class="challenges">
+      <li>Extend <code>Counter</code> with a <code>{:dec, by}</code> message. What happens to messages
+      that match no clause? (Hint: they stay in the mailbox — forever.)</li>
+      <li>Spawn 100&nbsp;000 counters in a loop and time it. Notice you can. Try that with OS threads.</li>
+      <li>Add an <code>after 5_000 -&gt; loop(n)</code> clause to <code>loop/1</code> so an idle counter
+      prints a heartbeat. You've just built a timeout — a feature GenServer gives you as an option.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Elixir docs, "Processes" &amp; <code>Kernel.spawn/1</code> ·
+    <em>Elixir</em> hexdocs, <code>GenServer</code> "Client / Server" overview · Erlang/OTP docs,
+    "Erlang Reference Manual: Processes."</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="02-let-it-crash.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/otp-anim.js"></script>
+</body>
+</html>
