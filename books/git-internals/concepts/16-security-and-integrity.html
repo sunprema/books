@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security and Integrity: Trusting Your History — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 16 · Security and Integrity</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="sec-kicker">Chapter 16 of 17 &middot; Proving it was really you</p>
+    <h1 data-anchor="sec-h1">Security and Integrity: <span class="hl">Trusting Your History</span></h1>
+
+    <p class="lede" data-anchor="sec-lede">
+      Chapter 15 closed on a question it deliberately left hanging:
+      <code>git fsck</code> can tell you every object in your repo is intact
+      &mdash; no corruption, no broken links &mdash; but intact isn't the same
+      question as trustworthy. A perfectly healthy object store can still be
+      full of commits that lie about who wrote them. This chapter is about
+      the difference between those two guarantees, and the one tool Git gives
+      you to close the gap: cryptographic signatures.
+    </p>
+
+    <h2 data-anchor="sec-integrity-h">Integrity Is Already Solved. Authenticity Isn't.</h2>
+    <p data-anchor="sec-integrity-p1">
+      Chapter 3 showed you that Git is built from just three kinds of object
+      &mdash; <span class="obj-chip blob">blob</span>
+      <span class="obj-chip tree">tree</span>
+      <span class="obj-chip commit">commit</span> &mdash; each one named by a
+      hash of its own content. Chapter 4 showed you exactly what gets fed into
+      that hash, and why the avalanche effect makes two similar-but-different
+      objects land on completely unrelated fingerprints. Chapter 6 showed you
+      that a commit doesn't just point at a tree; it also points at its
+      <strong>parent commit's hash</strong>, which is how three snapshots
+      become one connected graph instead of three loose photographs. Put
+      those three chapters together and you get a structure with a name:
+      a <strong>Merkle DAG</strong> &mdash; a directed acyclic graph where
+      every node's name is a hash that depends on the hashes of everything it
+      points to.
+    </p>
+    <p data-anchor="sec-integrity-p2">
+      That structure has a property this chapter has been building toward
+      the whole book: <strong>you cannot change one bit anywhere in history
+      without changing the hash of every object downstream of it</strong>.
+      Not "it's hard to hide." Not "someone would probably notice." The math
+      makes it structurally impossible to tamper quietly. That's
+      <em>integrity</em>, and Git has had it since Chapter 3's very first
+      <code>git hash-object</code>. What it doesn't give you for free is
+      <em>authenticity</em> &mdash; proof of <strong>who</strong> created an
+      object in the first place. Those are genuinely different guarantees,
+      and mixing them up is exactly the mistake that makes unsigned history
+      dangerous. The rest of this chapter proves the first claim with real
+      hashes from a real repo, then spends the second half closing the gap on
+      the second one.
+    </p>
+
+    <figure class="diagram" data-anchor="sec-diagram">
+      <svg viewBox="0 0 780 470" role="img" aria-labelledby="sec-svg-title">
+        <title id="sec-svg-title">A five-object chain — blob, tree, commit "Start the story", commit "Add sword", commit "Add shield" — shown twice. The top row is the original chain with hashes 09c6d7b, c4cad3f, 410aa16, f931c9f, a2f8c35. A zigzag red connector shows the blob's content edited from HP 100 to HP 9999. The bottom row is the tampered chain: every single hash changed — fca253d, 587ccc8, b2222b5, 587b940, 1637410 — including the last two commits, even though their trees are byte-for-byte identical to the originals, because each commit also embeds its parent commit's hash.</title>
+
+        <text x="390" y="22" text-anchor="middle" fill="var(--ink)" font-family="var(--font-display)" font-size="13" font-weight="800" letter-spacing=".03em">ONE EDITED BYTE &#8594; EVERY HASH AFTER IT CHANGES</text>
+        <text x="390" y="38" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="9">real hashes, from a real throwaway repo &mdash; see this chapter's lab</text>
+
+        <!-- column labels -->
+        <g font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)" text-anchor="middle">
+          <text x="78"  y="58">blob</text>
+          <text x="228" y="58">tree</text>
+          <text x="393" y="58">commit</text>
+          <text x="558" y="58">commit</text>
+          <text x="718" y="58">commit</text>
+        </g>
+
+        <!-- ============ ORIGINAL ROW ============ -->
+        <g font-family="var(--font-mono)" font-weight="700">
+          <rect x="18"  y="66" width="120" height="54" rx="8" fill="var(--code-bg)" stroke="var(--obj-blob)" stroke-width="2"></rect>
+          <text x="78" y="88" text-anchor="middle" fill="var(--obj-blob)" font-size="11">09c6d7b&#8230;</text>
+          <text x="78" y="103" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">"HP: 100"</text>
+
+          <rect x="168" y="66" width="120" height="54" rx="8" fill="var(--code-bg)" stroke="var(--obj-tree)" stroke-width="2"></rect>
+          <text x="228" y="88" text-anchor="middle" fill="var(--obj-tree)" font-size="11">c4cad3f&#8230;</text>
+          <text x="228" y="103" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">player.txt &#8594; 09c6d7b</text>
+
+          <rect x="333" y="66" width="120" height="54" rx="8" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2"></rect>
+          <text x="393" y="88" text-anchor="middle" fill="var(--obj-commit)" font-size="11">410aa16&#8230;</text>
+          <text x="393" y="103" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">"Start the story"</text>
+
+          <rect x="498" y="66" width="120" height="54" rx="8" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2"></rect>
+          <text x="558" y="88" text-anchor="middle" fill="var(--obj-commit)" font-size="11">f931c9f&#8230;</text>
+          <text x="558" y="103" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">"Add sword" (signed)</text>
+
+          <rect x="658" y="66" width="120" height="54" rx="8" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2"></rect>
+          <text x="718" y="88" text-anchor="middle" fill="var(--obj-commit)" font-size="11">a2f8c35&#8230;</text>
+          <text x="718" y="103" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">"Add shield"</text>
+        </g>
+
+        <!-- arrows original row: "hash embedded in ->" -->
+        <g stroke="var(--accent)" stroke-width="1.6" fill="none">
+          <path d="M138,93 L166,93"></path>
+          <path d="M288,93 L331,93"></path>
+          <path d="M453,93 L496,93"></path>
+          <path d="M618,93 L656,93"></path>
+        </g>
+        <g fill="var(--accent)">
+          <polygon points="166,93 155,88 155,98"></polygon>
+          <polygon points="331,93 320,88 320,98"></polygon>
+          <polygon points="496,93 485,88 485,98"></polygon>
+          <polygon points="656,93 645,88 645,98"></polygon>
+        </g>
+
+        <!-- edit connector, blob column, original -> tampered -->
+        <path d="M78,120 L78,150 L98,175 L78,200 L78,230" stroke="var(--danger)" stroke-width="2.2" fill="none" stroke-dasharray="1 6" stroke-linecap="round"></path>
+        <rect x="18" y="152" width="200" height="40" rx="8" fill="rgba(248,113,113,.12)" stroke="var(--danger)" stroke-width="1.4"></rect>
+        <text x="118" y="168" text-anchor="middle" fill="var(--danger)" font-family="var(--font-display)" font-size="9" font-weight="800" letter-spacing=".05em">ONE BYTE EDITED</text>
+        <text x="118" y="182" text-anchor="middle" fill="var(--ink)" font-family="var(--font-mono)" font-size="9">"HP: 100" &#8594; "HP: 9999"</text>
+
+        <!-- ============ TAMPERED ROW ============ -->
+        <g font-family="var(--font-mono)" font-weight="700">
+          <rect x="18"  y="230" width="120" height="54" rx="8" fill="rgba(248,113,113,.10)" stroke="var(--danger)" stroke-width="2.4"></rect>
+          <text x="78" y="252" text-anchor="middle" fill="var(--danger)" font-size="11">fca253d&#8230;</text>
+          <text x="78" y="267" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">"HP: 9999"</text>
+
+          <rect x="168" y="230" width="120" height="54" rx="8" fill="rgba(248,113,113,.10)" stroke="var(--danger)" stroke-width="2.4"></rect>
+          <text x="228" y="252" text-anchor="middle" fill="var(--danger)" font-size="11">587ccc8&#8230;</text>
+          <text x="228" y="267" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">player.txt &#8594; fca253d</text>
+
+          <rect x="333" y="230" width="120" height="54" rx="8" fill="rgba(248,113,113,.10)" stroke="var(--danger)" stroke-width="2.4"></rect>
+          <text x="393" y="252" text-anchor="middle" fill="var(--danger)" font-size="11">b2222b5&#8230;</text>
+          <text x="393" y="267" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">same message, new tree</text>
+
+          <rect x="498" y="230" width="120" height="54" rx="8" fill="rgba(248,113,113,.10)" stroke="var(--danger)" stroke-width="2.4"></rect>
+          <text x="558" y="252" text-anchor="middle" fill="var(--danger)" font-size="11">587b940&#8230;</text>
+          <text x="558" y="267" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">tree 54d61f4 &mdash; UNCHANGED</text>
+
+          <rect x="658" y="230" width="120" height="54" rx="8" fill="rgba(248,113,113,.10)" stroke="var(--danger)" stroke-width="2.4"></rect>
+          <text x="718" y="252" text-anchor="middle" fill="var(--danger)" font-size="11">1637410&#8230;</text>
+          <text x="718" y="267" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5" font-weight="400">tree 6220e18 &mdash; UNCHANGED</text>
+        </g>
+
+        <!-- arrows tampered row -->
+        <g stroke="var(--danger)" stroke-width="1.8" fill="none">
+          <path d="M138,257 L166,257"></path>
+          <path d="M288,257 L331,257"></path>
+          <path d="M453,257 L496,257"></path>
+          <path d="M618,257 L656,257"></path>
+        </g>
+        <g fill="var(--danger)">
+          <polygon points="166,257 155,252 155,262"></polygon>
+          <polygon points="331,257 320,252 320,262"></polygon>
+          <polygon points="496,257 485,252 485,262"></polygon>
+          <polygon points="656,257 645,252 645,262"></polygon>
+        </g>
+
+        <!-- callout box explaining the surprising part -->
+        <rect x="333" y="300" width="445" height="112" rx="10" fill="var(--bg-2)" stroke="var(--danger)" stroke-width="1.4" stroke-dasharray="4 4"></rect>
+        <text x="555" y="322" text-anchor="middle" fill="var(--danger)" font-family="var(--font-display)" font-size="10" font-weight="800" letter-spacing=".04em">THE PART THAT SURPRISES PEOPLE</text>
+        <text x="352" y="342" fill="var(--ink)" font-family="var(--font-body)" font-size="9.5">The last two commits' <tspan fill="var(--accent-2)" font-weight="700">trees are byte-for-byte identical</tspan></text>
+        <text x="352" y="358" fill="var(--ink)" font-family="var(--font-body)" font-size="9.5">to the originals &mdash; nobody touched player.txt in either one.</text>
+        <text x="352" y="378" fill="var(--ink)" font-family="var(--font-body)" font-size="9.5">Their hashes changed anyway, because a commit also embeds its</text>
+        <text x="352" y="394" fill="var(--ink)" font-family="var(--font-body)" font-size="9.5"><tspan fill="var(--accent-3)" font-weight="700">parent commit's hash</tspan> (Ch. 6). Tamper with an ancestor, and every</text>
+        <text x="352" y="410" fill="var(--ink)" font-family="var(--font-body)" font-size="9.5">descendant's identity changes too &mdash; that's the Merkle-DAG at work.</text>
+
+        <!-- legend -->
+        <g font-family="var(--font-body)" font-size="9" fill="var(--ink-soft)">
+          <rect x="18" y="440" width="10" height="10" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="1.5"></rect>
+          <text x="34" y="449">original chain (untouched)</text>
+          <rect x="188" y="440" width="10" height="10" fill="rgba(248,113,113,.15)" stroke="var(--danger)" stroke-width="1.5"></rect>
+          <text x="204" y="449">tampered chain &mdash; every hash after the edit is new</text>
+        </g>
+      </svg>
+      <figcaption>
+        <strong>Tamper-evidence, proven with real hashes, not just claimed.</strong>
+        Editing the earliest blob's content and rebuilding the chain with
+        Git's own plumbing (<code>git hash-object</code>, <code>git
+        mktree</code>, <code>git commit-tree</code>) produces five brand-new
+        hashes &mdash; including two commits whose <em>trees never changed at
+        all</em>. This chapter's lab reproduces every one of these hashes
+        yourself.
+      </figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="sec-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        A hash proves an object <em>wasn't altered after it was named</em>.
+        It says nothing about who created it. <code>git fsck</code> (Chapter
+        15) will happily certify a repository as perfectly intact even if
+        every single commit in it has a fabricated author line &mdash;
+        integrity and authenticity are separate promises, and only one of
+        them comes free with content-addressing.
+      </p>
+    </div>
+
+    <h2 data-anchor="sec-authorship-h">The Weak Spot: Nobody Checks the Author Line</h2>
+    <p data-anchor="sec-authorship-p1">
+      Here's the uncomfortable part. Every commit carries an
+      <code>author</code> line &mdash; a name and an email address &mdash;
+      and Git will write <strong>whatever you tell it to</strong>, no
+      questions asked. That name doesn't have to match who's typing. It
+      doesn't have to match any account on any hosting platform. It doesn't
+      have to be a real person at all. Git's job is recording history
+      faithfully, not policing who's allowed to claim credit for it &mdash;
+      those are, once again, two different jobs, and this book has been
+      showing you Git only signed up for the first one.
+    </p>
+
+    <div class="callout warn" data-anchor="sec-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        <strong>The author name and email on a commit are not verified or
+        authenticated by Git in any way.</strong> Anyone with a copy of Git
+        can set <code>user.name</code> and <code>user.email</code> to
+        literally anything &mdash; including your name, or a maintainer's
+        name, or a name that doesn't exist &mdash; and every plain commit
+        will accept it silently. There is no password, no identity check, no
+        gatekeeping at the object-format level. Unsigned authorship is a
+        <strong>claim</strong>, not a <strong>proof</strong>. Everything
+        below this warning exists to close that gap.
+      </p>
+    </div>
+
+    <p data-anchor="sec-spoof-p1">
+      Don't take that on faith &mdash; it's one command. This really ran, in
+      a throwaway repo, with nothing exotic:
+    </p>
+    <pre class="code" data-anchor="sec-spoof-code1"><span class="cap">Terminal — impersonating a famous maintainer, no special access required</span><code><span class="cm">$</span> git commit --allow-empty -m <span class="str">"Legit-looking fix"</span> \
+    --author=<span class="str">"Linus Torvalds &lt;torvalds@linux-foundation.org&gt;"</span>
+<span class="cm">$</span> git log -1 --format=<span class="str">"Author: %an &lt;%ae&gt;%nSigned:  %G? (%GS)"</span>
+Author: Linus Torvalds &lt;torvalds@linux-foundation.org&gt;
+Signed:  N ()</code></pre>
+    <p data-anchor="sec-spoof-p2">
+      Git accepted the commit without complaint &mdash; correctly, by its own
+      rules, since nothing in the object format claims otherwise. The
+      <code>%G?</code> column reads <code>N</code>: <strong>no signature was
+      even attempted</strong>, so there was never any authenticity claim to
+      check. That's the exact gap the rest of this chapter closes.
+    </p>
+
+    <h2 data-anchor="sec-gpg-h">GPG Signing: Proving It Was Really You</h2>
+    <p data-anchor="sec-gpg-p1">
+      Git's answer is the same one email, software downloads, and legal
+      documents landed on decades ago: a <strong>digital signature</strong>.
+      You generate a GPG (GNU Privacy Guard) key pair &mdash; a private key
+      you never share, and a public key you publish. Sign a commit with your
+      private key, and anyone holding your public key can mathematically
+      confirm two things at once: the commit's content matches exactly what
+      you signed (tamper-evidence again, this time on the signature itself),
+      and only someone holding your private key could have produced that
+      signature. Tell Git which key is yours, and add one flag to any commit
+      or tag:
+    </p>
+    <pre class="code" data-anchor="sec-gpg-setup-code"><span class="cap">Terminal — one-time setup: tell Git which key is yours</span><code><span class="cm">$</span> gpg --list-secret-keys --keyid-format=long
+<span class="cm">$</span> git config --global user.signingkey &lt;your-key-id&gt;
+<span class="cm">$</span> git config --global commit.gpgsign <span class="kw">true</span>   <span class="cm"># sign every commit by default</span></code></pre>
+    <p data-anchor="sec-gpg-p2">
+      With that in place, a single flag signs one commit on demand &mdash;
+      and this is real, live output, not a transcript pulled from a manual:
+    </p>
+    <pre class="code" data-anchor="sec-gpg-sign-code"><span class="cap">Terminal — a real GPG-signed commit, verified on the spot</span><code><span class="cm">$</span> git commit -S -m <span class="str">"Add sword to inventory"</span>
+<span class="cm">$</span> git log --show-signature -1
+commit f931c9fcab7caeb4f2e88f922e589eb0643819da
+gpg: Signature made Mon Jul 13 01:55:52 2026 UTC
+gpg:                using EDDSA key 4707A397E239C5893871FE48A37DBA7D0A533877
+gpg: Good signature from <span class="str">"Ava TestQuest &lt;ava@example.com&gt;"</span> [ultimate]
+Author: Ava TestQuest &lt;ava@example.com&gt;
+Date:   Mon Jul 13 12:00:00 2026 +0000
+
+    Add sword to inventory</code></pre>
+    <p data-anchor="sec-gpg-p3">
+      That "Good signature" line is GPG itself telling you the math checked
+      out &mdash; the commit's content hasn't changed since Ava's private key
+      signed it, and nobody without that key could have produced this exact
+      signature. Notice the signature isn't stored anywhere fancy: it's just
+      another field inside the commit object, right alongside
+      <code>author</code> and <code>tree</code> &mdash; sitting in the same
+      plain-text format Chapter 3 first showed you with <code>cat-file
+      -p</code>.
+    </p>
+
+    <div class="callout tip" data-anchor="sec-tip-flags">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        Two lowercase-vs-uppercase flags on <code>git commit</code> get mixed
+        up constantly, and they do completely different things:
+        <code>-S</code> (capital) <strong>cryptographically signs</strong>
+        the commit with GPG, the whole subject of this chapter.
+        <code>-s</code> (lowercase) just appends a plain-text
+        <code>Signed-off-by: Your Name &lt;you@example.com&gt;</code> line to
+        the message &mdash; a convention some projects use to record
+        "I agree to this project's contribution terms," with zero
+        cryptography involved. You can use both together
+        (<code>git commit -sS</code>), but only the capital one gives you an
+        actual, unforgeable proof of identity.
+      </p>
+    </div>
+
+    <h2 data-anchor="sec-verify-h">Verified vs. Unverified: Checking Signatures Later</h2>
+    <p data-anchor="sec-verify-p1">
+      A signature is only useful if someone actually checks it later.
+      <code>git log --show-signature</code> (above) is the interactive way;
+      for scripts and CI, <code>git verify-commit</code> gives you a plain
+      pass/fail, and the <code>%G?</code> placeholder in
+      <code>--pretty=format</code> lets you scan a whole history at a glance.
+      Run it across this chapter's four demo commits and the difference is
+      immediate:
+    </p>
+    <pre class="code" data-anchor="sec-verify-code"><span class="cap">Terminal — git verify-commit, and %G? across a real history</span><code><span class="cm">$</span> git verify-commit f931c9f
+gpg: Signature made Mon Jul 13 01:55:52 2026 UTC
+gpg:                using EDDSA key 4707A397E239C5893871FE48A37DBA7D0A533877
+gpg: Good signature from <span class="str">"Ava TestQuest &lt;ava@example.com&gt;"</span> [ultimate]
+
+<span class="cm">$</span> git log --pretty=<span class="str">"format:%h  %G?  %an  %s"</span> --all
+51b4dc0  <span class="mac">N</span>  Linus Torvalds  Legit-looking fix
+a2f8c35  <span class="mac">N</span>  Ava TestQuest    Add shield to inventory
+f931c9f  <span class="fn">G</span>  Ava TestQuest    Add sword to inventory
+410aa16  <span class="mac">N</span>  Ava TestQuest    Start the story</code></pre>
+    <p data-anchor="sec-verify-p2">
+      <code>G</code> means <em>good signature</em>; <code>N</code> means
+      <em>no signature was attempted at all</em>. Other codes exist too
+      &mdash; <code>B</code> for a signature that's outright bad, <code>U</code>
+      for good-but-from-an-untrusted key, <code>E</code> when Git couldn't
+      even check (missing key, GPG error) &mdash; but the two you'll see 95%
+      of the time are these: signed-and-good, or not signed at all. Notice
+      that <code>a2f8c35</code> and the spoofed <code>51b4dc0</code> land in
+      the exact same bucket, <code>N</code>. Git makes no distinction between
+      "an honest commit nobody bothered to sign" and "a commit actively
+      impersonating someone" &mdash; both simply have no authenticity claim
+      to evaluate. That symmetry is precisely why the next section matters.
+    </p>
+
+    <div class="callout tip" data-anchor="sec-github-tip">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        Hosting platforms build on exactly this mechanism for the little
+        badges you've probably already seen next to commits. Once you upload
+        your public GPG (or SSH, or S/MIME) key to your account, GitHub marks
+        each commit or tag <strong>Verified</strong>, <strong>Partially
+        verified</strong>, or <strong>Unverified</strong> based on the same
+        signature check <code>git log --show-signature</code> runs locally
+        &mdash; it's not a separate, platform-specific trust system, just a
+        friendlier UI on top of the GPG math. Turn on "vigilant mode" in your
+        GitHub settings and it'll flag <em>every</em> commit claiming to be
+        you that isn't signed, which is the platform-level version of the
+        warning above.
+      </p>
+    </div>
+
+    <h2 data-anchor="sec-tags-h">Signed Tags: <code>git tag -s</code></h2>
+    <p data-anchor="sec-tags-p1">
+      Chapter 12 mentioned this in passing and promised a return trip:
+      annotated tags can optionally be GPG-signed too, with the same idea
+      applied one level up &mdash; not "this commit is really mine" but
+      "this <em>release</em> is really mine." Swap <code>-a</code> for
+      <code>-s</code> and Git signs the tag object itself:
+    </p>
+    <pre class="code" data-anchor="sec-tags-code"><span class="cap">Terminal — a real signed release tag, then verified</span><code><span class="cm">$</span> git tag -s v1.0.0 -m <span class="str">"Release 1.0.0: sword and shield update"</span>
+<span class="cm">$</span> git cat-file -t v1.0.0
+tag
+<span class="cm">$</span> git tag -v v1.0.0
+gpg: Signature made Mon Jul 13 01:55:59 2026 UTC
+gpg:                using EDDSA key 4707A397E239C5893871FE48A37DBA7D0A533877
+gpg: Good signature from <span class="str">"Ava TestQuest &lt;ava@example.com&gt;"</span> [ultimate]
+object <span class="num">a2f8c35f34d8a18ec5fb76e6c11fcdad17a35ce4</span>
+type commit
+tag v1.0.0
+tagger Ava TestQuest &lt;ava@example.com&gt; <span class="num">1783944300</span> +0000
+
+Release 1.0.0: sword and shield update</code></pre>
+    <p data-anchor="sec-tags-p2">
+      That's the exact tag-object shape Chapter 12 showed you &mdash;
+      <code>object</code>, <code>type</code>, <code>tag</code>,
+      <code>tagger</code>, message &mdash; with one addition sitting inside
+      the object alongside them: a signature block, checked the same way
+      <code>git verify-commit</code> checks a commit. For an open-source
+      project, this is the single highest-leverage signature to get right:
+      thousands of people may <code>pip install</code> or <code>npm
+      install</code> whatever <code>v1.0.0</code> points to without ever
+      reading a line of it &mdash; the tag <em>is</em> the trust boundary.
+    </p>
+
+    <div class="callout key" data-anchor="sec-ssh-fact">
+      <span class="co-tag">Fun Fact</span>
+      <p>
+        You don't strictly need GPG anymore. Since Git 2.34 (2021), you can
+        sign commits and tags with a plain <strong>SSH key</strong> instead
+        &mdash; the same kind you may already have for pushing over
+        <code>ssh://</code> &mdash; by setting
+        <code>git config gpg.format ssh</code> and pointing
+        <code>user.signingkey</code> at your SSH public key. GitHub, GitLab,
+        and friends will happily mark SSH-signed commits "Verified" the same
+        as GPG ones. The upside is skipping GPG key management entirely if
+        you already maintain SSH keys; the tradeoff is that Git has no
+        built-in trust store for SSH keys the way GPG has its web of trust,
+        so verification needs an explicit
+        <code>gpg.ssh.allowedSignersFile</code> mapping emails to public
+        keys before <code>--show-signature</code> can confirm anything.
+      </p>
+    </div>
+
+    <h2 data-anchor="sec-trust-h">Why This Actually Matters: Supply-Chain Trust</h2>
+    <p data-anchor="sec-trust-p1">
+      This isn't a hypothetical concern dreamed up for a security chapter.
+      In February 2021, researchers submitted a series of intentionally
+      buggy patches to the Linux kernel &mdash; one of the most heavily
+      reviewed codebases on Earth &mdash; as part of a published study on
+      whether malicious-but-plausible-looking commits could slip past code
+      review under fabricated identities. Maintainers caught it, the
+      University of Minnesota was banned from contributing to the kernel,
+      and the incident became a widely cited case study in exactly the
+      failure mode this chapter is about: <strong>a commit's claimed author
+      is worth nothing on its own</strong>, no matter how legitimate the
+      surrounding pull request looks.
+    </p>
+    <p data-anchor="sec-trust-p2">
+      Scale that up to the entire open-source ecosystem and the stakes get
+      concrete fast. Package managers &mdash; npm, PyPI, crates.io, and
+      dozens more &mdash; pull source straight from Git repositories and
+      tags, often with no human reading every line before it reaches
+      production. A single convincingly-authored commit slipped into a
+      popular dependency doesn't just fool one reviewer; it potentially
+      ships to every project downstream that installs that package. That's
+      the "supply chain" in supply-chain security: trust doesn't stay
+      contained to the repo it was planted in, it propagates outward through
+      every dependency edge, the same way a tampered blob's hash propagates
+      forward through every commit after it.
+    </p>
+    <p data-anchor="sec-trust-p3">
+      Signing doesn't make bad code impossible &mdash; a legitimate
+      maintainer with a valid key can still sign something malicious or
+      simply buggy, and code review still has to do its actual job. What
+      signing removes is the <em>cheapest</em> attack: pretending to be
+      someone you aren't. Once maintainers require signed commits and
+      signed release tags &mdash; a setting many serious projects now
+      enforce with a branch-protection rule &mdash; "this patch came from
+      Linus Torvalds" stops being a free claim anyone can type into
+      <code>--author</code>, and starts being a mathematical fact you can
+      check yourself, offline, with nothing but a public key.
+    </p>
+
+    <div class="callout lab" data-anchor="sec-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        You don't need a real GPG key to see the tamper-evidence half of
+        this chapter &mdash; it's pure plumbing, the same commands Chapter 3
+        already taught you. Fresh throwaway repo:
+      </p>
+      <pre class="code" data-anchor="sec-lab-code1"><span class="cap">Terminal — set the scene: one commit, one blob</span><code><span class="cm">$</span> mkdir trust-quest &amp;&amp; cd trust-quest &amp;&amp; git init -q -b main
+<span class="cm">$</span> printf <span class="str">"Welcome to Trust Quest!\nHP: 100\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Start the story"</span>
+<span class="cm">$</span> ROOT=$(git rev-parse HEAD)
+<span class="cm">$</span> TREE=$(git rev-parse HEAD^{tree})
+<span class="cm">$</span> echo <span class="str">"$ROOT $TREE"</span></code></pre>
+      <p>
+        Now tamper: hash a <em>changed</em> version of the same file without
+        touching the working tree, splice it into a rebuilt tree, and rebuild
+        the commit &mdash; all with plumbing, none of it touching
+        <code>HEAD</code>:
+      </p>
+      <pre class="code" data-anchor="sec-lab-code2"><span class="cap">Terminal — rebuild blob, tree, and commit by hand</span><code><span class="cm">$</span> NEWBLOB=$(printf <span class="str">"Welcome to Trust Quest!\nHP: 9999\n"</span> | git hash-object -w --stdin)
+<span class="cm">$</span> NEWTREE=$(printf <span class="str">"100644 blob %s\tplayer.txt\n"</span> <span class="str">"$NEWBLOB"</span> | git mktree)
+<span class="cm">$</span> NEWROOT=$(printf <span class="str">"Start the story"</span> | git commit-tree <span class="str">"$NEWTREE"</span>)
+<span class="cm">$</span> echo <span class="str">"original: $ROOT  tampered: $NEWROOT"</span></code></pre>
+      <p>
+        Two completely different commit hashes, from a one-word content edit
+        &mdash; and if you had a second and third commit built on top of the
+        original (the way this chapter's diagram does), you'd rebuild those
+        too with <code>git commit-tree &lt;same tree&gt; -p $NEWROOT</code>
+        and watch <em>their</em> hashes change as well, even though you never
+        touched their trees. That's the whole diagram above, reproduced with
+        your own hands.
+      </p>
+      <p>
+        If you do have GPG installed (<code>gpg --version</code>), the
+        signing half is worth trying for real too:
+      </p>
+      <pre class="code" data-anchor="sec-lab-code3"><span class="cap">Terminal — a real signature, if you have a GPG key</span><code><span class="cm">$</span> gpg --quick-generate-key <span class="str">"Test Key &lt;test@example.com&gt;"</span> default default 1d
+<span class="cm">$</span> git config user.signingkey <span class="str">"Test Key"</span>
+<span class="cm">$</span> git commit --allow-empty -S -m <span class="str">"a signed commit"</span>
+<span class="cm">$</span> git log --show-signature -1</code></pre>
+      <p>
+        You should see <code>gpg: Good signature from "Test Key
+        &lt;test@example.com&gt;"</code> &mdash; the exact same confirmation
+        this chapter's own demo produced. (That key's only good for a day on
+        purpose &mdash; the <code>1d</code> expiry &mdash; so there's nothing
+        left lying around afterward worth cleaning up.)
+      </p>
+    </div>
+
+    <p data-anchor="sec-close-p1">
+      Zoom out, and this chapter has really been about upgrading one word:
+      Chapter 4 taught you a hash makes an object's content <em>provable</em>;
+      this chapter taught you a signature makes an object's <em>author</em>
+      provable, too. Neither one is optional plumbing tucked away for
+      security specialists &mdash; hashing is running under every command
+      you've typed since Chapter 3, and signing is one flag away whenever the
+      question "did this really come from who it claims?" actually matters.
+      Sixteen chapters in, you've now seen every load-bearing idea underneath
+      the <code>git</code> binary you use every day. The last chapter turns
+      the telescope around: where does all of this go from here?
+    </p>
+
+    <p class="sources" data-anchor="sec-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work" target="_blank" rel="noopener">Pro Git, Ch. 7.4 &mdash; Signing Your Work</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-commit" target="_blank" rel="noopener">git-scm.com &mdash; git-commit (-S)</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-verify-commit" target="_blank" rel="noopener">git-scm.com &mdash; git-verify-commit</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-tag" target="_blank" rel="noopener">git-scm.com &mdash; git-tag (-s / -v)</a>
+      &middot;
+      <a href="https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification" target="_blank" rel="noopener">GitHub Docs &mdash; About commit signature verification</a>
+      &middot;
+      <a href="https://itsfoss.com/news/hypocrite-commits/" target="_blank" rel="noopener">It's FOSS &mdash; the "hypocrite commits" Linux kernel incident</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="15-performance-and-optimization.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="17-the-future-of-git.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

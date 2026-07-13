@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance and Optimization: Git Under Load — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 15 · Performance and Optimization</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="perf-kicker">Chapter 15 of 17 &middot; Meet Git's janitor</p>
+    <h1 data-anchor="perf-h1">Performance and Optimization: <span class="hl">Git Under Load</span></h1>
+
+    <p class="lede" data-anchor="perf-lede">
+      Chapter 14 closed with a promise: this book has mostly been about
+      correctness &mdash; what Git stores and how &mdash; and now it's time
+      to talk about what happens when a repository stops being a tidy little
+      demo and starts being a five-year-old monorepo with forty thousand
+      commits, a design team's folder of 200MB Photoshop files, and three
+      hundred contributors all pushing at once. Git doesn't panic. It has a
+      whole toolkit for staying fast under that kind of load &mdash; some of
+      it running quietly in the background without you ever asking, some of
+      it one command away when you need to reach for it yourself.
+    </p>
+
+    <h2 data-anchor="perf-cost-h">Why Big Repos Actually Get Slow</h2>
+    <p data-anchor="perf-cost-p1">
+      "Big" isn't one problem, it's three, and they have completely
+      different fixes &mdash; which is exactly why Git ships more than one
+      maintenance tool instead of just one big "make it fast" button.
+    </p>
+    <p data-anchor="perf-cost-p2">
+      <strong>Deep history</strong> is commit <em>count</em>: tens of
+      thousands of commits piling up over years. Chapter 6 already told you
+      this one is mostly fine &mdash; every commit is a self-contained
+      snapshot, so <code>git checkout</code> and <code>git log</code> don't
+      get slower just because history got longer, they just have a bigger
+      graph to walk. The real cost of deep history shows up in <em>disk
+      space and network transfer</em>: every commit, tree, and blob object
+      Git has ever created is still sitting in <code>.git/objects/</code>
+      unless something cleans it up.
+    </p>
+    <p data-anchor="perf-cost-p3">
+      <strong>Wide trees</strong> are file <em>count</em> at any single
+      snapshot &mdash; a repo with 500,000 files means every
+      <code>git status</code> has to stat 500,000 files against the index,
+      even if you only touched one of them. That's a working-copy problem
+      more than an object-store one; it's the reason genuinely enormous
+      monorepos (think: an entire OS, or Windows' own source tree) lean on
+      extra tooling on top of plain Git, which the "fun fact" callout below
+      touches on.
+    </p>
+    <p data-anchor="perf-cost-p4">
+      <strong>Huge binary files</strong> are the odd one out, and the one
+      Git's core design genuinely struggles with &mdash; we'll get to exactly
+      why, and the standard fix, later in this chapter.
+    </p>
+
+    <div class="callout key" data-anchor="perf-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Chapter 6 showed you that packing &mdash; deduping and delta-compressing
+        loose objects into a <code>.pack</code> file &mdash; is what keeps
+        Git's storage layer small. This chapter is about the <em>commands</em>
+        that trigger and manage that process on purpose: <code>git gc</code>,
+        <code>git prune</code>, and <code>git fsck</code>. Same underlying
+        machinery, now with your hands on the controls.
+      </p>
+    </div>
+
+    <h2 data-anchor="perf-gc-h"><code>git gc</code>: Git's Own Cleanup Crew</h2>
+    <p data-anchor="perf-gc-p1">
+      <code>gc</code> stands for <strong>garbage collect</strong>, and it's
+      genuinely the closest thing Git has to a "tidy my whole repo" button.
+      One command runs a whole checklist: it packs your loose objects into
+      compact <code>.pack</code> files, repacks any existing packs that have
+      gotten fragmented, compresses <code>refs/</code> into a single
+      <code>packed-refs</code> file instead of thousands of tiny files, and
+      &mdash; carefully &mdash; prunes loose objects that are both unreachable
+      <em>and</em> old enough that nothing should still need them.
+    </p>
+    <p data-anchor="perf-gc-p2">
+      You almost never have to run it by hand, because Git already is:
+      most porcelain commands (<code>commit</code>, <code>merge</code>,
+      <code>pull</code>, and friends) call <code>git gc --auto</code> at the
+      end, which checks two thresholds before doing any real work &mdash;
+      roughly 6,700 loose objects (<code>gc.auto</code>), or more than 50
+      packs sitting around unconsolidated (<code>gc.autoPackLimit</code>).
+      Below those numbers, <code>--auto</code> is a no-op that costs you
+      nothing.
+    </p>
+
+    <figure class="diagram" data-anchor="perf-diagram">
+      <svg viewBox="0 0 780 400" role="img" aria-labelledby="perf-svg-title">
+        <title id="perf-svg-title">A scattering of small loose object boxes on the left, color-coded blue for blobs, green for trees, and amber for commits, each labeled as one file under dot-git slash objects. An arrow labeled git gc points from this scatter toward a single consolidated box on the right labeled one pack file plus an idx index, described as deduplicated and delta-compressed. Below, a small readout shows git count-objects -v before and after: count nine, in-pack zero, packs zero before; count zero, in-pack nine, packs one after.</title>
+
+        <text x="390" y="26" text-anchor="middle" fill="var(--ink)" font-family="var(--font-display)" font-size="13" font-weight="800" letter-spacing=".04em">LOOSE OBJECTS &#8594; ONE TIDY PACKFILE</text>
+        <text x="390" y="42" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="9">blue = blob &middot; green = tree &middot; amber = commit &mdash; same color-coding as every other diagram in this book</text>
+
+        <!-- scattered loose object boxes, left cluster -->
+        <g font-family="var(--font-mono)" font-size="8.5" font-weight="700">
+          <rect x="35"  y="70"  width="54" height="34" rx="6" fill="var(--code-bg)" stroke="var(--obj-blob)" stroke-width="1.6" transform="rotate(-4 62 87)"></rect>
+          <text x="62" y="90" text-anchor="middle" fill="var(--obj-blob)" transform="rotate(-4 62 87)">blob</text>
+
+          <rect x="120" y="55" width="54" height="34" rx="6" fill="var(--code-bg)" stroke="var(--obj-tree)" stroke-width="1.6" transform="rotate(6 147 72)"></rect>
+          <text x="147" y="75" text-anchor="middle" fill="var(--obj-tree)" transform="rotate(6 147 72)">tree</text>
+
+          <rect x="60" y="120" width="54" height="34" rx="6" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="1.6" transform="rotate(3 87 137)"></rect>
+          <text x="87" y="140" text-anchor="middle" fill="var(--obj-commit)" transform="rotate(3 87 137)">commit</text>
+
+          <rect x="150" y="130" width="54" height="34" rx="6" fill="var(--code-bg)" stroke="var(--obj-blob)" stroke-width="1.6" transform="rotate(-6 177 147)"></rect>
+          <text x="177" y="150" text-anchor="middle" fill="var(--obj-blob)" transform="rotate(-6 177 147)">blob</text>
+
+          <rect x="30" y="180" width="54" height="34" rx="6" fill="var(--code-bg)" stroke="var(--obj-tree)" stroke-width="1.6" transform="rotate(5 57 197)"></rect>
+          <text x="57" y="200" text-anchor="middle" fill="var(--obj-tree)" transform="rotate(5 57 197)">tree</text>
+
+          <rect x="130" y="200" width="54" height="34" rx="6" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="1.6" transform="rotate(-3 157 217)"></rect>
+          <text x="157" y="220" text-anchor="middle" fill="var(--obj-commit)" transform="rotate(-3 157 217)">commit</text>
+
+          <rect x="55" y="245" width="54" height="34" rx="6" fill="var(--code-bg)" stroke="var(--obj-blob)" stroke-width="1.6" transform="rotate(4 82 262)"></rect>
+          <text x="82" y="265" text-anchor="middle" fill="var(--obj-blob)" transform="rotate(4 82 262)">blob</text>
+        </g>
+        <text x="107" y="305" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="9">.git/objects/ &mdash; one file per object, scattered in 2-char folders</text>
+
+        <!-- arrow -->
+        <path d="M225,175 L340,175" stroke="var(--accent)" stroke-width="2.5" fill="none"></path>
+        <polygon points="340,175 326,166 326,184" fill="var(--accent)"></polygon>
+        <rect x="228" y="140" width="110" height="26" rx="13" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="1.5"></rect>
+        <text x="283" y="157" text-anchor="middle" fill="var(--accent)" font-family="var(--font-mono)" font-size="11" font-weight="700">git gc</text>
+
+        <!-- consolidated pack box, right -->
+        <rect x="350" y="90" width="290" height="170" rx="14" fill="var(--bg-2)" stroke="var(--accent-2)" stroke-width="2.5"></rect>
+        <text x="495" y="130" text-anchor="middle" fill="var(--accent-2)" font-family="var(--font-display)" font-size="16" font-weight="800">ONE PACKFILE</text>
+        <text x="495" y="152" text-anchor="middle" fill="var(--ink)" font-family="var(--font-mono)" font-size="10.5">pack-&#8230;.pack + pack-&#8230;.idx</text>
+        <g font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">
+          <rect x="368" y="168" width="8" height="8" fill="var(--obj-blob)"></rect>
+          <rect x="368" y="182" width="8" height="8" fill="var(--obj-tree)"></rect>
+          <rect x="368" y="196" width="8" height="8" fill="var(--obj-commit)"></rect>
+          <text x="382" y="176">blobs, deduped by content hash</text>
+          <text x="382" y="190">trees, one base kept in full</text>
+          <text x="382" y="204">commits, small &mdash; rarely delta'd</text>
+        </g>
+        <text x="495" y="228" text-anchor="middle" fill="var(--accent-2)" font-family="var(--font-body)" font-size="9" font-style="italic">similar objects stored as tiny deltas</text>
+        <text x="495" y="244" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="9">against one full base &mdash; see Chapter 6</text>
+
+        <!-- before/after count-objects readout -->
+        <rect x="20" y="330" width="620" height="55" rx="10" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1.2"></rect>
+        <text x="35" y="349" fill="var(--ink-soft)" font-family="var(--font-mono)" font-size="9.5">git count-objects -v &nbsp; BEFORE &#8594; count: 9   in-pack: 0   packs: 0</text>
+        <text x="35" y="369" fill="var(--accent-2)" font-family="var(--font-mono)" font-size="9.5" font-weight="700">git count-objects -v &nbsp; AFTER &nbsp;&nbsp;&#8594; count: 0   in-pack: 9   packs: 1</text>
+      </svg>
+      <figcaption>
+        <strong>Same objects, one home instead of dozens.</strong> <code>git gc</code>
+        doesn't create anything new &mdash; every blob, tree, and commit
+        that was loose before is still fully readable afterward, just
+        bundled into a single, delta-compressed <code>.pack</code> file
+        instead of scattered as one zlib-deflated file each. The numbers in
+        the readout are real output from this chapter's lab below.
+      </figcaption>
+    </figure>
+
+    <div class="callout tip" data-anchor="perf-gc-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        Want to watch it happen instead of taking the diagram's word for it?
+        <code>git count-objects -v</code> is the live readout &mdash;
+        <code>count</code> is loose objects, <code>in-pack</code> is objects
+        already folded into a pack, <code>packs</code> is how many pack files
+        exist. Run it, run <code>git gc</code>, run it again. Chapter 6
+        showed you this same trick; this chapter's lab below runs it for
+        real, on purpose, around a repo cleanup instead of a plain commit.
+      </p>
+    </div>
+
+    <h2 data-anchor="perf-prune-h"><code>git prune</code>: The Blunt Instrument Underneath</h2>
+    <p data-anchor="perf-prune-p1">
+      <code>git gc</code> doesn't invent object deletion &mdash; it delegates
+      that specific job to <code>git prune</code>, a smaller, sharper tool
+      you can also run directly. <code>prune</code> does exactly one thing:
+      it finds loose objects that are <strong>unreachable</strong> &mdash;
+      nothing in <code>refs/</code>, no reflog entry, nothing points at them,
+      directly or transitively &mdash; and deletes them from
+      <code>.git/objects/</code> for good.
+    </p>
+    <p data-anchor="perf-prune-p2">
+      The safety net is a grace period: by default, <code>prune</code> only
+      deletes unreachable loose objects <strong>older than two weeks</strong>
+      (<code>gc.pruneExpire</code>). That's deliberate slack for exactly the
+      kind of thing Chapter 9 covered &mdash; a commit you just detached
+      from with <code>reset --hard</code> is unreachable by the strict
+      definition, but it's still sitting safely in your reflog, and two
+      weeks is plenty of time to notice and rescue it before <code>prune</code>
+      (or the <code>prune</code> that <code>gc</code> runs internally) ever
+      touches it.
+    </p>
+
+    <div class="callout warn" data-anchor="perf-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        Two flags turn off the safety net, and Chapter 6 already warned you
+        about the first: <code>git gc --prune=now</code> (equivalently,
+        <code>git prune --expire=now</code>) skips the two-week grace period
+        and deletes eligible objects <strong>immediately</strong>. The word
+        "eligible" is doing real work in that sentence, though &mdash; an
+        object the <em>reflog</em> still remembers isn't eligible at all,
+        grace period or not, exactly like Chapter 9 explained. To actually
+        force a specific dangling commit gone, you'd need to expire the
+        reflog entries pointing at it first
+        (<code>git reflog expire --expire=now --expire-unreachable=now --all</code>),
+        <em>then</em> prune. That's two deliberate, separate "yes, really"
+        steps &mdash; treat needing both of them together as your last
+        warning before something becomes properly, permanently gone.
+      </p>
+    </div>
+
+    <h2 data-anchor="perf-fsck-h"><code>git fsck</code>: The Repo's Health Inspector</h2>
+    <p data-anchor="perf-fsck-p1">
+      <code>fsck</code> &mdash; "file system check," a name Git borrowed
+      straight from Unix &mdash; doesn't clean anything up. It <em>looks</em>.
+      It walks every object it can reach, verifies the object store isn't
+      corrupted, and reports anything unusual: broken links, objects with
+      the wrong hash for their content, or objects that exist but nothing
+      points to. Run it plain and, on a healthy repo, it should print
+      nothing at all &mdash; silence is the good outcome.
+    </p>
+    <p data-anchor="perf-fsck-p2">
+      Two flags make it genuinely useful for detective work rather than just
+      corruption-checking:
+    </p>
+    <ul data-anchor="perf-fsck-ul">
+      <li><code>git fsck --unreachable</code> lists every object nothing
+        points to &mdash; the raw material <code>prune</code> would consider
+        deleting.</li>
+      <li><code>git fsck --dangling</code> is the more useful subset: objects
+        that are unreachable <em>and</em> aren't referenced by any other
+        unreachable object either &mdash; in practice, almost always the tip
+        commit of some abandoned work, exactly the thing you'd want to
+        recover.</li>
+    </ul>
+    <p data-anchor="perf-fsck-p3">
+      There's a wrinkle worth knowing before you try this yourself, and it's
+      the exact same reflog awareness from the warning above: by default,
+      <code>fsck</code> treats anything your reflogs still remember as
+      reachable, so a commit you just orphaned with <code>reset --hard</code>
+      won't show up as unreachable or dangling <em>yet</em> &mdash; the
+      reflog is quietly keeping it alive. Add <code>--no-reflogs</code> to
+      see the object store's raw reachability, ignoring that safety net.
+      The lab below shows you exactly what that looks like, both ways.
+    </p>
+
+    <table data-anchor="perf-table">
+      <thead>
+        <tr><th>Command</th><th>What it actually does</th><th>Reach for it when&#8230;</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="mono">git gc</td><td>Packs loose objects, repacks fragmented packs, compresses refs, prunes old unreachable objects</td>
+          <td>Almost never manually &mdash; <code>--auto</code> already runs this for you</td></tr>
+        <tr><td class="mono">git prune</td><td>Deletes unreachable loose objects past the grace period (the one step of <code>gc</code>, run alone)</td>
+          <td>You explicitly want space back <em>right now</em> and know what you're deleting</td></tr>
+        <tr><td class="mono">git fsck</td><td>Checks integrity, reports corruption, lists unreachable/dangling objects &mdash; changes nothing</td>
+          <td>Something looks lost, or you just want to know what's about to be cleaned up</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout lab" data-anchor="perf-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Build a small repo, orphan a commit on purpose, and watch the whole
+        cast &mdash; <code>fsck</code>, <code>count-objects</code>, and
+        <code>gc</code> &mdash; work together. Fresh throwaway repo, same as
+        always:
+      </p>
+      <pre class="code" data-anchor="perf-lab-code1"><span class="cap">Terminal — a small guild roster, two commits</span><code><span class="cm">$</span> mkdir perf-quest &amp;&amp; cd perf-quest &amp;&amp; git init -q -b main
+<span class="cm">$</span> printf <span class="str">"Guild Roster\nMembers: 1\n"</span> &gt; roster.txt
+<span class="cm">$</span> git add roster.txt &amp;&amp; git commit -q -m <span class="str">"Found the guild"</span>
+<span class="cm">$</span> echo <span class="str">"Members: 2 (+rogue)"</span> &gt;&gt; roster.txt
+<span class="cm">$</span> git add roster.txt &amp;&amp; git commit -q -m <span class="str">"Recruit a rogue"</span>
+<span class="cm">$</span> git log --oneline
+b754f30 Recruit a rogue
+a52058d Found the guild</code></pre>
+        <p>
+        Recruit one more member, then decide &mdash; loudly, and with
+        <code>reset --hard</code> &mdash; that it was a mistake:
+        </p>
+      <pre class="code" data-anchor="perf-lab-code2"><span class="cap">Terminal — a bad recruit, then reset --hard to abandon it</span><code><span class="cm">$</span> echo <span class="str">"Members: 3 (+wizard, unstable build)"</span> &gt;&gt; roster.txt
+<span class="cm">$</span> git add roster.txt &amp;&amp; git commit -q -m <span class="str">"Recruit a wizard (buggy respec)"</span>
+<span class="cm">$</span> git log --oneline
+0ffe6e2 Recruit a wizard (buggy respec)
+b754f30 Recruit a rogue
+a52058d Found the guild
+<span class="cm">$</span> git reset -q --hard HEAD~1
+<span class="cm">$</span> git log --oneline
+b754f30 Recruit a rogue
+a52058d Found the guild</code></pre>
+        <p>
+        The wizard's commit, <code>0ffe6e2</code>, is gone from
+        <code>git log</code> &mdash; but you already know from Chapter 9
+        that <code>reset --hard</code> only moves a pointer. Ask
+        <code>fsck</code> plainly, and it stays quiet:
+        </p>
+      <pre class="code" data-anchor="perf-lab-code3"><span class="cap">Terminal — fsck finds nothing... at first</span><code><span class="cm">$</span> git fsck --unreachable
+<span class="cm">$</span> </code></pre>
+        <p>
+        Nothing printed &mdash; because your reflog still remembers
+        <code>0ffe6e2</code> as somewhere <code>HEAD</code> recently stood,
+        so by default <code>fsck</code> counts it as reachable. Tell it to
+        ignore the reflog and look at raw object-store reachability instead:
+        </p>
+      <pre class="code" data-anchor="perf-lab-code4"><span class="cap">Terminal — the real, un-safety-netted picture</span><code><span class="cm">$</span> git fsck --unreachable --no-reflogs
+unreachable commit 0ffe6e2f560d54091925974edb06031bd45984f1
+unreachable tree f437b92b92f51e22a03c1f40bb29cad464d1022e
+unreachable blob 0c8ca5bbfb96de06266b57a5bbb207d129fbe25e
+<span class="cm">$</span> git fsck --dangling --no-reflogs
+dangling commit 0ffe6e2f560d54091925974edb06031bd45984f1</code></pre>
+        <p>
+        There's the whole abandoned snapshot: the commit, its tree, and the
+        one blob it introduced. <code>--dangling</code> narrows it to just
+        the commit &mdash; exactly the hash you'd hand to
+        <code>git checkout -b</code> if you'd actually wanted that wizard
+        recruit back. Now watch <code>count-objects</code> before and after
+        a cleanup:
+        </p>
+      <pre class="code" data-anchor="perf-lab-code5"><span class="cap">Terminal — count-objects, then git gc, then count-objects again</span><code><span class="cm">$</span> git count-objects -v
+count: <span class="num">9</span>
+size: <span class="num">36</span>
+in-pack: <span class="num">0</span>
+packs: <span class="num">0</span>
+<span class="cm">$</span> git gc
+<span class="cm">$</span> git count-objects -v
+count: <span class="num">0</span>
+in-pack: <span class="num">9</span>
+packs: <span class="num">1</span></code></pre>
+        <p>
+        All nine loose objects &mdash; six from your two real commits, plus
+        the wizard's abandoned commit, tree, and blob &mdash; got folded into
+        one packfile. Notice the wizard's commit didn't get <em>deleted</em>:
+        it's well inside the two-week grace period and the reflog still
+        vouches for it, so <code>gc</code> packed it right alongside
+        everything else instead of pruning it. That's the safety net from
+        the warning above, working exactly as designed &mdash; tidy, but
+        not trigger-happy.
+        </p>
+    </div>
+
+    <h2 data-anchor="perf-binaries-h">Where Git's Model Breaks: Huge Binary Files</h2>
+    <p data-anchor="perf-binaries-p1">
+      Everything above assumes Git's delta compression can do its job, and
+      that job depends on a quiet assumption: that two versions of a file
+      are usually <em>similar</em>, so a delta &mdash; "start from this base,
+      apply these small byte-level edits" &mdash; comes out tiny. That's true
+      for source code, almost by definition. It's often <strong>false</strong>
+      for binary formats. Re-save a Photoshop file, re-export a video, or
+      rebuild a compiled asset, and the bytes on disk can scramble almost
+      completely even though the change "feels" small to a human &mdash; most
+      binary formats aren't laid out for byte-level diffing the way plain
+      text is. Git still tries, but the delta often ends up nearly as big as
+      the file itself, so every version effectively gets stored close to in
+      full. Multiply that by a growing folder of 200MB design files and a
+      few years of history, and you get a repository where
+      <code>git clone</code> takes an actual coffee break.
+    </p>
+
+    <div class="callout tip" data-anchor="perf-lfs-tip">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        The standard fix isn't "compress harder" &mdash; it's
+        <strong>Git LFS</strong> (Large File Storage), and the trick is
+        refreshingly simple: <code>git lfs track "*.psd"</code> tells Git
+        that matching files shouldn't live in the repo at all. Instead, Git
+        commits a tiny text <strong>pointer file</strong> (just an object ID
+        and a size) in their place, while a <code>clean</code> filter
+        uploads the real bytes to separate LFS storage on push, and a
+        <code>smudge</code> filter downloads them back on checkout. Your
+        history stays full of small, fast-to-clone commits; the big binaries
+        live somewhere built to hold them. It's not built into core Git
+        &mdash; it's a companion tool most hosts (GitHub, GitLab, Bitbucket)
+        support natively &mdash; but it's the answer nine times out of ten
+        when someone says "Git is bad with huge binary files."
+      </p>
+    </div>
+
+    <div class="callout key" data-anchor="perf-scale-fact">
+      <span class="co-tag">Fun Fact</span>
+      <p>
+        Ever wonder how GitHub or GitLab keep this snappy at a scale where
+        "big repo" means millions of objects and thousands of pushes a
+        minute? A few of the same ideas from this chapter, industrialized.
+        GitHub replicates every repository across multiple file servers
+        (a system called <strong>Spokes</strong>) and runs <code>git gc</code>
+        as a scheduled background job instead of waiting on your local
+        <code>--auto</code> threshold; GitLab does something similar with a
+        dedicated Git RPC service called <strong>Gitaly</strong>, sharding
+        repositories across nodes. Both also lean on newer Git features built
+        for exactly this problem: <strong>protocol v2</strong> (2018) lets
+        the server filter which refs it even advertises during a fetch,
+        instead of listing every branch and tag up front &mdash; a huge win
+        for repositories with hundreds of thousands of refs. And when the
+        problem is history depth or working-tree size rather than object
+        count, clients can ask for less in the first place: a
+        <strong>shallow clone</strong> (<code>git clone --depth=1</code>)
+        skips old history entirely, while a <strong>partial clone</strong>
+        (<code>git clone --filter=blob:none</code>, since Git 2.19) fetches
+        every commit and tree up front but defers downloading file contents
+        until you actually check them out. None of it changes the object
+        model this book has spent fourteen chapters on &mdash; it's the same
+        blobs, trees, and commits, just served smarter.
+      </p>
+    </div>
+
+    <p data-anchor="perf-close-p1">
+      Zoom out and this chapter has really been about one idea repeated
+      three ways: Git's object model (Chapters 2&ndash;6) is deliberately
+      simple and honest, and <em>performance</em> is what you get by
+      layering smart storage tricks &mdash; packing, pruning, filtering
+      &mdash; on top of that simple model instead of complicating the model
+      itself. A commit is still just a pointer to a tree, whether it's
+      sitting loose, packed, replicated across three servers, or fetched
+      partially over a slow connection. That same "keep the model simple,
+      layer trust and safety on top" instinct is exactly where the book
+      heads next &mdash; Chapter 16 asks a different question about all
+      these objects: not just "are they intact," which <code>fsck</code>
+      already checks, but "can I actually <em>trust</em> that this history
+      is who it says it is?"
+    </p>
+
+    <p class="sources" data-anchor="perf-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/book/en/v2/Git-Internals-Maintenance-and-Data-Recovery" target="_blank" rel="noopener">Pro Git, Ch. 10.7 &mdash; Maintenance and Data Recovery</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-gc" target="_blank" rel="noopener">git-scm.com &mdash; git-gc</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-prune" target="_blank" rel="noopener">git-scm.com &mdash; git-prune</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-fsck" target="_blank" rel="noopener">git-scm.com &mdash; git-fsck</a>
+      &middot;
+      <a href="https://git-lfs.com/" target="_blank" rel="noopener">git-lfs.com &mdash; Git Large File Storage</a>
+      &middot;
+      <a href="https://github.blog/open-source/git/get-up-to-speed-with-partial-clone-and-shallow-clone/" target="_blank" rel="noopener">The GitHub Blog &mdash; Partial Clone and Shallow Clone</a>
+      &middot;
+      <a href="https://github.blog/engineering/infrastructure/stretching-spokes/" target="_blank" rel="noopener">The GitHub Blog &mdash; Stretching Spokes</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="14-git-hooks.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="16-security-and-integrity.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>
