@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Dynamic Linker and Shared Libraries · From Disk to CPU</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="bolt">&gt;_</span> From Disk to CPU</div>
+  <div class="spacer"></div>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapno">Chapter 07</div>
+    <div class="eyebrow">The other program</div>
+    <h1 data-anchor="ch7-h1">The Dynamic Linker and Shared Libraries</h1>
+
+    <p class="lead" data-anchor="ch7-p1">Back in Chapter 6 we saw a <code class="inl">PT_INTERP</code> segment carrying a path: <code class="inl">/lib64/ld-linux-x86-64.so.2</code>. That's not a footnote — it's an instruction to the kernel: "don't just run me — run <em>that</em> program first, and let it finish preparing me."</p>
+
+    <div class="aside" data-anchor="ch7-aside1">Here's the analogy: your <code class="inl">hello</code> binary is like a piece of flat-pack furniture that arrives missing a few screws on purpose — because the manufacturer expects your house (this particular machine, this particular Linux distribution) to already stock those screws in a shared drawer, and re-shipping a fresh set with every single box would be wasteful. The dynamic linker is the assistant who walks over to that shared drawer (<code class="inl">/lib/x86_64-linux-gnu/</code> and friends), finds the exact screws your furniture calls for, and bolts them on before handing you the finished piece.</div>
+
+    <h2 data-anchor="ch7-h2a">What ld-linux.so actually does</h2>
+
+    <p data-anchor="ch7-p2"><code class="inl">ld.so</code> / <code class="inl">ld-linux.so</code> — the dynamic linker/loader — runs as a full program in its own right, mapped into your process's address space right alongside your code. Its job, roughly in order:</p>
+
+    <ol data-anchor="ch7-list1">
+      <li>Read your binary's <code class="inl">PT_DYNAMIC</code> segment to find the list of shared libraries it depends on (things like <code class="inl">libc.so.6</code>).</li>
+      <li><code class="inl">mmap()</code> each of those libraries into memory — they're ELF files too, with their own <code class="inl">PT_LOAD</code> segments.</li>
+      <li>Resolve <em class="term">symbols</em> — patch up every call to <code class="inl">printf</code>, every reference to a library global, so it points at the real address where that function or variable actually landed this time (which changes from run to run, especially under ASLR).</li>
+      <li>Apply any final protections (like making relocated tables read-only — <code class="inl">PT_GNU_RELRO</code>, Chapter 12).</li>
+      <li>Jump to your binary's real entry point, <code class="inl">e_entry</code> — only now does <em>your</em> code get to run.</li>
+    </ol>
+
+    <div class="callout key" data-anchor="ch7-callout1">
+      <span class="tag">Key idea</span>
+      Symbol resolution is why linking is "dynamic": the exact memory address of <code class="inl">printf</code> isn't baked into your binary at compile time. It's discovered fresh, on this machine, on this run, by the dynamic linker — which is precisely what lets you upgrade <code class="inl">libc</code> with a security patch <em>without recompiling every program on your system</em>.
+    </div>
+
+    <h2 data-anchor="ch7-h2b">Static vs. dynamic: the same program, two ways</h2>
+
+    <p data-anchor="ch7-p3">A <em class="term">statically</em> linked binary skips all of this — every library function it calls is copied straight into the executable at link time. No <code class="inl">PT_INTERP</code>, no relay race, no dynamic linker. The tradeoff is size and update story: a static binary is bigger and self-sufficient (great for containers and rescue disks); a dynamic binary is smaller and shares one copy of <code class="inl">libc</code> across every process on the machine (great for memory usage and patching).</p>
+
+    <table class="grid" data-anchor="ch7-table1">
+      <tr><th></th><th>Dynamically linked</th><th>Statically linked</th></tr>
+      <tr><td>PT_INTERP present?</td><td>Yes</td><td>No</td></tr>
+      <tr><td>File size</td><td>Small</td><td>Large (libc baked in)</td></tr>
+      <tr><td>Startup cost</td><td>A bit more (linker does work)</td><td>Slightly less</td></tr>
+      <tr><td>Security patches</td><td>Update one shared <code class="inl">.so</code>, every program benefits</td><td>Must recompile/redeploy each binary</td></tr>
+      <tr><td><code class="inl">ldd</code> output</td><td>Lists real libraries</td><td><code class="inl">not a dynamic executable</code></td></tr>
+    </table>
+
+    <div class="tryit" data-anchor="ch7-tryit1">
+      <h4>Try this</h4>
+      <p>Build <code class="inl">hello.c</code> both ways and compare:</p>
+      <pre class="code"><span class="prompt">$</span> gcc -O0 -o hello-dyn hello.c
+<span class="prompt">$</span> gcc -O0 -static -o hello-static hello.c
+<span class="prompt">$</span> ls -la hello-dyn hello-static
+<span class="out">-rwxr-xr-x 1 you you   16656 hello-dyn
+-rwxr-xr-x 1 you you  873728 hello-static</span>
+<span class="prompt">$</span> ldd hello-dyn
+<span class="out">	linux-vdso.so.1
+	libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6
+	/lib64/ld-linux-x86-64.so.2</span>
+<span class="prompt">$</span> ldd hello-static
+<span class="out">	not a dynamic executable</span></pre>
+      <p>The static binary is roughly 50&times; larger for the same 4 lines of C — that's the entire relevant slice of <code class="inl">libc</code> baked in. <code class="inl">linux-vdso.so.1</code> in the dynamic listing is a special case: the kernel maps it in for free, with no file on disk at all, to make certain syscalls (like getting the time) faster.</p>
+    </div>
+
+    <h2 data-anchor="ch7-h2c">Two knobs worth knowing</h2>
+
+    <p data-anchor="ch7-p4"><code class="inl">LD_LIBRARY_PATH</code> adds extra directories the dynamic linker should search for shared libraries — handy for testing a library build without installing it system-wide. <code class="inl">LD_PRELOAD</code> is more powerful (and more dangerous): it forces specific shared objects to be loaded <em>before</em> anything else, letting their symbols override the normal ones — the classic trick behind tools that intercept <code class="inl">malloc()</code> for memory debugging.</p>
+
+    <pre class="code" data-anchor="ch7-code1"><span class="prompt">$</span> LD_LIBRARY_PATH=./mylibs ./hello
+<span class="prompt">$</span> LD_PRELOAD=./my_malloc_logger.so ./hello</pre>
+
+    <p data-anchor="ch7-p5">Both are read directly by <code class="inl">ld.so</code> itself, before your program's <code class="inl">main()</code> has run a single line — which is exactly why they're such a common lever for both legitimate debugging tools and, historically, a few security tricks. (Notably: <code class="inl">ld.so</code> ignores both in "secure-execution mode" — e.g. for setuid binaries — precisely to close that door.)</p>
+
+    <p class="subtle" data-anchor="ch7-sources">Sources: <a href="https://man7.org/linux/man-pages/man8/ld.so.8.html">ld.so(8) — Linux man-pages</a>.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-segments-how-the-kernel-builds-your-process.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-building-the-process-image.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

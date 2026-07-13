@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tracing Execution with strace · From Disk to CPU</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="bolt">&gt;_</span> From Disk to CPU</div>
+  <div class="spacer"></div>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapno">Chapter 11</div>
+    <div class="eyebrow">Watching it happen</div>
+    <h1 data-anchor="ch11-h1">Tracing Execution with <code class="inl">strace</code></h1>
+
+    <p class="lead" data-anchor="ch11-p1">Static tools show you the blueprint. <code class="inl">strace</code> shows you the building actually going up, syscall by syscall, in real time. It works by attaching to your process with <code class="inl">ptrace()</code> and pausing it at every syscall boundary, printing the call and its result before letting execution continue.</p>
+
+    <div class="aside" data-anchor="ch11-aside1">If <code class="inl">readelf</code> is reading the architect's drawings, <code class="inl">strace</code> is standing on the construction site with a clipboard, writing down every single instruction the foreman shouts to the crew: "open this door," "map this wall," "now go tell the neighbors' handyman (the kernel) to load the plumbing library." Nothing is hidden — you see the entire conversation between your program and the kernel.</div>
+
+    <div class="tryit" data-anchor="ch11-tryit1">
+      <h4>Try this — just the exec</h4>
+      <pre class="code"><span class="prompt">$</span> strace -e trace=execve ./hello
+<span class="out">execve("./hello", ["./hello"], 0x7ffc... /* 41 vars */) = 0
+Hello, kernel!
++++ exited with 0 +++</span></pre>
+      <p>One line — the exact moment we studied in Chapter 2. Filtering to just <code class="inl">execve</code> is the fastest way to see when one program launches another, e.g. inside a shell script or a build system.</p>
+    </div>
+
+    <div class="tryit" data-anchor="ch11-tryit2">
+      <h4>Try this — the whole startup sequence</h4>
+      <p>Drop the filter and you'll see the dynamic linker's own work, live — every <code class="inl">mmap</code>, every library <code class="inl">openat</code>:</p>
+      <pre class="code"><span class="prompt">$</span> strace ./hello
+<span class="out">execve("./hello", ["./hello"], 0x7ffc... ) = 0
+brk(NULL)                              = 0x55a1...
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3...", 832)     = 832
+mmap(NULL, 8365624, PROT_NONE, ...)    = 0x7f2c...
+mmap(0x7f2c..., 1735672, PROT_READ|PROT_EXEC, ...) = 0x7f2c...
+mmap(0x7f2c..., 360448, PROT_READ|PROT_WRITE, ...) = 0x7f2c...
+close(3)                               = 0
+...
+write(1, "Hello, kernel!\n", 16)       = 16
+exit_group(0)                          = ?</span></pre>
+      <p>That block of <code class="inl">openat</code> + <code class="inl">read</code> + several <code class="inl">mmap</code> calls on <code class="inl">libc.so.6</code> is <code class="inl">ld.so</code> doing exactly the work described in Chapter 7 and 9 — mapping the library's own <code class="inl">PT_LOAD</code> segments in, one <code class="inl">PROT_READ|PROT_EXEC</code> region and one <code class="inl">PROT_READ|PROT_WRITE</code> region, just like your own binary got mapped by the kernel a moment earlier.</p>
+    </div>
+
+    <div class="tryit" data-anchor="ch11-tryit3">
+      <h4>Try this — statically linked, for contrast</h4>
+      <p>Trace the static build from Chapter 7 and count how much of that startup noise disappears:</p>
+      <pre class="code"><span class="prompt">$</span> strace -c ./hello-static
+<span class="out">% time     seconds  usecs/call     calls    syscall
+------ ----------- ----------- --------- ----------------
+ 45.20    0.000123         123         1 execve
+ 30.10    0.000082          41         2 mmap
+ 12.40    0.000034          34         1 write
+ ...
+------ ----------- ----------- --------- ----------------
+100.00    0.000273                    12 total</span></pre>
+      <p>No <code class="inl">openat</code> for <code class="inl">libc.so.6</code>, far fewer <code class="inl">mmap</code> calls — the dynamic-linking relay race from Chapter 9 simply never runs, because everything it would have fetched is already baked into the file.</p>
+    </div>
+
+    <h2 data-anchor="ch11-h2a">A few flags worth keeping in your fingers</h2>
+
+    <table class="grid" data-anchor="ch11-table1">
+      <tr><th>Flag</th><th>What it does</th></tr>
+      <tr><td class="mono">-e trace=SET</td><td>Only show syscalls in <code class="inl">SET</code>, e.g. <code class="inl">execve</code>, <code class="inl">open,openat</code>, or a category like <code class="inl">%file</code></td></tr>
+      <tr><td class="mono">-f</td><td>Follow forked child processes too — essential for shell scripts and multi-process programs</td></tr>
+      <tr><td class="mono">-c</td><td>Skip the play-by-play; print a summary table of time and call counts per syscall</td></tr>
+      <tr><td class="mono">-o file</td><td>Write the trace to a file instead of stderr (so it doesn't interleave with the program's own output)</td></tr>
+      <tr><td class="mono">-T</td><td>Show time spent inside each syscall — useful for spotting a slow <code class="inl">read()</code> or <code class="inl">connect()</code></td></tr>
+    </table>
+
+    <div class="callout warn" data-anchor="ch11-callout1">
+      <span class="tag">Watch out</span>
+      <code class="inl">strace</code> works by pausing your process at every syscall via <code class="inl">ptrace()</code>, which is real overhead — a syscall-heavy program can run noticeably slower under trace. It's a diagnostic tool, not something you leave attached to production traffic.
+    </div>
+
+    <p data-anchor="ch11-p2">We've now walked the entire path — from the shell's <code class="inl">fork()</code>+<code class="inl">exec()</code>, through the ELF file's own blueprint, to the kernel-to-linker-to-<code class="inl">main()</code> relay, and finally watched it all happen live with <code class="inl">strace</code>. One topic left: what does the system do to make sure none of this can be hijacked by an attacker?</p>
+
+    <p class="subtle" data-anchor="ch11-sources">Sources: <a href="https://man7.org/linux/man-pages/man1/strace.1.html">strace(1) — Linux man-pages</a>.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="10-peeking-inside-elf-files.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="12-security-and-modern-executables.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
