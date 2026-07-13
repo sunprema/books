@@ -40,7 +40,11 @@
       if (n0) n0.textContent = '';
       return;
     }
-    var W = vp.clientWidth, gap = Math.round(W * 0.08), colW = (W - gap) / 2;
+    // Available inline space is the leaf's CONTENT box — subtract its own
+    // horizontal padding, or two columns won't fit and Chrome collapses to one.
+    var cs = getComputedStyle(leaf);
+    var padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+    var W = vp.clientWidth - padX, gap = Math.round(W * 0.08), colW = (W - gap) / 2;
     leaf.style.columnGap = gap + 'px';
     leaf.style.columnWidth = colW + 'px';
     spread = 2 * (colW + gap);
