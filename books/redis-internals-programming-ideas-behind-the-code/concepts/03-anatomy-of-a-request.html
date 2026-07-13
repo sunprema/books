@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anatomy of a Request &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 3 &middot; Anatomy of a Request</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch3-kicker">Chapter 3 of 12 &middot; The event loop</p>
+    <h1 data-anchor="ch3-h1">Anatomy of a Request: Socket to <span class="hl">Reply</span></h1>
+
+    <p class="lede" data-anchor="ch3-lede">
+      Skip <code>redis-cli</code> for a moment and talk to Redis the way it
+      actually hears you &mdash; over a raw socket, in its wire protocol,
+      RESP:
+    </p>
+
+    <pre class="code" data-anchor="ch3-code1"><span class="cap">Terminal &mdash; raw RESP over a bare TCP connection</span><code><span class="cm">$</span> printf <span class="str">'*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n'</span> | nc localhost 6379
+<span class="fn">+OK</span>\r\n</code></pre>
+
+    <p data-anchor="ch3-p1">
+      That <code>*3\r\n$3\r\nSET\r\n...</code> is a RESP <em>multibulk</em>
+      request: an array of three bulk strings, <code>SET</code>,
+      <code>foo</code>, <code>bar</code>. Every client library you've ever
+      used &mdash; redis-cli included &mdash; is just building strings that
+      look like this. This chapter follows those bytes from the moment they
+      land on the socket to the moment a reply goes back out.
+    </p>
+
+    <h2 data-anchor="ch3-h2-lifecycle">The Lifecycle, Stage by Stage</h2>
+    <ol data-anchor="ch3-list-lifecycle">
+      <li><strong>Connection setup.</strong> <code>accept()</code> fires as a
+      file event on the listening socket; Redis allocates a
+      <span class="src-chip">client</span> struct, sets it non-blocking, and
+      registers a new file event for <em>reads</em> on the new connection.</li>
+      <li><strong>Input buffer handling.</strong> When bytes arrive,
+      <code>readQueryFromClient()</code> reads them into the client's query
+      buffer &mdash; a growable string, not one read-per-command, so a
+      pipeline of many commands in one TCP packet is handled efficiently.</li>
+      <li><strong>Protocol parsing.</strong> <code>processInputBuffer()</code>
+      splits the buffer into complete commands, understanding both the
+      multibulk form above and a simpler inline form (space-separated,
+      newline-terminated &mdash; mostly for humans typing directly into
+      <code>telnet</code>).</li>
+      <li><strong>Command lookup.</strong> The first bulk string
+      (<code>SET</code>) is looked up in the command table &mdash; the
+      subject of Chapter 7.</li>
+      <li><strong>Execution.</strong> The command's handler function runs,
+      reading or mutating the keyspace directly &mdash; no queue, no
+      indirection, just a function call.</li>
+      <li><strong>Reply buffering.</strong> The handler doesn't write to the
+      socket directly; it calls <code>addReply()</code> and friends, which
+      append the RESP-encoded reply to the client's <em>output</em> buffer.</li>
+      <li><strong>Flushing.</strong> Just before the event loop goes back to
+      sleep waiting for more events (<code>beforeSleep()</code>), every
+      client with pending output gets it written to its socket, batching the
+      syscalls instead of doing one write per reply.</li>
+    </ol>
+
+    <figure class="diagram" data-anchor="ch3-diagram">
+      <svg viewBox="0 0 780 200" role="img" aria-labelledby="ch3-svg-title">
+        <title id="ch3-svg-title">The pipeline a request travels: accept, read into input buffer, parse RESP, look up command, execute, buffer reply, flush at beforeSleep.</title>
+        <g font-family="var(--font-mono)" font-size="10">
+          <!-- pipeline boxes -->
+          <g fill="var(--bg-2)">
+            <rect x="10"  y="70" width="95" height="52" rx="7" stroke="var(--ty)" stroke-width="1.4"></rect>
+            <rect x="120" y="70" width="95" height="52" rx="7" stroke="var(--ty)" stroke-width="1.4"></rect>
+            <rect x="230" y="70" width="95" height="52" rx="7" stroke="var(--kw)" stroke-width="1.4"></rect>
+            <rect x="340" y="70" width="95" height="52" rx="7" stroke="var(--mac)" stroke-width="1.4"></rect>
+            <rect x="450" y="70" width="95" height="52" rx="7" stroke="var(--fn)" stroke-width="1.4"></rect>
+            <rect x="560" y="70" width="105" height="52" rx="7" stroke="var(--num)" stroke-width="1.4"></rect>
+            <rect x="680" y="70" width="90" height="52" rx="7" stroke="var(--accent)" stroke-width="1.4"></rect>
+          </g>
+          <text x="57"  y="93"  text-anchor="middle" fill="var(--ty)">accept()</text>
+          <text x="57"  y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">new client</text>
+          <text x="167" y="93"  text-anchor="middle" fill="var(--ty)">read into</text>
+          <text x="167" y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">query buffer</text>
+          <text x="277" y="93"  text-anchor="middle" fill="var(--kw)">parse RESP</text>
+          <text x="277" y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">multibulk / inline</text>
+          <text x="387" y="93"  text-anchor="middle" fill="var(--mac)">lookup</text>
+          <text x="387" y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">command table</text>
+          <text x="497" y="93"  text-anchor="middle" fill="var(--fn)">execute</text>
+          <text x="497" y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">mutate keyspace</text>
+          <text x="612" y="93"  text-anchor="middle" fill="var(--num)">addReply()</text>
+          <text x="612" y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">output buffer</text>
+          <text x="725" y="93"  text-anchor="middle" fill="var(--accent)">flush</text>
+          <text x="725" y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">beforeSleep()</text>
+
+          <g stroke="var(--rule)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow3)">
+            <path d="M105,96 L120,96"></path>
+            <path d="M215,96 L230,96"></path>
+            <path d="M325,96 L340,96"></path>
+            <path d="M435,96 L450,96"></path>
+            <path d="M545,96 L560,96"></path>
+            <path d="M665,96 L680,96"></path>
+          </g>
+          <text x="390" y="175" text-anchor="middle" fill="var(--ink-soft)" font-size="10">one client's turn, start to finish &mdash; then the loop moves to the next ready socket</text>
+        </g>
+        <defs>
+          <marker id="arrow3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--rule)"></path>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>The full request pipeline.</strong> Nothing here is
+        asynchronous with respect to the dataset &mdash; execution is a
+        direct function call, not a task handed off elsewhere. That's what
+        makes step 5 atomic (Chapter 7) and step 7's batching possible.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ch3-h2-blocking">What Actually Blocks the Loop</h2>
+    <p data-anchor="ch3-p2">
+      "Single-threaded" means the loop can only be doing one thing. The
+      danger is any command whose execution step takes a long time in
+      wall-clock terms: a full keyspace scan (<code>KEYS *</code>), a huge
+      <code>SORT</code> or <code>LRANGE</code> over millions of elements, an
+      unbounded Lua script. None of these are illegal &mdash; they're just
+      commands whose cost scales with data size instead of staying constant,
+      and on a single thread, that cost is paid by <em>every other client</em>
+      as wait time.
+    </p>
+
+    <div class="callout tip" data-anchor="ch3-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        This is exactly why <code>SCAN</code> exists next to <code>KEYS</code>.
+        <code>KEYS *</code> does all its O(N) work in one command, blocking
+        the loop for the whole scan. <code>SCAN</code> does the same
+        traversal but hands you a cursor, doing a small bounded slice of work
+        per call &mdash; the same "break a big job into small increments"
+        trick you'll see again for rehashing (Ch. 6) and expiration (Ch. 10).
+        Prefer <code>SCAN</code> in any code path that runs against
+        production.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch3-h2-blocking-cmds">The Clever Part: "Blocking" Commands Don't Block the Loop</h2>
+    <p data-anchor="ch3-p3">
+      <code>BLPOP</code> looks, from a client's point of view, like it blocks:
+      the connection just sits there until another client pushes to the list.
+      But it does <strong>not</strong> block the event loop for anyone else.
+      When a client issues <code>BLPOP</code> against an empty list, Redis
+      marks that one client as "blocked waiting on this key," parks it on a
+      per-key waiting list, and immediately returns control to the loop to
+      serve other clients. The moment some other client runs an
+      <code>RPUSH</code> on that key, Redis notices the key now has waiters,
+      wakes the blocked client, and serves its reply &mdash; all still
+      one command at a time, never actually pausing the thread to wait.
+    </p>
+
+    <div class="callout key" data-anchor="ch3-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        "Blocking" in Redis is a client-visible illusion built entirely out of
+        bookkeeping &mdash; a waiting list per key and a wake-up check after
+        every write &mdash; not an actual blocked OS thread. It's a clean
+        example of the recurring habit (Chapter 12 names it directly): solve
+        a concurrency-shaped problem with a small data structure instead of
+        an actual concurrency primitive.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="ch3-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        A truly long-running piece of <em>execution</em> &mdash; not waiting,
+        actual CPU-bound work, like a Lua script stuck in a loop &mdash;
+        genuinely does stall the whole server, because step 5 above really is
+        one uninterruptible function call. Redis's answer isn't to make
+        execution preemptible (that would reopen every concurrency problem
+        Chapter 2 avoided) &mdash; it's <code>lua-time-limit</code> /
+        script timeouts and operational discipline: keep any single
+        command's work bounded.
+      </p>
+    </div>
+
+    <p data-anchor="ch3-close-p1">
+      Every stage in this pipeline eventually reads or writes an object
+      sitting in the keyspace. What that object actually looks like in
+      memory &mdash; and why Redis represents the same logical type in
+      several different physical shapes &mdash; is next.
+    </p>
+
+    <p class="sources" data-anchor="ch3-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://pauladamsmith.com/blog/2011/03/redis_get_set.html" target="_blank" rel="noopener">Paul Smith &mdash; Tracing a GET &amp; SET</a>
+      &middot;
+      <a href="https://redis.io/docs/latest/develop/reference/protocol-spec/" target="_blank" rel="noopener">redis.io &mdash; RESP protocol spec</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="02-the-event-loop.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="04-the-object-model-and-strings.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

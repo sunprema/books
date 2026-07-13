@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What Redis Is Really Optimizing For &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 1 &middot; The System</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch1-kicker">Chapter 1 of 12 &middot; Redis as a system</p>
+    <h1 data-anchor="ch1-h1">What Redis Is Really Optimizing <span class="hl">For</span></h1>
+
+    <p class="lede" data-anchor="ch1-lede">
+      Open a terminal, start <code>redis-server</code>, and run one command:
+    </p>
+
+    <pre class="code" data-anchor="ch1-code1"><span class="cap">Terminal &mdash; a single round trip</span><code><span class="cm">$</span> redis-cli SET session:42 <span class="str">"alive"</span>
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli GET session:42
+<span class="str">"alive"</span>
+<span class="cm">$</span> redis-cli --latency -i 1
+<span class="cm">min: 0, max: 1, avg: 0.14 (312 samples)</span></code></pre>
+
+    <p data-anchor="ch1-p1">
+      Sub-millisecond, every time, no matter how busy the box is with other
+      clients. That consistency &mdash; not raw throughput &mdash; is the
+      entire design brief for Redis. It's easy to build something that's fast
+      <em>on average</em>. It's much harder to build something that's fast
+      <strong>reliably</strong>, and that harder goal is what shaped nearly
+      every decision in this codebase.
+    </p>
+
+    <h2 data-anchor="ch1-h2-latency">Latency Over Throughput</h2>
+    <p data-anchor="ch1-p2">
+      A database optimized purely for throughput will happily let one client's
+      big, slow operation eat into everyone else's response time &mdash; as
+      long as the aggregate numbers look good. Redis takes the opposite bet:
+      it would rather do less total work per second than let a single slow
+      operation introduce a latency spike for every other client waiting
+      behind it. You'll see this bet paid off, concretely, in almost every
+      later chapter: rehashing a hash table happens a few buckets at a time
+      instead of all at once (Chapter 6), expired keys are swept in small
+      timed batches instead of a full scan (Chapter 10), and the persistence
+      subsystem forks a whole separate process rather than pause the server to
+      write a snapshot (Chapter 8). None of these are obvious choices. All of
+      them trade a little bit of "maximum possible throughput" for a lot of
+      "no client ever waits behind a big job it didn't ask for."
+    </p>
+
+    <div class="callout key" data-anchor="ch1-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Predictability is a feature. A store that answers in 0.2ms nine times
+        out of ten and 200ms the tenth time is, for most applications, worse
+        than one that answers in 0.5ms every single time. Redis's internals
+        are full of small, unglamorous decisions made purely in service of
+        that predictability.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch1-h2-constraints">The Big Design Constraints</h2>
+    <p data-anchor="ch1-p3">
+      Three constraints fall directly out of that priority, and together they
+      explain most of the rest of this book:
+    </p>
+    <ul data-anchor="ch1-list-constraints">
+      <li><strong>Single-threaded command execution.</strong> Exactly one
+      command runs at a time against the dataset. No two commands ever
+      interleave mid-execution, so there's no lock to take, no race to guard
+      against, and no scheduler surprise &mdash; the price is that one slow
+      command really can hold up the line (Chapters 2, 3, and 7 unpack this
+      trade in full).</li>
+      <li><strong>An in-memory primary data path.</strong> The dataset a
+      command reads and writes lives entirely in RAM. Disk is never on the
+      critical path of a normal <code>GET</code> or <code>SET</code> &mdash;
+      it only shows up as a background concern.</li>
+      <li><strong>Persistence as a side concern, not a bottleneck.</strong>
+      Durability (RDB snapshots, the append-only file) is handled by
+      mechanisms designed to stay out of the main thread's way &mdash;
+      forking a child process, batching disk writes &mdash; rather than
+      making every write wait on a disk fsync (Chapter 8).</li>
+    </ul>
+    <p data-anchor="ch1-p4">
+      There's a fourth, quieter constraint too: <strong>protocol and
+      operational simplicity</strong>. Redis speaks one small text-ish wire
+      protocol (RESP), ships one binary, and mostly avoids the kind of
+      configuration sprawl that turns an infrastructure component into a
+      research project. That simplicity isn't a lack of ambition &mdash; it's
+      the same "reduce the number of ways this can surprise you" instinct
+      applied to operations instead of just to latency.
+    </p>
+
+    <figure class="diagram" data-anchor="ch1-diagram">
+      <svg viewBox="0 0 760 230" role="img" aria-labelledby="ch1-svg-title">
+        <title id="ch1-svg-title">A command's path through the system: client, over the wire, into the single event loop, through the command table, into a core data structure, and back out as a reply &mdash; the map the rest of this book fills in.</title>
+        <g font-family="var(--font-mono)" font-size="11">
+          <rect x="10" y="80" width="120" height="52" rx="8" fill="var(--code-bg)" stroke="var(--ty)" stroke-width="1.5"></rect>
+          <text x="70" y="102" text-anchor="middle" fill="var(--ty)" font-weight="700">client</text>
+          <text x="70" y="118" text-anchor="middle" fill="var(--ink-soft)" font-size="9">redis-cli</text>
+
+          <path d="M130,106 L200,106" stroke="var(--rule)" stroke-width="1.5" stroke-dasharray="4,4" fill="none" marker-end="url(#arrow1)"></path>
+
+          <rect x="200" y="70" width="150" height="72" rx="8" fill="var(--bg-2)" stroke="var(--kw)" stroke-width="1.5"></rect>
+          <text x="275" y="94" text-anchor="middle" fill="var(--kw)" font-weight="700">event loop</text>
+          <text x="275" y="110" text-anchor="middle" fill="var(--ink-soft)" font-size="9">ae.c &middot; ch. 2&ndash;3</text>
+          <text x="275" y="124" text-anchor="middle" fill="var(--ink-soft)" font-size="9">parse &amp; dispatch</text>
+
+          <path d="M350,106 L420,106" stroke="var(--rule)" stroke-width="1.5" stroke-dasharray="4,4" fill="none" marker-end="url(#arrow1)"></path>
+
+          <rect x="420" y="70" width="150" height="72" rx="8" fill="var(--bg-2)" stroke="var(--mac)" stroke-width="1.5"></rect>
+          <text x="495" y="94" text-anchor="middle" fill="var(--mac)" font-weight="700">command table</text>
+          <text x="495" y="110" text-anchor="middle" fill="var(--ink-soft)" font-size="9">server.commands</text>
+          <text x="495" y="124" text-anchor="middle" fill="var(--ink-soft)" font-size="9">ch. 7</text>
+
+          <path d="M570,106 L640,106" stroke="var(--rule)" stroke-width="1.5" stroke-dasharray="4,4" fill="none" marker-end="url(#arrow1)"></path>
+
+          <rect x="640" y="70" width="115" height="72" rx="8" fill="var(--bg-2)" stroke="var(--fn)" stroke-width="1.5"></rect>
+          <text x="697" y="94" text-anchor="middle" fill="var(--fn)" font-weight="700">t_*.c</text>
+          <text x="697" y="110" text-anchor="middle" fill="var(--ink-soft)" font-size="9">objects &amp;</text>
+          <text x="697" y="124" text-anchor="middle" fill="var(--ink-soft)" font-size="9">encodings, ch. 4&ndash;6</text>
+
+          <path d="M697,142 C697,190 275,190 275,142" stroke="var(--rule)" stroke-width="1.5" stroke-dasharray="4,4" fill="none" marker-end="url(#arrow1)"></path>
+          <text x="486" y="205" text-anchor="middle" fill="var(--ink-soft)" font-size="10">reply flows back the same road, in one pass</text>
+        </g>
+        <defs>
+          <marker id="arrow1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--rule)"></path>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>The map for this whole book.</strong> Every chapter zooms into
+        one box of this picture: how the loop dispatches (Ch. 2&ndash;3), how
+        the command table decides atomicity (Ch. 7), how objects choose their
+        physical encoding (Ch. 4&ndash;6), and, later, everything that happens
+        <em>beside</em> this path &mdash; persistence, replication, expiry.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ch1-h2-codebase">Reading the Codebase: A Five-Minute Orientation</h2>
+    <p data-anchor="ch1-p5">
+      The Redis source tree rewards curiosity &mdash; it's a few hundred
+      thousand lines of quite readable C, organized by subsystem rather than
+      by layer. A handful of files carry most of the weight you'll meet in
+      this book:
+    </p>
+    <table data-anchor="ch1-table-files">
+      <thead><tr><th>File</th><th>What lives there</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">server.c / server.h</td><td>The main loop wiring, the global <span class="src-chip">struct redisServer server</span>, startup sequence.</td></tr>
+        <tr><td class="mono">ae.c</td><td>The event library &mdash; file events and time events (Chapter 2).</td></tr>
+        <tr><td class="mono">networking.c</td><td>Reading query bytes, writing reply bytes, client buffers (Chapter 3).</td></tr>
+        <tr><td class="mono">object.c</td><td>The generic <span class="src-chip">robj</span> object and its encodings (Chapter 4).</td></tr>
+        <tr><td class="mono">t_string.c, t_list.c, t_hash.c, t_set.c, t_zset.c</td><td>One file per data type, each supporting several physical encodings (Chapters 4&ndash;5).</td></tr>
+        <tr><td class="mono">dict.c</td><td>The hash table used everywhere, including the main keyspace (Chapter 6).</td></tr>
+        <tr><td class="mono">rdb.c, aof.c</td><td>The two persistence formats (Chapter 8).</td></tr>
+        <tr><td class="mono">replication.c, cluster.c</td><td>Master/replica sync and sharded clustering (Chapter 9).</td></tr>
+        <tr><td class="mono">expire.c, evict.c</td><td>Key expiration and memory-pressure eviction (Chapter 10).</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout tip" data-anchor="ch1-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        Naming is consistent enough to navigate by grep alone. Every command
+        handler is named <code>&lt;commandName&gt;Command</code> &mdash;
+        <code>getCommand</code>, <code>setCommand</code>,
+        <code>expireCommand</code>. If you want to trace any command end to
+        end, that's your entry point: find the handler, then read outward.
+        Chapter 12 turns this into a repeatable habit.
+      </p>
+    </div>
+
+    <p data-anchor="ch1-close-p1">
+      Keep that map in mind as you read on. Every remaining chapter is really
+      answering one question: given that Redis has committed to
+      "predictable and simple" over "maximal and clever," what specific,
+      inventive engineering does it take to still be this fast? The answer,
+      chapter after chapter, turns out to be the same handful of tricks
+      applied in different corners of the codebase &mdash; which is exactly
+      the point Chapter 12 will make explicit.
+    </p>
+
+    <p class="sources" data-anchor="ch1-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://redis.io/docs/latest/operate/oss_and_stack/" target="_blank" rel="noopener">redis.io &mdash; Open Source docs</a>
+      &middot;
+      <a href="https://github.com/redis/redis" target="_blank" rel="noopener">github.com/redis/redis</a>
+      &middot;
+      <a href="https://github.com/zpoint/Redis-Internals" target="_blank" rel="noopener">zpoint/Redis-Internals</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="02-the-event-loop.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

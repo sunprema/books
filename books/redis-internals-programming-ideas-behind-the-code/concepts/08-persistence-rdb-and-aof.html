@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Persistence: RDB Snapshots and the Append-Only File &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 8 &middot; Persistence</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch8-kicker">Chapter 8 of 12 &middot; Persistence</p>
+    <h1 data-anchor="ch8-h1">Persistence: RDB Snapshots and the <span class="hl">Append-Only File</span></h1>
+
+    <p class="lede" data-anchor="ch8-lede">
+      Trigger a background save on a server holding a few gigabytes of data,
+      and keep issuing commands the entire time:
+    </p>
+
+    <pre class="code" data-anchor="ch8-code1"><span class="cap">Terminal &mdash; a snapshot that doesn't pause the server</span><code><span class="cm">$</span> redis-cli BGSAVE
+<span class="fn">Background saving started</span>
+<span class="cm">$</span> redis-cli SET still:working <span class="str">"yes"</span>   <span class="cm"># answers immediately, mid-save</span>
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli INFO persistence | grep rdb_bgsave_in_progress
+<span class="cm">rdb_bgsave_in_progress:1</span></code></pre>
+
+    <p data-anchor="ch8-p1">
+      Writing gigabytes of data to disk is a slow operation by the standards
+      of an in-memory database &mdash; exactly the kind of thing Chapter 1
+      said must never block the main thread. Redis solves this with one
+      well-chosen operating-system trick, applied to both of its persistence
+      formats.
+    </p>
+
+    <h2 data-anchor="ch8-h2-rdb">RDB: fork(), Then Get Out of the Way</h2>
+    <p data-anchor="ch8-p2">
+      <code>BGSAVE</code> calls <code>fork()</code>. The child process
+      receives, in effect, a private snapshot of the parent's entire memory
+      &mdash; but thanks to the OS's copy-on-write page mapping, that snapshot
+      costs almost nothing up front: parent and child share the same physical
+      memory pages until one of them writes to a page, at which point the OS
+      copies just <em>that</em> page for the writer. The child walks the
+      (now-frozen, from its point of view) dataset and writes it out as one
+      compact binary <strong>RDB</strong> file; the parent goes right back to
+      serving commands, and any key the parent modifies while the child is
+      still saving simply triggers a copy-on-write for that one page &mdash;
+      the child's view stays exactly as it was at the instant of the fork.
+    </p>
+
+    <figure class="diagram" data-anchor="ch8-diagram">
+      <svg viewBox="0 0 700 230" role="img" aria-labelledby="ch8-svg-title">
+        <title id="ch8-svg-title">Fork and copy-on-write: parent and child processes initially share every memory page; a write by the parent to a shared page triggers the OS to copy only that page, leaving the child's snapshot view of the rest of memory untouched.</title>
+        <g font-family="var(--font-mono)" font-size="10.5">
+          <rect x="40" y="30" width="180" height="46" rx="8" fill="var(--code-bg)" stroke="var(--ty)" stroke-width="1.6"></rect>
+          <text x="130" y="58" text-anchor="middle" fill="var(--ty)" font-weight="700">parent (serving clients)</text>
+
+          <rect x="480" y="30" width="180" height="46" rx="8" fill="var(--code-bg)" stroke="var(--mac)" stroke-width="1.6"></rect>
+          <text x="570" y="58" text-anchor="middle" fill="var(--mac)" font-weight="700">child (writing RDB)</text>
+
+          <text x="350" y="105" text-anchor="middle" fill="var(--ink-soft)" font-size="10">shared physical pages (copy-on-write)</text>
+          <g fill="var(--bg-2)" stroke="var(--rule)" stroke-width="1.2">
+            <rect x="120" y="115" width="46" height="34" rx="4"></rect>
+            <rect x="180" y="115" width="46" height="34" rx="4"></rect>
+            <rect x="240" y="115" width="46" height="34" rx="4"></rect>
+            <rect x="300" y="115" width="46" height="34" rx="4"></rect>
+            <rect x="360" y="115" width="46" height="34" rx="4"></rect>
+            <rect x="420" y="115" width="46" height="34" rx="4"></rect>
+            <rect x="480" y="115" width="46" height="34" rx="4"></rect>
+            <rect x="540" y="115" width="46" height="34" rx="4"></rect>
+          </g>
+          <path d="M130,76 L143,115" stroke="var(--ty)" stroke-width="1.2" fill="none" stroke-dasharray="2,2"></path>
+          <path d="M570,76 L563,115" stroke="var(--mac)" stroke-width="1.2" fill="none" stroke-dasharray="2,2"></path>
+
+          <rect x="240" y="115" width="46" height="34" rx="4" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="2.2"></rect>
+          <text x="263" y="163" text-anchor="middle" fill="var(--kw)" font-size="9">parent writes here</text>
+          <path d="M263,149 L263,175" stroke="var(--kw)" stroke-width="1.4" fill="none" marker-end="url(#arrow8)"></path>
+          <rect x="240" y="180" width="46" height="34" rx="4" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.6" stroke-dasharray="3,2"></rect>
+          <text x="263" y="228" text-anchor="middle" fill="var(--kw)" font-size="9">OS copies just this page</text>
+        </g>
+        <defs>
+          <marker id="arrow8" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--kw)"></path></marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>One syscall buys an entire consistent snapshot.</strong> The
+        parent never copies the dataset itself &mdash; the OS's page tables
+        do that lazily, one page at a time, only for pages that actually
+        change during the save.
+      </figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch8-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        <code>fork()</code> plus copy-on-write turns "take a consistent
+        snapshot of a live, changing dataset" from an application-level
+        problem into an operating-system-level one Redis gets almost for
+        free. It's a great example of reaching for the right layer to solve a
+        problem instead of building elaborate machinery yourself.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="ch8-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        <code>fork()</code> itself is not entirely free &mdash; copying page
+        <em>tables</em> (not the pages themselves) still takes time
+        proportional to how much memory the process maps, so on a very large
+        dataset the fork call itself can pause the parent for tens to
+        hundreds of milliseconds. That's exactly the kind of latency spike
+        Chapter 1 wants to avoid, which is why <code>BGSAVE</code> frequency
+        and replica full-syncs (Chapter 9, which also forks for RDB) are
+        operational levers worth tuning on memory-heavy deployments.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch8-h2-aof">AOF: Log Every Write, Replay on Restart</h2>
+    <p data-anchor="ch8-p2b">
+      The append-only file takes the opposite approach: instead of a
+      point-in-time snapshot, it logs every write command as it happens, so
+      recovery means replaying the log from the start. Three
+      <code>appendfsync</code> policies trade durability against write
+      latency directly:
+    </p>
+    <table data-anchor="ch8-table-fsync">
+      <thead><tr><th>Policy</th><th>Behavior</th><th>Worst-case data loss</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">always</td><td><code>fsync</code> after every single write</td><td class="good">effectively none</td></tr>
+        <tr><td class="mono">everysec</td><td><code>fsync</code> once per second (the default)</td><td class="bad">up to ~1 second</td></tr>
+        <tr><td class="mono">no</td><td>let the OS decide when to flush</td><td class="bad">up to the OS flush interval</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="ch8-p3">
+      <code>everysec</code> is the default for a reason: it's close to
+      <code>always</code>'s durability in practice, but at a small fraction
+      of its latency cost, because it batches many writes' worth of fsyncing
+      into one syscall per second instead of one per command.
+    </p>
+
+    <h2 data-anchor="ch8-h2-rewrite">Rewrite: Compacting the Log</h2>
+    <p data-anchor="ch8-p4">
+      A pure append-only log of every write ever issued would grow forever
+      &mdash; ten thousand increments to the same counter is ten thousand log
+      lines for a value <code>GET</code> could reconstruct from just one.
+      <code>BGREWRITEAOF</code> fixes this the same way <code>BGSAVE</code>
+      does: it forks a child that writes a fresh, minimal AOF representing
+      only the dataset's <em>current</em> state, while the parent keeps
+      logging new writes to the old file (and, since Redis 7's multi-part
+      AOF, to a small incremental file alongside a base file, tracked by a
+      manifest) until the rewrite finishes and the files are swapped over.
+    </p>
+
+    <div class="callout lab" data-anchor="ch8-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Enable both: <code>redis-cli CONFIG SET appendonly yes</code>, then
+        watch <code>redis-cli INFO persistence</code> for
+        <code>aof_rewrite_in_progress</code> while you run
+        <code>BGREWRITEAOF</code>. Compare the file sizes of
+        <code>dump.rdb</code> and the AOF directory for the same dataset
+        &mdash; RDB is almost always smaller, since it stores final values,
+        not the history of commands that produced them.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch8-h2-recovery">Crash Recovery and Choosing a Durability Profile</h2>
+    <p data-anchor="ch8-p5">
+      On startup, Redis prefers the AOF over the RDB file if both are present
+      and AOF is enabled &mdash; it's the more complete, more recent record.
+      A corrupted AOF tail (from a crash mid-write) is handled with
+      <code>redis-check-aof</code>, which can truncate the log back to the
+      last complete, valid command rather than refuse to start. None of this
+      is automatic magic: choosing RDB-only, AOF-only, or both (the common
+      production choice) is a real decision about how much data loss on
+      crash is acceptable, traded directly against write-path latency and
+      operational complexity &mdash; Chapter 1's core theme, once more, now
+      applied to durability instead of raw command latency.
+    </p>
+
+    <p data-anchor="ch8-close-p1">
+      Persistence answers "what happens if this one server crashes."
+      Replication and clustering answer the next question up: what happens
+      when one server isn't enough, either for availability or for scale?
+      That's next.
+    </p>
+
+    <p class="sources" data-anchor="ch8-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/" target="_blank" rel="noopener">redis.io &mdash; Persistence</a>
+      &middot;
+      <a href="https://www.alibabacloud.com/blog/design-and-implementation-of-redis-7-0-multi-part-aof_599199" target="_blank" rel="noopener">Alibaba Cloud &mdash; Redis 7.0 Multi-Part AOF</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-command-dispatch-and-atomicity.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="09-replication-and-clustering.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>
