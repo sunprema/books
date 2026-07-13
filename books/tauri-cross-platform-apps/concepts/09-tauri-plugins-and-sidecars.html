@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Plugins and Sidecars — Tauri: Cross-Platform Apps</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="bolt">&#9635;</span> Tauri Field Guide</div>
+  <div class="spacer"></div>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapno" data-anchor="pi-chapno">Chapter 09</p>
+    <p class="eyebrow" data-anchor="pi-eyebrow">Two Ways Core Grows Without You Rewriting the World in Rust</p>
+    <h1 data-anchor="pi-h1">Plugins and Sidecars</h1>
+
+    <p class="lead" data-anchor="pi-lead">
+      Chapter&nbsp;3 gave you the two words and a one-line test: reimplementing an existing tool as a plugin, or
+      reaching for a sidecar when a plugin already does the job, both waste real effort. This chapter is the deep
+      version &mdash; how to reach for an official plugin first, when writing your own actually pays off, how a
+      sidecar binary actually gets bundled and spawned, and why both still answer to the capability system from
+      Chapter&nbsp;8.
+    </p>
+
+    <h2 data-anchor="pi-h2-recap">The test, restated</h2>
+    <p data-anchor="pi-p-recap-1">
+      A <span class="badge tag-plugin">plugin</span> runs <em>inside</em> Core &mdash; a Rust crate (plus an
+      optional JS package) that registers its own commands, events, and state into your app's own process at
+      startup. A <span class="badge tag-sidecar">sidecar</span> runs <em>beside</em> Core &mdash; a separately
+      compiled binary that Core spawns as its own OS process and talks to over stdio, the way a shell script
+      shells out to another program. Same question every time a feature needs something outside the webview:
+      does Tauri (or the plugin ecosystem) already have Rust code for this, or does a working, already-written
+      program for this already exist on disk?
+    </p>
+
+    <figure class="schematic diagram" data-anchor="pi-fig-shape">
+      <svg viewBox="0 0 640 320" role="img" aria-labelledby="pi-fig-title pi-fig-desc">
+        <title id="pi-fig-title">A plugin runs inside Core's process; a sidecar runs as its own spawned process</title>
+        <desc id="pi-fig-desc">The webview sends commands to Core and receives events back. Inside Core's own process boundary sits an inset box representing a registered plugin, reached by an ordinary in-process function call. Outside that boundary, connected by a spawn arrow and a stdio pipe, sits a separate sidecar process that Core starts and supervises but does not share memory with.</desc>
+
+        <rect class="node fe" x="20" y="110" width="140" height="90" rx="10"/>
+        <text class="node-label" x="90" y="100" text-anchor="middle">WEBVIEW</text>
+        <text x="90" y="150" text-anchor="middle" font-size="10.5" fill="var(--ink)">your frontend</text>
+        <text x="90" y="168" text-anchor="middle" font-size="10.5" fill="var(--ink)">code</text>
+
+        <rect class="node rs" x="230" y="20" width="220" height="280" rx="10"/>
+        <text class="node-label" x="340" y="10" text-anchor="middle">CORE &mdash; ONE RUST PROCESS</text>
+        <text x="340" y="55" text-anchor="middle" font-size="10.5" fill="var(--ink)">your own #[tauri::command]s</text>
+
+        <rect x="253" y="150" width="174" height="72" rx="8" fill="rgba(199,146,234,.10)" stroke="var(--mac)" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="340" y="140" text-anchor="middle" font-size="10.5" fill="var(--mac)">PLUGIN (in-process)</text>
+        <text x="340" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink)">tauri-plugin-store</text>
+        <text x="340" y="200" text-anchor="middle" font-size="9.5" fill="var(--ink-soft)">an ordinary Rust call &mdash;</text>
+        <text x="340" y="213" text-anchor="middle" font-size="9.5" fill="var(--ink-soft)">no process boundary crossed</text>
+
+        <line x1="470" y1="60" x2="470" y2="280" stroke="var(--edge-2)" stroke-width="1.5" stroke-dasharray="2 5"/>
+        <text x="478" y="70" font-size="9" fill="var(--ink-soft)">OS process</text>
+        <text x="478" y="83" font-size="9" fill="var(--ink-soft)">boundary</text>
+
+        <rect x="500" y="150" width="120" height="80" rx="8" fill="rgba(240,161,90,.08)" stroke="var(--num)" stroke-width="1.5"/>
+        <text x="560" y="140" text-anchor="middle" font-size="10.5" fill="var(--num)">SIDECAR PROCESS</text>
+        <text x="560" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink)">whisper-cli</text>
+        <text x="560" y="198" text-anchor="middle" font-size="9.5" fill="var(--ink-soft)">spawned, supervised,</text>
+        <text x="560" y="211" text-anchor="middle" font-size="9.5" fill="var(--ink-soft)">no shared memory</text>
+
+        <path class="trace command" d="M160,140 H230" marker-end="url(#pi-arrow-kw)"/>
+        <text x="195" y="132" text-anchor="middle" font-size="9" fill="var(--kw)">invoke()</text>
+        <path class="trace event" d="M230,175 H160" marker-end="url(#pi-arrow-en)"/>
+        <text x="195" y="192" text-anchor="middle" font-size="9" fill="var(--en)">emit()</text>
+
+        <path d="M470,175 H500" stroke="var(--num)" stroke-width="2" stroke-dasharray="3 4" fill="none" marker-end="url(#pi-arrow-num)"/>
+        <text x="485" y="167" text-anchor="middle" font-size="8.5" fill="var(--num)">spawn</text>
+        <path d="M500,205 H470" stroke="var(--num)" stroke-width="2" stroke-dasharray="1 5" fill="none" marker-end="url(#pi-arrow-num)"/>
+        <text x="485" y="220" text-anchor="middle" font-size="8.5" fill="var(--num)">stdio</text>
+
+        <defs>
+          <marker id="pi-arrow-kw" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--kw)"/></marker>
+          <marker id="pi-arrow-en" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--en)"/></marker>
+          <marker id="pi-arrow-num" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--num)"/></marker>
+        </defs>
+      </svg>
+      <div class="legend">
+        <span><i class="command"></i> command &mdash; request/response</span>
+        <span><i class="event" style="background:var(--en);border-top-color:var(--en)"></i> event &mdash; pub/sub</span>
+        <span><i style="background:var(--num)"></i> spawn / stdio &mdash; crosses an OS process boundary</span>
+      </div>
+      <figcaption>A plugin is a function call away. A sidecar is a whole other process away &mdash; supervised, not shared.</figcaption>
+    </figure>
+
+    <h2 data-anchor="pi-h2-official">Reach for an official plugin first</h2>
+    <p data-anchor="pi-p-official-1">
+      Before writing anything, check whether the Tauri team already shipped it. The official
+      <a href="https://github.com/tauri-apps/plugins-workspace" target="_blank" rel="noopener">plugins-workspace</a>
+      repo covers most of what an app needs to touch the OS: dialogs, filesystem access, HTTP, notifications,
+      shelling out, autostart, a persistent key-value store, in-app updates, deep links, clipboard
+      read/write, global shortcuts, SQL databases, and window-state persistence, among others. Each is a
+      normal <code class="inl">tauri-plugin-*</code> crate plus (usually) a small
+      <code class="inl">@tauri-apps/plugin-*</code> npm package, wired in with one line in Rust and one import in
+      JS &mdash; and governed by the exact same permission/capability system as your own commands, so adopting
+      one doesn't open a side door around Chapter&nbsp;8's model.
+    </p>
+
+    <table class="grid" data-anchor="pi-table-official">
+      <thead><tr><th>Need</th><th>Official plugin</th></tr></thead>
+      <tbody>
+        <tr><td>Native open/save/message dialogs</td><td class="mono">dialog</td></tr>
+        <tr><td>Read/write files beyond the JS sandbox</td><td class="mono">fs</td></tr>
+        <tr><td>HTTP requests from Rust (bypassing CORS)</td><td class="mono">http</td></tr>
+        <tr><td>OS notifications</td><td class="mono">notification</td></tr>
+        <tr><td>Spawn processes, including sidecars</td><td class="mono">shell</td></tr>
+        <tr><td>Persist small settings/state as JSON</td><td class="mono">store</td></tr>
+        <tr><td>Persist window size and position</td><td class="mono">window-state</td></tr>
+        <tr><td>Ship in-app updates</td><td class="mono">updater</td></tr>
+        <tr><td>Register the app as a URL/deep-link handler</td><td class="mono">deep-link</td></tr>
+        <tr><td>Read/write the system clipboard</td><td class="mono">clipboard-manager</td></tr>
+        <tr><td>Register a system-wide hotkey</td><td class="mono">global-shortcut</td></tr>
+        <tr><td>Launch at system startup</td><td class="mono">autostart</td></tr>
+      </tbody>
+    </table>
+
+    <pre class="code" data-anchor="pi-code-register"><span class="cm">// src-tauri/src/lib.rs</span>
+<span class="kw">pub fn</span> <span class="fn">run</span>() {
+    tauri::Builder::<span class="fn">default</span>()
+        .<span class="fn">plugin</span>(tauri_plugin_store::<span class="fn">Builder</span>::<span class="fn">default</span>().<span class="fn">build</span>())
+        .<span class="fn">plugin</span>(tauri_plugin_window_state::<span class="fn">Builder</span>::<span class="fn">default</span>().<span class="fn">build</span>())
+        .<span class="fn">invoke_handler</span>(tauri::generate_handler![<span class="fn">your_own_commands</span>])
+        .<span class="fn">run</span>(tauri::generate_context!())
+        .<span class="fn">expect</span>(<span class="str">"error while running tauri application"</span>);
+}</pre>
+    <p data-anchor="pi-p-official-2">
+      Each registered plugin still needs its permissions <em>granted</em> in a capability file before any window
+      can call it &mdash; registering <code class="inl">tauri_plugin_store</code> on the Rust side makes the
+      commands exist, but a window with no capability naming <code class="inl">store:default</code> still gets
+      nothing, exactly like Chapter&nbsp;8's default-deny rule for your own commands.
+    </p>
+
+    <div class="agent-ask" data-anchor="pi-agent-ask-official">
+      <h4>Ask your agent</h4>
+      <p class="prompt-text">Add the official window-state plugin so the main window remembers its size and
+position between launches. Register it in src-tauri/src/lib.rs, add the
+npm package if one exists for this plugin, and grant only the "main"
+window's capability the permission it needs — don't add it to the
+"settings" window, which doesn't need persisted geometry.</p>
+      <button type="button" class="copy-btn" data-copy-target="_prev">Copy prompt</button>
+    </div>
+
+    <div class="usecase" data-anchor="pi-usecase-official">
+      <span class="tag">In practice</span>
+      A note-taking app persists the sidebar width and last-opened note via <code class="inl">store</code>,
+      restores window geometry via <code class="inl">window-state</code>, and registers a system-wide
+      "quick capture" hotkey via <code class="inl">global-shortcut</code> &mdash; three cross-platform native
+      behaviors, zero custom Rust, zero bundled binaries.
+    </div>
+
+    <h2 data-anchor="pi-h2-custom">Writing your own plugin, when nothing official fits</h2>
+    <p data-anchor="pi-p-custom-1">
+      Sometimes the feature is genuinely native and genuinely yours &mdash; a hardware integration, a proprietary
+      SDK with a Rust or C binding, a piece of logic you want packaged once and reused across several apps.
+      <code class="inl">cargo tauri plugin new &lt;name&gt;</code> scaffolds a real plugin project: a
+      <code class="inl">tauri-plugin-&lt;name&gt;</code> crate, an optional
+      <code class="inl">tauri-plugin-&lt;name&gt;-api</code> npm package (skip it with <code class="inl">--no-api</code>
+      if the plugin is Rust-only), and Android/iOS project stubs if you pass <code class="inl">--android</code> /
+      <code class="inl">--ios</code>. Inside, it looks exactly like your app's own backend &mdash; commands
+      decorated with <code class="inl">#[tauri::command]</code>, an <code class="inl">init()</code> that builds a
+      <code class="inl">tauri::plugin::Builder</code>, its own <code class="inl">permissions/</code> directory
+      defining what a capability can grant. It's the same commands-and-permissions shape as Chapters&nbsp;6
+      through&nbsp;8, just packaged to be registered into a different app later instead of living in
+      <code class="inl">src-tauri/src/</code> directly.
+    </p>
+
+    <div class="compare" data-anchor="pi-compare-decide">
+      <div class="compare-toggle" role="tablist">
+        <button type="button" class="active">Write a plugin</button>
+        <button type="button">Bundle a sidecar</button>
+      </div>
+      <div class="compare-panel active">
+        <p><strong>Reach for this when the capability needs to live in Rust itself.</strong></p>
+        <ul>
+          <li>No existing compiled tool does the job &mdash; you're writing the logic from scratch anyway</li>
+          <li>The feature needs tight, low-latency access to Tauri's own state (windows, app handle, other commands)</li>
+          <li>You want it reusable across several apps, or shared with the mobile targets</li>
+          <li>Cost: real Rust code to write and maintain, same as any command in Chapter&nbsp;6</li>
+        </ul>
+      </div>
+      <div class="compare-panel">
+        <p><strong>Reach for this when a working program already solves it.</strong></p>
+        <ul>
+          <li>An existing CLI tool, model runtime, or script already does exactly this, in another language</li>
+          <li>Rewriting it in Rust would take weeks and add risk for no real benefit</li>
+          <li>It's fine to run as a separate, supervised OS process talking over stdio</li>
+          <li>Cost: one binary per target platform, plus explicit spawn permission &mdash; see below</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="agent-ask" data-anchor="pi-agent-ask-custom">
+      <h4>Ask your agent</h4>
+      <p class="prompt-text">Scaffold a new Tauri plugin called barcode-reader with cargo tauri plugin new,
+including the npm API package. Give it one command, scan_from_bytes, that
+takes image bytes and returns a decoded string or an error — implement
+the decoding with an existing Rust barcode crate, not a bundled external
+binary. Define its permission as scan-from-bytes:allow so a consuming
+app's capability has to grant it explicitly.</p>
+      <button type="button" class="copy-btn" data-copy-target="_prev">Copy prompt</button>
+    </div>
+
+    <h2 data-anchor="pi-h2-sidecar-bundle">Bundling and spawning a sidecar</h2>
+    <p data-anchor="pi-p-sidecar-1">
+      A sidecar starts as a binary you already have &mdash; built any way you like, in any language. List it
+      under <code class="inl">bundle.externalBin</code> in <code class="inl">tauri.conf.json</code>, and the
+      bundler packages it alongside your app for every platform target you build for. The one wrinkle: a single
+      binary can't run on every OS/architecture, so Tauri expects <strong>one file per target</strong>, each
+      named with its <a href="https://doc.rust-lang.org/nightly/rustc/platform-support.html" target="_blank" rel="noopener">Rust target triple</a>
+      appended &mdash; find your own host triple by running <code class="inl">rustc -vV</code> and reading the
+      <code class="inl">host:</code> line.
+    </p>
+    <pre class="code" data-anchor="pi-code-externalbin"><span class="cm">// src-tauri/tauri.conf.json</span>
+<span class="kw">{</span>
+  <span class="kw">"bundle"</span>: <span class="kw">{</span>
+    <span class="kw">"externalBin"</span>: [<span class="str">"binaries/whisper-cli"</span>]
+  <span class="kw">}</span>
+<span class="kw">}</span>
+<span class="cm">// src-tauri/binaries/ must then contain, per platform you ship:</span>
+<span class="cm">//   whisper-cli-x86_64-pc-windows-msvc.exe</span>
+<span class="cm">//   whisper-cli-x86_64-apple-darwin</span>
+<span class="cm">//   whisper-cli-aarch64-apple-darwin</span>
+<span class="cm">//   whisper-cli-x86_64-unknown-linux-gnu</span></pre>
+
+    <p data-anchor="pi-p-sidecar-2">
+      Spawning goes through the <code class="inl">shell</code> plugin &mdash; a sidecar is just a process, and the
+      shell plugin already owns "run a process" as a permissioned capability. From Rust, call
+      <code class="inl">.sidecar()</code> with the <em>bare name</em> you configured (not the platform-suffixed
+      filename &mdash; Tauri resolves that for you at runtime); from JS, the equivalent
+      <code class="inl">Command.sidecar()</code> call takes the same string.
+    </p>
+    <pre class="code" data-anchor="pi-code-spawn"><span class="cm">// Rust: spawn it, stream stdout lines back as events</span>
+<span class="kw">use</span> tauri_plugin_shell::ShellExt;
+
+<span class="at">#[tauri::command]</span>
+<span class="kw">async fn</span> <span class="fn">transcribe</span>(app: tauri::AppHandle, audio_path: <span class="ty">String</span>) -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">String</span>&gt; {
+    <span class="kw">let</span> (<span class="kw">mut</span> rx, <span class="kw">_</span>child) = app
+        .<span class="fn">shell</span>()
+        .<span class="fn">sidecar</span>(<span class="str">"whisper-cli"</span>).<span class="fn">map_err</span>(|e| e.<span class="fn">to_string</span>())?
+        .<span class="fn">args</span>([<span class="str">"--file"</span>, &amp;audio_path])
+        .<span class="fn">spawn</span>().<span class="fn">map_err</span>(|e| e.<span class="fn">to_string</span>())?;
+
+    <span class="kw">while let</span> <span class="ty">Some</span>(event) = rx.<span class="fn">recv</span>().<span class="kw">await</span> {
+        <span class="kw">if let</span> tauri_plugin_shell::process::CommandEvent::Stdout(line) = event {
+            app.<span class="fn">emit</span>(<span class="str">"transcribe-progress"</span>, <span class="ty">String</span>::from_utf8_lossy(&amp;line).<span class="fn">to_string</span>())
+                .<span class="fn">ok</span>();
+        }
+    }
+    <span class="ty">Ok</span>(())
+}</pre>
+
+    <div class="callout warn" data-anchor="pi-callout-triples">
+      <span class="tag">Gotcha</span>
+      A build that only produces the host machine's own target triple looks correct in dev and passes CI on one
+      runner, then ships a Windows or Linux build with no matching binary at all &mdash;
+      <code class="inl">.sidecar()</code> fails at runtime on exactly the platforms nobody tested locally. Building
+      (or cross-compiling, or fetching a prebuilt release) one binary per shipped target is part of the release
+      checklist, not an afterthought; Chapter&nbsp;10 covers building per-platform in the CI pipeline.
+    </div>
+
+    <h2 data-anchor="pi-h2-sidecar-security">Sidecars still answer to the capability system</h2>
+    <p data-anchor="pi-p-security-1">
+      Spawning a process is exactly the kind of power Chapter&nbsp;8 default-denies. A window can call
+      <code class="inl">.sidecar()</code> at all only if its capability grants
+      <code class="inl">shell:allow-execute</code> (or a narrower permission naming just that command), and the
+      permission's argument validator decides how much freedom the caller actually has: <code class="inl">true</code>
+      allows any arguments through, <code class="inl">false</code> allows none, and an explicit array pins the
+      exact arguments (or an exact shape of them) the frontend is allowed to pass &mdash; the same
+      allow/scope pairing from Chapter&nbsp;8, applied to "which process can this window start, with what."
+    </p>
+    <pre class="code" data-anchor="pi-code-capability"><span class="cm">// src-tauri/capabilities/main.json</span>
+<span class="kw">{</span>
+  <span class="kw">"identifier"</span>: <span class="str">"main-capability"</span>,
+  <span class="kw">"windows"</span>: [<span class="str">"main"</span>],
+  <span class="kw">"permissions"</span>: [
+    <span class="kw">{</span>
+      <span class="kw">"identifier"</span>: <span class="str">"shell:allow-execute"</span>,
+      <span class="kw">"allow"</span>: [<span class="kw">{</span> <span class="kw">"name"</span>: <span class="str">"whisper-cli"</span>, <span class="kw">"sidecar"</span>: <span class="kw">true</span>, <span class="kw">"args"</span>: [<span class="str">"--file"</span>, <span class="kw">true</span>] <span class="kw">}</span>]
+    <span class="kw">}</span>
+  ]
+<span class="kw">}</span></pre>
+
+    <div class="usecase" data-anchor="pi-usecase-sidecar">
+      <span class="tag">In practice</span>
+      A local-first transcription app bundles a compiled <code class="inl">whisper.cpp</code> binary instead of
+      binding it over FFI or reimplementing model inference in Rust; a video tool bundles
+      <code class="inl">ffmpeg</code> for transcoding rather than writing a codec pipeline. Both grant
+      <code class="inl">shell:allow-execute</code> scoped to that one binary name with a fixed argument shape
+      &mdash; never a general "run this string as a command" permission, which is exactly the shell-injection
+      shape Chapter&nbsp;8 warned about.
+    </div>
+
+    <div class="agent-ask" data-anchor="pi-agent-ask-sidecar">
+      <h4>Ask your agent</h4>
+      <p class="prompt-text">We're bundling the existing ffmpeg-cli binary as a sidecar named "ffmpeg" to
+transcode a user-picked video to mp4. Add it to bundle.externalBin, write
+a Rust command transcode_video(input_path, output_path) that spawns it
+with a fixed, hardcoded argument template (only the two paths are
+variable), and add a capability granting shell:allow-execute scoped to
+the "ffmpeg" sidecar only, with the args validator matching that exact
+template — not "true" for arbitrary arguments.</p>
+      <button type="button" class="copy-btn" data-copy-target="_prev">Copy prompt</button>
+    </div>
+
+    <h2 data-anchor="pi-h2-decide">Deciding what a new capability needs</h2>
+    <table class="grid" data-anchor="pi-table-decide">
+      <thead><tr><th>You're about to&hellip;</th><th>Reach for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Add a common OS integration (dialogs, notifications, storage, shortcuts)</td>
+          <td>An official plugin from plugins-workspace, permission scoped as narrowly as it allows</td>
+        </tr>
+        <tr>
+          <td>Add native logic that's genuinely yours, or reusable across apps</td>
+          <td><code class="inl">cargo tauri plugin new</code>, same commands/permissions shape as your own backend</td>
+        </tr>
+        <tr>
+          <td>Reuse an existing compiled tool or heavy runtime you won't rewrite in Rust</td>
+          <td>A sidecar via <code class="inl">externalBin</code>, spawned through the shell plugin</td>
+        </tr>
+        <tr>
+          <td>Ship that sidecar to more than one OS/architecture</td>
+          <td>One binary per Rust target triple, named and placed exactly as Tauri expects</td>
+        </tr>
+        <tr>
+          <td>Let a window spawn a sidecar at all</td>
+          <td><code class="inl">shell:allow-execute</code> scoped to that sidecar's name, args pinned &mdash; not <code class="inl">true</code></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="pi-h2-glossary">Quick glossary</h2>
+    <div class="sheet-grid" data-anchor="pi-glossary-grid">
+      <div class="sheet-card">
+        <h3>Plugin</h3>
+        <p>A Rust crate (+ optional JS package) registered into Core's own process; runs in-process, no OS boundary crossed.</p>
+      </div>
+      <div class="sheet-card">
+        <h3>Sidecar</h3>
+        <p>A separately compiled binary Core spawns as its own OS process and talks to over stdio.</p>
+      </div>
+      <div class="sheet-card">
+        <h3>externalBin</h3>
+        <p>The <code class="inl">tauri.conf.json</code> bundle field listing sidecar binaries to package with the app.</p>
+      </div>
+      <div class="sheet-card">
+        <h3>Target triple</h3>
+        <p>The platform-architecture suffix (e.g. <code class="inl">x86_64-pc-windows-msvc</code>) a sidecar binary's filename must carry per platform.</p>
+      </div>
+      <div class="sheet-card">
+        <h3>cargo tauri plugin new</h3>
+        <p>Scaffolds a new plugin crate (+ optional npm package, optional mobile stubs) with the standard shape.</p>
+      </div>
+      <div class="sheet-card">
+        <h3>shell:allow-execute</h3>
+        <p>The permission gating which processes (sidecars included) a window's capability may spawn, and with what arguments.</p>
+      </div>
+    </div>
+
+    <p class="mentor-note" data-anchor="pi-mentor-note">
+      Asked to "add PDF export" or "add barcode scanning," an agent will often reach straight for a sidecar
+      wrapping some CLI tool, because it's the fastest path to a demo that works. That's sometimes right &mdash;
+      but check first whether an existing Rust crate already does it in-process (no binary to bundle, no target
+      triples to chase), and if a sidecar genuinely is the right call, push back on any capability that grants
+      <code class="inl">shell:allow-execute</code> with <code class="inl">"args": true</code>. Fixed, pinned
+      arguments turn "this window can run any command" into "this window can run exactly this one conversion."
+    </p>
+
+    <h2 data-anchor="pi-h2-takeaway">The takeaway</h2>
+    <p data-anchor="pi-p-takeaway-1">
+      Official plugin, then custom plugin, then sidecar &mdash; in that order of preference, because each step
+      trades less bundling and less process-boundary complexity for more code you'd have to write yourself. A
+      sidecar earns its keep when a working program already exists; once it's in the app, it's still just another
+      thing a capability has to explicitly allow, scoped as tightly as the feature allows. Chapter&nbsp;10 picks up
+      the thread on the bundling side: building those per-target binaries and packaging everything &mdash; plugins
+      compiled in, sidecars alongside &mdash; into something installable.
+    </p>
+
+    <p class="subtle" data-anchor="pi-sources">
+      Sources: <a href="https://v2.tauri.app/develop/plugins/" target="_blank" rel="noopener">Tauri docs &mdash; Plugin Development</a>,
+      <a href="https://v2.tauri.app/plugin/" target="_blank" rel="noopener">Tauri docs &mdash; Features &amp; Recipes (official plugins)</a>,
+      <a href="https://v2.tauri.app/develop/sidecar/" target="_blank" rel="noopener">Tauri docs &mdash; Embedding External Binaries</a>,
+      <a href="https://github.com/tauri-apps/plugins-workspace" target="_blank" rel="noopener">tauri-apps/plugins-workspace on GitHub</a>.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-tauri-security-model-capabilities.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-tauri-build-run-deploy.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
+</html>
