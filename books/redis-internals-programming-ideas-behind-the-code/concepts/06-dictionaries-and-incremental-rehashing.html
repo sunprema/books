@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dictionaries and Incremental Rehashing &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 6 &middot; Objects &amp; Memory</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch6-kicker">Chapter 6 of 12 &middot; Core objects and memory</p>
+    <h1 data-anchor="ch6-h1">Dictionaries and Incremental <span class="hl">Rehashing</span></h1>
+
+    <p class="lede" data-anchor="ch6-lede">
+      Load a few million keys and watch latency while it happens:
+    </p>
+
+    <pre class="code" data-anchor="ch6-code1"><span class="cap">Terminal &mdash; loading 2 million keys while watching latency</span><code><span class="cm">$</span> redis-cli --latency -i 1 &amp;
+<span class="cm">$</span> redis-benchmark -n 2000000 -r 2000000 -t set -q
+<span class="cm">min: 0, max: 2, avg: 0.19 (no sustained spike, even mid-load)</span></code></pre>
+
+    <p data-anchor="ch6-p1">
+      That flat latency line is worth stopping on. The main keyspace &mdash;
+      every key name mapped to its value &mdash; is itself one giant hash
+      table. Hash tables that fill up need to grow, and growing a hash table
+      normally means allocating a bigger array and re-inserting every single
+      entry into it: an O(n) pause proportional to how much data you have.
+      For a keyspace with millions of entries, that pause would be exactly
+      the kind of latency spike Chapter 1 said Redis refuses to accept. So
+      Redis doesn't do it that way.
+    </p>
+
+    <h2 data-anchor="ch6-h2-dict">The dict: Two Tables, Not One</h2>
+    <p data-anchor="ch6-p2">
+      The hash table implementation, <code>dict.c</code>, keeps
+      <strong>two</strong> hash tables per dictionary, <code>ht[0]</code> and
+      <code>ht[1]</code>, plus one integer, <code>rehashidx</code>. Normally
+      <code>rehashidx</code> is <code>-1</code>: the dict isn't rehashing,
+      <code>ht[0]</code> is the only table in use, and <code>ht[1]</code> is
+      empty. When <code>ht[0]</code>'s load factor crosses its threshold,
+      Redis allocates <code>ht[1]</code> at roughly double the size and sets
+      <code>rehashidx</code> to <code>0</code> &mdash; and that's the moment
+      everything gets interesting.
+    </p>
+
+    <h2 data-anchor="ch6-h2-incremental">Rehashing a Little Bit at a Time</h2>
+    <p data-anchor="ch6-p3">
+      Instead of migrating every entry from <code>ht[0]</code> to
+      <code>ht[1]</code> immediately, Redis migrates a <strong>few buckets at
+      a time</strong>, riggered opportunistically:
+    </p>
+    <ul data-anchor="ch6-list-rehash">
+      <li>Every read or write on the dictionary, while <code>rehashidx
+      &ge; 0</code>, first migrates a small, bounded number of buckets from
+      <code>ht[0][rehashidx]</code> into <code>ht[1]</code>, then advances
+      <code>rehashidx</code>, before doing the actual lookup or insert the
+      caller asked for.</li>
+      <li>A background time event (part of <code>serverCron</code>, Chapter
+      10) also nudges rehashing forward in small time-boxed steps even if the
+      keyspace is momentarily quiet, so a dict doesn't get stuck half-rehashed
+      forever on an idle server.</li>
+      <li>While rehashing is in progress, <strong>reads check both
+      tables</strong> &mdash; look in <code>ht[0]</code> first, then
+      <code>ht[1]</code> &mdash; and <strong>all new writes go straight into
+      <code>ht[1]</code></strong>, so the dict never needs to migrate an entry
+      it just added.</li>
+      <li>When <code>ht[0]</code> finally empties out, Redis frees it,
+      promotes <code>ht[1]</code> to be the new <code>ht[0]</code>, and resets
+      <code>rehashidx</code> back to <code>-1</code>. Business as usual, until
+      the next resize.</li>
+    </ul>
+
+    <figure class="diagram" data-anchor="ch6-diagram">
+      <svg viewBox="0 0 720 260" role="img" aria-labelledby="ch6-svg-title">
+        <title id="ch6-svg-title">Two hash tables during a rehash: ht zero shrinking as rehashidx sweeps across its buckets, migrating entries into the larger ht one, while reads check both tables and writes land only in ht one.</title>
+        <g font-family="var(--font-mono)" font-size="10">
+          <text x="180" y="30" text-anchor="middle" fill="var(--ty)" font-weight="700">ht[0] (old, shrinking)</text>
+          <g fill="var(--code-bg)" stroke="var(--rule)" stroke-width="1.2">
+            <rect x="60" y="45" width="240" height="26"></rect>
+            <rect x="60" y="71" width="240" height="26"></rect>
+            <rect x="60" y="97" width="240" height="26"></rect>
+            <rect x="60" y="123" width="240" height="26"></rect>
+          </g>
+          <rect x="60" y="45" width="80" height="26" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.6"></rect>
+          <rect x="140" y="71" width="80" height="26" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.6"></rect>
+          <text x="100" y="63" text-anchor="middle" fill="var(--kw)" font-size="9">migrated</text>
+          <text x="180" y="89" text-anchor="middle" fill="var(--kw)" font-size="9">migrated</text>
+          <text x="220" y="115" text-anchor="middle" fill="var(--ink-soft)" font-size="9">bucket[2]&nbsp;&larr;&nbsp;rehashidx</text>
+          <path d="M180,132 L180,150" stroke="var(--accent)" stroke-width="1.6" marker-end="url(#arrow6)"></path>
+
+          <text x="540" y="30" text-anchor="middle" fill="var(--fn)" font-weight="700">ht[1] (new, growing)</text>
+          <g fill="var(--code-bg)" stroke="var(--fn)" stroke-width="1.4">
+            <rect x="400" y="45" width="280" height="26"></rect>
+            <rect x="400" y="71" width="280" height="26"></rect>
+            <rect x="400" y="97" width="280" height="26"></rect>
+            <rect x="400" y="123" width="280" height="26"></rect>
+            <rect x="400" y="149" width="280" height="26"></rect>
+          </g>
+          <text x="540" y="63" text-anchor="middle" fill="var(--ink-soft)" font-size="9">bigger table, roughly 2&times; capacity</text>
+
+          <path d="M300,58 C340,58 360,58 400,58" stroke="var(--fn)" stroke-width="1.6" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow6)"></path>
+
+          <rect x="230" y="195" width="260" height="50" rx="8" fill="var(--bg-2)" stroke="var(--ty)" stroke-width="1.4"></rect>
+          <text x="360" y="215" text-anchor="middle" fill="var(--ty)" font-size="9.5">reads: check ht[0], then ht[1]</text>
+          <text x="360" y="232" text-anchor="middle" fill="var(--ty)" font-size="9.5">writes: always go straight to ht[1]</text>
+        </g>
+        <defs>
+          <marker id="arrow6" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--fn)"></path>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>Incremental rehashing, mid-flight.</strong> A handful of
+        buckets have already moved; <code>rehashidx</code> marks how far the
+        sweep has gotten. No single operation ever pays the cost of the whole
+        table &mdash; the cost is smeared, a few buckets at a time, across
+        every command that touches the dict while it's rehashing.
+      </figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch6-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Incremental rehashing turns one big, unpredictable pause into many
+        tiny, bounded ones, each riding along on a command that was going to
+        touch the dict anyway. It's the single clearest example in the whole
+        codebase of Chapter 1's core trade: a little bit of extra bookkeeping
+        (two tables, one index, a branch in every lookup) in exchange for
+        eliminating a latency spike entirely.
+      </p>
+    </div>
+
+    <div class="callout tip" data-anchor="ch6-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        This exact same <code>dict</code> structure backs more than just your
+        keyspace &mdash; it's also what a large hash-encoded Hash, Set, or the
+        expires table (Chapter 10) rehashes into once they outgrow their
+        compact encoding (Chapter 5). Learn the two-table trick once here and
+        you've understood how every big dictionary in Redis grows.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="ch6-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        Incremental rehashing amortizes cost, it doesn't eliminate it &mdash;
+        a dict actively rehashing briefly uses roughly 1.5&times; its steady-state
+        memory (both tables live at once), and iterating a dict mid-rehash
+        (as <code>SCAN</code> does) has to account for entries living in
+        either table. That complexity is exactly why <code>SCAN</code>'s
+        cursor guarantee is "every key present for the whole scan is returned
+        at least once," not "returned exactly once" &mdash; a subtlety worth
+        knowing before you rely on <code>SCAN</code> for exact-once processing.
+      </p>
+    </div>
+
+    <p data-anchor="ch6-close-p1">
+      Two tables and one index solve "how do you grow a hash table without a
+      pause." The next problem is different: given that exactly one command
+      runs at a time (Chapter 2), what does that buy you for free when it
+      comes to correctness under concurrent access? That's atomicity, and
+      it's the whole subject of Chapter 7.
+    </p>
+
+    <p class="sources" data-anchor="ch6-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://github.com/redis/redis/blob/unstable/src/dict.c" target="_blank" rel="noopener">redis/redis &mdash; dict.c</a>
+      &middot;
+      <a href="https://codeburst.io/a-closer-look-at-redis-dictionary-implementation-internals-3fd815aae535" target="_blank" rel="noopener">A Closer Look at Redis Dictionary Internals</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="05-collections-in-disguise.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="07-command-dispatch-and-atomicity.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

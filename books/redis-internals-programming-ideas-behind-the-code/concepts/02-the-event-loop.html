@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Event Loop &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 2 &middot; The Event Loop</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch2-kicker">Chapter 2 of 12 &middot; The event loop</p>
+    <h1 data-anchor="ch2-h1">The Event Loop: One Thread, <span class="hl">Thousands</span> of Clients</h1>
+
+    <p class="lede" data-anchor="ch2-lede">
+      Open two terminals against the same Redis. In the first, run a command
+      that takes a while on a large keyspace; in the second, time a plain
+      <code>GET</code>:
+    </p>
+
+    <pre class="code" data-anchor="ch2-code1"><span class="cap">Terminal A &mdash; a deliberately expensive scan</span><code><span class="cm">$</span> redis-cli KEYS <span class="str">'*'</span>   <span class="cm"># O(N) over the whole keyspace &mdash; never do this in production</span>
+
+<span class="cap">Terminal B &mdash; running at the same moment</span><span class="cm">$</span> redis-cli GET some:key
+<span class="cm">(waits until KEYS finishes)</span></code></pre>
+
+    <p data-anchor="ch2-p1">
+      That pause in Terminal B isn't a bug &mdash; it's the single most
+      important fact about how Redis works, made visible. Every command
+      Redis executes runs to completion on <strong>one thread</strong>,
+      inside <strong>one loop</strong>, before the next command even begins.
+      This chapter is about that loop: the tiny, custom-built library that
+      drives it, and why Redis chose to write its own instead of reaching for
+      an off-the-shelf one.
+    </p>
+
+    <h2 data-anchor="ch2-h2-ae">The Asynchronous Event Library: <span class="term">ae</span></h2>
+    <p data-anchor="ch2-p2">
+      Redis's event loop lives in <code>ae.c</code> / <code>ae.h</code>
+      &mdash; a self-contained, roughly-700-line C library Redis maintains
+      itself rather than depending on <code>libevent</code> or
+      <code>libuv</code>. It wraps whichever OS multiplexing syscall is
+      available (<code>epoll</code> on Linux, <code>kqueue</code> on BSD/macOS,
+      a portable <code>select()</code> fallback) behind one small API, and it
+      understands exactly two kinds of things to wait for:
+    </p>
+    <ul data-anchor="ch2-list-events">
+      <li><strong>File events</strong> &mdash; a client socket becoming
+      readable (bytes have arrived) or writable (there's room to send a
+      reply). Registered with <code>aeCreateFileEvent()</code>.</li>
+      <li><strong>Time events</strong> &mdash; "call this function again in
+      N milliseconds," used for periodic housekeeping. Registered with
+      <code>aeCreateTimeEvent()</code>.</li>
+    </ul>
+    <p data-anchor="ch2-p3">
+      The main loop itself, <code>aeMain()</code>, is almost embarrassingly
+      short: it repeatedly calls <code>aeProcessEvents()</code>, which figures
+      out how long it can safely block waiting for socket activity (bounded by
+      the nearest scheduled time event), waits, then fires whatever file and
+      time events are now ready. There is no thread pool here executing your
+      commands concurrently &mdash; there's one thread taking turns.
+    </p>
+
+    <figure class="diagram" data-anchor="ch2-diagram">
+      <svg viewBox="0 0 700 320" role="img" aria-labelledby="ch2-svg-title">
+        <title id="ch2-svg-title">A reactor loop: many client sockets register file events, one timer registers the periodic serverCron time event, and aeProcessEvents serves them one at a time, in turn, on a single thread.</title>
+        <g font-family="var(--font-mono)" font-size="10.5">
+          <circle cx="350" cy="170" r="80" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="2" stroke-dasharray="6,4"></circle>
+          <text x="350" y="164" text-anchor="middle" fill="var(--accent)" font-weight="700" font-size="13">aeProcessEvents</text>
+          <text x="350" y="182" text-anchor="middle" fill="var(--ink-soft)">one thread, one turn</text>
+          <text x="350" y="198" text-anchor="middle" fill="var(--ink-soft)">at a time</text>
+
+          <!-- client sockets around the loop -->
+          <g>
+            <rect x="30" y="40" width="120" height="34" rx="6" fill="var(--bg-2)" stroke="var(--ty)" stroke-width="1.5"></rect>
+            <text x="90" y="61" text-anchor="middle" fill="var(--ty)">client A: read</text>
+            <path d="M100,74 C140,110 200,130 275,150" stroke="var(--ty)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow2)"></path>
+          </g>
+          <g>
+            <rect x="30" y="240" width="120" height="34" rx="6" fill="var(--bg-2)" stroke="var(--ty)" stroke-width="1.5"></rect>
+            <text x="90" y="261" text-anchor="middle" fill="var(--ty)">client B: write</text>
+            <path d="M100,240 C140,210 200,195 275,182" stroke="var(--ty)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow2)"></path>
+          </g>
+          <g>
+            <rect x="550" y="40" width="120" height="34" rx="6" fill="var(--bg-2)" stroke="var(--ty)" stroke-width="1.5"></rect>
+            <text x="610" y="61" text-anchor="middle" fill="var(--ty)">client C: read</text>
+            <path d="M600,74 C560,110 500,130 425,150" stroke="var(--ty)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow2)"></path>
+          </g>
+          <g>
+            <rect x="270" y="10" width="160" height="34" rx="6" fill="var(--bg-2)" stroke="var(--cm)" stroke-width="1.5"></rect>
+            <text x="350" y="31" text-anchor="middle" fill="var(--cm)">serverCron (time event)</text>
+            <path d="M350,44 L350,90" stroke="var(--cm)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow2)"></path>
+          </g>
+          <text x="350" y="300" text-anchor="middle" fill="var(--ink-soft)" font-size="10">file events (sockets) + time events (timers) &rarr; one queue, one turn each</text>
+        </g>
+        <defs>
+          <marker id="arrow2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--cm)"></path>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>The reactor pattern.</strong> Client sockets don't get their
+        own thread &mdash; they register interest ("tell me when this socket
+        is readable") and wait their turn. <code>serverCron</code>, the
+        recurring housekeeping time event from Chapter 10, is just one more
+        thing waiting its turn alongside them.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ch2-h2-why-one">Why One Main Loop?</h2>
+    <p data-anchor="ch2-p4">
+      It would be easy to read "single-threaded" as a limitation Redis is
+      stuck with. It's closer to the opposite: it's a limitation Redis
+      <em>chose</em>, because of what it buys back. If two commands could run
+      at the same instant against the same dictionary, every data structure
+      in the codebase would need locking &mdash; mutexes around hash table
+      buckets, careful ordering to avoid deadlock, memory barriers to avoid
+      torn reads. All of that is expensive, both in raw CPU cycles and, worse,
+      in <em>engineer time</em> spent finding and fixing races. By committing
+      to "exactly one command executes at a time," Redis's own C code for
+      lists, hashes, and sorted sets can stay refreshingly simple: no lock
+      ever needs to be taken to mutate the keyspace, because nothing else is
+      ever running concurrently with it.
+    </p>
+
+    <div class="callout key" data-anchor="ch2-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Single-threaded execution isn't the absence of concurrency handling
+        &mdash; it's a different, cheaper way of getting the same safety
+        guarantee a lock would give you, paid for once at the architecture
+        level instead of thousands of times throughout the code. Chapter 7
+        pushes this all the way to its most useful consequence: commands
+        become atomic <em>for free</em>.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch2-h2-io-threads">A Nuance: I/O Threads Don't Break This</h2>
+    <p data-anchor="ch2-p5">
+      Modern Redis (6.0+) can use extra threads for reading raw bytes off the
+      network and writing raw bytes back &mdash; the plain socket I/O, not
+      command execution. That's a throughput optimization for very
+      high-connection-count workloads, and it's opt-in via
+      <code>io-threads</code>. The command itself &mdash; parsing what it
+      means, looking it up, mutating the dataset &mdash; still happens on the
+      single main thread, one at a time. The "exactly one command runs
+      against the data at once" guarantee this chapter is built on is
+      unaffected.
+    </p>
+
+    <div class="callout warn" data-anchor="ch2-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        Because there's exactly one thread doing the work, <strong>a slow
+        command really does stall every other client</strong> &mdash; there's
+        no other thread to pick up the slack. <code>KEYS *</code> on a large
+        keyspace, a huge <code>SORT</code>, or a Lua script with an
+        accidental infinite loop are the classic ways to learn this the hard
+        way in production. Chapter 3 covers exactly which operations are
+        dangerous and why, and Chapter 11 covers how to catch them
+        (<code>SLOWLOG</code>) before your users do.
+      </p>
+    </div>
+
+    <div class="callout lab" data-anchor="ch2-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Start <code>redis-server</code> locally and load a few hundred
+        thousand keys with <code>redis-benchmark -n 300000 -r 300000 -t set
+        -q</code>. Then, in one terminal run <code>redis-cli --bigkeys</code>
+        (it scans the whole keyspace) while in a second terminal you run
+        <code>redis-cli --latency</code>. Watch the latency samples spike for
+        the duration of the scan, then return to baseline the instant it
+        finishes &mdash; that's the single event loop, visible from the
+        outside.
+      </p>
+    </div>
+
+    <p data-anchor="ch2-close-p1">
+      The event loop tells you <em>when</em> a socket has something worth
+      reading. It doesn't yet tell you what happens to those bytes once
+      they're read &mdash; that's the full trip from raw socket data to a
+      command result, and it's next.
+    </p>
+
+    <p class="sources" data-anchor="ch2-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/internals/internals-rediseventlib/" target="_blank" rel="noopener">redis.io &mdash; the ae event library</a>
+      &middot;
+      <a href="https://oneuptime.com/blog/post/2026-03-31-redis-event-loop-internals/view" target="_blank" rel="noopener">How Redis's Event Loop Works</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="01-what-redis-optimizes-for.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="03-anatomy-of-a-request.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>
