@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Go Toolchain — LLMs, Go Code!</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="gopher-mark">
+      <svg width="20" height="16" viewBox="0 0 20 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <ellipse cx="10" cy="9" rx="9" ry="6.5" fill="#00add8"/>
+        <circle cx="10" cy="3.6" r="3.4" fill="#00add8"/>
+        <circle cx="6.6" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="13.4" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="6.9" cy="2.7" r=".7" fill="#142229"/>
+        <circle cx="13.1" cy="2.7" r=".7" fill="#142229"/>
+      </svg>
+    </span>
+    LLMs, Go Code! <span class="pick">&mdash; a BookBank field guide</span>
+  </span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Part I &middot; The Go Blueprint</p>
+    <p class="chapno">Chapter 6</p>
+    <h1>The Go Toolchain as an Automated Feedback Loop for Agents</h1>
+
+    <p class="lead">Here's a question worth sitting with: when an agent writes you a hundred lines
+    of Go at two in the morning, who checks it before you wake up? The honest answer, for most of
+    us, is <em>nobody &mdash; unless we've built something that does</em>. This chapter is about
+    that something. Go ships with an opinionated, batteries-included toolchain, and it turns out
+    that toolchain is almost perfectly shaped to be an agent's tireless, incorruptible reviewer.</p>
+
+    <h2>The cheapest bug you'll ever get</h2>
+    <p>Let's start with a comforting fact about how LLMs fail at Go specifically. When a model
+    hallucinates &mdash; invents a function that doesn't exist, imports a package that was never
+    published, misremembers a standard-library signature &mdash; Go's strict compiler and small
+    standard library turn that hallucination into the loudest, cheapest possible signal: a
+    <code class="inl">go build</code> failure. Not a silent runtime panic three weeks from now.
+    Not a subtly wrong number in a report nobody double-checks. A red exit code, on your machine,
+    before a single byte of the change reaches a colleague or a customer.</p>
+    <p>Compare that to a dynamically typed language, where a typo'd attribute name or a
+    made-up keyword argument can sail through review and only explode when a rare code path
+    finally executes in production. Go's compiler doesn't let hallucinations hide. That's the
+    whole thesis of this chapter: Go's toolchain isn't just a set of developer conveniences, it's
+    a sequence of increasingly expensive gates, and every one of them can be pointed at an agent
+    instead of (or in addition to) a human.</p>
+
+    <table class="grid">
+      <tr><th>Gate</th><th class="mono">Command</th><th>What it catches</th><th>Cost to run</th></tr>
+      <tr><td>Formatting</td><td class="mono">gofmt -l</td><td>Style disagreements, diff noise</td><td>Milliseconds</td></tr>
+      <tr><td>Static analysis</td><td class="mono">go vet</td><td>Real, provable bugs</td><td>Under a second</td></tr>
+      <tr><td>Compilation</td><td class="mono">go build</td><td>Hallucinated symbols, type errors</td><td>Seconds</td></tr>
+      <tr><td>Behavior</td><td class="mono">go test -race</td><td>Wrong logic, data races</td><td>Seconds to minutes</td></tr>
+      <tr><td>Performance</td><td class="mono">pprof</td><td>Hot paths, leaks, regressions</td><td>Only when it matters</td></tr>
+    </table>
+
+    <h2>gofmt &mdash; no bikeshedding, ever</h2>
+    <p>Every team that has ever argued about tabs versus spaces, or where the brace goes, has
+    wasted hours it will never get back. Go's answer was blunt: there is one canonical
+    formatting, <code class="inl">gofmt</code> produces it, and the argument is over before it
+    starts. This matters more than it sounds like it should, because it removes an entire
+    category of noise from code review &mdash; human <em>or</em> agent.</p>
+    <p>For our purposes, the useful trick is <code class="inl">gofmt -l</code>, which lists any
+    file that isn't already formatted instead of silently reformatting it. That distinction
+    matters in an automated loop: you don't want your pipeline quietly rewriting an agent's
+    output (that hides information), you want it to <em>fail loudly</em> when the output doesn't
+    match the canonical form, so the failure becomes an instruction the agent can act on.</p>
+    <pre class="tab"><code><span class="cm">$ gofmt -l ./...</span>
+internal/pricing/discount.go
+<span class="cm">$ echo $?</span>
+1</code></pre>
+    <p>A non-empty file list plus a non-zero exit code is all you need. Feed that filename back
+    to the agent with the instruction "run <code class="inl">gofmt -w</code> on this file and
+    resubmit," and you've closed the cheapest loop in the whole chapter &mdash; often before the
+    agent even gets to explain itself.</p>
+
+    <h2>go vet &mdash; a linter for bugs, not taste</h2>
+    <p>It's tempting to lump <code class="inl">go vet</code> in with style linters, but that
+    undersells it. <code class="inl">go vet</code> doesn't care about your naming conventions;
+    it looks for constructs that compile fine but are almost certainly wrong &mdash; a
+    <code class="inl">Printf</code> call whose format verbs don't match its arguments, a struct
+    copied by value that contains a <code class="inl">sync.Mutex</code>, an unreachable branch,
+    a loop variable captured incorrectly. These are exactly the kinds of small, confident
+    mistakes an LLM makes when it's pattern-matching on "code that looks like this usually works."</p>
+    <pre class="tab"><code><span class="cm">$ go vet ./...</span>
+<span class="cm"># github.com/acme/inventory/internal/pricing</span>
+internal/pricing/discount.go:42:2: Printf call needs 1 arg but has 2 args</code></pre>
+    <p>Notice the shape of that message: file, line, column, and a plain-English description of
+    exactly what's wrong. That's not an accident &mdash; it's designed to be actionable by a
+    human skimming a terminal, and it turns out to be equally actionable pasted verbatim into an
+    agent's next turn. No summarizing, no interpretation required.</p>
+
+    <h2>go build and go test -race &mdash; ground truth</h2>
+    <p>Formatting and vetting are cheap sanity checks. <code class="inl">go build</code> and
+    <code class="inl">go test</code> are where the rubber meets the road, because they're the
+    only two commands in this chapter that actually execute the agent's reasoning rather than
+    just reading it. Consider an agent asked to add a rounding helper to a pricing package. It
+    writes the call site, but forgets &mdash; or hallucinates &mdash; the helper itself:</p>
+    <pre class="tab"><code><span class="kw">package</span> pricing
+
+<span class="kw">func</span> <span class="fn">ApplyDiscount</span>(price <span class="ty">float64</span>, pct <span class="ty">int</span>) <span class="ty">float64</span> {
+    discounted <span class="kw">:=</span> price - (price * <span class="ty">float64</span>(pct) / <span class="num">100</span>)
+    <span class="kw">return</span> <span class="fn">RoundToCents</span>(discounted) <span class="cm">// never defined anywhere</span>
+}</code></pre>
+    <pre class="tab"><code><span class="cm">$ go build ./...</span>
+<span class="cm"># github.com/acme/inventory/internal/pricing</span>
+internal/pricing/discount.go:6:9: undefined: RoundToCents</code></pre>
+    <p>This is the "cheapest bug" from the top of the chapter, made concrete. A model confidently
+    reached for a function name that felt plausible &mdash; probably because it exists in some
+    other codebase it was trained on &mdash; and Go's compiler refused to let it slide. No test
+    run needed, no staging deploy, no 3am page. Just an exit code and a line number.</p>
+    <p>Once the code compiles, <code class="inl">go test -race</code> is your next and most
+    important gate, especially for anything touching goroutines (which, as the last chapter
+    argued, is exactly where agents stumble most). The race detector instruments memory
+    accesses at build time and watches for two goroutines touching the same location without
+    synchronization &mdash; something no amount of code review will reliably catch by eye.</p>
+    <pre class="tab"><code><span class="cm">$ go test -race ./internal/pricing/...</span>
+==================
+WARNING: DATA RACE
+Write at 0x00c0000a4010 by goroutine 8:
+  internal/pricing.(*Cache).Set()
+      /internal/pricing/cache.go:34 +0x64
+
+Previous read at 0x00c0000a4010 by goroutine 7:
+  internal/pricing.(*Cache).Get()
+      /internal/pricing/cache.go:22 +0x50
+
+Goroutine 8 (running) created at:
+  internal/pricing.(*Cache).warm()
+      /internal/pricing/cache.go:58 +0x8c
+==================
+--- FAIL: TestCacheConcurrentAccess (0.02s)
+FAIL</code></pre>
+    <p>That trace names the exact write, the exact conflicting read, and the goroutine that
+    created the offending one. An agent doesn't need you to translate "there's a race condition
+    somewhere in the cache" &mdash; it needs precisely this: three stack traces and two line
+    numbers. Feed the block back verbatim and the agent has everything a senior engineer would
+    ask for.</p>
+
+    <h2>go.mod &mdash; reproducible dependencies an agent can't wiggle out of</h2>
+    <p>Agents love to reach for a library. Sometimes that's the right call; often it's a shortcut
+    around code the agent should have just written. Go's module system doesn't stop an agent from
+    adding a dependency, but it does make the decision <em>visible and reviewable</em>. Every
+    dependency an agent pulls in lands as an explicit, diffable line in <code class="inl">go.mod</code>
+    and a pinned, hash-verified entry in <code class="inl">go.sum</code>:</p>
+    <pre class="tab"><code><span class="kw">module</span> github.com/acme/inventory
+
+<span class="kw">go</span> <span class="num">1.26</span>
+
+<span class="kw">require</span> (
+    github.com/google/uuid <span class="str">v1.6.0</span>
+)</code></pre>
+    <p>Treat that diff exactly like you'd treat a human teammate quietly adding a new dependency
+    in a pull request: read it. Does the package exist? Is it maintained? Did the agent actually
+    need it, or did it reach for a library to avoid writing twelve lines of arithmetic? Because
+    <code class="inl">go.mod</code> pins exact versions and <code class="inl">go.sum</code>
+    records cryptographic checksums, the build is reproducible on every machine and every CI
+    run &mdash; there's no "works on my agent's sandbox" ambiguity to untangle later.</p>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      Ask your agent to run <code class="inl">go mod tidy</code> as part of its own workflow,
+      not as an afterthought you run yourself. An agent that tidies its own module file after
+      every change surfaces unused imports and stray dependencies immediately &mdash; while the
+      context of <em>why</em> it added something is still fresh in the conversation, not three
+      commits later when nobody remembers.
+    </div>
+
+    <h2>pprof &mdash; profiling what the agent shipped</h2>
+    <p>Correctness gates catch bugs; they don't catch an agent that wrote something correct but
+    needlessly slow &mdash; an O(n&sup2;) loop where a map lookup would do, or a hot path that
+    allocates a fresh slice on every call. That's what <code class="inl">pprof</code> is for.
+    Add the standard import for a quick local profile, or wire up
+    <code class="inl">net/http/pprof</code> for a running service, and you get CPU, heap,
+    and (as of the newest toolchain) goroutine-health profiles you can hand an agent as
+    concretely as a stack trace:</p>
+    <pre class="tab"><code><span class="cm">$ go test -run none -bench BenchmarkApplyDiscount -cpuprofile cpu.out ./internal/pricing
+$ go tool pprof -top cpu.out</span>
+Showing nodes accounting for 1.81s, 94.3% of 1.92s total
+      flat  flat%   sum%        cum   cum%
+     1.12s 58.33% 58.33%      1.12s 58.33%  internal/pricing.roundHalfEven
+      0.41s 21.35% 79.68%      0.41s 21.35%  runtime.mallocgc</code></pre>
+    <p>The rule of thumb here isn't "profile everything" &mdash; that's a good way to drown in
+    noise. It's "profile anything you're about to trust with real load." An agent's code should
+    earn its way into a hot path the same way a human's does: with a benchmark and a profile,
+    not a vibe.</p>
+
+    <h2>Wiring it into a loop</h2>
+    <p>Here's the idea this whole chapter has been building toward. Individually, these commands
+    are just tools you run by hand. Wired together with a little scripting, they become
+    something more interesting: a closed feedback loop that lets an agent self-correct without
+    a human in the middle of every iteration.</p>
+
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 640 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A cyclic diagram: the agent writes code, the toolchain checks it in stages, and any failure is fed back to the agent verbatim, repeating until everything passes.">
+        <defs>
+          <marker id="arrow6" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="var(--accent-deep)"/>
+          </marker>
+        </defs>
+
+        <rect x="16" y="96" width="130" height="64" rx="10" fill="var(--yellow-bg)" stroke="var(--yellow)" stroke-width="2"/>
+        <text x="81" y="122" text-anchor="middle" font-family="var(--font-display)" font-size="14" fill="var(--ink)">Agent</text>
+        <text x="81" y="140" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">writes / edits</text>
+
+        <rect x="220" y="30" width="120" height="46" rx="8" fill="#eefbfd" stroke="var(--edge-2)"/>
+        <text x="280" y="58" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--accent-deep)">gofmt -l</text>
+
+        <rect x="220" y="90" width="120" height="46" rx="8" fill="#eefbfd" stroke="var(--edge-2)"/>
+        <text x="280" y="118" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--accent-deep)">go vet</text>
+
+        <rect x="220" y="150" width="120" height="46" rx="8" fill="#eefbfd" stroke="var(--edge-2)"/>
+        <text x="280" y="178" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--accent-deep)">go build</text>
+
+        <rect x="220" y="210" width="120" height="46" rx="8" fill="#eefbfd" stroke="var(--edge-2)"/>
+        <text x="280" y="238" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--accent-deep)">go test -race</text>
+
+        <rect x="452" y="96" width="172" height="64" rx="10" fill="#fdf1f4" stroke="var(--fuchsia)" stroke-width="2"/>
+        <text x="538" y="122" text-anchor="middle" font-family="var(--font-display)" font-size="14" fill="var(--ink)">exact failure text</text>
+        <text x="538" y="140" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">fed back verbatim</text>
+
+        <path d="M146,120 L220,53" fill="none" stroke="var(--accent-deep)" stroke-width="2" marker-end="url(#arrow6)"/>
+        <path d="M146,128 L220,113" fill="none" stroke="var(--accent-deep)" stroke-width="2" marker-end="url(#arrow6)"/>
+        <path d="M146,136 L220,173" fill="none" stroke="var(--accent-deep)" stroke-width="2" marker-end="url(#arrow6)"/>
+        <path d="M146,144 L220,233" fill="none" stroke="var(--accent-deep)" stroke-width="2" marker-end="url(#arrow6)"/>
+
+        <path d="M340,233 C 430,233 452,150 452,128" fill="none" stroke="var(--fuchsia)" stroke-width="2" marker-end="url(#arrow6)"/>
+
+        <path d="M538,160 C 538,220 200,230 81,161" fill="none" stroke="var(--fuchsia)" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow6)"/>
+      </svg>
+      <figcaption>Any stage's failure text becomes the agent's next instruction. The loop only exits when every gate is silent.</figcaption>
+    </figure>
+
+    <p>The mechanics are almost embarrassingly simple. A script &mdash; a shell script, a
+    pre-commit hook, a CI job, or the harness driving your coding agent directly &mdash; runs
+    each gate in order and stops at the first failure:</p>
+    <pre class="tab"><code><span class="cm">#!/usr/bin/env bash</span>
+<span class="kw">set</span> -euo pipefail
+
+unformatted<span class="kw">=</span>$(gofmt -l .)
+<span class="kw">if</span> [ -n <span class="str">"$unformatted"</span> ]; <span class="kw">then</span>
+  <span class="cm"># feed $unformatted back to the agent as the next instruction</span>
+  <span class="kw">exit</span> 1
+<span class="kw">fi</span>
+
+go vet ./...   <span class="cm"># feed stderr back verbatim on failure</span>
+go build ./... <span class="cm"># feed stderr back verbatim on failure</span>
+go test -race ./... <span class="cm"># feed stdout+stderr back verbatim on failure</span></code></pre>
+    <p>The crucial design choice is the word <em>verbatim</em>. Don't summarize the failure,
+    don't paraphrase it, don't tell the agent "the build failed, please fix it." Paste the exact
+    compiler or test output back as the next turn. Go's error messages are already written for
+    a reader with no other context &mdash; file, line, column, plain description &mdash; which
+    is precisely what a language model needs to make a targeted, minimal fix instead of
+    rewriting half the package out of guesswork.</p>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      Resist the urge to let an agent "fix" a failure by deleting the failing test or adding a
+      <code class="inl">//go:build ignore</code> tag to a file that won't compile. Both make the
+      loop go green without making the code correct. Your gate script should treat a shrinking
+      test count as suspicious as a red one &mdash; diff the test files, not just the exit code.
+    </div>
+
+    <h2>Edge cases: when the loop lies to you</h2>
+    <p>No feedback loop is perfect, and it's worth naming where this one can quietly mislead you.
+    <code class="inl">go vet</code> is deliberately conservative &mdash; it only flags patterns
+    it can prove are wrong, so an agent can still write logically broken code that vets clean.
+    <code class="inl">go test -race</code> only catches races that actually occur during the run;
+    a race guarded by a timing coincidence in your test data can hide for months. And a loop that
+    only checks "does it compile and pass" says nothing about whether the code does the
+    <em>right</em> thing &mdash; that's still a job for the tests you write, which is exactly the
+    subject of the test-driven chapter ahead. Treat every green run as "no known problems," never
+    as "provably correct."</p>
+
+    <h2>Reflection</h2>
+    <p>What makes this loop worth building isn't any single command &mdash; it's that Go handed
+    us all five gates already sharpened, already fast, and already opinionated enough that there's
+    little to configure. A team using a language with a looser compiler or a fragmented tooling
+    ecosystem has to build most of this scaffolding from scratch before an agent can be trusted
+    to iterate unsupervised. In Go, you mostly just have to wire together commands that already
+    ship in the box. The agent gets faster, cheaper iterations; you get to spend your attention
+    on the one thing none of these tools can check &mdash; whether the code is solving the right
+    problem in the first place.</p>
+
+    <div class="callout key">
+      <span class="tag">Key takeaway</span>
+      Every gate in this chapter answers a different question &mdash; <b>gofmt</b>: is it
+      readable, <b>vet</b>: is it obviously wrong, <b>build</b>: does it exist, <b>test -race</b>:
+      does it behave, <b>pprof</b>: is it fast enough. Run them in that order, cheapest first,
+      and feed every failure back to the agent exactly as the toolchain wrote it.
+    </div>
+
+    <div class="audit">
+      <h4>Audit Checklist</h4>
+      <ul>
+        <li>CI runs <b>gofmt -l</b>, <b>go vet</b>, <b>go build</b>, and <b>go test -race</b> on
+        every agent-authored change, in that order, and fails the pipeline on the first
+        non-zero exit.</li>
+        <li>Failure output is captured and replayed to the agent <b>verbatim</b> &mdash; not
+        summarized, not paraphrased &mdash; so line numbers and messages stay actionable.</li>
+        <li>A shrinking test count or a new <b>//go:build ignore</b> / skip tag is treated as a
+        red flag, not a passing loop.</li>
+        <li><b>go.mod</b> and <b>go.sum</b> are committed and reviewed like any other diff,
+        especially new <b>require</b> entries an agent added on its own.</li>
+        <li><b>pprof</b> is used to sanity-check anything performance-sensitive &mdash; a
+        benchmark plus a profile, not a vibe &mdash; before agent-authored code ships to a hot
+        path.</li>
+        <li>The toolchain version is pinned in <b>go.mod</b>'s <b>go</b> directive and kept
+        current with security patch releases, not just major versions.</li>
+      </ul>
+    </div>
+
+    <div class="sources">Sources:
+      <a href="https://go.dev/doc/go1.26">Go 1.26 Release Notes</a>,
+      <a href="https://go.dev/blog/go1.26">Go 1.26 is released &mdash; The Go Blog</a>,
+      <a href="https://go.dev/doc/devel/release">Go Release History (go1.26.5 security release)</a>,
+      <a href="https://github.com/golang/go/issues/74609">runtime/pprof, runtime: new goroutine leak profile &mdash; golang/go#74609</a>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-concurrency-context.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-executable-specifications.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

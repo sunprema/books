@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Goroutines, Channels &amp; Context — LLMs, Go Code!</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="gopher-mark">
+      <svg width="20" height="16" viewBox="0 0 20 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <ellipse cx="10" cy="9" rx="9" ry="6.5" fill="#00add8"/>
+        <circle cx="10" cy="3.6" r="3.4" fill="#00add8"/>
+        <circle cx="6.6" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="13.4" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="6.9" cy="2.7" r=".7" fill="#142229"/>
+        <circle cx="13.1" cy="2.7" r=".7" fill="#142229"/>
+      </svg>
+    </span>
+    LLMs, Go Code! <span class="pick">&mdash; a BookBank field guide</span>
+  </span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Part I &middot; The Go Blueprint</p>
+    <p class="chapno">Chapter 5</p>
+    <h1>Goroutines, Channels &amp; Context: Auditing What Agents Get Wrong Most</h1>
+
+    <p class="lead">Every other chapter so far has been about reading code that sits still on the
+    page. This one is about code that moves. Goroutines run at the same time as each other, and
+    the instant you have two things happening at once, you've traded a problem you can reason
+    about linearly for one you have to reason about <em class="term">concurrently</em>. That
+    trade is exactly where agent-written Go tends to fall apart &mdash; not because concurrency
+    is exotic, but because it's the one place where code can look completely correct, compile
+    cleanly, pass a happy-path test, and still be broken.</p>
+
+    <h2>The Big Picture: Cheap Threads, Not Free Threads</h2>
+    <p>A goroutine is a function that runs concurrently with the rest of your program. You start
+    one by putting <code class="inl">go</code> in front of a function call:</p>
+
+    <pre class="tab"><code><span class="kw">go</span> <span class="fn">fetchUser</span>(id)</code></pre>
+
+    <p>That's it. No thread pool to configure, no future to wrap. The Go runtime multiplexes
+    goroutines onto a small number of OS threads, and each one starts with a stack of only a
+    couple of kilobytes that grows as needed. That's why people say goroutines are &ldquo;cheap&rdquo;
+    &mdash; you can genuinely spin up tens of thousands of them without blinking.</p>
+
+    <p>But cheap to create doesn't mean free to manage. Every goroutine you start is a
+    commitment: something, somewhere, has to know when it's done and be able to make it stop.
+    A goroutine with no owner and no exit path isn't lightweight &mdash; it's a slow leak. We'll
+    come back to that, because it's the single most common concurrency mistake an agent makes.</p>
+
+    <h2>Channels: How Goroutines Talk Without Sharing Memory</h2>
+    <p>Go's proverb is &ldquo;don't communicate by sharing memory; share memory by
+    communicating.&rdquo; A <em class="term">channel</em> is a typed pipe that one goroutine can
+    send values into and another can receive values from:</p>
+
+    <pre class="tab"><code><span class="kw">ch</span> <span class="op">:=</span> <span class="fn">make</span>(<span class="kw">chan</span> <span class="ty">int</span>)   <span class="cm">// unbuffered</span>
+<span class="kw">go</span> <span class="kw">func</span>() { ch <span class="op">&lt;-</span> <span class="num">42</span> }()
+<span class="kw">result</span> <span class="op">:=</span> <span class="op">&lt;-</span>ch                <span class="cm">// blocks until someone sends</span></code></pre>
+
+    <p>An <strong>unbuffered</strong> channel like the one above has no storage: a send blocks
+    until a receive is ready for it, and vice versa. That rendezvous is a synchronization point
+    &mdash; it's what makes unbuffered channels so useful for handing off work, and also what
+    makes them dangerous when nobody shows up on the other end.</p>
+
+    <p>A <strong>buffered</strong> channel, <code class="inl">make(chan int, 4)</code>, holds up
+    to four values before a send blocks. Buffering decouples producer and consumer speed, but it
+    doesn't remove the need for someone to eventually drain it &mdash; it just delays the moment
+    the mistake becomes visible, which is exactly why agents like to reach for a buffer size as
+    a band-aid instead of fixing the underlying ownership problem.</p>
+
+    <p><code class="inl">select</code> lets a goroutine wait on multiple channel operations at
+    once, proceeding with whichever is ready first:</p>
+
+    <pre class="tab"><code><span class="kw">select</span> {
+<span class="kw">case</span> v <span class="op">:=</span> <span class="op">&lt;-</span>work:
+    <span class="fn">process</span>(v)
+<span class="kw">case</span> <span class="op">&lt;-</span>ctx.<span class="fn">Done</span>():
+    <span class="kw">return</span> ctx.<span class="fn">Err</span>()
+}</code></pre>
+
+    <p>That second <code class="inl">case</code> is the pattern to look for in every blocking
+    <code class="inl">select</code> you review. Without an escape hatch, a <code class="inl">select</code>
+    with only one channel case is just a blocking receive wearing a disguise.</p>
+
+    <h2>context.Context: A Signal, Not a Kill Switch</h2>
+    <p>Here's a fact worth sitting with: Go has no way to forcibly stop a goroutine from the
+    outside. There's no <code class="inl">goroutine.Kill()</code>. Every goroutine has to check
+    in on its own and decide to leave. <code class="inl">context.Context</code> is the standard
+    mechanism for asking it to.</p>
+
+    <p>A context carries a cancellation signal (and optionally a deadline and request-scoped
+    values) down a call tree. You derive one from a parent:</p>
+
+    <pre class="tab"><code><span class="kw">ctx</span>, <span class="kw">cancel</span> <span class="op">:=</span> context.<span class="fn">WithTimeout</span>(parent, <span class="num">5</span><span class="op">*</span>time.Second)
+<span class="kw">defer</span> <span class="fn">cancel</span>()</code></pre>
+
+    <p><code class="inl">context.WithCancel</code>, <code class="inl">WithTimeout</code>, and
+    <code class="inl">WithDeadline</code> all return a derived context and a
+    <code class="inl">cancel</code> function. Calling <code class="inl">cancel</code> closes an
+    internal channel that <code class="inl">ctx.Done()</code> exposes; anything selecting on
+    <code class="inl">&lt;-ctx.Done()</code> wakes up and can check <code class="inl">ctx.Err()</code>
+    to see whether it was cancellation or a timeout. That <code class="inl">defer cancel()</code>
+    on the very next line is non-negotiable &mdash; skip it and the context (and its internal
+    timer, if it's a timeout context) leaks until the deadline eventually fires on its own, or
+    forever in the <code class="inl">WithCancel</code> case.</p>
+
+    <p>Two conventions matter enough that the Go team put them in the standard library's own
+    style guide: context is always the <strong>first parameter</strong>, named <code class="inl">ctx</code>,
+    never stored inside a struct; and a context only ever flows <strong>downward</strong>, from
+    caller to callee, never sideways or back up. If you see an agent stash a context on a struct
+    field so it can reuse it later, that's a tell &mdash; it means the agent doesn't understand
+    that a context's lifetime is supposed to match a single call, not an object.</p>
+
+    <div class="callout key">
+      <span class="tag">Key idea</span>
+      Cancellation in Go is <strong>cooperative</strong>. Calling <code class="inl">cancel()</code>
+      doesn't stop anything by itself &mdash; it just closes a channel. The goroutine still has
+      to be written to notice. A goroutine blocked on a plain channel receive with no
+      <code class="inl">ctx.Done()</code> case will simply never notice, no matter how many
+      times you cancel its context.
+    </div>
+
+    <h2>The Three Bugs Agents Write Most Often</h2>
+    <p>Ask an agent to &ldquo;fetch these ten URLs concurrently and combine the results,&rdquo;
+    and it will almost always produce something that compiles, runs, and even prints the right
+    answer on your machine, today. That's the trap. Concurrency bugs are timing-dependent, so a
+    single successful run tells you almost nothing. There are three failure modes worth knowing
+    cold, because they cover the overwhelming majority of what shows up in agent-generated Go.</p>
+
+    <h3>1. Data races</h3>
+    <p>A data race happens when two goroutines access the same memory location concurrently and
+    at least one of those accesses is a write, with no synchronization between them. The classic
+    example is an agent adding a counter to a worker pool:</p>
+
+    <pre class="tab"><code><span class="kw">var</span> total <span class="ty">int</span>
+<span class="kw">for</span> _, job <span class="op">:=</span> <span class="kw">range</span> jobs {
+    <span class="kw">go</span> <span class="kw">func</span>() {
+        total<span class="op">++</span>          <span class="cm">// read-modify-write from N goroutines, no lock</span>
+    }()
+}</code></pre>
+
+    <p>This compiles. It often even produces the right number, because on your laptop the
+    goroutines rarely collide mid-increment. The bug is invisible by inspection and invisible on
+    most runs &mdash; it needs a tool, not a read-through, which is exactly why we cover the
+    tooling below.</p>
+
+    <h3>2. Deadlocks</h3>
+    <p>A deadlock is two or more goroutines each waiting on something the other holds, so none of
+    them can ever proceed. The simplest version an agent writes is a channel send with nobody
+    receiving:</p>
+
+    <pre class="tab"><code>ch <span class="op">:=</span> <span class="fn">make</span>(<span class="kw">chan</span> <span class="ty">int</span>)  <span class="cm">// unbuffered, and this goroutine is the only one that touches it</span>
+ch <span class="op">&lt;-</span> <span class="num">1</span>                    <span class="cm">// blocks forever: nobody is on the other end</span></code></pre>
+
+    <p>The Go runtime can actually catch the special case where <em>every</em> goroutine in the
+    program is asleep &mdash; it panics with <code class="inl">fatal error: all goroutines are
+    asleep - deadlock!</code> But that only fires when the whole program is stuck. A deadlock
+    between two goroutines out of a hundred running ones produces no crash at all; the rest of
+    the program looks perfectly healthy while a piece of it quietly stops making progress
+    forever.</p>
+
+    <h3>3. Goroutine leaks</h3>
+    <p>A goroutine leak is a goroutine that blocks permanently on a channel, mutex, or condition
+    variable that will never become ready, and is never going to be cleaned up. It's a deadlock's
+    quieter cousin: instead of freezing the whole program, it just accumulates, one stuck
+    goroutine at a time, silently eating stack memory until something falls over hours or days
+    later. This is the bug agents write the most, because it usually comes from an innocent-looking
+    shortcut: spawning a goroutine to do work and assuming someone will always be there to collect
+    the result.</p>
+
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 640 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="leak-svg-title leak-svg-desc">
+        <title id="leak-svg-title">Anatomy of a goroutine leak</title>
+        <desc id="leak-svg-desc">A worker goroutine sends on an unbuffered channel while the caller goroutine has already returned early, so the send blocks forever.</desc>
+        <rect x="0" y="0" width="640" height="210" fill="none"/>
+        <!-- worker goroutine -->
+        <rect x="20" y="60" width="180" height="90" rx="10" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="110" y="90" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--accent-deep)">go func()</text>
+        <text x="110" y="110" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">worker goroutine</text>
+        <text x="110" y="130" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">ch &lt;- result</text>
+
+        <!-- channel pipe -->
+        <line x1="200" y1="105" x2="430" y2="105" stroke="var(--edge-2)" stroke-width="10" stroke-linecap="round"/>
+        <text x="315" y="90" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">ch (unbuffered)</text>
+
+        <!-- blocked marker -->
+        <circle cx="360" cy="105" r="15" fill="var(--yellow-bg)" stroke="var(--fuchsia)" stroke-width="2.5"/>
+        <text x="360" y="110" text-anchor="middle" font-family="var(--font-mono)" font-weight="700" font-size="16" fill="var(--fuchsia)">&times;</text>
+        <text x="360" y="140" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" fill="var(--fuchsia)">blocked forever</text>
+
+        <!-- caller goroutine, faded / gone -->
+        <rect x="440" y="60" width="180" height="90" rx="10" fill="var(--bg)" stroke="var(--edge-2)" stroke-width="2" stroke-dasharray="5 4"/>
+        <text x="530" y="90" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink-soft)">main()</text>
+        <text x="530" y="110" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">already returned</text>
+        <text x="530" y="130" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">on timeout</text>
+
+        <text x="320" y="190" text-anchor="middle" font-family="var(--font-body)" font-size="12" fill="var(--ink-soft)">Nobody is left to read &mdash; the worker goroutine, and its stack, live on forever.</text>
+      </svg>
+      <figcaption>The receiving goroutine left early; the sender is still waiting for a rendezvous that will never happen.</figcaption>
+    </figure>
+
+    <h2>A Worked Example: The Leak an Agent Wrote</h2>
+    <p>Say we prompted an agent for &ldquo;a function that fetches a price quote, but gives up
+    after 2 seconds.&rdquo; A very plausible first draft looks like this:</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">GetQuote</span>(sym <span class="ty">string</span>) (<span class="ty">float64</span>, <span class="ty">error</span>) {
+    ch <span class="op">:=</span> <span class="fn">make</span>(<span class="kw">chan</span> <span class="ty">float64</span>)  <span class="cm">// unbuffered</span>
+    <span class="kw">go</span> <span class="kw">func</span>() {
+        price <span class="op">:=</span> <span class="fn">slowLookup</span>(sym)  <span class="cm">// may take a while</span>
+        ch <span class="op">&lt;-</span> price               <span class="cm">// leak: only sent if someone is still listening</span>
+    }()
+
+    <span class="kw">select</span> {
+    <span class="kw">case</span> p <span class="op">:=</span> <span class="op">&lt;-</span>ch:
+        <span class="kw">return</span> p, <span class="kw">nil</span>
+    <span class="kw">case</span> <span class="op">&lt;-</span>time.<span class="fn">After</span>(<span class="num">2</span><span class="op">*</span>time.Second):
+        <span class="kw">return</span> <span class="num">0</span>, errors.<span class="fn">New</span>(<span class="str">"quote timed out"</span>)
+    }
+}</code></pre>
+
+    <p>It reads fine. It even handles the timeout &mdash; there's a <code class="inl">select</code>
+    with two cases, which looks like exactly the pattern we asked for earlier. But walk through
+    what happens when <code class="inl">slowLookup</code> takes 5 seconds: the
+    <code class="inl">time.After</code> case fires, <code class="inl">GetQuote</code> returns an
+    error, and the calling goroutine moves on. Three seconds later, the inner goroutine finishes
+    <code class="inl">slowLookup</code> and tries <code class="inl">ch &lt;- price</code> &mdash;
+    but <code class="inl">ch</code> is unbuffered and nobody is receiving anymore. That send
+    blocks <em>forever</em>. The goroutine, and the memory it's holding onto, never gets
+    reclaimed. Call <code class="inl">GetQuote</code> in a hot path and you leak one goroutine
+    per slow lookup, indefinitely.</p>
+
+    <p>The fix is to give the goroutine a way to notice that nobody's listening anymore &mdash;
+    which is precisely what <code class="inl">context.Context</code> is for:</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">GetQuote</span>(ctx context.Context, sym <span class="ty">string</span>) (<span class="ty">float64</span>, <span class="ty">error</span>) {
+    ctx, cancel <span class="op">:=</span> context.<span class="fn">WithTimeout</span>(ctx, <span class="num">2</span><span class="op">*</span>time.Second)
+    <span class="kw">defer</span> <span class="fn">cancel</span>()
+
+    ch <span class="op">:=</span> <span class="fn">make</span>(<span class="kw">chan</span> <span class="ty">float64</span>, <span class="num">1</span>)  <span class="cm">// buffered: the send below can never block</span>
+    <span class="kw">go</span> <span class="kw">func</span>() {
+        ch <span class="op">&lt;-</span> <span class="fn">slowLookup</span>(sym)
+    }()
+
+    <span class="kw">select</span> {
+    <span class="kw">case</span> p <span class="op">:=</span> <span class="op">&lt;-</span>ch:
+        <span class="kw">return</span> p, <span class="kw">nil</span>
+    <span class="kw">case</span> <span class="op">&lt;-</span>ctx.<span class="fn">Done</span>():
+        <span class="kw">return</span> <span class="num">0</span>, ctx.<span class="fn">Err</span>()
+    }
+}</code></pre>
+
+    <p>Two small, deliberate changes. First, the channel is now buffered with capacity 1, so the
+    inner goroutine's send always succeeds immediately, whether or not anyone is still around to
+    receive &mdash; the goroutine finishes and exits cleanly either way, and the buffered value
+    is simply garbage collected if nobody ever reads it. Second, the timeout is expressed as a
+    real <code class="inl">context.Context</code> passed in from the caller instead of a bare
+    <code class="inl">time.After</code>, so the caller can also cancel early, and the deadline
+    composes correctly if <code class="inl">GetQuote</code> is itself called from something with
+    its own deadline. Neither change is dramatic. That's the point &mdash; the fix for a leak is
+    almost never a rewrite, it's making sure every goroutine has an exit that doesn't depend on
+    someone else's good behavior.</p>
+
+    <h2>Tooling: You Cannot Review Concurrency By Reading It</h2>
+    <p>This is the chapter where &ldquo;read the diff carefully&rdquo; stops being enough advice.
+    Races and leaks are scheduling-dependent; a correct-looking function can fail one time in a
+    thousand runs. You need tools that watch the program execute, not just the source.</p>
+
+    <table class="grid">
+      <tr><th>Tool</th><th class="mono">Command</th><th>Catches</th></tr>
+      <tr><td>Race detector</td><td class="mono">go test -race ./...</td><td>Data races, observed at runtime on executed code paths</td></tr>
+      <tr><td>Race detector</td><td class="mono">go build -race / go run -race</td><td>Same instrumentation, for manual or load-test runs</td></tr>
+      <tr><td>Goroutine leak profile</td><td class="mono">GOEXPERIMENT=goroutineleakprofile</td><td>Goroutines blocked on an unreachable channel/mutex/cond</td></tr>
+      <tr><td>go vet</td><td class="mono">go vet ./...</td><td>Suspicious lock copies, unreachable Println-style misuse</td></tr>
+    </table>
+
+    <p>The race detector works by instrumenting every memory access when you build with
+    <code class="inl">-race</code>: the runtime watches reads and writes to shared variables and
+    reports a race the moment it observes one, with a stack trace for each side of the
+    conflicting access. It only finds races on code paths that actually execute during that run,
+    so it's not a proof of absence &mdash; it's a proof of presence when it fires, and it needs
+    your test suite to actually exercise the concurrent paths to have anything to observe. It's
+    also expensive: expect memory use to climb roughly 5&ndash;10&times; and runtime
+    2&ndash;20&times;, which is exactly why it belongs in CI rather than every local
+    <code class="inl">go build</code>.</p>
+
+    <p>Goroutine leaks are newer territory for tooling. Go 1.26 shipped an experimental
+    <code class="inl">goroutineleak</code> profile in <code class="inl">runtime/pprof</code>,
+    enabled at build time with <code class="inl">GOEXPERIMENT=goroutineleakprofile</code> (and
+    exposed live at <code class="inl">/debug/pprof/goroutineleak</code> when the experiment is
+    on). It works by leaning on the garbage collector: if a goroutine is blocked on a channel or
+    mutex, and that primitive is unreachable from anything that's still runnable, the runtime
+    knows it can never be unblocked and flags it. That's a genuinely good fit for auditing agent
+    output, because it doesn't need you to already suspect where the leak is &mdash; point it at
+    a running program and it tells you.</p>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      This is, empirically, where coding agents fail the most. An agent optimizes for &ldquo;the
+      code I generated ran and produced the right answer once,&rdquo; and concurrency bugs are
+      specifically the class of bug that a single successful run cannot reveal. An agent will
+      confidently hand you a goroutine with no shutdown path, a <code class="inl">select</code>
+      with no <code class="inl">ctx.Done()</code> escape, or a shared counter with no mutex
+      &mdash; and every one of those will look completely normal in review unless you know to
+      look for the specific shape of the mistake. Treat any agent-generated code that spawns a
+      goroutine as a draft, not a deliverable, until it's passed <code class="inl">-race</code>
+      under real concurrent load.
+    </div>
+
+    <div class="callout warn">
+      <span class="tag">Watch for</span>
+      A dead giveaway of agent-written concurrency is a goroutine launched with no corresponding
+      <code class="inl">sync.WaitGroup</code>, no channel it's expected to report back on, and
+      no context threaded through it at all &mdash; &ldquo;fire and forget&rdquo; code that reads
+      as fine because nothing crashes today. Ask: if the caller returns early, does this
+      goroutine know? If the answer is no, you're looking at a future leak.
+    </div>
+
+    <p class="why"><b>Reflection.</b> None of this makes concurrency in Go complicated &mdash;
+    goroutines, channels, and context really are a small, coherent set of primitives, and that's
+    still true with an agent in the loop. What changes is where your attention has to go. You're
+    no longer reviewing whether the code <em>looks</em> right; you're reviewing whether every
+    goroutine has an owner, every context has a deferred cancel, and every blocking operation has
+    an escape. That's a checklist, not a mystery, and it's the one place in this book where
+    running the tool genuinely tells you more than reading the diff ever will.</p>
+
+    <div class="audit">
+      <h4>Audit Checklist</h4>
+      <ul>
+        <li>Every <code class="inl">go func()</code> has a clear owner and a visible shutdown path &mdash; someone waits on it, cancels it, or explains in a comment why it's meant to outlive the caller.</li>
+        <li>Every <code class="inl">context.WithCancel</code>, <code class="inl">WithTimeout</code>, or <code class="inl">WithDeadline</code> is followed immediately by <b>defer cancel()</b>.</li>
+        <li><code class="inl">context.Context</code> is the first parameter, named <code class="inl">ctx</code>, and is never stored on a struct or passed backward up the call stack.</li>
+        <li>No blocking channel send or receive exists without a <code class="inl">ctx.Done()</code> escape in a <code class="inl">select</code>, or a buffer sized so the send can never block.</li>
+        <li><code class="inl">go test -race ./...</code> actually runs in CI, not just locally on a good day.</li>
+        <li>Shared state written from more than one goroutine is behind a mutex or a channel &mdash; never a bare variable incremented from multiple <code class="inl">go</code> statements.</li>
+      </ul>
+    </div>
+
+    <div class="sources">Sources:
+      <a href="https://go.dev/doc/articles/race_detector">Data Race Detector — go.dev</a>,
+      <a href="https://go.dev/doc/go1.26">Go 1.26 Release Notes — go.dev</a>,
+      <a href="https://github.com/golang/go/issues/74609">runtime/pprof, runtime: new goroutine leak profile — golang/go#74609</a>,
+      <a href="https://pkg.go.dev/context">context package documentation — pkg.go.dev</a>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-errors-as-values.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-toolchain-feedback-loop.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

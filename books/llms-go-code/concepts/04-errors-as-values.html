@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Errors as Values — LLMs, Go Code!</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="gopher-mark">
+      <svg width="20" height="16" viewBox="0 0 20 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <ellipse cx="10" cy="9" rx="9" ry="6.5" fill="#00add8"/>
+        <circle cx="10" cy="3.6" r="3.4" fill="#00add8"/>
+        <circle cx="6.6" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="13.4" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="6.9" cy="2.7" r=".7" fill="#142229"/>
+        <circle cx="13.1" cy="2.7" r=".7" fill="#142229"/>
+      </svg>
+    </span>
+    LLMs, Go Code! <span class="pick">&mdash; a BookBank field guide</span>
+  </span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Part I &middot; The Go Blueprint</p>
+    <p class="chapno">Chapter 4</p>
+    <h1>Errors as Values: Catching an Agent That Cuts Corners</h1>
+
+    <p class="lead">Quick question: what does a Go function do when something goes wrong? It doesn't
+    throw. It doesn't raise. It doesn't unwind the stack looking for a handler three call frames up.
+    It just <em class="term">returns</em>. An error in Go is a value &mdash; the same way an
+    <code class="inl">int</code> or a <code class="inl">string</code> is a value &mdash; and that one
+    design choice changes almost everything about how you read, write, and audit Go code.</p>
+
+    <h2>Motivation: no exceptions, no magic</h2>
+    <p>Coming from Python, Java, or JavaScript, this feels like a downgrade at first. Where's
+    <code class="inl">try</code>? Where's <code class="inl">catch</code>? Go's answer is: nowhere, on
+    purpose. Instead, any function that can fail returns two things &mdash; the result you wanted, and
+    an <code class="inl">error</code> describing what went wrong, or <code class="inl">nil</code> if
+    nothing did:</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">ReadConfig</span>(path <span class="ty">string</span>) (*Config, <span class="ty">error</span>) {
+    data, err := os.ReadFile(path)
+    <span class="kw">if</span> err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> <span class="kw">nil</span>, err
+    }
+    <span class="kw">var</span> cfg Config
+    <span class="kw">if</span> err := json.Unmarshal(data, &amp;cfg); err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> <span class="kw">nil</span>, err
+    }
+    <span class="kw">return</span> &amp;cfg, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>There's no hidden control-flow jump here. Every place a call can fail is a visible
+    <code class="inl">if err != nil</code> a few lines below it. That's tedious to type, and it's
+    exactly why people joke about Go being "if err != nil the language." But tedium is the price of
+    honesty: nothing is invisible, nothing is inferred, and nothing can silently blow past three
+    layers of your call stack the way an uncaught exception can. When you're reading code &mdash;
+    especially code you didn't write yourself, like an agent's output &mdash; that honesty is worth
+    a lot more than it costs.</p>
+
+    <h2>Design: the <code class="inl">error</code> interface</h2>
+    <p>Under the hood, <code class="inl">error</code> is almost insultingly simple. It's a
+    one-method interface defined in the language's universe block:</p>
+
+    <pre class="tab"><code><span class="kw">type</span> <span class="ty">error</span> <span class="kw">interface</span> {
+    <span class="fn">Error</span>() <span class="ty">string</span>
+}</code></pre>
+
+    <p>Anything with an <code class="inl">Error() string</code> method satisfies it &mdash; remember
+    from the last chapter, that's implicit, structural typing at work again. That minimalism is
+    deliberate: an error just needs to be able to describe itself. Go gives you three common ways to
+    produce one, and knowing all three &mdash; and when an agent should reach for which &mdash; is
+    the real skill in this chapter.</p>
+
+    <h3>1. Sentinel errors</h3>
+    <p>A <em class="term">sentinel error</em> is a package-level value, usually built with
+    <code class="inl">errors.New</code>, that callers compare against to detect a specific,
+    well-known failure:</p>
+
+    <pre class="tab"><code><span class="kw">var</span> ErrNotFound = errors.<span class="fn">New</span>(<span class="str">"item not found"</span>)
+
+<span class="kw">func</span> <span class="fn">Lookup</span>(id <span class="ty">string</span>) (*Item, <span class="ty">error</span>) {
+    item, ok := store[id]
+    <span class="kw">if</span> <span class="kw">!</span>ok {
+        <span class="kw">return</span> <span class="kw">nil</span>, ErrNotFound
+    }
+    <span class="kw">return</span> item, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>The standard library does this too &mdash; <code class="inl">io.EOF</code> and
+    <code class="inl">sql.ErrNoRows</code> are both sentinels. The catch: <code class="inl">errors.New</code>
+    returns a distinct value every time it's called, even with identical text, so sentinels only work
+    as a shared <code class="inl">var</code> a caller can reference. And crucially, callers should
+    compare with <code class="inl">errors.Is(err, ErrNotFound)</code>, never <code class="inl">==</code>
+    &mdash; more on why in a moment.</p>
+
+    <h3>2. Custom error types</h3>
+    <p>Sometimes a string isn't enough &mdash; you want structured data alongside the failure: which
+    field was invalid, what the retry-after duration was, which HTTP status came back. For that, define
+    a type and give it an <code class="inl">Error() string</code> method:</p>
+
+    <pre class="tab"><code><span class="kw">type</span> <span class="ty">ValidationError</span> <span class="kw">struct</span> {
+    Field <span class="ty">string</span>
+    Msg   <span class="ty">string</span>
+}
+
+<span class="kw">func</span> (e *ValidationError) <span class="fn">Error</span>() <span class="ty">string</span> {
+    <span class="kw">return</span> fmt.<span class="fn">Sprintf</span>(<span class="str">"field %q: %s"</span>, e.Field, e.Msg)
+}</code></pre>
+
+    <p>Now a caller who wants the structured detail can pull it back out with
+    <code class="inl">errors.As</code>, which we'll get to in a page. This is the pattern to reach
+    for whenever "something went wrong" isn't descriptive enough for the code that has to react to it.</p>
+
+    <h3>3. Wrapping: <code class="inl">%w</code> versus <code class="inl">%v</code></h3>
+    <p>Real systems have layers. A repository calls a driver, a service calls the repository, a
+    handler calls the service &mdash; and an error from the bottom needs to travel up through all of
+    them without losing its identity, while still picking up context at each hop ("failed to save
+    user" is more useful than a bare "connection refused"). Since Go 1.13, <code class="inl">fmt.Errorf</code>
+    has a verb for exactly this: <code class="inl">%w</code>.</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">SaveUser</span>(u User) <span class="ty">error</span> {
+    <span class="kw">if</span> err := db.<span class="fn">Insert</span>(u); err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"save user %s: %w"</span>, u.ID, err)
+    }
+    <span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>When <code class="inl">fmt.Errorf</code> sees <code class="inl">%w</code>, the error it
+    returns grows an <code class="inl">Unwrap() error</code> method that hands back the original
+    error underneath. That one method is the entire mechanism &mdash; there's no other magic. It's
+    what lets <code class="inl">errors.Is</code> and <code class="inl">errors.As</code> walk back
+    down through every layer of wrapping to find a match, using a pre-order, depth-first walk of the
+    error tree (the Go blog's own description of the algorithm). Swap that <code class="inl">%w</code>
+    for <code class="inl">%v</code>, and you still get a nice printable message &mdash; but the
+    resulting error has <em>no</em> <code class="inl">Unwrap</code> method. The original error is
+    baked into a string and thrown away as a distinct value. <code class="inl">errors.Is</code> and
+    <code class="inl">errors.As</code> simply can't see past it anymore.</p>
+
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 640 190" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram showing three stacked errors connected by wraps arrows, with errors.Is and errors.As shown walking down the chain via Unwrap, but stopping at a break where %v was used instead of %w.">
+        <defs>
+          <marker id="arrowAccent" markerWidth="9" markerHeight="9" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="var(--accent-deep)"/>
+          </marker>
+        </defs>
+        <style>
+          .fbox{ fill:var(--bg-2); stroke:var(--edge-2); stroke-width:1.4; }
+          .fboxbreak{ fill:var(--yellow-bg); stroke:var(--fuchsia); stroke-width:1.6; }
+          .flabel{ font-family:var(--font-mono); font-size:11px; fill:var(--ink); }
+          .fsub{ font-family:var(--font-mono); font-size:9.5px; fill:var(--ink-soft); }
+          .fwrap{ font-family:var(--font-mono); font-size:9.5px; fill:var(--accent-deep); }
+          .fwarn{ font-family:var(--font-mono); font-size:9.5px; fill:var(--fuchsia); font-weight:bold; }
+        </style>
+
+        <rect x="16" y="18" width="168" height="52" rx="8" class="fbox"/>
+        <text x="30" y="40" class="flabel">sql.ErrNoRows</text>
+        <text x="30" y="56" class="fsub">the root cause</text>
+
+        <rect x="236" y="18" width="168" height="52" rx="8" class="fbox"/>
+        <text x="250" y="40" class="flabel">repo error</text>
+        <text x="250" y="56" class="fsub">fmt.Errorf(&quot;...: %w&quot;)</text>
+
+        <rect x="456" y="18" width="168" height="52" rx="8" class="fboxbreak"/>
+        <text x="470" y="40" class="flabel">handler error</text>
+        <text x="470" y="56" class="fwarn">fmt.Errorf(&quot;...: %v&quot;)</text>
+
+        <line x1="236" y1="44" x2="188" y2="44" stroke="var(--accent-deep)" stroke-width="1.6" marker-end="url(#arrowAccent)"/>
+        <text x="192" y="36" class="fwrap">wraps</text>
+
+        <line x1="456" y1="44" x2="408" y2="44" stroke="var(--fuchsia)" stroke-width="1.6" stroke-dasharray="4 3"/>
+        <text x="410" y="36" class="fwrap">copies text only</text>
+
+        <rect x="16" y="118" width="608" height="54" rx="8" fill="none" stroke="var(--edge-2)" stroke-width="1"/>
+        <text x="30" y="138" class="fsub">errors.Is(handlerErr, sql.ErrNoRows) walks Unwrap() right-to-left&#8230;</text>
+        <line x1="470" y1="150" x2="426" y2="150" stroke="var(--ink-soft)" stroke-width="1.4" marker-end="url(#arrowAccent)"/>
+        <text x="428" y="146" class="fwarn">&#10007; chain ends here</text>
+        <line x1="330" y1="150" x2="200" y2="150" stroke="var(--accent-deep)" stroke-width="1.4" marker-end="url(#arrowAccent)"/>
+        <text x="200" y="163" class="fsub">reaches sql.ErrNoRows only if every hop used %w</text>
+      </svg>
+      <figcaption>The wrapping chain: <code class="inl">%w</code> keeps <code class="inl">Unwrap()</code> intact so <code class="inl">errors.Is</code>/<code class="inl">errors.As</code> can walk all the way to the root cause. One <code class="inl">%v</code> anywhere in the chain severs it.</figcaption>
+    </figure>
+
+    <p>The signatures worth memorizing, straight from the <code class="inl">errors</code> package:</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">New</span>(text <span class="ty">string</span>) <span class="ty">error</span>
+<span class="kw">func</span> <span class="fn">Is</span>(err, target <span class="ty">error</span>) <span class="ty">bool</span>
+<span class="kw">func</span> <span class="fn">As</span>(err <span class="ty">error</span>, target <span class="ty">any</span>) <span class="ty">bool</span>
+<span class="kw">func</span> <span class="fn">Unwrap</span>(err <span class="ty">error</span>) <span class="ty">error</span>
+<span class="kw">func</span> <span class="fn">Join</span>(errs &#8230;<span class="ty">error</span>) <span class="ty">error</span></code></pre>
+
+    <p><code class="inl">errors.Is</code> is for sentinels &mdash; "is this, or does it wrap, that
+    specific value?" <code class="inl">errors.As</code> is for custom types &mdash; "does this chain
+    contain an error of this type, and if so, give it to me." Both only work as far down the chain as
+    the <code class="inl">Unwrap</code> methods actually go. As of Go 1.26 there's also a generic
+    convenience, <code class="inl">errors.AsType[E]</code>, which does the same walk as
+    <code class="inl">As</code> but returns the typed value directly instead of writing through a
+    pointer &mdash; handy, but it doesn't change the underlying contract: wrapping still has to be
+    real for it to find anything.</p>
+
+    <div class="callout key">
+      <span class="tag">Key idea</span>
+      <code class="inl">%w</code> isn't a formatting nicety &mdash; it's the one thing that keeps an
+      error's <em>identity</em> attached to its <em>message</em>. Lose it, and you can still print the
+      error; you just can't programmatically react to it anymore.
+    </div>
+
+    <h2>Implementation: what "checking" actually means</h2>
+    <p>Notice that everything above still boils down to the same three-line ritual:
+    call something, check <code class="inl">err != nil</code>, decide what to do. The interesting
+    part &mdash; the part that separates good Go from Go-shaped noise &mdash; is what goes
+    <em>inside</em> that branch. Your options, roughly in order of how often you should use them:</p>
+
+    <table class="grid">
+      <tr><th>Situation</th><th class="mono">Do this</th></tr>
+      <tr><td>Caller needs to know the operation failed, nothing more</td><td class="mono">return err</td></tr>
+      <tr><td>Caller needs context about <em>where</em> it failed</td><td class="mono">return fmt.Errorf("...: %w", err)</td></tr>
+      <tr><td>Caller needs to branch on a known failure kind</td><td class="mono">errors.Is / errors.As</td></tr>
+      <tr><td>This really is the end of the line, nothing more to do</td><td class="mono">log.Printf / handle it, don't discard it</td></tr>
+    </table>
+
+    <p>What's <em>not</em> on that table: silently swallowing the error and moving on as if nothing
+    happened. That's always wrong, and it's the single most common way agent-written Go quietly
+    breaks in production.</p>
+
+    <h2>Edge cases: where this bites</h2>
+    <p>A few sharp corners worth knowing before you go looking for them in agent output:</p>
+    <ul>
+      <li><strong>Comparing sentinels with <code class="inl">==</code>.</strong> It works right up
+      until someone wraps the error one layer further up the stack, at which point the identity
+      comparison silently starts failing. <code class="inl">errors.Is</code> doesn't have this
+      problem &mdash; use it by default, even when you're "sure" nothing wraps it today.</li>
+      <li><strong>Double-wrapping the same context.</strong> If the repository layer already says
+      "save user u123:" and the service layer wraps again with "save user u123:", the caller gets a
+      redundant, confusing message. Each layer should add <em>new</em> information, not repeat what's
+      already there.</li>
+      <li><strong>Wrapping a sentinel changes its message but not its identity.</strong>
+      <code class="inl">fmt.Errorf("query users: %w", sql.ErrNoRows)</code> still satisfies
+      <code class="inl">errors.Is(err, sql.ErrNoRows)</code> &mdash; the printed text is
+      cosmetic, the chain underneath is what matters.</li>
+      <li><strong><code class="inl">errors.As</code> needs a pointer to the target type</strong>,
+      e.g. <code class="inl">var ve *ValidationError; errors.As(err, &amp;ve)</code>. Passing the
+      wrong shape panics at runtime instead of failing to compile &mdash; a rare case where Go's
+      strictness doesn't catch a mistake until execution.</li>
+    </ul>
+
+    <h2>The agent angle: three ways an agent cuts corners</h2>
+    <p>Here's the thing about coding agents and error handling: an agent under token or instruction
+    pressure will produce code that <em>compiles</em>, <em>looks</em> idiomatic at a glance, and
+    passes a shallow review &mdash; while quietly discarding the information a caller three layers up
+    actually needs. Three patterns show up constantly. Watch for all of them.</p>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      Agents love the blank identifier. <code class="inl">_, _ = f()</code> compiles cleanly, satisfies
+      <code class="inl">go vet</code> in the common case, and makes the diff look tidy &mdash; but it
+      throws the error away before anyone ever sees it. If you see <code class="inl">_ =</code> or
+      <code class="inl">_, _ =</code> anywhere near a call that can fail, stop and ask: was that
+      deliberate, or did the agent just want the line count to shrink?
+    </div>
+
+    <p>Here's a "spot the bug" pair. Both compile. Only one is safe to ship.</p>
+
+    <pre class="tab"><code><span class="cm">// --- agent-written, broken ---</span>
+<span class="kw">func</span> <span class="fn">ProcessOrder</span>(id <span class="ty">string</span>) <span class="ty">error</span> {
+    order, _ := repo.<span class="fn">FindOrder</span>(id)              <span class="cm">// (1) error silently dropped</span>
+
+    <span class="kw">if</span> err := billing.<span class="fn">Charge</span>(order); err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> <span class="kw">nil</span>                                    <span class="cm">// (2) checked, then thrown away</span>
+    }
+
+    <span class="kw">if</span> err := ship.<span class="fn">Dispatch</span>(order); err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"dispatch failed: %v"</span>, err)  <span class="cm">// (3) %v hides ErrOutOfStock</span>
+    }
+    <span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <pre class="tab"><code><span class="cm">// --- corrected ---</span>
+<span class="kw">func</span> <span class="fn">ProcessOrder</span>(id <span class="ty">string</span>) <span class="ty">error</span> {
+    order, err := repo.<span class="fn">FindOrder</span>(id)
+    <span class="kw">if</span> err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"process order %s: %w"</span>, id, err)  <span class="cm">// (1) fixed: checked and wrapped</span>
+    }
+
+    <span class="kw">if</span> err := billing.<span class="fn">Charge</span>(order); err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"charge order %s: %w"</span>, id, err)   <span class="cm">// (2) fixed: real failure, real return</span>
+    }
+
+    <span class="kw">if</span> err := ship.<span class="fn">Dispatch</span>(order); err <span class="kw">!=</span> <span class="kw">nil</span> {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"dispatch order %s: %w"</span>, id, err)  <span class="cm">// (3) fixed: %w preserves ErrOutOfStock</span>
+    }
+    <span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>Walk through why each fix matters:</p>
+    <ul>
+      <li><strong>(1)</strong> If <code class="inl">FindOrder</code> fails, the broken version
+      happily proceeds with a zero-value <code class="inl">order</code> and charges a customer for
+      nothing. The blank identifier didn't just lose an error message &mdash; it let the function
+      barrel past a failure as if it succeeded.</li>
+      <li><strong>(2)</strong> This is the sneakiest one, because it <em>looks</em> like careful error
+      handling &mdash; there's an <code class="inl">if err != nil</code> right there. But the branch
+      body does nothing useful; it reports success (<code class="inl">nil</code>) after a real charge
+      failure. A caller checking <code class="inl">if err != nil</code> on <code class="inl">ProcessOrder</code>
+      will never know billing failed.</li>
+      <li><strong>(3)</strong> Suppose <code class="inl">ship.Dispatch</code> returns a sentinel,
+      <code class="inl">ErrOutOfStock</code>, when the warehouse is empty, and the caller wants to
+      retry later specifically for that case with
+      <code class="inl">errors.Is(err, ship.ErrOutOfStock)</code>. With <code class="inl">%v</code>,
+      that check always fails &mdash; the sentinel's identity was flattened into a string the moment
+      it was formatted. Swapping in <code class="inl">%w</code> is a one-character fix that restores
+      the caller's ability to make that decision at all.</li>
+    </ul>
+
+    <div class="callout warn">
+      <span class="tag">Warning</span>
+      None of these three bugs fail a build. <code class="inl">go build</code> and even
+      <code class="inl">go vet</code> are happy with all of them. This is exactly the kind of defect
+      that slips through an agent's own self-check ("does it compile? does it pass the test I
+      wrote?") and only shows up later, in production, as a customer who got charged for an order
+      that was never dispatched.
+    </div>
+
+    <h2>Reflection</h2>
+    <p>Go didn't give you exceptions because exceptions make it too easy to let a failure travel
+    somewhere you didn't intend, silently, until it surfaces as a stack trace nobody wrote down
+    context for. Errors as values force every failure path into the open &mdash; which is exactly
+    the property you want when the code writing those paths is an agent instead of you. The syntax
+    is boring on purpose: <code class="inl">if err != nil</code> is small enough to read in a glance,
+    which means it's small enough to <em>audit</em> in a glance, too. Your job isn't to eliminate
+    that boilerplate. It's to make sure every single occurrence of it does something real.</p>
+
+    <h3>Challenges</h3>
+    <ol>
+      <li>Grep a real (or agent-generated) Go file for <code class="inl">_ =</code> and
+      <code class="inl">_, err :=</code> followed by an empty or no-op branch. For each hit, decide:
+      deliberate, or corner-cut?</li>
+      <li>Take the corrected <code class="inl">ProcessOrder</code> above and add a
+      <code class="inl">*ValidationError</code> custom type for a bad order ID, then write the
+      <code class="inl">errors.As</code> call a caller would use to detect it specifically.</li>
+      <li>Write a one-sentence prompt instruction you'd add to an agent's system prompt that would
+      have prevented all three bugs in the broken snippet. Test it by asking an agent to write a
+      similar three-step pipeline and see if the instruction actually holds.</li>
+    </ol>
+
+    <div class="audit">
+      <h4>Audit Checklist</h4>
+      <ul>
+        <li>Grep the diff for <code class="inl">_ = </code> or <code class="inl">_, _ =</code> next to any call that returns an error &mdash; every hit needs a reason.</li>
+        <li>Every <code class="inl">err</code> returned by a called function is either checked or explicitly, deliberately ignored with a comment saying why.</li>
+        <li>Every non-empty <code class="inl">if err != nil</code> branch actually <em>does</em> something with the error &mdash; return it, wrap it, log it, or retry. Not just <code class="inl">return nil</code>.</li>
+        <li><code class="inl">%w</code> is used (not <code class="inl">%v</code>) anywhere a caller might reasonably need <code class="inl">errors.Is</code> or <code class="inl">errors.As</code> to work on that error later.</li>
+        <li>No layer repeats context a caller below it already added &mdash; each wrap should add new information, not restate the last one.</li>
+        <li>Sentinel errors are compared with <code class="inl">errors.Is</code>, and custom error types are extracted with <code class="inl">errors.As</code> &mdash; never a bare <code class="inl">==</code> or type assertion on something that might be wrapped.</li>
+      </ul>
+    </div>
+
+    <div class="sources">
+      Sources:
+      <a href="https://go.dev/blog/go1.13-errors">Working with Errors in Go 1.13 &mdash; The Go Blog</a>,
+      <a href="https://pkg.go.dev/errors">package errors &mdash; pkg.go.dev</a>,
+      <a href="https://pkg.go.dev/fmt">package fmt &mdash; pkg.go.dev (Errorf and the %w verb)</a>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-implicit-interfaces.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-concurrency-context.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
