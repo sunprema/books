@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Landlock — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 11 &middot; Locking Your Own Doors</p>
+    <h1>Landlock</h1>
+    <p class="lead" data-anchor="ll-lead">Sandboxing on Linux has traditionally required someone else's
+    cooperation. SELinux and AppArmor need an administrator to write and load a policy. Namespaces and
+    chroot want privileges you'd rather not have. seccomp filters syscalls, not <em>paths</em> &mdash; it
+    can stop you calling <code class="inl">open</code>, but it has no idea what you're opening.
+    Landlock closes that gap: an ordinary unprivileged process can tell the kernel
+    <em>&ldquo;from this line onward, I may only read <code class="inl">/usr</code> and write
+    <code class="inl">/tmp/work</code>&rdquo;</em> &mdash; and the kernel will hold it to that, forever.</p>
+
+    <h2>The idea: voluntary, irreversible, inherited</h2>
+    <p data-anchor="ll-idea">Landlock is a stackable LSM that, in the kernel's own words, &ldquo;enables any
+    processes to securely restrict themselves and their future children.&rdquo; It landed in
+    <strong>Linux 5.13</strong>. Three properties make it work:</p>
+    <ul data-anchor="ll-props">
+      <li><strong>No privilege needed.</strong> You're giving power up, not taking it. Nothing dangerous
+      about letting anyone do that, so anyone can.</li>
+      <li><strong>Irreversible.</strong> &ldquo;Once a thread is landlocked, there is no way to remove its
+      security policy; only adding more restrictions is allowed.&rdquo; A one-way ratchet. Compromised
+      code cannot un-sandbox itself, because there is no syscall that would do it.</li>
+      <li><strong>Inherited.</strong> The policy &ldquo;will be enforced on all its subsequently created
+      children as well&rdquo; &mdash; every thread from <code class="inl">clone(2)</code> and every process
+      from <code class="inl">fork</code>/<code class="inl">exec</code> inherits the domain. You cannot escape
+      by spawning a helper.</li>
+    </ul>
+
+    <div class="callout key" data-anchor="ll-key">
+      <span class="tag">The key idea</span>
+      Sandboxing is usually something done <em>to</em> a program by an administrator who must guess what
+      it needs. Landlock lets the program &mdash; the one thing that actually knows what files it
+      touches &mdash; do it to itself, at the exact moment it stops needing anything more.
+    </div>
+
+    <h2>Always ask the ABI first</h2>
+    <p data-anchor="ll-abi-why">Landlock is still growing, and each kernel version knows a different set of
+    access rights. Request a right the running kernel has never heard of and ruleset creation fails
+    outright. So the first thing every real Landlock program does is ask what it's talking to:</p>
+
+    <pre class="tab" data-anchor="ll-abi-code"><span class="cap">c &middot; probe the ABI before anything else</span><code><span class="ty">int</span> abi = <span class="fn">landlock_create_ruleset</span>(<span class="en">NULL</span>, <span class="num">0</span>, <span class="en">LANDLOCK_CREATE_RULESET_VERSION</span>);
+<span class="cm">/* With this flag, attr must be NULL and size must be 0.
+   abi &lt; 0  -> no Landlock here (old kernel, or not enabled).
+   abi >= 1 -> the highest ABI version this kernel supports. */</span>
+<span class="kw">if</span> (abi &lt; <span class="num">0</span>) {
+    <span class="cm">/* Decide deliberately: degrade quietly, or refuse to run.
+       Do not pretend you are sandboxed when you are not. */</span>
+}</code></pre>
+
+    <table class="grid" data-anchor="ll-abi-table">
+      <tr><th>ABI</th><th>Kernel</th><th>What it added</th></tr>
+      <tr><td class="mono">1</td><td class="mono">5.13</td><td>the base filesystem access rights</td></tr>
+      <tr><td class="mono">2</td><td class="mono">5.19</td><td><code class="inl">LANDLOCK_ACCESS_FS_REFER</code> &mdash; controlled rename/link across directories</td></tr>
+      <tr><td class="mono">3</td><td class="mono">6.2</td><td><code class="inl">LANDLOCK_ACCESS_FS_TRUNCATE</code></td></tr>
+      <tr><td class="mono">4</td><td class="mono">6.7</td><td>network rights: <code class="inl">LANDLOCK_ACCESS_NET_BIND_TCP</code>, <code class="inl">…CONNECT_TCP</code></td></tr>
+      <tr><td class="mono">5</td><td class="mono">6.10</td><td><code class="inl">LANDLOCK_ACCESS_FS_IOCTL_DEV</code></td></tr>
+      <tr><td class="mono">6</td><td class="mono">6.12</td><td><code class="inl">LANDLOCK_SCOPE_*</code> &mdash; scoping abstract UNIX sockets and signals</td></tr>
+      <tr><td class="mono">7</td><td class="mono">6.15</td><td>logging restriction flags</td></tr>
+      <tr><td class="mono">8</td><td class="mono">7.0</td><td><code class="inl">LANDLOCK_RESTRICT_SELF_TSYNC</code></td></tr>
+    </table>
+
+    <h2>The rights you can hand back</h2>
+    <p data-anchor="ll-rights">A ruleset declares which access rights it <em>handles</em> &mdash; the
+    complete set it intends to police. Anything handled is denied by default; you then grant it back on
+    specific directory subtrees. Anything <em>not</em> handled is left entirely alone, which is what
+    makes the ABI table above matter: on an older kernel you must drop the rights it doesn't know.</p>
+    <table class="grid" data-anchor="ll-rights-table">
+      <tr><th>On files</th><th>On directories</th></tr>
+      <tr>
+        <td class="mono">LANDLOCK_ACCESS_FS_EXECUTE<br>LANDLOCK_ACCESS_FS_READ_FILE<br>LANDLOCK_ACCESS_FS_WRITE_FILE<br>LANDLOCK_ACCESS_FS_TRUNCATE<br>LANDLOCK_ACCESS_FS_IOCTL_DEV</td>
+        <td class="mono">LANDLOCK_ACCESS_FS_READ_DIR<br>LANDLOCK_ACCESS_FS_REMOVE_DIR<br>LANDLOCK_ACCESS_FS_REMOVE_FILE<br>LANDLOCK_ACCESS_FS_MAKE_REG / _DIR / _SYM<br>LANDLOCK_ACCESS_FS_MAKE_CHAR / _BLOCK / _SOCK / _FIFO<br>LANDLOCK_ACCESS_FS_REFER</td>
+      </tr>
+    </table>
+
+    <h2>Sandboxing yourself, end to end</h2>
+    <p data-anchor="ll-nowrapper">As with <code class="inl">userfaultfd</code>, glibc provides no wrappers &mdash;
+    you write three thin <code class="inl">syscall</code> shims:</p>
+
+    <pre class="tab" data-anchor="ll-shims"><span class="cap">c &middot; the three syscalls</span><code><span class="mac">#define _GNU_SOURCE</span>
+<span class="mac">#include</span> <span class="str">&lt;linux/landlock.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;sys/prctl.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;sys/syscall.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;fcntl.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="kw">static</span> <span class="ty">int</span> <span class="fn">landlock_create_ruleset</span>(<span class="kw">const</span> <span class="ty">struct</span> <span class="ty">landlock_ruleset_attr</span> *attr,
+                                   <span class="ty">size_t</span> size, <span class="ty">__u32</span> flags) {
+    <span class="kw">return</span> <span class="fn">syscall</span>(<span class="en">__NR_landlock_create_ruleset</span>, attr, size, flags);
+}
+<span class="kw">static</span> <span class="ty">int</span> <span class="fn">landlock_add_rule</span>(<span class="ty">int</span> fd, <span class="ty">enum</span> <span class="ty">landlock_rule_type</span> type,
+                             <span class="kw">const</span> <span class="ty">void</span> *attr, <span class="ty">__u32</span> flags) {
+    <span class="kw">return</span> <span class="fn">syscall</span>(<span class="en">__NR_landlock_add_rule</span>, fd, type, attr, flags);
+}
+<span class="kw">static</span> <span class="ty">int</span> <span class="fn">landlock_restrict_self</span>(<span class="ty">int</span> fd, <span class="ty">__u32</span> flags) {
+    <span class="kw">return</span> <span class="fn">syscall</span>(<span class="en">__NR_landlock_restrict_self</span>, fd, flags);
+}</code></pre>
+
+    <pre class="tab" data-anchor="ll-usage"><span class="cap">c &middot; read /usr, write /tmp/work, nothing else &mdash; ever again</span><code><span class="ty">struct</span> <span class="ty">landlock_ruleset_attr</span> attr = {
+    .handled_access_fs =
+        <span class="en">LANDLOCK_ACCESS_FS_EXECUTE</span>    | <span class="en">LANDLOCK_ACCESS_FS_READ_FILE</span>  |
+        <span class="en">LANDLOCK_ACCESS_FS_WRITE_FILE</span> | <span class="en">LANDLOCK_ACCESS_FS_READ_DIR</span>   |
+        <span class="en">LANDLOCK_ACCESS_FS_REMOVE_FILE</span>| <span class="en">LANDLOCK_ACCESS_FS_MAKE_REG</span>,
+};
+<span class="ty">int</span> rs = <span class="fn">landlock_create_ruleset</span>(&amp;attr, <span class="kw">sizeof</span>(attr), <span class="num">0</span>);
+
+<span class="ty">struct</span> <span class="ty">landlock_path_beneath_attr</span> pb;
+
+<span class="cm">/* Grant: read-only under /usr. Note O_PATH — a descriptor that names a
+   place without opening it for I/O. Chapter 02's trick, put to work. */</span>
+pb.allowed_access = <span class="en">LANDLOCK_ACCESS_FS_READ_FILE</span> | <span class="en">LANDLOCK_ACCESS_FS_READ_DIR</span> |
+                    <span class="en">LANDLOCK_ACCESS_FS_EXECUTE</span>;
+pb.parent_fd = <span class="fn">open</span>(<span class="str">"/usr"</span>, <span class="en">O_PATH</span> | <span class="en">O_CLOEXEC</span>);
+<span class="fn">landlock_add_rule</span>(rs, <span class="en">LANDLOCK_RULE_PATH_BENEATH</span>, &amp;pb, <span class="num">0</span>);
+<span class="fn">close</span>(pb.parent_fd);
+
+<span class="cm">/* Grant: read-write under /tmp/work. */</span>
+pb.allowed_access = <span class="en">LANDLOCK_ACCESS_FS_READ_FILE</span> | <span class="en">LANDLOCK_ACCESS_FS_WRITE_FILE</span> |
+                    <span class="en">LANDLOCK_ACCESS_FS_READ_DIR</span>  | <span class="en">LANDLOCK_ACCESS_FS_MAKE_REG</span> |
+                    <span class="en">LANDLOCK_ACCESS_FS_REMOVE_FILE</span>;
+pb.parent_fd = <span class="fn">open</span>(<span class="str">"/tmp/work"</span>, <span class="en">O_PATH</span> | <span class="en">O_CLOEXEC</span>);
+<span class="fn">landlock_add_rule</span>(rs, <span class="en">LANDLOCK_RULE_PATH_BENEATH</span>, &amp;pb, <span class="num">0</span>);
+<span class="fn">close</span>(pb.parent_fd);
+
+<span class="cm">/* Required — see below. */</span>
+<span class="fn">prctl</span>(<span class="en">PR_SET_NO_NEW_PRIVS</span>, <span class="num">1</span>, <span class="num">0</span>, <span class="num">0</span>, <span class="num">0</span>);
+
+<span class="cm">/* The point of no return. */</span>
+<span class="fn">landlock_restrict_self</span>(rs, <span class="num">0</span>);
+<span class="fn">close</span>(rs);
+
+<span class="cm">/* From here: /etc/shadow does not exist as far as this thread is
+   concerned. Neither does $HOME. And there is no way back. */</span></code></pre>
+
+    <div class="callout warn" data-anchor="ll-nnp">
+      <span class="tag">no_new_privs is not optional</span>
+      <code class="inl">landlock_restrict_self()</code> refuses to run without
+      <code class="inl">PR_SET_NO_NEW_PRIVS</code> first, and the reason is worth understanding. Without
+      it, sandboxed code could <code class="inl">exec</code> a set-user-ID binary &mdash;
+      <code class="inl">sudo</code>, <code class="inl">passwd</code> &mdash; and gain privileges
+      <em>inside</em> the sandbox, using a trusted program as a crowbar. <code class="inl">no_new_privs</code>
+      makes that structurally impossible: nothing this thread execs can ever be more privileged than
+      the thread itself. Only then will the kernel accept the ratchet.
+    </div>
+
+    <figure data-anchor="ll-fig">
+    <svg viewBox="0 0 640 210" class="figure-svg" role="img" aria-label="A timeline of one process. Before landlock_restrict_self it can reach the entire filesystem. After the call, an irreversible boundary is crossed: only /usr read-only and /tmp/work read-write remain reachable, and a forked child inherits exactly the same restricted view with no way back out.">
+      <g font-family="monospace" font-size="9" fill="#2b2114">
+        <text x="14" y="16" font-size="10" font-weight="bold" fill="#6f5c3e">before</text>
+        <rect x="14" y="26" width="230" height="150" rx="7" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="26" y="46" font-size="8" fill="#6f5c3e">reachable:</text>
+        <text x="26" y="64">/usr</text><text x="26" y="80">/etc/shadow</text>
+        <text x="26" y="96">$HOME/.ssh/id_ed25519</text>
+        <text x="26" y="112">/tmp/work</text><text x="26" y="128">/dev/*</text>
+        <text x="26" y="144">&hellip;the whole tree</text>
+        <text x="26" y="166" font-size="8" fill="#a5561a">one bug away from all of it</text>
+
+        <path d="M256 100 H310" stroke="#8a2f22" stroke-width="2" marker-end="url(#c1)"/>
+        <text x="252" y="84" font-size="8" fill="#8a2f22">restrict_self()</text>
+        <line x1="283" y1="26" x2="283" y2="176" stroke="#8a2f22" stroke-width="2" stroke-dasharray="5 3"/>
+        <text x="266" y="192" font-size="8" fill="#8a2f22">no way back</text>
+
+        <text x="322" y="16" font-size="10" font-weight="bold" fill="#3f6d3a">after</text>
+        <rect x="322" y="26" width="150" height="150" rx="7" fill="#e6efe0" stroke="#3f6d3a"/>
+        <text x="334" y="46" font-size="8" fill="#3f6d3a">reachable:</text>
+        <text x="334" y="64">/usr <tspan font-size="8" fill="#6f5c3e">(r-x)</tspan></text>
+        <text x="334" y="80">/tmp/work <tspan font-size="8" fill="#6f5c3e">(rw)</tspan></text>
+        <text x="334" y="104" font-size="8" fill="#6f5c3e">everything else:</text>
+        <text x="334" y="118" font-size="8" fill="#8a2f22">EACCES</text>
+        <text x="334" y="150" font-size="8" fill="#3f6d3a">a bug reaches</text>
+        <text x="334" y="162" font-size="8" fill="#3f6d3a">two directories</text>
+
+        <path d="M400 178 V196" stroke="#3f6d3a" stroke-width="1.4" marker-end="url(#c2)"/>
+        <rect x="486" y="70" width="140" height="62" rx="7" fill="#e6efe0" stroke="#3f6d3a" stroke-dasharray="4 2"/>
+        <text x="496" y="90" font-size="8" fill="#3f6d3a">fork() / exec()</text>
+        <text x="496" y="106">child inherits</text>
+        <text x="496" y="122" font-size="8" fill="#3f6d3a">the same domain</text>
+        <path d="M474 100 H484" stroke="#3f6d3a" stroke-width="1.4" marker-end="url(#c2)"/>
+      </g>
+      <defs>
+        <marker id="c1" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6 z" fill="#8a2f22"/></marker>
+        <marker id="c2" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0 0 L6 2.5 L0 5 z" fill="#3f6d3a"/></marker>
+      </defs>
+    </svg>
+    <figcaption>The ratchet only turns one way &mdash; and children are born on the far side of it.</figcaption>
+    </figure>
+
+    <h2>Who's actually using it</h2>
+    <div class="usecase" data-anchor="ll-use-apps">
+      <span class="tag">Real-world use</span>
+      <strong>pacman 7</strong> sandboxes package downloads, so a compromised download can't wander the
+      filesystem with the privileges the package manager runs under. <strong>GNOME's localsearch</strong>
+      sandboxes its file indexer &mdash; a process that parses untrusted documents all day is exactly
+      what you want fenced in. <strong>Nix</strong> and OpenBSD's <strong>rpki-client</strong> use it
+      too; rpki-client is a neat case, since it wanted the hardening its home OS gets from
+      <code class="inl">unveil(2)</code> and Landlock is the closest Linux equivalent.
+    </div>
+    <div class="usecase" data-anchor="ll-use-suricata">
+      <span class="tag">Real-world use</span>
+      <strong>Suricata</strong> makes the argument for self-sandboxing better than any manual could: an
+      intrusion-detection system knows precisely which directories it reads rules from and writes logs
+      to, so it can enforce a tight deny-by-default policy on itself &mdash; something no external
+      administrator could have written as accurately.
+    </div>
+    <p data-anchor="ll-systemd">Tooling is arriving too. <strong>Island</strong> is a general-purpose
+    Landlock sandboxing wrapper, and <strong>systemd</strong> has an in-progress
+    <code class="inl">LandlockConfig=</code> service setting, which would let you sandbox a unit
+    declaratively without touching its source at all.</p>
+
+    <div class="callout funny" data-anchor="ll-funny">
+      <span class="tag">A small delight</span>
+      Eleven chapters ago the kernel handed us a file descriptor for a timer, because a number you can
+      <code class="inl">poll</code> is more useful than a special case. Here the pattern completes: you
+      build a <em>security policy</em>, get a file descriptor for it, and hand it back. Even the ability
+      to give up your own power arrives as an integer you can <code class="inl">close</code>. Everything
+      really is a file.
+    </div>
+
+    <div class="sources" data-anchor="ll-sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man7/landlock.7.html">landlock(7)</a> &mdash; man7.org;
+      <a href="https://docs.kernel.org/userspace-api/landlock.html">Landlock: unprivileged access control</a> &mdash; kernel.org;
+      <a href="https://landlock.io/">landlock.io</a>;
+      <a href="https://docs.suricata.io/en/latest/configuration/landlock.html">Using Landlock LSM</a> &mdash; Suricata docs.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="10-copy-file-range.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

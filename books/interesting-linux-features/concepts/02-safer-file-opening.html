@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Safer Ways to Open a File — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 02 &middot; Paths &amp; Traps</p>
+    <h1>Safer Ways to Open a File</h1>
+    <p class="lead">The plain <code class="inl">open(2)</code> call has three quieter cousins that exist purely
+    because "open a file by name" is a surprisingly dangerous operation once an attacker &mdash;
+    or just an unlucky race &mdash; gets to choose what that name points to.</p>
+
+    <p class="dropcap">Between the moment you resolve a path and the moment you act on it, the world can
+    change. Someone can swap a symlink under you, another process can be mid-write to the file
+    you're about to read, or the path you meant to check and the path you actually open can turn
+    out to be two different files. This whole family of bugs has a name &mdash;
+    <strong>TOCTOU</strong>, "time of check to time of use" &mdash; and three flags on
+    <code class="inl">open(2)</code> exist specifically to close the window.</p>
+
+    <h2>O_PATH &mdash; a handle with no read or write power</h2>
+    <p><code class="inl">O_PATH</code> opens a file descriptor that <em>refers</em> to a location
+    in the filesystem without actually opening the file for I/O. You can't
+    <code class="inl">read()</code> or <code class="inl">write()</code> through it. What you
+    <em>can</em> do is pass it as the <code class="inl">dirfd</code> argument to the
+    <code class="inl">*at()</code> family &mdash; <code class="inl">fstatat()</code>,
+    <code class="inl">fchownat()</code>, <code class="inl">linkat()</code>,
+    <code class="inl">readlinkat()</code>, <code class="inl">openat()</code> &mdash; or reopen it
+    properly through <code class="inl">/proc/self/fd/N</code>.</p>
+    <pre class="tab"><span class="cap">c &middot; resolve once, act many times, safely</span><code><span class="ty">int</span> <span class="fn">pfd</span> = <span class="fn">open</span>(<span class="str">"/var/lib/app/data"</span>, <span class="mac">O_PATH</span> | <span class="mac">O_NOFOLLOW</span>);
+<span class="cm">// pfd now names *this exact inode*, resolved once -- no re-lookup, no race</span>
+
+<span class="kw">struct</span> stat st;
+<span class="fn">fstatat</span>(pfd, <span class="str">""</span>, &amp;st, <span class="mac">AT_EMPTY_PATH</span>);      <span class="cm">// stat the pfd itself</span>
+<span class="fn">openat</span>(pfd, <span class="str">"config.json"</span>, <span class="mac">O_RDONLY</span>);       <span class="cm">// relative to that exact directory</span></code></pre>
+    <p>Because the <code class="inl">*at()</code> calls resolve their relative path starting
+    from the already-pinned <code class="inl">pfd</code>, nobody can trick you by renaming or
+    replacing a directory somewhere earlier in the path &mdash; you already committed to
+    <em>this</em> inode. If the final component turns out to be a symlink and you passed
+    <code class="inl">O_NOFOLLOW</code>, you get an fd referring to the symlink itself, which you
+    can then safely inspect with <code class="inl">readlinkat(pfd, "", ...)</code> without ever
+    following it.</p>
+
+    <div class="usecase" data-anchor="path-use">
+      <span class="tag">Real-world use</span>
+      Container runtimes and systemd use <code class="inl">O_PATH</code> extensively to walk
+      untrusted or attacker-influenced paths (bind-mount targets, container root filesystems)
+      one safely-pinned component at a time, refusing to ever silently follow a symlink out of
+      the intended tree.
+    </div>
+
+    <h2>O_TMPFILE &mdash; a file with no name, until you decide it needs one</h2>
+    <p>Normally, creating a file means the moment <code class="inl">creat()</code>/<code class="inl">open(O_CREAT)</code>
+    returns, a directory entry exists that anyone can open, read, and see mid-write. <code class="inl">O_TMPFILE</code>
+    creates a completely unnamed inode &mdash; visible in the filesystem only as the caller's fd
+    &mdash; that never gets a name unless you explicitly give it one:</p>
+    <pre class="tab"><span class="cap">c &middot; write the whole file, then publish it atomically</span><code><span class="ty">int</span> <span class="fn">fd</span> = <span class="fn">open</span>(<span class="str">"/var/lib/app"</span>, <span class="mac">O_TMPFILE</span> | <span class="mac">O_WRONLY</span>, <span class="num">0600</span>);
+<span class="fn">write</span>(fd, buf, len);                       <span class="cm">// nobody else can see this file yet</span>
+<span class="fn">fsync</span>(fd);
+
+<span class="kw">char</span> path[<span class="num">64</span>];
+<span class="fn">snprintf</span>(path, <span class="kw">sizeof</span> path, <span class="str">"/proc/self/fd/%d"</span>, fd);
+<span class="fn">linkat</span>(<span class="mac">AT_FDCWD</span>, path, <span class="mac">AT_FDCWD</span>, <span class="str">"/var/lib/app/data.json"</span>, <span class="mac">AT_SYMLINK_FOLLOW</span>);
+<span class="cm">// only NOW does the fully-written file appear, atomically, with its final name</span></code></pre>
+    <p>Readers can never observe a partially-written file, because the file has no name to open
+    until you're done &mdash; and the final <code class="inl">linkat()</code> is a single atomic
+    filesystem operation. Add <code class="inl">O_EXCL</code> to <code class="inl">O_TMPFILE</code>
+    and you get the opposite guarantee: a file that can <em>never</em> be linked into the
+    directory tree at all, a true anonymous scratch file that vanishes the instant every fd
+    referencing it is closed &mdash; no cleanup code, no crash-leaves-a-tempfile-behind bugs.</p>
+
+    <div class="callout funny" data-anchor="tmpfile-funny">
+      <span class="tag">A small delight</span>
+      An <code class="inl">O_TMPFILE</code> + <code class="inl">O_EXCL</code> file is, for all
+      practical purposes, a Schr&ouml;dinger's file: it fully exists (you can read and write
+      gigabytes to it, it occupies real disk blocks), yet as far as anyone with a plain path is
+      concerned, it was never born and never will be. Close the last fd and it's gone &mdash; no
+      obituary required.
+    </div>
+
+    <div class="usecase" data-anchor="tmpfile-use">
+      <span class="tag">Real-world use</span>
+      This "write it all, then link it into place" pattern is the standard, kernel-assisted way
+      to do an atomic file replace &mdash; used by systemd's state files, package manager
+      downloads, and any database or config writer that wants to guarantee a reader never sees a
+      half-written file, without the old trick of writing to <code class="inl">file.tmp</code>
+      and <code class="inl">rename()</code>-ing it (which still leaves a named, visible temp
+      file for a window).
+    </div>
+
+    <h2>O_NOFOLLOW / AT_SYMLINK_NOFOLLOW &mdash; refuse to be redirected</h2>
+    <p>If the last component of the path you're opening is a symbolic link,
+    <code class="inl">O_NOFOLLOW</code> makes <code class="inl">open()</code> fail with
+    <code class="inl">ELOOP</code> instead of quietly following it. That sounds small, but it
+    closes a whole class of classic attacks: a world-writable directory like <code class="inl">/tmp</code>
+    lets any local user plant a symlink named exactly what your program is about to create or
+    open &mdash; pointing it at <code class="inl">/etc/passwd</code>, someone else's home
+    directory, or a device file. Without <code class="inl">O_NOFOLLOW</code>, your privileged
+    process happily follows the trap.</p>
+    <pre class="tab"><span class="cap">c &middot; a lock file that can't be redirected</span><code><span class="ty">int</span> <span class="fn">fd</span> = <span class="fn">open</span>(<span class="str">"/tmp/myapp.lock"</span>,
+               <span class="mac">O_CREAT</span> | <span class="mac">O_EXCL</span> | <span class="mac">O_NOFOLLOW</span> | <span class="mac">O_WRONLY</span>, <span class="num">0600</span>);
+<span class="kw">if</span> (fd == -<span class="num">1</span> &amp;&amp; errno == <span class="en">ELOOP</span>) {
+  <span class="cm">// someone planted a symlink where our lock file should be -- bail out</span>
+}</code></pre>
+    <p><code class="inl">AT_SYMLINK_NOFOLLOW</code> is the same idea for the <code class="inl">*at()</code>
+    family &mdash; pass it to <code class="inl">fstatat()</code>, <code class="inl">fchownat()</code>,
+    or <code class="inl">unlinkat()</code> when you specifically want to operate on the symlink
+    itself, not whatever it points to.</p>
+
+    <div class="usecase" data-anchor="nofollow-use">
+      <span class="tag">Real-world use</span>
+      Mail delivery agents, cron, sudo, and anything that creates predictably-named files in
+      shared directories use <code class="inl">O_NOFOLLOW</code> (often together with
+      <code class="inl">O_EXCL</code>) as baseline hardening against symlink-planting attacks
+      from other local users.
+    </div>
+
+    <svg viewBox="0 0 640 210" class="figure-svg" role="img" aria-label="Two timelines. Top: a naive open() resolves a path, then a second operation later resolves the same path again, and an attacker swaps a symlink in between -- a TOCTOU race. Bottom: an O_PATH fd is resolved once and every later operation reuses that pinned fd, so the swap cannot happen.">
+      <text x="16" y="24" font-family="monospace" font-size="10" fill="#8a2f22" font-weight="bold">without O_PATH: two lookups, a window to attack</text>
+      <line x1="16" y1="50" x2="600" y2="50" stroke="#d8c49c" stroke-width="2"/>
+      <circle cx="80" cy="50" r="5" fill="#3f6d3a"/><text x="80" y="70" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">check(path)</text>
+      <circle cx="320" cy="50" r="5" fill="#a5561a"/><text x="320" y="70" text-anchor="middle" font-family="monospace" font-size="9" fill="#a5561a">attacker swaps symlink</text>
+      <circle cx="540" cy="50" r="5" fill="#8a2f22"/><text x="540" y="70" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">use(path) &mdash; wrong file!</text>
+
+      <text x="16" y="120" font-family="monospace" font-size="10" fill="#3f6d3a" font-weight="bold">with O_PATH: one lookup, then pinned</text>
+      <line x1="16" y1="146" x2="600" y2="146" stroke="#d8c49c" stroke-width="2"/>
+      <circle cx="80" cy="146" r="5" fill="#3f6d3a"/><text x="80" y="166" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">pfd = open(O_PATH)</text>
+      <line x1="80" y1="146" x2="540" y2="146" stroke="#3f6d3a" stroke-width="4"/>
+      <text x="310" y="130" text-anchor="middle" font-family="monospace" font-size="8" fill="#6f5c3e">same inode, guaranteed, the whole way</text>
+      <circle cx="540" cy="146" r="5" fill="#3f6d3a"/><text x="540" y="166" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">fstatat(pfd, ...) &mdash; correct file</text>
+    </svg>
+    <p class="figure-cap">O_PATH turns "resolve, then trust the path is still the same thing" into "resolve once, reuse the fd."</p>
+
+    <div class="sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man2/open.2.html">open(2)</a> &mdash; man7.org Linux
+      man-pages, sections on O_PATH, O_TMPFILE, and O_NOFOLLOW.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-everything-is-a-fd.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-zero-copy-data-movement.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zero-Copy Data Movement — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 03 &middot; Moving Bytes Without Moving Them</p>
+    <h1>Zero-Copy Data Movement</h1>
+    <p class="lead">The ordinary way to move data from a file to a socket &mdash;
+    <code class="inl">read()</code> into a buffer, then <code class="inl">write()</code> it back
+    out &mdash; copies every byte through your process's memory twice, for no reason except that
+    the API makes you ask for the bytes by name. Four syscalls exist purely to skip that.</p>
+
+    <p class="dropcap">A "copy" in the kernel is really a reference to a page of memory. If all
+    you want is for data to travel from a file's page-cache page into a socket buffer, the
+    kernel can just hand out another pointer to the same physical page and bump a reference
+    count &mdash; no CPU cycles spent shuffling bytes, no trip through your userspace buffer at
+    all. <code class="inl">sendfile</code>, <code class="inl">splice</code>,
+    <code class="inl">vmsplice</code>, and <code class="inl">tee</code> are four different doors
+    into that trick.</p>
+
+    <h2>sendfile &mdash; file straight to socket</h2>
+    <p>The simplest case: you want to serve a static file over a socket, and your process never
+    needs to look at the bytes. <code class="inl">sendfile(2)</code> says so directly:</p>
+    <pre class="tab"><span class="cap">c &middot; the whole web server, one call</span><code><span class="ty">off_t</span> offset = <span class="num">0</span>;
+<span class="kw">struct</span> stat st; <span class="fn">fstat</span>(file_fd, &amp;st);
+<span class="fn">sendfile</span>(socket_fd, file_fd, &amp;offset, st.st_size);
+<span class="cm">// bytes travel disk-cache -> socket buffer, entirely inside the kernel</span></code></pre>
+    <p>Without it, serving a file means: <code class="inl">read()</code> copies disk-cache bytes
+    into your buffer, then <code class="inl">write()</code> copies your buffer into the socket's
+    kernel buffer &mdash; two copies and two user/kernel context-switch round trips for data your
+    program never actually touches. <code class="inl">sendfile</code> collapses that to a single
+    call and, on hardware that supports scatter-gather DMA, the network card can read straight
+    out of the page-cache page itself.</p>
+
+    <div class="usecase" data-anchor="sendfile-use">
+      <span class="tag">Real-world use</span>
+      This is the mechanism behind nginx's and Apache's <code class="inl">sendfile</code>
+      directive for serving static assets &mdash; the reason a well-tuned static file server can
+      saturate a network link while barely registering on the CPU.
+    </div>
+
+    <h2>splice &mdash; the general case, via a pipe</h2>
+    <p><code class="inl">sendfile</code> only handles file&rarr;socket. <code class="inl">splice(2)</code>
+    generalizes the same zero-copy trick to <em>any</em> two file descriptors &mdash; as long as
+    at least one of them is a pipe. The kernel implements a pipe internally as a ring of
+    reference-counted page pointers, and <code class="inl">splice</code> just moves pointers in
+    and out of that ring instead of copying the bytes they point to:</p>
+    <pre class="tab"><span class="cap">c &middot; socket to socket, via an anonymous pipe, no copies</span><code><span class="ty">int</span> pipefd[<span class="num">2</span>]; <span class="fn">pipe</span>(pipefd);
+<span class="fn">splice</span>(in_socket,  <span class="en">NULL</span>, pipefd[<span class="num">1</span>], <span class="en">NULL</span>, <span class="num">65536</span>, <span class="mac">SPLICE_F_MOVE</span>);
+<span class="fn">splice</span>(pipefd[<span class="num">0</span>], <span class="en">NULL</span>, out_socket, <span class="en">NULL</span>, <span class="num">65536</span>, <span class="mac">SPLICE_F_MOVE</span>);
+<span class="cm">// data never enters this process's address space at all</span></code></pre>
+    <p>This is exactly how a proxy or load balancer can shovel gigabytes between an inbound and
+    an outbound socket without the proxying process's own memory ever holding a copy of the
+    traffic. <code class="inl">SPLICE_F_NONBLOCK</code> makes the pipe operations
+    non-blocking; <code class="inl">SPLICE_F_MORE</code> is a hint (like TCP_CORK) that more
+    data is coming right behind this chunk, so the kernel can hold off flushing a partial
+    network packet.</p>
+
+    <div class="usecase" data-anchor="splice-use">
+      <span class="tag">Real-world use</span>
+      HAProxy and other high-throughput L4 proxies use <code class="inl">splice</code>-based
+      socket-to-socket forwarding specifically to avoid copying every proxied byte through
+      userspace, which is the difference between a proxy that scales to tens of gigabits and one
+      that becomes the bottleneck.
+    </div>
+
+    <h2>vmsplice &mdash; your own memory, gifted into a pipe</h2>
+    <p><code class="inl">vmsplice(2)</code> goes the other direction: it maps pages of your
+    program's <em>own</em> memory directly into a pipe's buffer, without copying them there
+    first.</p>
+    <pre class="tab"><span class="cap">c &middot; hand a big buffer to a pipe without copying it</span><code><span class="kw">struct</span> iovec iov = { .iov_base = big_buffer, .iov_len = big_buffer_len };
+<span class="fn">vmsplice</span>(pipefd[<span class="num">1</span>], &amp;iov, <span class="num">1</span>, <span class="num">0</span>);
+<span class="cm">// the pipe now references your pages directly -- don't modify big_buffer</span>
+<span class="cm">// until you know the reader has consumed it, or use SPLICE_F_GIFT carefully</span></code></pre>
+    <p>This is sharp: the pipe now holds live references to your process's actual memory pages,
+    so mutating that buffer before the reader has drained the pipe can corrupt what the reader
+    sees. Used carefully, though, it's the fastest way to get a large in-memory buffer into a
+    pipe (and from there, into <code class="inl">splice</code>'s zero-copy world) without ever
+    calling <code class="inl">write()</code>.</p>
+
+    <h2>tee &mdash; duplicate a stream without consuming it</h2>
+    <p><code class="inl">tee(2)</code> copies data from one pipe into another <em>without
+    removing it from the source</em> &mdash; the pipe equivalent of a plumbing T-joint. The
+    original data is still there for the next reader to consume normally.</p>
+    <pre class="tab"><span class="cap">c &middot; fan a stream out to a second consumer, for free</span><code><span class="fn">tee</span>(source_pipe, monitor_pipe, <span class="num">65536</span>, <span class="num">0</span>);
+<span class="cm">// source_pipe is untouched; monitor_pipe now has a copy of the same pages</span>
+<span class="fn">splice</span>(source_pipe, <span class="en">NULL</span>, real_destination, <span class="en">NULL</span>, <span class="num">65536</span>, <span class="num">0</span>);</code></pre>
+
+    <div class="usecase" data-anchor="tee-use">
+      <span class="tag">Real-world use</span>
+      Stream-fan-out tools that need to forward traffic <em>and</em> mirror it &mdash; to a
+      logging pipeline, an intrusion-detection sensor, or a debugging capture &mdash; use
+      <code class="inl">tee</code> to duplicate a pipe's contents without paying for a second
+      full copy of the data.
+    </div>
+
+    <div class="callout funny" data-anchor="zc-funny">
+      <span class="tag">A small delight</span>
+      A pipe, in this world, isn't really "a queue of bytes." It's a small ring of pointers to
+      pages somewhere else in memory &mdash; which is why <code class="inl">tee</code> can
+      "copy" 64&nbsp;KB of data in microseconds. It's not copying the data. It's copying a
+      handful of pointers <em>to</em> the data, and letting reference counting sort out the
+      rest.
+    </div>
+
+    <svg viewBox="0 0 640 190" class="figure-svg" role="img" aria-label="A page of data in the kernel page cache with three arrows: one labeled read+write showing a full copy through user space; one labeled sendfile/splice showing the page reference moving directly from source fd to destination fd inside the kernel; one labeled tee showing the page reference duplicated into a second pipe while the original stays.">
+      <rect x="270" y="20" width="100" height="46" rx="6" fill="#efe3c6" stroke="#8a2f22" stroke-width="1.6"/>
+      <text x="320" y="48" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">one page of data</text>
+
+      <text x="60" y="100" font-family="monospace" font-size="9" fill="#a5561a">read()+write():</text>
+      <path d="M320 66 L320 90 L60 90 L60 130" fill="none" stroke="#a5561a" stroke-width="2"/>
+      <rect x="20" y="130" width="90" height="30" rx="5" fill="#faf0e1" stroke="#a5561a"/>
+      <text x="65" y="150" text-anchor="middle" font-family="monospace" font-size="8" fill="#a5561a">userspace copy</text>
+
+      <text x="460" y="100" font-family="monospace" font-size="9" fill="#3f6d3a">sendfile/splice:</text>
+      <path d="M320 66 L320 90 L520 90 L520 130" fill="none" stroke="#3f6d3a" stroke-width="2.6"/>
+      <rect x="470" y="130" width="100" height="30" rx="5" fill="#eef3ea" stroke="#3f6d3a"/>
+      <text x="520" y="150" text-anchor="middle" font-family="monospace" font-size="8" fill="#3f6d3a">socket, in-kernel</text>
+
+      <path d="M320 66 L320 90 L320 130" fill="none" stroke="#7a3b8a" stroke-width="2.6" stroke-dasharray="4 3"/>
+      <rect x="270" y="130" width="100" height="30" rx="5" fill="#f3ecf5" stroke="#7a3b8a"/>
+      <text x="320" y="150" text-anchor="middle" font-family="monospace" font-size="8" fill="#7a3b8a">tee: 2nd pipe ref</text>
+    </svg>
+    <p class="figure-cap">Same page, three destinies: copied twice, moved by reference, or referenced from two places at once.</p>
+
+    <div class="sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man2/splice.2.html">splice(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/vmsplice.2.html">vmsplice(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/tee.2.html">tee(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/sendfile.2.html">sendfile(2)</a> &mdash; man7.org Linux man-pages.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-safer-file-opening.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-anonymous-memory-files.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

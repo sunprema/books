@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>copy_file_range — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 10 &middot; The Best Copy Is No Copy</p>
+    <h1>copy_file_range</h1>
+    <p class="lead" data-anchor="cfr-lead">Copying a file is the most ordinary thing a program does, and
+    almost every program does it the same naive way: read a chunk into a buffer, write the buffer back
+    out, repeat. The data climbs out of the kernel into your address space and then climbs straight
+    back in, having been changed in no way whatsoever.
+    <code class="inl">copy_file_range</code> asks the obvious question &mdash; why did it need to leave?</p>
+
+    <h2>The dance we all learned first</h2>
+    <pre class="tab" data-anchor="cfr-naive"><span class="cap">c &middot; the copy loop you have written a dozen times</span><code><span class="ty">char</span> buf[<span class="num">65536</span>];
+<span class="ty">ssize_t</span> n;
+<span class="kw">while</span> ((n = <span class="fn">read</span>(fd_in, buf, <span class="kw">sizeof</span> buf)) &gt; <span class="num">0</span>)
+    <span class="fn">write</span>(fd_out, buf, n);
+<span class="cm">/* every byte: page cache -> user buffer -> page cache. Two crossings,
+   two copies, one syscall pair per chunk, all to change nothing. */</span></code></pre>
+    <p data-anchor="cfr-naive-cost">For a 4&nbsp;GB file at 64&nbsp;KB a chunk that's over 65,000 syscall
+    round-trips and 8&nbsp;GB of memory traffic to move 4&nbsp;GB of data. Chapter 03's
+    <code class="inl">splice</code> and <code class="inl">sendfile</code> already showed the kernel is
+    willing to move bytes without handing them to you. <code class="inl">copy_file_range</code> is that
+    idea aimed squarely at the file-to-file case &mdash; and it goes considerably further, because when
+    both ends are files the kernel can sometimes skip <em>moving the bytes at all</em>.</p>
+
+    <h2>The call</h2>
+    <pre class="tab" data-anchor="cfr-sig"><span class="cap">c &middot; signature</span><code><span class="mac">#define _GNU_SOURCE</span>
+<span class="mac">#define _FILE_OFFSET_BITS 64</span>
+<span class="mac">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="ty">ssize_t</span> <span class="fn">copy_file_range</span>(<span class="ty">int</span> fd_in,  <span class="ty">off_t</span> *_Nullable off_in,
+                        <span class="ty">int</span> fd_out, <span class="ty">off_t</span> *_Nullable off_out,
+                        <span class="ty">size_t</span> size, <span class="ty">unsigned int</span> flags);</code></pre>
+    <p data-anchor="cfr-offsets">The offset arguments carry a small piece of cleverness. Pass
+    <code class="inl">NULL</code> and the call behaves like <code class="inl">read</code>/<code class="inl">write</code>:
+    it starts at the descriptor's current file offset and advances it. Pass a pointer and the
+    descriptor's own offset is left <em>untouched</em> &mdash; the kernel reads the starting position out of
+    your variable and updates that instead. So you can copy from the middle of a file that another part
+    of your program is independently reading, without the two fighting over one shared cursor.
+    <code class="inl">flags</code> is reserved and must be <code class="inl">0</code>.</p>
+
+    <pre class="tab" data-anchor="cfr-loop"><span class="cap">c &middot; the whole copy</span><code><span class="ty">ssize_t</span> ret;
+<span class="kw">do</span> {
+    ret = <span class="fn">copy_file_range</span>(fd_in, <span class="en">NULL</span>, fd_out, <span class="en">NULL</span>, len, <span class="num">0</span>);
+    <span class="kw">if</span> (ret == <span class="num">-1</span>) { <span class="fn">perror</span>(<span class="str">"copy_file_range"</span>); <span class="kw">break</span>; }
+    len -= ret;
+} <span class="kw">while</span> (len &gt; <span class="num">0</span> &amp;&amp; ret &gt; <span class="num">0</span>);</code></pre>
+    <div class="callout warn" data-anchor="cfr-short">
+      <span class="tag">Short copies are normal, not an error</span>
+      The return value is the number of bytes copied and &ldquo;could be less than the size originally
+      requested.&rdquo; It is not a promise to finish. Loop until you're done &mdash; a single call that
+      returns less than <code class="inl">size</code> has not failed. A return of <code class="inl">0</code>
+      means the source offset is at or past end-of-file.
+    </div>
+
+    <h2>What the kernel does with the freedom</h2>
+    <p data-anchor="cfr-accel">Once the kernel owns the whole copy rather than 65,000 disconnected
+    read/write pairs, it can hand the job to the filesystem, which may know a shortcut. The man page
+    puts it plainly: the call &ldquo;gives filesystems an opportunity to implement <em>copy
+    acceleration</em> techniques, such as the use of reflinks &hellip; or server-side-copy (in the case
+    of NFS).&rdquo;</p>
+    <table class="grid" data-anchor="cfr-paths">
+      <tr><th>Where the files live</th><th>What can actually happen</th></tr>
+      <tr><td>Btrfs, XFS with reflink support</td><td><strong>A reflink.</strong> Both inodes are pointed at the <em>same</em> copy-on-write extents. No data blocks are read, written, or allocated. A 4&nbsp;GB copy finishes in about the time it takes to update metadata.</td></tr>
+      <tr><td>Both files on one NFS server</td><td><strong>Server-side copy.</strong> The client asks the server to do the copy; the bytes never traverse the network at all. If the server's own filesystem does reflinks, the server does the trick above and the total work approaches zero.</td></tr>
+      <tr><td>An ordinary filesystem with no shortcut</td><td>The kernel copies it in-kernel &mdash; still no crossings into your address space, and still one syscall instead of thousands.</td></tr>
+    </table>
+
+    <figure data-anchor="cfr-fig">
+    <svg viewBox="0 0 640 250" class="figure-svg" role="img" aria-label="Three diagrams comparing copy strategies. First: read/write moves every byte from the page cache up into a user buffer and back down, crossing the user-kernel boundary twice per chunk. Second: copy_file_range keeps all the data inside the kernel, crossing the boundary zero times. Third: on a reflink-capable filesystem, both files simply point at the same shared copy-on-write extents and no data moves at all.">
+      <g font-family="monospace" font-size="9" fill="#2b2114">
+        <text x="14" y="16" font-size="10" font-weight="bold" fill="#8a2f22">1 &middot; read() + write()</text>
+        <line x1="14" y1="26" x2="200" y2="26" stroke="#d8c49c" stroke-dasharray="3 2"/>
+        <text x="150" y="23" font-size="7" fill="#6f5c3e">user</text>
+        <rect x="60" y="30" width="90" height="20" rx="4" fill="#f7e9e2" stroke="#8a2f22"/>
+        <text x="80" y="44" fill="#8a2f22">buf[64K]</text>
+        <line x1="14" y1="58" x2="200" y2="58" stroke="#d8c49c" stroke-dasharray="3 2"/>
+        <text x="148" y="70" font-size="7" fill="#6f5c3e">kernel</text>
+        <rect x="20" y="76" width="70" height="22" rx="4" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="34" y="91">file A</text>
+        <rect x="120" y="76" width="70" height="22" rx="4" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="136" y="91">file B</text>
+        <path d="M55 74 V52" stroke="#8a2f22" stroke-width="1.4" marker-end="url(#b1)"/>
+        <path d="M155 52 V74" stroke="#8a2f22" stroke-width="1.4" marker-end="url(#b1)"/>
+        <text x="20" y="116" font-size="8" fill="#8a2f22">2 crossings &times; every chunk</text>
+
+        <text x="230" y="16" font-size="10" font-weight="bold" fill="#a5561a">2 &middot; copy_file_range()</text>
+        <line x1="230" y1="26" x2="416" y2="26" stroke="#d8c49c" stroke-dasharray="3 2"/>
+        <text x="366" y="23" font-size="7" fill="#6f5c3e">user</text>
+        <text x="258" y="44" font-size="8" fill="#6f5c3e">(one syscall,</text>
+        <text x="258" y="54" font-size="8" fill="#6f5c3e">no buffer)</text>
+        <line x1="230" y1="58" x2="416" y2="58" stroke="#d8c49c" stroke-dasharray="3 2"/>
+        <text x="364" y="70" font-size="7" fill="#6f5c3e">kernel</text>
+        <rect x="236" y="76" width="70" height="22" rx="4" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="250" y="91">file A</text>
+        <rect x="336" y="76" width="70" height="22" rx="4" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="352" y="91">file B</text>
+        <path d="M308 87 H334" stroke="#a5561a" stroke-width="1.6" marker-end="url(#b2)"/>
+        <text x="236" y="116" font-size="8" fill="#a5561a">0 crossings &mdash; stays inside</text>
+
+        <text x="446" y="16" font-size="10" font-weight="bold" fill="#3f6d3a">3 &middot; &hellip;on btrfs / XFS</text>
+        <line x1="446" y1="26" x2="626" y2="26" stroke="#d8c49c" stroke-dasharray="3 2"/>
+        <text x="576" y="23" font-size="7" fill="#6f5c3e">user</text>
+        <line x1="446" y1="58" x2="626" y2="58" stroke="#d8c49c" stroke-dasharray="3 2"/>
+        <text x="574" y="70" font-size="7" fill="#6f5c3e">kernel</text>
+        <rect x="452" y="76" width="60" height="22" rx="4" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="464" y="91">file A</text>
+        <rect x="556" y="76" width="60" height="22" rx="4" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="570" y="91">file B</text>
+        <rect x="490" y="122" width="90" height="22" rx="4" fill="#e6efe0" stroke="#3f6d3a"/>
+        <text x="497" y="137" fill="#3f6d3a">CoW extents</text>
+        <path d="M482 100 L522 120" stroke="#3f6d3a" stroke-width="1.4" marker-end="url(#b3)"/>
+        <path d="M586 100 L548 120" stroke="#3f6d3a" stroke-width="1.4" marker-end="url(#b3)"/>
+        <text x="452" y="162" font-size="8" fill="#3f6d3a">no data moves at all</text>
+      </g>
+      <defs>
+        <marker id="b1" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0 0 L6 2.5 L0 5 z" fill="#8a2f22"/></marker>
+        <marker id="b2" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0 0 L6 2.5 L0 5 z" fill="#a5561a"/></marker>
+        <marker id="b3" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0 0 L6 2.5 L0 5 z" fill="#3f6d3a"/></marker>
+      </defs>
+    </svg>
+    <figcaption>Three ways to copy four gigabytes. The third one doesn't copy four gigabytes.</figcaption>
+    </figure>
+
+    <div class="usecase" data-anchor="cfr-use-cp">
+      <span class="tag">Real-world use</span>
+      You have already used this without knowing. GNU <code class="inl">cp</code> calls
+      <code class="inl">copy_file_range</code>, which is why copying a large file on Btrfs can return
+      instantly &mdash; <code class="inl">--reflink=auto</code> has been the default since
+      <strong>coreutils 9</strong>. Older versions reached for a Btrfs-specific ioctl; the syscall
+      generalised that trick to every filesystem willing to implement it.
+    </div>
+
+    <h2>A version history worth knowing</h2>
+    <p data-anchor="cfr-history">This is a syscall whose behaviour genuinely changed under people's feet,
+    so the kernel version matters more than usual:</p>
+    <table class="grid" data-anchor="cfr-versions">
+      <tr><th>Version</th><th>What changed</th></tr>
+      <tr><td class="mono">Linux 4.5</td><td>the syscall first appears</td></tr>
+      <tr><td class="mono">glibc 2.27</td><td>wrapper added, with a user-space fallback for older kernels</td></tr>
+      <tr><td class="mono">glibc 2.30</td><td>the fallback is <strong>removed</strong> &mdash; the call now genuinely fails on a kernel without it</td></tr>
+      <tr><td class="mono">Linux 5.3</td><td>major rework; cross-filesystem copies are attempted rather than refused</td></tr>
+      <tr><td class="mono">Linux 5.19</td><td>cross-filesystem copies properly supported when both filesystems are the same type and implement it; <code class="inl">EOPNOTSUPP</code> introduced</td></tr>
+    </table>
+
+    <div class="callout danger" data-anchor="cfr-danger">
+      <span class="tag">The gap you must handle</span>
+      Before Linux 5.3, both files had to be on the same filesystem or you got
+      <code class="inl">EXDEV</code>. That's an honest error and easy to handle. The genuinely nasty
+      window is <strong>5.3 through 5.18</strong>: cross-filesystem copies were attempted, and on some
+      virtual filesystems the call <em>failed to copy while still reporting success</em>. A copy that
+      silently produces the wrong bytes and returns a cheerful positive number is the worst possible
+      failure mode. <strong>Always keep a read/write fallback</strong> and take it on
+      <code class="inl">EXDEV</code>, <code class="inl">EOPNOTSUPP</code>, or
+      <code class="inl">EINVAL</code> &mdash; this is exactly why coreutils carries one.
+    </div>
+
+    <h2>The other sharp edges</h2>
+    <ul data-anchor="cfr-errors">
+      <li><strong><code class="inl">EINVAL</code></strong> &mdash; <code class="inl">fd_in</code> and
+      <code class="inl">fd_out</code> refer to the same file and the ranges overlap. (Non-overlapping
+      ranges in one file are fine.)</li>
+      <li><strong><code class="inl">EBADF</code></strong> &mdash; the descriptors aren't open for
+      reading/writing respectively, <em>or</em> <code class="inl">fd_out</code> was opened with
+      <code class="inl">O_APPEND</code>. Append mode and explicit destination offsets are irreconcilable.</li>
+      <li><strong><code class="inl">EISDIR</code></strong> &mdash; one of them is a directory. This moves
+      file contents, not directory entries.</li>
+      <li><strong>Sparse files may get denser.</strong> If <code class="inl">fd_in</code> is sparse, the
+      call &ldquo;may expand any holes existing in the requested range&rdquo; &mdash; a 1&nbsp;GB sparse
+      file that occupies 4&nbsp;KB on disk can land as a genuine 1&nbsp;GB of zeroes. Observed on ext4.</li>
+    </ul>
+
+    <div class="callout funny" data-anchor="cfr-funny">
+      <span class="tag">A small delight</span>
+      There is a certain honesty to a syscall whose best-case behaviour is to do nothing at all. Ask
+      it to copy four gigabytes on Btrfs and it updates a little metadata, points the second file at
+      the first one's blocks, and returns. The copy is real &mdash; write to either file and they part
+      ways instantly. It's just that until someone actually changes something, the cheapest way to
+      have two identical files is to have one.
+    </div>
+
+    <div class="sources" data-anchor="cfr-sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man2/copy_file_range.2.html">copy_file_range(2)</a> &mdash; man7.org;
+      <a href="https://lwn.net/Articles/789623/">The Linux &ldquo;copy problem&rdquo;</a> &mdash; LWN.net;
+      GNU coreutils <code class="inl">cp</code> release notes.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-userfaultfd.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="11-landlock.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
