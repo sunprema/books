@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Everything Is a File Descriptor — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 01 &middot; The Idea</p>
+    <h1 data-anchor="fd-h1">Everything Is a File Descriptor</h1>
+    <p class="lead" data-anchor="fd-lede">Unix's oldest trick &mdash; "everything is a file" &mdash; turns out to have a second act. The
+    kernel has spent the last twenty years quietly turning things that are <em>not</em> files at
+    all &mdash; a counter, a timer, a stream of signals, a whole other process &mdash; into file
+    descriptors too, just so you can hand them to <code class="inl">epoll</code> and stop
+    thinking about them as special cases.</p>
+
+    <p class="dropcap" data-anchor="fd-p1">A file descriptor is really just a small integer that means "ask the kernel about this
+    later." Historically that "this" was a file, a socket, or a pipe. But once you have a
+    single, universal <code class="inl">epoll_wait()</code> that can watch a pile of descriptors
+    and tell you which ones are ready, an obvious question appears: why should timers, signals,
+    and events be handled through entirely different, older mechanisms &mdash; <code class="inl">alarm()</code>,
+    signal handlers, condition variables &mdash; when they could just be fds you read a number
+    from?</p>
+
+    <div class="callout why" data-anchor="fd-why">
+      <span class="tag">Why this matters</span>
+      Once a timer, a signal, or "process X has exited" is a readable file descriptor, it can
+      sit in the exact same <code class="inl">epoll_wait()</code> loop as your sockets. One
+      thread, one loop, no separate polling mechanisms, no signal-handler footguns. This is the
+      single idea that makes modern C event loops (Redis, Node's libuv, systemd, nginx) as small
+      and fast as they are.
+    </div>
+
+    <h2>eventfd &mdash; a counter you can wait on</h2>
+    <p><code class="inl">eventfd(2)</code> hands back a file descriptor that wraps a single
+    unsigned 64-bit counter, maintained entirely by the kernel:</p>
+    <pre class="tab"><span class="cap">c &middot; a minimal wakeup fd</span><code><span class="mac">#include</span> <span class="str">&lt;sys/eventfd.h&gt;</span>
+
+<span class="ty">int</span> <span class="fn">efd</span> = <span class="fn">eventfd</span>(<span class="num">0</span>, <span class="mac">EFD_NONBLOCK</span> | <span class="mac">EFD_CLOEXEC</span>);
+<span class="cm">// another thread, or a signal handler-safe context:</span>
+<span class="ty">uint64_t</span> one = <span class="num">1</span>;
+<span class="fn">write</span>(efd, &amp;one, <span class="kw">sizeof</span>(one));  <span class="cm">// wake the loop</span>
+
+<span class="cm">// the event loop:</span>
+<span class="ty">uint64_t</span> count;
+<span class="fn">read</span>(efd, &amp;count, <span class="kw">sizeof</span>(count)); <span class="cm">// blocks until non-zero, then resets to 0</span></code></pre>
+    <p>Every <code class="inl">write()</code> adds its 8-byte value to the counter; every
+    <code class="inl">read()</code> returns the current count and resets it to zero &mdash; unless
+    you pass <code class="inl">EFD_SEMAPHORE</code> at creation, in which case each read only
+    decrements the counter by one, turning the fd into an actual kernel-backed semaphore. It's
+    the cheapest possible "something happened, go check" signal between threads or processes,
+    and it's entirely epoll-friendly.</p>
+
+    <div class="usecase" data-anchor="fd-eventfd-use">
+      <span class="tag">Real-world use</span>
+      KVM uses <code class="inl">eventfd</code>-backed <em>ioeventfd</em>/<em>irqfd</em> so a
+      guest VM's virtio device writes can notify (or interrupt) the host without a full,
+      expensive VM-exit round trip through QEMU's userspace emulation &mdash; the kernel just
+      bumps the counter directly.
+    </div>
+
+    <h2>timerfd &mdash; a timer you can epoll</h2>
+    <p>Before <code class="inl">timerfd_create(2)</code>, a timer meant <code class="inl">alarm()</code>
+    or <code class="inl">setitimer()</code> delivering <code class="inl">SIGALRM</code> &mdash;
+    async-signal-unsafe and impossible to multiplex cleanly. <code class="inl">timerfd</code>
+    makes a timer just another fd:</p>
+    <pre class="tab"><span class="cap">c &middot; a periodic timer, no signals involved</span><code><span class="ty">int</span> <span class="fn">tfd</span> = <span class="fn">timerfd_create</span>(<span class="en">CLOCK_MONOTONIC</span>, <span class="num">0</span>);
+<span class="kw">struct</span> itimerspec spec = {
+  .it_interval = {<span class="num">1</span>, <span class="num">0</span>},  <span class="cm">// repeat every 1s</span>
+  .it_value    = {<span class="num">1</span>, <span class="num">0</span>},  <span class="cm">// first fire in 1s</span>
+};
+<span class="fn">timerfd_settime</span>(tfd, <span class="num">0</span>, &amp;spec, <span class="en">NULL</span>);
+
+<span class="ty">uint64_t</span> expirations;
+<span class="fn">read</span>(tfd, &amp;expirations, <span class="kw">sizeof</span>(expirations)); <span class="cm">// how many ticks fired since last read</span></code></pre>
+    <p>Reading returns an 8-byte count of how many times the timer has fired since you last
+    read &mdash; so a busy loop that fell behind still gets an honest answer instead of a burst
+    of missed signals. <code class="inl">TFD_TIMER_ABSTIME</code> lets you arm it against an
+    absolute wall-clock deadline instead of a relative delay, which matters if you don't want
+    drift to accumulate across many short waits.</p>
+
+    <div class="usecase" data-anchor="fd-timerfd-use">
+      <span class="tag">Real-world use</span>
+      systemd and most modern C/C++ event-loop libraries (libevent, libuv, Boost.Asio on Linux)
+      implement their "sleep until" and periodic-tick primitives on top of
+      <code class="inl">timerfd</code> specifically so a timeout can live in the same
+      <code class="inl">epoll</code> set as every socket.
+    </div>
+
+    <h2>signalfd &mdash; signals without a signal handler</h2>
+    <p>Signal handlers run at an arbitrary point, on an arbitrary stack, and can only safely
+    call a tiny list of "async-signal-safe" functions. <code class="inl">signalfd(2)</code>
+    sidesteps all of that: block the signals you care about, then read them out of a normal fd
+    whenever it's convenient.</p>
+    <pre class="tab"><span class="cap">c &middot; SIGTERM/SIGINT as data, not an interrupt</span><code>sigset_t mask;
+<span class="fn">sigemptyset</span>(&amp;mask);
+<span class="fn">sigaddset</span>(&amp;mask, <span class="en">SIGTERM</span>);
+<span class="fn">sigaddset</span>(&amp;mask, <span class="en">SIGINT</span>);
+<span class="fn">sigprocmask</span>(<span class="en">SIG_BLOCK</span>, &amp;mask, <span class="en">NULL</span>); <span class="cm">// stop default delivery</span>
+
+<span class="ty">int</span> <span class="fn">sfd</span> = <span class="fn">signalfd</span>(-<span class="num">1</span>, &amp;mask, <span class="mac">SFD_NONBLOCK</span>);
+
+<span class="kw">struct</span> signalfd_siginfo si;
+<span class="fn">read</span>(sfd, &amp;si, <span class="kw">sizeof</span>(si));
+<span class="cm">// si.ssi_signo, si.ssi_pid, si.ssi_status ... ordinary struct fields</span></code></pre>
+    <p>The signal simply stops arriving asynchronously and instead queues up as a readable
+    <code class="inl">struct signalfd_siginfo</code> record on the fd &mdash; which means your
+    graceful-shutdown handling on <code class="inl">SIGTERM</code> can be plain, ordinary,
+    non-reentrant code that runs in your main loop's turn, not in a signal handler fighting your
+    own data structures.</p>
+
+    <div class="callout funny" data-anchor="fd-signal-funny">
+      <span class="tag">A small delight</span>
+      Blocking a signal and then reading it back out through a file descriptor means you can
+      literally <code class="inl">cat</code>-style pipe your process's own <code class="inl">SIGTERM</code>
+      through the same code path you'd use to read a socket. The kernel doesn't care that a
+      signal isn't "really" a stream of bytes &mdash; it'll happily pretend.
+    </div>
+
+    <h2>pidfd &mdash; a process, held safely by the hand</h2>
+    <p>The classic way to signal a process, <code class="inl">kill(pid, sig)</code>, has a nasty
+    race: PIDs get reused. If the process you meant to signal has already exited and the kernel
+    handed its PID to a brand-new, unrelated process, your <code class="inl">kill()</code>
+    happily signals the wrong thing. <code class="inl">pidfd_open(2)</code> fixes this by giving
+    you a file descriptor that refers to <em>that specific process</em>, not to a PID number
+    that might get recycled:</p>
+    <pre class="tab"><span class="cap">c &middot; race-free process signaling</span><code><span class="ty">int</span> <span class="fn">pidfd</span> = <span class="fn">pidfd_open</span>(child_pid, <span class="num">0</span>);
+<span class="cm">// later, maybe much later:</span>
+<span class="kw">if</span> (<span class="fn">pidfd_send_signal</span>(pidfd, <span class="en">SIGTERM</span>, <span class="en">NULL</span>, <span class="num">0</span>) == -<span class="num">1</span>
+    &amp;&amp; errno == <span class="en">ESRCH</span>) {
+  <span class="cm">// the process is really gone -- not "some other process now owns this PID"</span>
+}</code></pre>
+    <p>Because a pidfd is a normal fd, you can also <code class="inl">poll()</code> or
+    <code class="inl">epoll_wait()</code> on it: it becomes readable the instant the process
+    exits, turning "wait for my child (or any process I have a handle to) to die" into just
+    another epoll event, with zero races and zero <code class="inl">SIGCHLD</code> juggling.
+    <code class="inl">clone3(2)</code>'s <code class="inl">CLONE_PIDFD</code> flag goes one step
+    further and hands you the pidfd atomically at creation time, closing even the tiny window
+    between "process is born" and "I open a handle to it."</p>
+
+    <div class="usecase" data-anchor="fd-pidfd-use">
+      <span class="tag">Real-world use</span>
+      Container runtimes and init systems (systemd, runc) use pidfds to track child processes
+      without PID-reuse races, and checkpoint/restore tools use <code class="inl">pidfd_getfd(2)</code>
+      to duplicate a file descriptor <em>out of a different process</em> by pidfd &mdash; handy
+      for live-migrating a running container's open connections.
+    </div>
+
+    <h2>The picture</h2>
+    <svg viewBox="0 0 640 250" class="figure-svg" role="img" aria-label="A process's file descriptor table with four entries beyond the usual stdin/stdout/stderr: an eventfd counter, a timerfd, a signalfd, and a pidfd pointing at another process. A single epoll ring at the bottom watches all four uniformly.">
+      <defs>
+        <linearGradient id="tk" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#a5561a"/><stop offset="1" stop-color="#7a3f10"/>
+        </linearGradient>
+      </defs>
+      <rect x="16" y="16" width="150" height="200" rx="10" fill="#fdf8ee" stroke="#8a2f22" stroke-width="1.6"/>
+      <text x="91" y="38" text-anchor="middle" font-family="monospace" font-size="10" fill="#6f5c3e">your process</text>
+      <text x="91" y="54" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">fd table</text>
+      <g font-family="monospace" font-size="9">
+        <rect x="30" y="64" width="26" height="20" rx="4" fill="url(#tk)"/><text x="43" y="78" text-anchor="middle" fill="#fff">3</text>
+        <text x="66" y="78" fill="#2b2114">eventfd (counter)</text>
+        <rect x="30" y="92" width="26" height="20" rx="4" fill="url(#tk)"/><text x="43" y="106" text-anchor="middle" fill="#fff">4</text>
+        <text x="66" y="106" fill="#2b2114">timerfd (ticks)</text>
+        <rect x="30" y="120" width="26" height="20" rx="4" fill="url(#tk)"/><text x="43" y="134" text-anchor="middle" fill="#fff">5</text>
+        <text x="66" y="134" fill="#2b2114">signalfd (SIGTERM)</text>
+        <rect x="30" y="148" width="26" height="20" rx="4" fill="url(#tk)"/><text x="43" y="162" text-anchor="middle" fill="#fff">6</text>
+        <text x="66" y="162" fill="#2b2114">pidfd (child)</text>
+      </g>
+      <text x="91" y="200" text-anchor="middle" font-family="monospace" font-size="8" fill="#6f5c3e">(fds 0-2 are stdio, as usual)</text>
+      <g stroke="#9c8a63" stroke-width="1.4" fill="none">
+        <path d="M166 74 C260 74 260 130 330 130"/>
+        <path d="M166 102 C250 102 250 130 330 130"/>
+        <path d="M166 130 C280 130 280 130 330 130"/>
+        <path d="M166 158 C260 158 260 130 330 130"/>
+      </g>
+      <circle cx="360" cy="130" r="46" fill="#efe3c6" stroke="#8a2f22" stroke-width="2"/>
+      <text x="360" y="126" text-anchor="middle" font-family="monospace" font-size="10" fill="#8a2f22" font-weight="bold">epoll_wait()</text>
+      <text x="360" y="140" text-anchor="middle" font-family="monospace" font-size="8" fill="#6f5c3e">one loop, one call</text>
+      <g font-family="monospace" font-size="9" fill="#3f6d3a">
+        <text x="470" y="70">"the counter moved"</text>
+        <text x="470" y="98">"a second ticked"</text>
+        <text x="470" y="126">"SIGTERM arrived"</text>
+        <text x="470" y="154">"the child exited"</text>
+      </g>
+      <g stroke="#3f6d3a" stroke-width="1.4" stroke-dasharray="3 3">
+        <line x1="406" y1="118" x2="466" y2="66"/>
+        <line x1="406" y1="122" x2="466" y2="94"/>
+        <line x1="406" y1="130" x2="466" y2="122"/>
+        <line x1="406" y1="138" x2="466" y2="150"/>
+      </g>
+    </svg>
+    <p class="figure-cap">Four completely different kernel subsystems, one uniform interface: a readable fd.</p>
+
+    <div class="sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man2/eventfd.2.html">eventfd(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/timerfd_create.2.html">timerfd_create(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/signalfd.2.html">signalfd(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/pidfd_open.2.html">pidfd_open(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html">pidfd_send_signal(2)</a> &mdash; man7.org Linux man-pages.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="../index.html">&lsaquo; Cover</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="02-safer-file-opening.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
