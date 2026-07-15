@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Executable Specifications — LLMs, Go Code!</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="gopher-mark">
+      <svg width="20" height="16" viewBox="0 0 20 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <ellipse cx="10" cy="9" rx="9" ry="6.5" fill="#00add8"/>
+        <circle cx="10" cy="3.6" r="3.4" fill="#00add8"/>
+        <circle cx="6.6" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="13.4" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="6.9" cy="2.7" r=".7" fill="#142229"/>
+        <circle cx="13.1" cy="2.7" r=".7" fill="#142229"/>
+      </svg>
+    </span>
+    LLMs, Go Code! <span class="pick">&mdash; a BookBank field guide</span>
+  </span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Part II &middot; Directing the Agent</p>
+    <p class="chapno">Chapter 7</p>
+    <h1>Executable Specifications: Prompts, Interfaces &amp; Schema-First Design</h1>
+
+    <p class="lead">Everything up to this point has trained your eye. You can read a struct and
+    tell whether it models the domain honestly, catch a swallowed error, spot a leaked
+    goroutine, and wire the toolchain into a loop that keeps an agent honest after the fact.
+    That's Part I: reading and auditing. Part II turns the camera around. Instead of asking
+    &ldquo;is this code good?&rdquo; we're asking a harder question up front: &ldquo;how do I
+    tell the agent what <em>good</em> even means, in a form it can't quietly misread?&rdquo;</p>
+
+    <h2>The problem with prose</h2>
+
+    <p>Here's a spec, the kind you'd type into a chat box without thinking twice about it:</p>
+
+    <p><em>&ldquo;Write a function that looks up a user by their email address.&rdquo;</em></p>
+
+    <p>It sounds complete. It is not. What does it return if no user matches &mdash; a zero
+    value, a nil pointer, an error? Is the lookup case-sensitive? Is it safe to call
+    concurrently? None of that is in the sentence, so the agent invents answers &mdash;
+    confidently, plausibly, and possibly differently every time you ask. A paragraph of English
+    is a weak specification because nothing checks it. You read the code, it looks reasonable,
+    you move on, and the gap between what you meant and what got built survives to production.</p>
+
+    <p>Compare that to this:</p>
+
+    <pre class="tab"><code><span class="cm">// UserByEmail looks up a user by email address. The match is
+// case-insensitive; leading and trailing whitespace is trimmed
+// before comparison. It returns ErrNotFound if no user has that
+// email, and it is safe for concurrent use by multiple goroutines.</span>
+<span class="kw">type</span> <span class="ty">UserFinder</span> <span class="kw">interface</span> {
+    <span class="fn">UserByEmail</span>(ctx <span class="ty">context</span>.<span class="ty">Context</span>, email <span class="ty">string</span>) (<span class="ty">User</span>, <span class="ty">error</span>)
+}</code></pre>
+
+    <p>That's still English &mdash; the doc comment is prose too &mdash; but it sits on top of a
+    <code class="inl">func</code> signature, and the signature is a contract the compiler
+    enforces whether the agent read the comment carefully or not. Wrong argument count: compile
+    error. Wrong return type: compile error. Forgot the <code class="inl">error</code> return
+    and tried to panic instead: compile error, because nothing else in your codebase can
+    satisfy the interface without it. The English still carries the nuance, but now it has
+    teeth, because you're about to pair it with a test that checks whether the agent read it.</p>
+
+    <p>This is the central claim of the chapter: <strong>a Go interface, a doc comment, and a
+    failing test are a strong specification, because the compiler and the test runner can
+    mechanically check whether the agent satisfied it.</strong> You don't have to trust the
+    agent's summary of what it did. You run <code class="inl">go build</code> and
+    <code class="inl">go test</code> and you get a verdict. We call this class of artifact an
+    <em class="term">executable specification</em> &mdash; not because it runs the business
+    logic itself, but because it runs the <em>check</em> for you.</p>
+
+    <h2>Interface first, implementation second</h2>
+
+    <p>Chapters 2 and 3 already built the muscle for this: model the data as a struct before
+    the agent writes a method, and describe behavior as a small interface before the agent
+    writes an implementation. Executable specifications are just that discipline applied to
+    the moment you hand work to an agent. The order matters:</p>
+
+    <ol>
+      <li><strong>Define the types and the interface.</strong> Decide the caller-facing shape
+      &mdash; struct fields, method signatures, error types &mdash; before any business logic
+      exists.</li>
+      <li><strong>Write a doc comment on every exported symbol</strong> stating the contract:
+      valid input, the zero-value or error case, any ordering or concurrency requirement. Go's
+      own convention &mdash; a doc comment starts with the symbol's name and reads as a full
+      sentence &mdash; already nudges you toward a testable claim.</li>
+      <li><strong>Write one stub, failing test</strong> that calls the not-yet-implemented
+      function and asserts on the contract you just wrote. It should fail on purpose &mdash;
+      that failure is the target the agent aims at.</li>
+      <li><strong>Hand all three to the agent</strong> as the spec, and ask it to make the test
+      pass without changing the interface or the test's assertions.</li>
+    </ol>
+
+    <p>Notice what you're <em>not</em> doing: describing the algorithm. You don't care whether
+    the agent uses a map or a database index, as long as <code class="inl">UserByEmail</code>
+    returns the right thing for the right reasons within the constraints you wrote. That's the
+    trade-off &mdash; you buy a mechanically checkable contract at the cost of design work that
+    used to happen implicitly, in whatever code the agent felt like writing. That trade is
+    almost always worth it: the design work has to happen somewhere, and doing it before
+    generation is far cheaper than auditing it in afterward.</p>
+
+    <div class="callout key">
+      <span class="tag">Key idea</span>
+      A spec is only as strong as what checks it. English is checked by a human skimming a
+      diff &mdash; unreliable, and it doesn't scale. A type signature is checked by the
+      compiler, every time, for free. A test is checked by <code class="inl">go test</code>,
+      every time, for free. Push as much intent as you can into the second and third bucket.
+    </div>
+
+    <h2>Small packages, small blast radius</h2>
+
+    <p>There's a second, quieter failure mode executable specifications also help fix:
+    cross-package hallucination. Drop an agent into a single sprawling package &mdash; the
+    classic <code class="inl">internal/</code> junk drawer with forty files and no clear
+    boundaries &mdash; and it has to guess which of the two hundred exported names it's allowed
+    to touch, and which struct field is safe to add without breaking an invariant three files
+    away that it never read. It will guess wrong sometimes, not out of malice, but because it
+    genuinely can't hold the whole package in its head any better than you can.</p>
+
+    <p>The fix is architectural, not prompt-engineering: a <em class="term">modular monolith</em>.
+    Keep it one deployable binary if that's the right call, but split the <em>code</em> into a
+    handful of small, purpose-named packages, each with a narrow public surface and its own doc
+    comment describing what it owns:</p>
+
+    <pre class="tab"><code>billing/      <span class="cm">// invoices, charges, refunds — owns money movement</span>
+catalog/      <span class="cm">// products, pricing — owns what's for sale</span>
+identity/     <span class="cm">// users, sessions, auth — owns who's asking</span>
+notify/       <span class="cm">// email, webhooks — owns telling people things</span></code></pre>
+
+    <p>When you ask an agent to add a refund reason code, you hand it the
+    <code class="inl">billing</code> package's interfaces and tests &mdash; not the whole
+    module. It cannot import <code class="inl">identity</code>'s unexported helpers by
+    accident, because Go's package-level visibility won't let it, and it has no reason to even
+    open <code class="inl">catalog</code>'s files. The interface between packages becomes the
+    same kind of checkable contract as the interface between your code and the agent: small,
+    explicit, and enforced by the compiler rather than by the agent's memory of a sprawling
+    codebase.</p>
+
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="specflow-title">
+        <title id="specflow-title">Schema flows to generated boilerplate, which the agent fills in with business logic</title>
+        <defs>
+          <marker id="arrowhead7" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+            <path d="M0,0 L10,4 L0,8 Z" fill="var(--accent-deep)"/>
+          </marker>
+        </defs>
+
+        <!-- box 1: schema -->
+        <rect x="14" y="45" width="190" height="100" rx="10" fill="var(--yellow-bg)" stroke="var(--yellow)" stroke-width="2"/>
+        <text x="109" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink)">OpenAPI / .proto</text>
+        <text x="109" y="100" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink)">/ SQL schema</text>
+        <text x="109" y="124" text-anchor="middle" font-family="var(--font-body)" font-size="11" fill="var(--ink-soft)">source of truth</text>
+
+        <line x1="204" y1="95" x2="256" y2="95" stroke="var(--accent-deep)" stroke-width="2" marker-end="url(#arrowhead7)"/>
+        <text x="230" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">codegen</text>
+
+        <!-- box 2: generated boilerplate -->
+        <rect x="260" y="45" width="200" height="100" rx="10" fill="#eefbfd" stroke="var(--aqua)" stroke-width="2"/>
+        <text x="360" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink)">generated types,</text>
+        <text x="360" y="100" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink)">marshaling, routes</text>
+        <text x="360" y="124" text-anchor="middle" font-family="var(--font-body)" font-size="11" fill="var(--ink-soft)">never hand-edited</text>
+
+        <line x1="460" y1="95" x2="512" y2="95" stroke="var(--accent-deep)" stroke-width="2" marker-end="url(#arrowhead7)"/>
+        <text x="486" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">agent fills in</text>
+
+        <!-- box 3: business logic -->
+        <rect x="516" y="45" width="190" height="100" rx="10" fill="#f2fbfd" stroke="var(--accent)" stroke-width="2"/>
+        <text x="611" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink)">handler / resolver</text>
+        <text x="611" y="100" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink)">business logic</text>
+        <text x="611" y="124" text-anchor="middle" font-family="var(--font-body)" font-size="11" fill="var(--ink-soft)">agent-authored, tested</text>
+
+        <text x="109" y="175" text-anchor="middle" font-family="var(--font-body)" font-size="11" fill="var(--ink-soft)">you edit this</text>
+        <text x="611" y="175" text-anchor="middle" font-family="var(--font-body)" font-size="11" fill="var(--ink-soft)">agent edits this</text>
+      </svg>
+      <figcaption>The schema is the only thing anyone hand-writes at the boundary; everything to
+      its right is either generated or checked against it.</figcaption>
+    </figure>
+
+    <h2>Schema-first design for services</h2>
+
+    <p>Interfaces work beautifully inside a Go binary, where the compiler is watching. The
+    moment your contract crosses a process boundary &mdash; an HTTP API, a gRPC service, a
+    database &mdash; the compiler can't help you, and that's exactly where an unsupervised
+    agent tends to invent field names, get a type slightly wrong (a price as a
+    <code class="inl">float64</code> instead of integer cents), or drift the client and server
+    apart one &ldquo;helpful&rdquo; change at a time.</p>
+
+    <p>The fix is the same idea one level up: make the schema the executable specification, and
+    generate the boilerplate from it rather than asking the agent to type it by hand.</p>
+
+    <ul>
+      <li><strong>HTTP APIs &mdash; OpenAPI.</strong> Write the OpenAPI document first (paths,
+      request/response schemas, error shapes), then run a generator such as
+      <a href="https://github.com/oapi-codegen/oapi-codegen">oapi-codegen</a> to produce Go
+      structs, router bindings, and client stubs. The agent fills in handler bodies against
+      generated interfaces, not guessed JSON field names.</li>
+      <li><strong>gRPC services &mdash; Protocol Buffers.</strong> Write the
+      <code class="inl">.proto</code> file, then run <code class="inl">protoc</code> with the
+      <code class="inl">protoc-gen-go</code> and <code class="inl">protoc-gen-go-grpc</code>
+      plugins to generate message types and service interfaces, per the official
+      <a href="https://protobuf.dev/reference/go/go-generated/">Go Generated Code Guide</a>.
+      The agent implements the generated server interface; it never hand-writes a wire type.</li>
+      <li><strong>SQL-backed services &mdash; the schema itself.</strong> Write the
+      <code class="inl">CREATE TABLE</code> statements and queries, then run
+      <a href="https://docs.sqlc.dev/">sqlc</a> to generate type-safe Go functions per query,
+      columns and all &mdash; no hand-typed scan target that can drift from the column list.</li>
+    </ul>
+
+    <p>The trade-off is identical to the interface-and-test pattern: you spend effort up front
+    describing the contract precisely, in a format a tool can parse, and in exchange you get
+    boilerplate that is correct by construction instead of one autocomplete away from a typo
+    that shows up at 2 a.m. The rule worth remembering: <strong>if a human would find
+    generating it by hand tedious and mechanical, an agent will find it tedious too, and
+    tedious is exactly where hallucination creeps in.</strong> Let the generator own the
+    tedious part; save the agent's judgment for what actually needs judgment.</p>
+
+    <h2>A worked example: the spec you'd paste into the context window</h2>
+
+    <p>Let's make this concrete: a coupon-redemption check for the <code class="inl">billing</code>
+    package. Here is literally what we'd put in front of an agent &mdash; interface, doc
+    comment, and one failing table-driven test stub &mdash; before writing a line of
+    implementation ourselves.</p>
+
+    <pre class="tab"><code><span class="cm">// coupon.go</span>
+<span class="kw">package</span> billing
+
+<span class="kw">import</span> <span class="str">"context"</span>
+
+<span class="cm">// ErrCouponExpired is returned by Redeem when the coupon's expiry
+// date has passed. ErrCouponUnknown is returned when no coupon with
+// that code exists. Both are safe to check with errors.Is.</span>
+<span class="kw">var</span> (
+    <span class="en">ErrCouponExpired</span> = <span class="ty">errors</span>.<span class="fn">New</span>(<span class="str">"billing: coupon expired"</span>)
+    <span class="en">ErrCouponUnknown</span> = <span class="ty">errors</span>.<span class="fn">New</span>(<span class="str">"billing: coupon unknown"</span>)
+)
+
+<span class="cm">// CouponRedeemer applies a coupon code to an order total.
+//
+// Redeem looks up code (case-sensitive, no whitespace trimming —
+// codes are generated uppercase-only) and, if valid and unexpired,
+// returns the discounted total in cents. It never returns a
+// negative total: a coupon that would discount below zero clamps
+// to zero. Redeem does not mutate the coupon's use count; call
+// MarkUsed separately once the order is confirmed. Safe for
+// concurrent use.</span>
+<span class="kw">type</span> <span class="ty">CouponRedeemer</span> <span class="kw">interface</span> {
+    <span class="fn">Redeem</span>(ctx <span class="ty">context</span>.<span class="ty">Context</span>, code <span class="ty">string</span>, totalCents <span class="ty">int</span>) (<span class="ty">int</span>, <span class="ty">error</span>)
+}</code></pre>
+
+    <pre class="tab"><code><span class="cm">// coupon_test.go</span>
+<span class="kw">package</span> billing
+
+<span class="kw">import</span> (
+    <span class="str">"context"</span>
+    <span class="str">"errors"</span>
+    <span class="str">"testing"</span>
+)
+
+<span class="kw">func</span> <span class="fn">TestRedeem</span>(t *<span class="ty">testing</span>.<span class="ty">T</span>) {
+    <span class="kw">cases</span> := []<span class="kw">struct</span> {
+        name       <span class="ty">string</span>
+        code       <span class="ty">string</span>
+        totalCents <span class="ty">int</span>
+        wantCents  <span class="ty">int</span>
+        wantErr    <span class="ty">error</span>
+    }{
+        {<span class="str">"valid 20% off"</span>, <span class="str">"SAVE20"</span>, <span class="num">1000</span>, <span class="num">800</span>, <span class="kw">nil</span>},
+        {<span class="str">"discount clamps at zero"</span>, <span class="str">"FREEBIE"</span>, <span class="num">50</span>, <span class="num">0</span>, <span class="kw">nil</span>},
+        {<span class="str">"unknown code"</span>, <span class="str">"NOPE"</span>, <span class="num">1000</span>, <span class="num">0</span>, <span class="en">ErrCouponUnknown</span>},
+        {<span class="str">"expired code"</span>, <span class="str">"OLD10"</span>, <span class="num">1000</span>, <span class="num">0</span>, <span class="en">ErrCouponExpired</span>},
+    }
+    <span class="kw">for</span> _, tc := <span class="kw">range</span> cases {
+        t.<span class="fn">Run</span>(tc.name, <span class="kw">func</span>(t *<span class="ty">testing</span>.<span class="ty">T</span>) {
+            <span class="kw">var</span> r <span class="ty">CouponRedeemer</span> = <span class="fn">newTestRedeemer</span>(t) <span class="cm">// t.Fatal: not implemented</span>
+            got, err := r.<span class="fn">Redeem</span>(<span class="ty">context</span>.<span class="fn">Background</span>(), tc.code, tc.totalCents)
+            <span class="kw">if</span> !<span class="ty">errors</span>.<span class="fn">Is</span>(err, tc.wantErr) {
+                t.<span class="fn">Fatalf</span>(<span class="str">"err = %v, want %v"</span>, err, tc.wantErr)
+            }
+            <span class="kw">if</span> got != tc.wantCents {
+                t.<span class="fn">Errorf</span>(<span class="str">"got %d cents, want %d"</span>, got, tc.wantCents)
+            }
+        })
+    }
+}</code></pre>
+
+    <p>That's the spec, pasted whole into the context window. Here's the &ldquo;now your
+    task&rdquo; prompt that goes with it &mdash; short on purpose, because everything
+    load-bearing already lives in the code above:</p>
+
+    <div class="callout">
+      <span class="tag">Example prompt</span>
+      Implement <code class="inl">newTestRedeemer</code> and a concrete type satisfying
+      <code class="inl">CouponRedeemer</code> in <code class="inl">coupon.go</code>, backed by
+      the in-memory <code class="inl">couponStore</code> already in this package. Don't change
+      the interface signature, the error variables, or any assertion in
+      <code class="inl">coupon_test.go</code>. Run <code class="inl">go test ./billing/...</code>
+      and don't stop until it's green.
+    </div>
+
+    <p>Notice how little the prompt has to say. It doesn't explain what &ldquo;expired&rdquo;
+    means or what to return for an unknown code &mdash; that's already nailed down,
+    mechanically, in the doc comment and the test table. Its only job is to point at the target
+    and name the one detail the spec can't infer (which store to use). Everything else is
+    checked, not requested.</p>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      Agents are eager to please, and prose specs give them room to please you with something
+      other than what you meant. A failing test closes that room: there's exactly one way to
+      make it pass, which is to satisfy the contract. If you catch yourself writing three
+      paragraphs of expected behavior into a chat prompt, ask whether that could instead be a
+      doc comment plus a test case. It almost always can &mdash; and &ldquo;make this red test
+      green without touching its assertions&rdquo; is a far more disciplined goal than
+      &ldquo;please handle the coupon logic.&rdquo;
+    </div>
+
+    <h2>Edge cases the format doesn't save you from</h2>
+
+    <p>A word of caution before you start treating interfaces as magic: executable specs
+    constrain the <em>shape</em> of the answer, not its quality. An agent can satisfy
+    <code class="inl">CouponRedeemer</code>'s signature and pass every case in the table above
+    while still writing an <code class="inl">O(n)</code> linear scan over every coupon ever
+    issued, or leaking the store's internal mutex through a subtle aliasing bug. The test table
+    only covers cases you thought to write down; a clever-but-wrong implementation can satisfy
+    all of them and still be wrong on one you didn't enumerate. That's not a flaw in the
+    approach &mdash; it's a reminder that executable specs raise the floor, they don't replace
+    the audit skills from Part I. Read the diff. Run <code class="inl">go vet</code> and the
+    race detector from Chapter 6's feedback loop. The spec tells you the agent didn't cheat on
+    the contract; it doesn't tell you the contract was complete.</p>
+
+    <p>The same caution applies to generated boilerplate: it only helps if the schema is
+    actually the source of truth. If someone hand-edits a <code class="inl">.pb.go</code> file,
+    or the OpenAPI document drifts out of sync with a route added by hand, you've quietly
+    reintroduced the exact problem schema-first design was supposed to solve. Regenerate on
+    every schema change, commit the generated output so drift is visible in the diff, and treat
+    a hand-edit inside a generated file as a process bug, not a shortcut.</p>
+
+    <h2>Reflection</h2>
+
+    <p>The theme underneath all of this is one you've now seen from several angles: Go gives
+    you cheap, compiler-enforced checkpoints &mdash; a type signature, a package boundary, a
+    doc comment convention &mdash; and an agent workflow gets dramatically more reliable the
+    more of your intent you push into one of those checkpoints instead of leaving it as prose
+    the agent has to infer. Writing the interface first isn't ceremony bolted onto &ldquo;real&rdquo;
+    development; it <em>is</em> the design work, done at the moment it's cheapest &mdash;
+    before code exists to disagree with it. The next chapter takes this further: instead of one
+    failing test as a starting point, we'll build a whole red-green-refactor loop around the
+    agent, table by table.</p>
+
+    <div class="audit">
+      <h4>Audit Checklist</h4>
+      <ul>
+        <li>Did the agent get an <b>interface and a failing test</b>, not just a paragraph of
+        prose describing the desired behavior?</li>
+        <li>Does every exported symbol in the spec have a <b>doc comment</b> that states
+        pre-conditions, post-conditions, and the exact error/zero-value returned on failure?</li>
+        <li>Is the package boundary <b>small enough</b> that the agent's task didn't require it
+        to read or guess at unrelated packages?</li>
+        <li>For any service boundary (HTTP/gRPC/SQL): is there an actual <b>schema file</b>
+        (OpenAPI doc, <code class="inl">.proto</code>, <code class="inl">CREATE TABLE</code>)
+        checked in, and was the boilerplate <b>regenerated from it</b> rather than hand-typed?</li>
+        <li>Does the generated code match the schema right now &mdash; no hand-edits inside a
+        generated file, no route or field that exists in one but not the other?</li>
+        <li>Did passing the test table actually verify the contract, or only the handful of
+        cases someone thought to write down &mdash; and does the diff still deserve a real
+        read (<code class="inl">go vet</code>, race detector) on top of a green test run?</li>
+      </ul>
+    </div>
+
+    <div class="sources">
+      Sources:
+      <a href="https://github.com/oapi-codegen/oapi-codegen">oapi-codegen: Generate Go client and server boilerplate from OpenAPI 3 specifications</a>,
+      <a href="https://protobuf.dev/reference/go/go-generated/">Protocol Buffers &mdash; Go Generated Code Guide</a>,
+      <a href="https://grpc.io/docs/languages/go/quickstart/">gRPC Go Quick Start (protoc-gen-go / protoc-gen-go-grpc)</a>,
+      <a href="https://docs.sqlc.dev/">sqlc documentation &mdash; generate type-safe Go from SQL</a>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-toolchain-feedback-loop.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-test-driven-agent-development.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

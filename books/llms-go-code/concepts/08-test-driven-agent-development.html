@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test-Driven Agent Development — LLMs, Go Code!</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="gopher-mark">
+      <svg width="20" height="16" viewBox="0 0 20 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <ellipse cx="10" cy="9" rx="9" ry="6.5" fill="#00add8"/>
+        <circle cx="10" cy="3.6" r="3.4" fill="#00add8"/>
+        <circle cx="6.6" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="13.4" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="6.9" cy="2.7" r=".7" fill="#142229"/>
+        <circle cx="13.1" cy="2.7" r=".7" fill="#142229"/>
+      </svg>
+    </span>
+    LLMs, Go Code! <span class="pick">&mdash; a BookBank field guide</span>
+  </span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Part II &middot; Directing the Agent</p>
+    <p class="chapno">Chapter 8</p>
+    <h1>Test-Driven Agent Development: Red, Green, Refactor &mdash; with an LLM</h1>
+
+    <p class="lead">Here's a question worth asking before you type a single prompt: what's the
+    fastest way to tell an agent exactly what &ldquo;done&rdquo; means, without writing a page
+    of prose it can misread? The answer, it turns out, is the same one Go testers have leaned
+    on for over a decade &mdash; a table of inputs and expected outputs, executed as real,
+    running code. Give an agent a failing test instead of a paragraph of requirements, and you've
+    replaced an ambiguous instruction with an unambiguous contract. It either makes the test
+    pass, or it doesn't, and there's no room for a confident-sounding guess in between.</p>
+
+    <h2>Why the Test Comes First, Not the Code</h2>
+    <p>Classic test-driven development asks you to write a failing test, then write just enough
+    code to make it pass, then clean up. That discipline is useful with a human at the keyboard.
+    It's close to essential with an agent at the keyboard, for a reason that has nothing to do
+    with process purity: <strong>an agent will happily implement the version of your feature
+    that's easiest to write, unless something concrete stops it.</strong> Ask for &ldquo;a
+    function that calculates a cart subtotal&rdquo; in prose, and you'll likely get a function
+    that handles the happy path beautifully and quietly ignores negative quantities, unknown
+    SKUs, and empty carts &mdash; not out of malice, but because prose requirements are a fuzzy
+    target and code that compiles is a strong signal of &ldquo;good enough,&rdquo; even when
+    it isn't.</p>
+
+    <p>A test table closes that gap. When the edge cases are already sitting in the test file
+    before the agent writes a line of implementation, there's no version of &ldquo;good
+    enough&rdquo; that skips them &mdash; <code class="inl">go test</code> will simply keep
+    failing until every row is satisfied. You've turned a matter of judgment into a matter of
+    fact.</p>
+
+    <h2>The Go Idiom: a Table, Not a Pile of Functions</h2>
+    <p>If you've written Go tests before, you've almost certainly seen this shape, and if you
+    haven't, you're about to adopt it for life. Instead of one function per scenario &mdash;
+    <code class="inl">TestParse_Empty</code>, <code class="inl">TestParse_Negative</code>,
+    <code class="inl">TestParse_TooLong</code>, each duplicating the same setup and assertion
+    logic &mdash; Go's idiom is a single slice of small structs, one struct per case, run
+    through one shared loop. The <a href="https://go.dev/wiki/TableDrivenTests">Go Wiki's
+    TableDrivenTests page</a> gives the canonical minimal shape: a slice of anonymous structs
+    with an input field and a want field, walked in a loop that calls the function under test
+    and compares the result.</p>
+
+    <pre class="tab"><code><span class="kw">var</span> tests = []<span class="kw">struct</span> {
+    name  <span class="ty">string</span>
+    input <span class="ty">int</span>
+    want  <span class="ty">string</span>
+}{
+    {name: <span class="str">"zero"</span>, input: <span class="num">0</span>, want: <span class="str">"zero"</span>},
+    {name: <span class="str">"one"</span>, input: <span class="num">1</span>, want: <span class="str">"one"</span>},
+    {name: <span class="str">"negative"</span>, input: -<span class="num">1</span>, want: <span class="str">"minus one"</span>},
+}</code></pre>
+
+    <p>That's it &mdash; no framework, no assertion DSL, no annotations. It's just a Go value.
+    Which is exactly the point: a test table is data, and data is the easiest thing in the
+    world to review quickly, diff cleanly, and extend by adding one more line. Dave Cheney's
+    widely cited <a href="https://dave.cheney.net/2019/05/07/prefer-table-driven-tests">&ldquo;Prefer
+    table driven tests&rdquo;</a> pushes the idea one step further: use a
+    <code class="inl">map[string]struct{...}</code> instead of a slice when the case order
+    genuinely shouldn't matter, because Go's undefined map iteration order will shuffle your
+    tests on every run &mdash; a cheap, free way to catch a test (or an implementation) that
+    was secretly depending on execution order.</p>
+
+    <h2>Subtests via t.Run: Isolation and Names You Can Grep</h2>
+    <p>A bare loop over a table has one weakness: if case three panics or fails an assertion,
+    you may never learn whether cases four and five would have passed too. Since Go 1.7, the
+    <code class="inl">testing</code> package has solved this with subtests. Wrap the body of
+    your loop in <code class="inl">t.Run(tt.name, func(t *testing.T) {...})</code> and each
+    table row becomes its own named, independently reported test &mdash; one failure doesn't
+    take down its neighbors, and each gets its own pass/fail line in the output.</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">TestParse</span>(t *testing.T) {
+    <span class="kw">for</span> _, tt := <span class="kw">range</span> tests {
+        t.<span class="fn">Run</span>(tt.name, <span class="kw">func</span>(t *testing.T) {
+            got := Parse(tt.input)
+            <span class="kw">if</span> got != tt.want {
+                t.<span class="fn">Errorf</span>(<span class="str">"Parse(%d) = %q, want %q"</span>, tt.input, got, tt.want)
+            }
+        })
+    }
+}</code></pre>
+
+    <p>Two small habits pay off here. First, name every case with a phrase that describes the
+    <em>scenario</em>, not the input &mdash; <code class="inl">"negative quantity is
+    rejected"</code> reads as a specification when it shows up in a failing test log; <code
+    class="inl">"case 4"</code> does not. Second, remember that named subtests are individually
+    addressable: <code class="inl">go test -run TestParse/negative</code> runs just that one,
+    which turns &ldquo;the agent broke something&rdquo; into &ldquo;the agent broke exactly
+    this one row&rdquo; in a single command.</p>
+
+    <h2>The Loop-Variable Trap</h2>
+    <p>Here's a subtlety worth getting precisely right, because agents get it wrong in both
+    directions. For years, Go's <code class="inl">for</code> loops declared a single loop
+    variable that was <em>reused</em> across every iteration. If you captured that variable in
+    a closure &mdash; exactly what <code class="inl">t.Run</code>'s callback does &mdash; and
+    the loop had already moved on by the time the closure ran, every closure could see the
+    <em>same</em>, final value of <code class="inl">tt</code>. This bit hardest when subtests
+    ran in parallel: add <code class="inl">t.Parallel()</code> inside the closure so cases run
+    concurrently, and without a fix, every parallel subtest could silently race to see the last
+    row's data instead of its own. The standard workaround, seen in nearly every pre-2024 Go
+    codebase, was to shadow the variable once per iteration:</p>
+
+    <pre class="tab"><code><span class="kw">for</span> _, tt := <span class="kw">range</span> tests {
+    tt := tt <span class="cm">// pre-Go 1.22 idiom: give this iteration its own copy</span>
+    t.<span class="fn">Run</span>(tt.name, <span class="kw">func</span>(t *testing.T) {
+        t.<span class="fn">Parallel</span>()
+        <span class="cm">// ... uses tt safely, even after the outer loop has moved on</span>
+    })
+}</code></pre>
+
+    <p><strong>Go 1.22 (February 2024) changed this at the language level.</strong> Both
+    classic <code class="inl">for</code> loops and <code class="inl">for&hellip;range</code>
+    loops now give each iteration its own fresh copy of the loop variable, so the closure
+    captured inside <code class="inl">t.Run</code> sees exactly the row it was handed &mdash;
+    no aliasing, no race, and the <code class="inl">tt := tt</code> line is no longer doing
+    anything. Crucially, the new behavior is opt-in per module: it only applies to packages in
+    a module whose <code class="inl">go.mod</code> declares <code class="inl">go 1.22</code>
+    or later, so a module still pinned to an older <code class="inl">go</code> directive keeps
+    the old, reused-variable semantics even when built with a modern toolchain.</p>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      Watch for this in both directions. Agents trained on a huge corpus of older Go will
+      cargo-cult <code class="inl">tt := tt</code> into brand-new, Go-1.22+ code out of habit
+      &mdash; harmless, if a little noisy, so don't fight it hard in review. The dangerous
+      direction is the opposite: an agent that <em>omits</em> the shadow line in a codebase
+      whose <code class="inl">go.mod</code> still declares an older Go version, reasoning
+      (correctly, for modern Go, incorrectly for yours) that &ldquo;Go fixed this already.&rdquo;
+      That's a real, silent data race hiding behind a green build. Before you trust an agent's
+      judgment on this one, check the <code class="inl">go</code> line in <code
+      class="inl">go.mod</code> yourself.
+    </div>
+
+    <h2>Mocking Without a Database: Small Interfaces as Test Doubles</h2>
+    <p>Back in Chapter 3 we built the case for implicit interfaces as sandboxes for
+    agent-generated code &mdash; define the boundary, and let the agent build safely on either
+    side of it without ever touching the other. Test-driven agent development is where that
+    pays its biggest dividend. If the function you want tested depends on a real database, a
+    real HTTP client, or a real clock, you either need to stand up that infrastructure for
+    every test run, or you need a boundary you can swap out. Go's structural typing makes the
+    second option nearly free: define a small interface that describes only the handful of
+    methods your code actually calls, and hand the agent a trivial fake that satisfies it in
+    memory.</p>
+
+    <p>The interface should be as narrow as the code needs &mdash; not a mirror of your entire
+    <code class="inl">*sql.DB</code>, just the one or two methods this function actually calls.
+    A narrow interface is also a narrower thing for an agent to accidentally misuse.</p>
+
+    <h2>The Worked Example</h2>
+    <p>Let's put all three ideas &mdash; a table, subtests, and a mock behind a small interface
+    &mdash; into one compact, complete test. Say we need a function that totals a shopping
+    cart. It needs prices, but it shouldn't need a database to be tested, so it depends on a
+    narrow <code class="inl">PriceLookup</code> interface instead of a concrete store:</p>
+
+    <pre class="tab"><code><span class="kw">type</span> CartLine <span class="kw">struct</span> {
+    SKU      <span class="ty">string</span>
+    Quantity <span class="ty">int</span>
+}
+
+<span class="kw">type</span> PriceLookup <span class="kw">interface</span> {
+    Price(sku <span class="ty">string</span>) (cents <span class="ty">int64</span>, err <span class="ty">error</span>)
+}
+
+<span class="kw">func</span> <span class="fn">Subtotal</span>(prices PriceLookup, lines []CartLine) (<span class="ty">int64</span>, <span class="ty">error</span>) {
+    <span class="kw">var</span> total <span class="ty">int64</span>
+    <span class="kw">for</span> _, l := <span class="kw">range</span> lines {
+        <span class="kw">if</span> l.Quantity &lt; <span class="num">0</span> {
+            <span class="kw">return</span> <span class="num">0</span>, fmt.<span class="fn">Errorf</span>(<span class="str">"negative quantity for %s"</span>, l.SKU)
+        }
+        cents, err := prices.<span class="fn">Price</span>(l.SKU)
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            <span class="kw">return</span> <span class="num">0</span>, fmt.<span class="fn">Errorf</span>(<span class="str">"price lookup for %s: %w"</span>, l.SKU, err)
+        }
+        total += cents * <span class="ty">int64</span>(l.Quantity)
+    }
+    <span class="kw">return</span> total, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>The fake that satisfies <code class="inl">PriceLookup</code> in tests is a single line
+    of behavior on top of a map &mdash; no mocking framework required, because Go's implicit
+    interfaces mean any type with a matching <code class="inl">Price</code> method qualifies:</p>
+
+    <pre class="tab"><code><span class="kw">type</span> fakeCatalog <span class="kw">map</span>[<span class="ty">string</span>]<span class="ty">int64</span>
+
+<span class="kw">func</span> (f fakeCatalog) <span class="fn">Price</span>(sku <span class="ty">string</span>) (<span class="ty">int64</span>, <span class="ty">error</span>) {
+    cents, ok := f[sku]
+    <span class="kw">if</span> !ok {
+        <span class="kw">return</span> <span class="num">0</span>, fmt.<span class="fn">Errorf</span>(<span class="str">"unknown sku %q"</span>, sku)
+    }
+    <span class="kw">return</span> cents, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>Now the table &mdash; and notice this is where the human's job actually lives. The happy
+    path is one line. The other four are the ones an agent, left to its own devices, tends to
+    skip: a zero-quantity line that should be valid and free, a negative quantity that should
+    be rejected outright, and a SKU the catalog has never heard of, which should come back as a
+    clearly wrapped error rather than a panic.</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">TestSubtotal</span>(t *testing.T) {
+    tests := []<span class="kw">struct</span> {
+        name    <span class="ty">string</span>
+        catalog fakeCatalog
+        lines   []CartLine
+        want    <span class="ty">int64</span>
+        wantErr <span class="ty">bool</span>
+    }{
+        {
+            name:    <span class="str">"single line"</span>,
+            catalog: fakeCatalog{<span class="str">"WIDGET"</span>: <span class="num">500</span>},
+            lines:   []CartLine{{<span class="str">"WIDGET"</span>, <span class="num">2</span>}},
+            want:    <span class="num">1000</span>,
+        },
+        {
+            name:    <span class="str">"multiple lines sum correctly"</span>,
+            catalog: fakeCatalog{<span class="str">"WIDGET"</span>: <span class="num">500</span>, <span class="str">"GADGET"</span>: <span class="num">1200</span>},
+            lines:   []CartLine{{<span class="str">"WIDGET"</span>, <span class="num">1</span>}, {<span class="str">"GADGET"</span>, <span class="num">3</span>}},
+            want:    <span class="num">4100</span>,
+        },
+        {
+            name:    <span class="str">"zero quantity line is valid and free"</span>,
+            catalog: fakeCatalog{<span class="str">"WIDGET"</span>: <span class="num">500</span>},
+            lines:   []CartLine{{<span class="str">"WIDGET"</span>, <span class="num">0</span>}},
+            want:    <span class="num">0</span>,
+        },
+        {
+            name:    <span class="str">"negative quantity is rejected"</span>,
+            catalog: fakeCatalog{<span class="str">"WIDGET"</span>: <span class="num">500</span>},
+            lines:   []CartLine{{<span class="str">"WIDGET"</span>, -<span class="num">1</span>}},
+            wantErr: <span class="kw">true</span>,
+        },
+        {
+            name:    <span class="str">"unknown sku surfaces a wrapped error"</span>,
+            catalog: fakeCatalog{<span class="str">"WIDGET"</span>: <span class="num">500</span>},
+            lines:   []CartLine{{<span class="str">"GHOST"</span>, <span class="num">1</span>}},
+            wantErr: <span class="kw">true</span>,
+        },
+    }
+
+    <span class="kw">for</span> _, tt := <span class="kw">range</span> tests {
+        t.<span class="fn">Run</span>(tt.name, <span class="kw">func</span>(t *testing.T) {
+            t.<span class="fn">Parallel</span>()
+            got, err := <span class="fn">Subtotal</span>(tt.catalog, tt.lines)
+            <span class="kw">if</span> (err != <span class="kw">nil</span>) != tt.wantErr {
+                t.<span class="fn">Fatalf</span>(<span class="str">"Subtotal() error = %v, wantErr %v"</span>, err, tt.wantErr)
+            }
+            <span class="kw">if</span> err == <span class="kw">nil</span> &amp;&amp; got != tt.want {
+                t.<span class="fn">Errorf</span>(<span class="str">"Subtotal() = %d, want %d"</span>, got, tt.want)
+            }
+        })
+    }
+}</code></pre>
+
+    <p>Notice what's absent from that loop: no <code class="inl">tt := tt</code> shadow line.
+    This file's <code class="inl">go.mod</code> declares <code class="inl">go 1.22</code> or
+    later, so each iteration already owns its own <code class="inl">tt</code>, and
+    <code class="inl">t.Parallel()</code> is safe as written.</p>
+
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="fig2title fig2desc">
+        <title id="fig2title">The red-green-refactor cycle, split between human and agent</title>
+        <desc id="fig2desc">A three-stage cycle: Red, where the human writes a failing table-driven test with edge cases; Green, where the agent implements code until the table passes; and Refactor, where the human reviews and requests cleanup, looping back to Red for the next feature.</desc>
+
+        <circle cx="320" cy="150" r="118" fill="none" stroke="var(--edge-2)" stroke-width="1.5" stroke-dasharray="3 5"/>
+
+        <g font-family="var(--font-body)" font-size="11" fill="var(--bg-2)">
+          <circle cx="320" cy="40" r="34" fill="var(--fuchsia)"/>
+          <text x="320" y="36" text-anchor="middle" font-weight="600">RED</text>
+          <text x="320" y="49" text-anchor="middle" font-size="9">failing test</text>
+
+          <circle cx="500" cy="205" r="34" fill="var(--en)"/>
+          <text x="500" y="201" text-anchor="middle" font-weight="600" fill="var(--ink)">GREEN</text>
+          <text x="500" y="214" text-anchor="middle" font-size="9" fill="var(--ink)">table passes</text>
+
+          <circle cx="140" cy="205" r="34" fill="var(--yellow)"/>
+          <text x="140" y="201" text-anchor="middle" font-weight="600" fill="var(--ink)">REFACTOR</text>
+          <text x="140" y="214" text-anchor="middle" font-size="9" fill="var(--ink)">cleaned up</text>
+        </g>
+
+        <g fill="none" stroke="var(--ink-soft)" stroke-width="1.6" marker-end="url(#arrow)">
+          <path d="M 348 62 A 118 118 0 0 1 478 182"/>
+          <path d="M 472 226 A 118 118 0 0 1 168 226"/>
+          <path d="M 162 182 A 118 118 0 0 1 292 62"/>
+        </g>
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="var(--ink-soft)"/>
+          </marker>
+        </defs>
+
+        <text x="440" y="115" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent-deep)">agent implements</text>
+        <text x="320" y="272" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent-deep)" text-anchor="middle">human reviews, asks for cleanup</text>
+        <text x="205" y="115" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent-deep)" text-anchor="end">human writes table + edge cases</text>
+      </svg>
+      <figcaption>The human owns Red and the review half of Refactor; the agent owns turning
+      Red into Green. Neither side skips a stage.</figcaption>
+    </figure>
+
+    <h2>Handing It to the Agent</h2>
+    <p>With that test file finished and committed &mdash; still red, since <code
+    class="inl">Subtotal</code> and <code class="inl">fakeCatalog</code> don't exist yet in this
+    telling &mdash; the prompt to the agent becomes almost embarrassingly short: &ldquo;Here is
+    <code class="inl">cart_test.go</code>. Implement <code class="inl">Subtotal</code> and the
+    <code class="inl">PriceLookup</code> interface it needs so that <code class="inl">go
+    test</code> passes. Don't modify the test file.&rdquo; That last sentence matters as much as
+    the rest of the prompt combined; without it, an agent under pressure to turn a test green
+    will sometimes take the easy road and loosen the assertion instead of fixing the code. The
+    test file is the spec. It stays locked.</p>
+
+    <p>From here the loop is genuinely mechanical: the agent edits, runs <code class="inl">go
+    test</code>, reads the failure, edits again, until every subtest reports <code
+    class="inl">PASS</code>. You don't need to watch every intermediate attempt &mdash; that's
+    the whole benefit of having turned the spec into an executable check instead of a
+    conversation. Once it's green, you read the diff for the <em>refactor</em> step: is the
+    implementation doing more than the tests demand? Did the agent introduce an interface for
+    something that only ever has one caller? Ask for a cleanup pass with the tests still
+    passing, and you've completed one full red-green-refactor cycle without writing the
+    implementation yourself.</p>
+
+    <h2>Edge Cases in the Practice Itself</h2>
+    <p>A couple of failure modes are worth naming, because they show up even when every
+    individual technique above is used correctly. First, a test table is only as good as the
+    cases in it &mdash; if the human writing the table doesn't think of the negative-quantity
+    case, the agent has no reason to handle it either, and a green build will quietly ship the
+    gap. Writing the tricky cases first, before the happy path even, is a good habit for
+    exactly this reason. Second, watch for an agent that makes a test pass by special-casing
+    the test's own inputs &mdash; an <code class="inl">if sku == "GHOST" { return
+    errors.New(...) }</code> hiding inside otherwise generic code is a green build that proves
+    nothing. The fix is simple and cheap: add one more row with a different unknown SKU and
+    confirm it still fails the same way for the same general reason.</p>
+
+    <h2>Reflection</h2>
+    <p>Table-driven tests were never really about saving keystrokes, though they do that too.
+    They're about turning &ldquo;what should this function do&rdquo; into something you can
+    hand to another party &mdash; a teammate, your future self, or an agent &mdash; without a
+    conversation. Writing the table first forces you to think through the tricky cases while
+    you still have the full context in your head, and it gives the agent an unambiguous target
+    it cannot argue its way around. The agent still writes the code. You still own the
+    definition of correct.</p>
+
+    <h3>Challenges</h3>
+    <ol>
+      <li>Take a function an agent already wrote for you and retrofit a table-driven test
+      around it before reading its implementation closely. How many rows pass on the first
+      try, and did writing the table surface a case the original code never handled?</li>
+      <li>Convert one of your test tables from a slice to a <code class="inl">map[string]struct{...}</code>
+      as Dave Cheney suggests, and run <code class="inl">go test</code> a few times. Did the
+      shuffled order expose any hidden ordering dependency?</li>
+      <li>Find a table-driven test in your codebase that still has <code class="inl">tt :=
+      tt</code> inside its loop. Check the <code class="inl">go</code> directive in
+      <code class="inl">go.mod</code> and decide, deliberately, whether the line is a harmless
+      habit or load-bearing.</li>
+    </ol>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      A test-first prompt does double duty as a leash. &ldquo;Implement against this test file;
+      don't modify it&rdquo; keeps an agent from quietly redefining success when the real
+      implementation turns out to be harder than the happy path suggested. If you ever do want
+      the agent's opinion on whether a test case itself is wrong, ask for that explicitly, in
+      words, separate from the implementation turn &mdash; never let an agent change the
+      specification and the code that must satisfy it in the same breath.
+    </div>
+
+    <div class="audit">
+      <h4>Audit Checklist</h4>
+      <ul>
+        <li><b>Edge and negative cases exist before the agent sees the table.</b> A table with
+        only happy-path rows will get you a happy-path-only implementation.</li>
+        <li><b>Subtests use <code class="inl">t.Run</code> with descriptive names.</b> Names
+        should read as a scenario (&ldquo;negative quantity is rejected&rdquo;), not an index,
+        so a failure log doubles as documentation.</li>
+        <li><b>Mocking goes through a small interface, not a real dependency.</b> If a test
+        needs a live database or network call to pass, the boundary interface is missing.</li>
+        <li><b>If <code class="inl">t.Parallel()</code> is used, loop-variable handling matches
+        the module's declared Go version.</b> Check the <code class="inl">go</code> line in
+        <code class="inl">go.mod</code>: 1.22+ needs no <code class="inl">tt := tt</code>
+        shadow; anything older still does.</li>
+        <li><b>The agent didn't edit the test file to make it pass.</b> Diff the test file
+        separately from the implementation; a loosened assertion is a red flag, not a green
+        build.</li>
+        <li><b>A refactor pass happened after green.</b> Confirm the human reviewed the
+        implementation for unnecessary complexity once the tests passed, not just that the
+        tests passed.</li>
+      </ul>
+    </div>
+
+    <div class="sources">Sources:
+      <a href="https://go.dev/wiki/TableDrivenTests">Go Wiki: TableDrivenTests</a>,
+      <a href="https://dave.cheney.net/2019/05/07/prefer-table-driven-tests">Prefer table driven tests &mdash; Dave Cheney, May 2019</a>,
+      <a href="https://go.dev/blog/loopvar-preview">Fixing For Loops in Go 1.22 &mdash; The Go Blog</a>,
+      <a href="https://go.dev/doc/go1.22">Go 1.22 Release Notes</a>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-executable-specifications.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-case-study-api-service.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
