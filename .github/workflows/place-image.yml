@@ -1,0 +1,130 @@
+name: Place approved image
+
+# Fires when a MAINTAINER adds the `art-approved` label to an `image-request`
+# issue. The label is the trigger AND the security boundary: an issue author
+# cannot self-assign a label (that needs triage/write), so a random user's
+# attached image is inert until a maintainer approves it. See AUTOMATION.md.
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  place:
+    if: github.event.label.name == 'art-approved'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ github.event.issue.number }}
+      SENDER: ${{ github.event.sender.login }}
+    steps:
+      # 1. SECURITY GATE — belt-and-suspenders. Only triage+ can label, but
+      #    verify the labeler really has write/admin before touching the repo.
+      #    exit 0 (not 1) on failure: a spoof attempt leaves a green no-op run.
+      - name: Verify labeler is a maintainer
+        run: |
+          perm=$(gh api "repos/${{ github.repository }}/collaborators/$SENDER/permission" -q .permission 2>/dev/null || echo none)
+          echo "permission=$perm"
+          if [[ "$perm" != "admin" && "$perm" != "write" ]]; then
+            echo "::notice::$SENDER lacks write access — ignoring."
+            exit 0
+          fi
+          echo "ok=1" >> "$GITHUB_ENV"
+
+      - name: Checkout books repo
+        if: env.ok == '1'
+        uses: actions/checkout@v4
+
+      # 2. Fetch the placement tool from the public kit plugin (blobless+sparse).
+      - name: Fetch bookbank library
+        if: env.ok == '1'
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/sunprema/kit /tmp/kit
+          git -C /tmp/kit sparse-checkout set bookbank/library
+
+      - name: Set up Python + Pillow
+        if: env.ok == '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Pillow
+        if: env.ok == '1'
+        run: pip install --quiet Pillow
+
+      # 3. Resolve the target slot from the machine-readable marker, and grab
+      #    the newest attached image URL — scanning the issue body AND every
+      #    comment (the user may attach in either).
+      - name: Resolve slot + image URL
+        if: env.ok == '1'
+        id: resolve
+        run: |
+          blob=$(gh issue view "$ISSUE" --json body,comments \
+                   -q '.body + "\n" + ([.comments[].body] | join("\n"))')
+          book=$(grep -oP 'bookbank-img:\s*book=\K[^\s]+'   <<<"$blob" | head -1)
+          slot=$(grep -oP 'bookbank-img:.*\bslot=\K[^\s>]+' <<<"$blob" | head -1)
+          # Newest attached image: modern user-attachments OR legacy user-images.
+          url=$(grep -oP '(https://github\.com/user-attachments/assets/[^\s)"]+|https://user-images\.githubusercontent\.com/[^\s)"]+)' <<<"$blob" | tail -1)
+          echo "book=$book slot=$slot"
+          if [[ -z "$book" || -z "$slot" ]]; then
+            gh issue comment "$ISSUE" --body "⚠️ Could not find a \`bookbank-img\` marker (book/slot). Not placing. Re-add **art-approved** after fixing."
+            gh issue edit "$ISSUE" --remove-label art-approved
+            exit 1
+          fi
+          if [[ -z "$url" ]]; then
+            gh issue comment "$ISSUE" --body "⚠️ No attached image found on this issue or its comments. Attach one, then re-add the **art-approved** label."
+            gh issue edit "$ISSUE" --remove-label art-approved
+            exit 1
+          fi
+          if [[ ! -d "books/$book" ]]; then
+            gh issue comment "$ISSUE" --body "⚠️ No such book \`$book\` in the repo. Not placing."
+            gh issue edit "$ISSUE" --remove-label art-approved
+            exit 1
+          fi
+          echo "book=$book" >> "$GITHUB_OUTPUT"
+          echo "slot=$slot" >> "$GITHUB_OUTPUT"
+          curl -sL --retry 3 --retry-all-errors "$url" -o /tmp/incoming.img
+          echo "bytes=$(wc -c < /tmp/incoming.img)"
+
+      # 4. Place it. place_image.py validates the slot exists in book.json,
+      #    re-encodes to the declared extension, writes to the declared path,
+      #    and warns (non-fatal) on >10% aspect drift.
+      - name: Place image into slot
+        if: env.ok == '1'
+        run: |
+          python3 /tmp/kit/bookbank/library/place_image.py \
+            "books/${{ steps.resolve.outputs.book }}" \
+            "${{ steps.resolve.outputs.slot }}" \
+            /tmp/incoming.img --force
+
+      # 5. Commit to the book's SHARED art branch and open/update ONE PR that
+      #    accumulates every image for this book. The user merges it once.
+      - name: Commit to art branch & open/update PR
+        if: env.ok == '1'
+        env:
+          BOOK: ${{ steps.resolve.outputs.book }}
+          SLOT: ${{ steps.resolve.outputs.slot }}
+        run: |
+          branch="art/$BOOK"
+          git config user.name  "bookbank-bot"
+          git config user.email "bookbank-bot@users.noreply.github.com"
+          git fetch origin "$branch" 2>/dev/null && git checkout "$branch" || git checkout -b "$branch"
+          git add "books/$BOOK"
+          if git diff --cached --quiet; then
+            echo "::notice::No file change (image identical to what's already placed)."
+          else
+            git commit -m "art($BOOK): add $SLOT (closes #$ISSUE)"
+            git push -u origin "$branch"
+          fi
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create --base main --head "$branch" \
+              --title "Art for $BOOK" \
+              --label art-pr \
+              --body "Accumulating generated images for \`$BOOK\`. Merging this PR publishes the finished art (see \`publish-on-merge\`)."
+          fi
+          pr_url=$(gh pr view "$branch" --json url -q .url)
+          gh issue comment "$ISSUE" --body "✅ Placed \`$SLOT\` on [\`$branch\`]($pr_url). Merge that PR to publish the book."
+          gh issue close "$ISSUE" --reason completed
