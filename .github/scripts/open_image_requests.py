@@ -14,14 +14,19 @@ already has a placed file, or already has an OPEN image-request issue, is
 skipped, so it's safe to re-run.
 
 Each issue carries a machine-readable marker the `place-image` workflow
-parses:
+parses. It names the book PR BRANCH so placement commits the art onto the
+still-unmerged book PR (the book is never live with prompt placeholders — it
+goes to Pages complete, only when that PR merges):
 
-    <!-- bookbank-img: book=<book-id> slot=<slot-id> -->
+    <!-- bookbank-img: book=<book-id> slot=<slot-id> branch=<pr-branch> -->
 
 Usage:
-  open_image_requests.py <book-id> [--repo owner/name] [--dry-run]
+  open_image_requests.py <book-id> --branch <pr-branch> [--repo owner/name] [--dry-run]
 
   <book-id>     directory name under books/ (has book.json)
+  --branch      the open book PR's head branch (e.g. claude/book-26-svelte);
+                placement commits art here. Auto-detected from the open PR
+                touching books/<book-id>/ if omitted.
   --repo        target repo (default: $BOOKBANK_BOOKS_REPO or sunprema/books)
   --dry-run     print what would be opened; create nothing
 
@@ -81,14 +86,14 @@ def open_issue_markers(repo):
     return seen
 
 
-def issue_body(book_id, slot):
+def issue_body(book_id, slot, branch):
     sid = slot["id"]
     prompt = slot.get("prompt", "").strip() or "(no prompt recorded — see the book page)"
     aspect = slot.get("aspect", "")
     alt = slot.get("alt", "")
     caption = slot.get("caption", "")
     lines = [
-        f"<!-- bookbank-img: book={book_id} slot={sid} -->",
+        f"<!-- bookbank-img: book={book_id} slot={sid} branch={branch} -->",
         "",
         f"An image is needed for the **`{book_id}`** book, slot **`{sid}`**"
         + (f" ({aspect})." if aspect else "."),
@@ -108,17 +113,33 @@ def issue_body(book_id, slot):
         "1. Generate the image with your image agent using the prompt above.",
         "2. **Drag the file into a comment on this issue** (or into the issue body).",
         f"3. A maintainer adds the **`{APPROVE_LABEL}`** label. That triggers the "
-        "`place-image` workflow, which drops the file into the slot and opens/updates "
-        "the book's art PR. Merging that PR publishes the book.",
+        "`place-image` workflow, which commits the file into the slot **on the book's "
+        "PR branch**. Once every slot is filled, merging the book PR publishes it live "
+        "for the first time — already complete, so readers never see a prompt.",
         "",
         "_Do not edit the marker comment at the top — the automation needs it._",
     ]
     return "\n".join(lines)
 
 
+def detect_pr_branch(repo, book_id):
+    """Head branch of the open PR that touches books/<book_id>/, or None."""
+    r = gh("pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+           "--json", "headRefName,files", check=False)
+    if r.returncode != 0:
+        return None
+    prefix = f"books/{book_id}/"
+    for pr in json.loads(r.stdout or "[]"):
+        if any((f.get("path") or "").startswith(prefix) for f in pr.get("files", [])):
+            return pr.get("headRefName")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("book_id")
+    ap.add_argument("--branch", default=None,
+                    help="book PR head branch (auto-detected if omitted)")
     ap.add_argument("--repo",
                     default=os.environ.get("BOOKBANK_BOOKS_REPO", "sunprema/books"))
     ap.add_argument("--dry-run", action="store_true")
@@ -128,6 +149,13 @@ def main():
     bj = book_dir / "book.json"
     if not bj.is_file():
         sys.exit(f"error: no book.json at {bj} (run from the repo root)")
+
+    branch = args.branch or detect_pr_branch(args.repo, args.book_id)
+    if not branch:
+        sys.exit(f"error: no --branch given and no open PR touches "
+                 f"books/{args.book_id}/ — placement needs a book PR branch "
+                 f"to commit art onto. Open the book PR first.")
+    print(f"{args.book_id}: art will be placed onto branch '{branch}'")
 
     data = json.loads(bj.read_text())
     images = data.get("images", [])
@@ -163,7 +191,7 @@ def main():
             continue
 
         title = f"🎨 Image needed — {args.book_id} / {sid}"
-        body = issue_body(args.book_id, slot)
+        body = issue_body(args.book_id, slot, branch)
         if args.dry_run:
             print(f"  + would open: {title}")
             opened += 1
