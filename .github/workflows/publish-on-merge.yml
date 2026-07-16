@@ -1,0 +1,65 @@
+name: Publish on art merge
+
+# Fires when an `art/<book-id>` PR is MERGED to main. The book files are
+# already on main (Pages auto-deploys them); this job only regenerates the
+# generated front door — index.html + catalog.json — so the shelf card flips
+# from gradient to the real cover. Pure deterministic Python, no agent.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'art/')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main (with the just-merged art)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # build-library.py lives in the kit plugin; defaults/personas is REQUIRED
+      # or persona names/taglines in the catalog render blank (documented
+      # regression, 2026-07-10). PINNED to a SHA so kit's moving `main` can't
+      # silently restyle the shelf on an unrelated art-merge — bump it
+      # deliberately (one reviewable line) to adopt kit's shelf/generator fixes.
+      # Blobless (no --depth) keeps full history so the pin stays checkoutable.
+      - name: Fetch bookbank plugin (pinned)
+        run: |
+          git clone --filter=blob:none --sparse https://github.com/sunprema/kit /tmp/kit
+          git -C /tmp/kit sparse-checkout set bookbank/library bookbank/defaults
+          git -C /tmp/kit checkout c8a11533670d882908109f8c36eadc69c3429cc0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Regenerate the front door IN PLACE. --root == --out == "." → the script
+      # detects same-clone and skips re-sync, just rebuilding index.html +
+      # catalog.json from the book.json's already on main. `sips`-based share
+      # JPEGs are macOS-only and skipped gracefully on Ubuntu (cosmetic only).
+      - name: Rebuild shelf & catalog
+        env:
+          CLAUDE_PLUGIN_ROOT: /tmp/kit/bookbank
+        run: |
+          python3 /tmp/kit/bookbank/library/build-library.py \
+            --out . --root . --repo "${{ github.repository }}"
+
+      - name: Commit regenerated front door
+        run: |
+          git config user.name  "bookbank-bot"
+          git config user.email "bookbank-bot@users.noreply.github.com"
+          git add index.html catalog.json assets books
+          if git diff --cached --quiet; then
+            echo "::notice::Shelf already current — nothing to publish."
+            exit 0
+          fi
+          git commit -m "Publish: rebuild shelf after ${{ github.event.pull_request.head.ref }}"
+          git push origin main
+      # GitHub Pages auto-deploys the push to main. Add a curl-poll gate here
+      # later if you want a hard "it's live" check before the job goes green.
