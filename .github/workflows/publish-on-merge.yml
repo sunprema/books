@@ -1,34 +1,40 @@
-name: Publish on art merge
+name: Publish on book merge
 
-# Fires when an `art/<book-id>` PR is MERGED to main. The book files are
-# already on main (Pages auto-deploys them); this job only regenerates the
-# generated front door — index.html + catalog.json — so the shelf card flips
-# from gradient to the real cover. Pure deterministic Python, no agent.
+# Fires when a book lands on main — i.e. a fully art-complete book PR merges,
+# pushing changes under books/**. The book was NEVER on Pages before this
+# (it lived on its PR branch, art was placed there first), so the FIRST time
+# it's ever live it's already complete — no prompt placeholders, ever, in
+# anyone's cache. This job just regenerates the generated front door.
+#
+# Loop-safety: the regen only writes index.html / catalog.json / assets/**,
+# never books/**, so the `paths` filter below means the publish commit can't
+# re-trigger this workflow.
 on:
-  pull_request:
-    types: [closed]
+  push:
+    branches: [main]
+    paths:
+      - 'books/**'
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
   publish:
-    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'art/')
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout main (with the just-merged art)
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
           ref: main
 
-      # build-library.py lives in the kit plugin; defaults/personas is REQUIRED
-      # or persona names/taglines in the catalog render blank (documented
-      # regression, 2026-07-10). PINNED to a SHA so kit's moving `main` can't
-      # silently restyle the shelf on an unrelated art-merge — bump it
-      # deliberately (one reviewable line) to adopt kit's shelf/generator fixes.
-      # Blobless (no --depth) keeps full history so the pin stays checkoutable.
+      # build-library.py + defaults/personas from the pinned kit plugin.
+      # Bump the SHA deliberately to adopt kit's shelf/generator fixes.
       - name: Fetch bookbank plugin (pinned)
         run: |
           git clone --filter=blob:none --sparse https://github.com/sunprema/kit /tmp/kit
@@ -39,10 +45,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Regenerate the front door IN PLACE. --root == --out == "." → the script
-      # detects same-clone and skips re-sync, just rebuilding index.html +
-      # catalog.json from the book.json's already on main. `sips`-based share
-      # JPEGs are macOS-only and skipped gracefully on Ubuntu (cosmetic only).
+      # Regenerate index.html + catalog.json IN PLACE from the book.json's on
+      # main. --root == --out == "." → same-clone, no re-sync. CLAUDE_PLUGIN_ROOT
+      # is required or persona names render blank. `sips` share-JPEG is macOS-only
+      # and skipped gracefully on Ubuntu (cosmetic).
       - name: Rebuild shelf & catalog
         env:
           CLAUDE_PLUGIN_ROOT: /tmp/kit/bookbank
@@ -54,12 +60,11 @@ jobs:
         run: |
           git config user.name  "bookbank-bot"
           git config user.email "bookbank-bot@users.noreply.github.com"
-          git add index.html catalog.json assets books
+          git add index.html catalog.json assets
           if git diff --cached --quiet; then
             echo "::notice::Shelf already current — nothing to publish."
             exit 0
           fi
-          git commit -m "Publish: rebuild shelf after ${{ github.event.pull_request.head.ref }}"
+          git commit -m "Publish: rebuild shelf after ${{ github.sha }}"
           git push origin main
-      # GitHub Pages auto-deploys the push to main. Add a curl-poll gate here
-      # later if you want a hard "it's live" check before the job goes green.
+      # GitHub Pages auto-deploys the push to main.
