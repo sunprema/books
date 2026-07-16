@@ -58,9 +58,12 @@ from `book.json`. Don't edit or remove this line; the automation parses it.
 
 ## Dependencies
 
-Both workflows shallow-sparse-clone the public **`sunprema/kit`** plugin for
-the two scripts they shell out to (`place_image.py`, `build-library.py`) and
-`defaults/personas` (required, or catalog persona names render blank).
+Both workflows sparse-clone the public **`sunprema/kit`** plugin for the two
+scripts they shell out to (`place_image.py`, `build-library.py`) and
+`defaults/personas` (required, or catalog persona names render blank). The
+clone is **pinned to a kit SHA** (search `git -C /tmp/kit checkout` in the
+workflows) so kit's moving `main` can't silently change CI behavior — bump
+that SHA deliberately, in a reviewable one-line change, to adopt kit fixes.
 `build-library.py`'s macOS-only `sips` share-JPEG step degrades gracefully on
 the Ubuntu runner (cosmetic loss only).
 
