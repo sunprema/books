@@ -1,0 +1,176 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Surviving Failure Storms — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="st-eyebrow">Chapter 07</p>
+    <h1 data-anchor="st-title">Surviving Failure Storms</h1>
+    <p class="lede" data-anchor="st-lede">Here is the design instinct most observability tooling gets backwards: failures are not independent, they are <strong>correlated</strong>. When a dependency dies you don't get one failure — you get ten thousand identical ones in a minute. So we design for the 100%-failure case, not the 0.1% one. This chapter is about the gate that keeps a storm from turning your safety net into the outage.</p>
+
+    <figure class="img-slot" data-img-slot="storm-illustration" data-img-file="assets/img/storm-illustration.png" style="--img-aspect:16 / 9" data-anchor="st-illustration">
+      <img class="img-real" src="../assets/img/storm-illustration.png" alt="A storm of identical failures funneled through a token bucket; only a few pass, the rest are counted" width="1280" height="720" onerror="this.closest('.img-slot').classList.add('img-missing')">
+      <div class="img-drop"><div class="img-drop-inner">
+        <strong>Illustration</strong>
+        <p class="img-prompt">A cyan-on-navy blueprint-style editorial illustration of a failure storm: hundreds of identical small error glyphs raining down toward a funnel/token-bucket that lets only a few drops through into a single labelled checkpoint, while a counter tallies the suppressed rest. Thin technical schematic linework, drafting grid, one bright cyan accent on the drops that pass. No readable text baked in. ~1280×720px, 16:9, centred with safe margins.</p>
+        <button type="button" class="img-copy">Copy prompt</button>
+        <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+      </div></div>
+      <figcaption>A correlated storm: one checkpoint is kept per signature per minute, the rest are counted, not lost.</figcaption>
+    </figure>
+
+    <h2 data-anchor="st-h-math">The storm math nobody plans for</h2>
+    <p data-anchor="st-p-math1">Do the arithmetic once and you never forget it. A shared dependency — a database, a downstream API, a cache — goes down. Every request that touches it now fails, and they fail the same way, all at once. On a busy service that is not a handful of errors; it is tens of thousands of identical exceptions inside sixty seconds.</p>
+    <p data-anchor="st-p-math2">Now imagine LinkLog with no containment. Each failure commits a <code>.llog</code> artifact, so that's 10,000 artifacts. The sidecar dutifully analyses each one, so that's 10,000 AI analyses. And if analysis opens a PR or a ticket, that's 10,000 PRs. All for <em>one bug</em>. The tool you installed to survive incidents just became the second incident — and it did it at exactly the moment you could least afford it.</p>
+
+    <div class="callout key" data-anchor="st-key-signature">
+      <span class="ct">The gotcha to internalise</span>
+      <p>Rate limiting here is <strong>per-signature</strong>, not global. Two <em>different</em> bugs never starve each other — each gets its own budget. But a storm of the <em>same</em> signature is capped hard, by design. That is the whole point: collapse the redundant copies, keep the distinct ones.</p>
+    </div>
+
+    <h2 data-anchor="st-h-gate">The gate, in code</h2>
+    <p data-anchor="st-p-gate1">LinkLog contains the storm <strong>at the SDK</strong>, before an artifact ever hits the disk. You opt into a tighter or looser cap with one argument to <code>init()</code>. Example first — here is a high-traffic service dialling its per-signature budget down, then reading back how many commits got suppressed:</p>
+
+    <pre data-anchor="st-code-init"><code><span class="cap">payment_api/bootstrap.py</span><span class="kw">import</span> llog
+
+llog.<span class="fn">init</span>(
+    service=<span class="str">"payment-api"</span>,
+    <span class="cm"># default is 10 commits / signature / minute;</span>
+    <span class="cm"># a very high-traffic service can go lower.</span>
+    max_commits_per_min=<span class="num">5</span>,
+)
+
+<span class="cm"># ...later, from a health endpoint or a metrics scrape:</span>
+<span class="kw">print</span>(<span class="str">"suppressed commits:"</span>, llog.stats.suppressed)
+</code></pre>
+
+    <p data-anchor="st-p-gate2">That's the entire operator-facing surface. Everything below happens inside the SDK on the failure path, and you never call it directly. But you should know exactly how it decides, because the behaviour under a storm is a promise you're relying on.</p>
+
+    <h2 data-anchor="st-h-signature">Step one: a cheap local signature</h2>
+    <p data-anchor="st-p-sig1">Before the limiter can cap a storm it has to know two failures are "the same." It builds a <strong>signature</strong> from three cheap pieces: the exception type, the top (innermost) stack frame, and the intent name. That combination is deliberately coarse — it's not the sidecar's authoritative fingerprint — but it's exactly enough to collapse a burst of one bug on one process:</p>
+
+    <pre data-anchor="st-code-sig"><code><span class="cap">llog/ratelimit.py</span><span class="kw">def</span> <span class="fn">signature</span>(exc: BaseException, intent_name: <span class="ty">str</span> = <span class="str">""</span>,
+              tb: TracebackType | <span class="kw">None</span> = <span class="kw">None</span>) -> <span class="ty">str</span>:
+    <span class="kw">try</span>:
+        exc_type = <span class="fn">type</span>(exc).__name__
+        <span class="kw">return</span> <span class="fn">f</span><span class="str">"{exc_type}|{_top_frame(...)}|{intent_name}"</span>
+    <span class="kw">except</span> <span class="ty">Exception</span>:
+        <span class="cm"># degrade to the type alone — still groups the common case</span>
+        <span class="kw">return</span> <span class="fn">type</span>(exc).__name__
+</code></pre>
+
+    <p data-anchor="st-p-sig2">Why include the intent name and the failing function, not just the exception type? Because two <em>distinct</em> bugs that both raise <code>ValueError</code> must not share a budget — if they did, a noisy bug would starve a quiet one right out of the record. The signature keeps distinct bugs on separate buckets so they don't crowd each other out. Notice too that the line number is dropped on purpose: it moves on every edit, and a burst of one bug shares a type, a function, and an intent regardless.</p>
+
+    <div class="callout note" data-anchor="st-note-failopen">
+      <span class="ct">Why the caps are conservative</span>
+      <p>LinkLog is offline-first. When the control channel is down — an outage, exactly when failures spike — these <strong>local caps are all the containment there is</strong>. They have to survive a fleet storm unaided, with no help from the control plane. So the SDK fails <strong>open</strong> to these local caps: if the limiter itself hits an error it allows the commit rather than block your pipeline. Failing closed would silence all reporting during a storm, which is worse than the storm.</p>
+    </div>
+
+    <h2 data-anchor="st-h-bucket">Step two: a token bucket per signature</h2>
+    <p data-anchor="st-p-bucket1">Each signature gets its own token bucket that allows up to <code>max_commits_per_min</code> commits per minute — <span class="pill default">default 10</span>. The bucket starts <em>full</em>, so the very first failure of any signature always commits; you never miss the opening shot of a new bug. When the bucket empties, the SDK discards that buffer — no artifact — and counts the suppression instead:</p>
+
+    <pre data-anchor="st-code-check"><code><span class="cap">llog/ratelimit.py — Limiter.check(sig)</span>            <span class="kw">if</span> b.tokens >= <span class="num">1.0</span>:
+                b.tokens -= <span class="num">1.0</span>
+                <span class="cm"># hand back the count dropped since last commit, then reset</span>
+                n, b.suppressed = b.suppressed, <span class="num">0</span>
+                <span class="kw">return</span> <span class="kw">True</span>, n
+            b.suppressed += <span class="num">1</span>
+            <span class="kw">return</span> <span class="kw">False</span>, <span class="num">0</span>
+</code></pre>
+
+    <figure class="diagram" data-anchor="st-fig-bucket">
+      <svg viewBox="0 0 720 300" role="img" aria-label="A per-signature token bucket: identical failures arrive, a few commit, the rest are counted as suppressed">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+        </defs>
+        <!-- storm of identical failures -->
+        <text x="70" y="40" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">one signature,</text>
+        <text x="70" y="54" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">10,000 failures</text>
+        <g fill="#ef6a6a">
+          <circle cx="40" cy="90" r="3"></circle><circle cx="58" cy="80" r="3"></circle>
+          <circle cx="74" cy="98" r="3"></circle><circle cx="92" cy="84" r="3"></circle>
+          <circle cx="46" cy="118" r="3"></circle><circle cx="66" cy="128" r="3"></circle>
+          <circle cx="86" cy="116" r="3"></circle><circle cx="102" cy="132" r="3"></circle>
+          <circle cx="52" cy="150" r="3"></circle><circle cx="80" cy="160" r="3"></circle>
+        </g>
+        <line x1="115" y1="120" x2="205" y2="120" stroke="#46b1e0" stroke-width="1.5" marker-end="url(#arrow)"></line>
+        <!-- bucket -->
+        <rect x="210" y="70" width="150" height="120" rx="8" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.5"></rect>
+        <text x="285" y="60" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">token bucket · signature</text>
+        <text x="285" y="120" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="13" text-anchor="middle">≤ N tokens</text>
+        <text x="285" y="140" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">refills / minute</text>
+        <text x="285" y="178" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">starts full → 1st always commits</text>
+        <!-- allowed branch -->
+        <line x1="360" y1="100" x2="470" y2="70" stroke="#9fd35a" stroke-width="1.5" marker-end="url(#arrow)"></line>
+        <text x="500" y="60" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="12">token left</text>
+        <rect x="500" y="72" width="180" height="44" rx="6" fill="#0a1b28" stroke="#9fd35a" stroke-width="1.5"></rect>
+        <text x="590" y="90" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">commit {uuid}.llog</text>
+        <text x="590" y="106" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">one representative checkpoint</text>
+        <!-- suppressed branch -->
+        <line x1="360" y1="150" x2="470" y2="200" stroke="#f0a15a" stroke-width="1.5" marker-end="url(#arrow)"></line>
+        <text x="500" y="188" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="12">empty</text>
+        <rect x="500" y="196" width="180" height="44" rx="6" fill="#0a1b28" stroke="#f0a15a" stroke-width="1.5"></rect>
+        <text x="590" y="214" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">discard · suppressed += 1</text>
+        <text x="590" y="230" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">no artifact, count kept</text>
+      </svg>
+      <figcaption>One bucket per signature. Tokens gate the commits; the drops that don't fit are tallied, not thrown away.</figcaption>
+    </figure>
+
+    <h2 data-anchor="st-h-ride">Suppressed, not lost</h2>
+    <p data-anchor="st-p-ride1">This is the part that makes the cap safe to trust. Suppression does not erase the fact that a failure happened — it drops the <em>redundant copy</em> while keeping the <em>count</em>. When the next commit for a signature is allowed, the accumulated suppressed count rides out on that ERROR event as a vendor-tagged field:</p>
+
+    <pre data-anchor="st-code-ride"><code><span class="cap">llog/tracker.py — _capture_and_commit()</span>sig = ratelimit.<span class="fn">signature</span>(exc, s.intent_name, tb)
+allowed, suppressed = limiter.<span class="fn">check</span>(sig)
+<span class="kw">if</span> <span class="kw">not</span> allowed:
+    s.buffer.<span class="fn">discard</span>()      <span class="cm"># no artifact for this one</span>
+    stats.suppressed += <span class="num">1</span>   <span class="cm"># but it is counted</span>
+    <span class="kw">return</span> <span class="kw">None</span>
+<span class="cm"># allowed: the dropped count rides this ERROR event</span>
+<span class="fn">emit_error</span>(exc, tb, suppressed_since_last=suppressed)
+s.<span class="fn">finish</span>()
+<span class="kw">return</span> s.buffer.<span class="fn">commit</span>()
+</code></pre>
+
+    <p data-anchor="st-p-ride2">So a storm that suppressed 9,997 of 10,000 still <em>reports</em> that all 10,000 happened. You keep one representative checkpoint with full forensic context and a count of how many identical siblings it stood in for. That's the trade: you lose the redundant copies, never the knowledge that they occurred.</p>
+
+    <div class="callout note" data-anchor="st-note-uniform">
+      <span class="ct">One gate, every path</span>
+      <p>Every failure path — the <code>@llog.intent</code> decorator, the <code>sys.excepthook</code>, the 5xx middleware — routes through this same <code>_capture_and_commit</code> gate. There is no side door. That's what lets you reason about storm behaviour as a single property of the SDK rather than something you have to re-verify per integration.</p>
+    </div>
+
+    <h2 data-anchor="st-h-depth">Defense in depth downstream</h2>
+    <p data-anchor="st-p-depth1">The SDK cap is the first line, not the only one. Even after a commit, the sidecar <strong>dedupes by fingerprint</strong> — its own authoritative one, stronger than the SDK's cheap signature — before it spends anything on expensive AI analysis. And there are hard caps on AI, PR, and ticket actions per fingerprint per window. Three layers, each catching what the last let through. We cover the sidecar's half in full in Chapter 9; for now just know the storm meets more than one wall.</p>
+
+    <h2 data-anchor="st-h-tune">Tuning it in practice</h2>
+    <p data-anchor="st-p-tune1">The default of 10 commits per signature per minute is a sane starting point for most services. Adjust it deliberately:</p>
+    <ul>
+      <li><strong>Raise it</strong> only if you genuinely want more samples of the same failure — say, a flaky bug where the state varies run to run and a handful of extra checkpoints helps.</li>
+      <li><strong>Lower it</strong> for very high-traffic services, where even a short storm at 10/min is more artifacts than you'll ever read.</li>
+      <li><strong>Watch <code>llog.stats.suppressed</code></strong> as a storm signal. A rising suppressed count is not a problem to fix — it's the containment working, and a useful thing to graph next to your error rate.</li>
+    </ul>
+
+    <p class="soft" data-anchor="st-p-next">You now trust the SDK to survive its worst hour. Next we make that trust precise: Chapter 8 lays out the exact guarantees LinkLog gives you — and, just as importantly, the ones it deliberately doesn't.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-privacy-allowlist.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-guarantees.html">Next: The Guarantees ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>

@@ -1,0 +1,200 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Catching Failures: Middleware & the Excepthook — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="de-eyebrow">Chapter 04</p>
+    <h1 data-anchor="de-title">Catching Failures: Middleware &amp; the Excepthook</h1>
+    <p class="lede" data-anchor="de-lede">Here is the part that surprises people. LinkLog's <strong>primary</strong> detection path is not the global exception hook you'd reach for first — it's a piece of ASGI middleware. The global <code>sys.excepthook</code> is only the fallback. That ordering looks backwards until you see what a web framework does to your exceptions, so let's start there.</p>
+
+    <h2 data-anchor="de-h-why">Why the hook you'd reach for first is the wrong one</h2>
+    <p data-anchor="de-p-why1">Reach for <code>sys.excepthook</code> and your instinct is sound for a script: an unhandled exception unwinds all the way to the interpreter, the hook fires, you capture it. But a web framework never lets an exception get that far. When your handler raises, FastAPI (or any ASGI framework) <em>catches</em> it inside its own error-handling layer and converts it into a <code>500</code> response. The interpreter never sees an unhandled exception, so <code>sys.excepthook</code> <strong>never fires</strong>.</p>
+    <p data-anchor="de-p-why2">Sit with what that means. A tool built only on the global hook would be structurally blind to nearly every production web failure — the exact case LinkLog exists to capture. So the design inverts the obvious priority: middleware is primary, the hook is the fallback for the places a framework isn't standing in the way.</p>
+
+    <figure class="diagram" data-anchor="de-fig-shapes">
+      <svg viewBox="0 0 720 340" role="img" aria-label="Two failure shapes contrasted: a raised exception propagating through the middleware, and a framework-swallowed 500 seen by status code">
+        <defs>
+          <marker id="de-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+        </defs>
+
+        <!-- TOP: raised -> propagates -->
+        <text x="20" y="30" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="11">SHAPE A — handler raises, exception propagates out</text>
+        <rect x="30" y="46" width="120" height="46" rx="8" fill="#0a1b28" stroke="#ef6a6a" stroke-width="1.5"></rect>
+        <text x="90" y="68" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">handler</text>
+        <text x="90" y="83" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">raises</text>
+
+        <line x1="150" y1="69" x2="235" y2="69" stroke="#ef6a6a" stroke-width="1.5" marker-end="url(#de-arrow)"></line>
+
+        <rect x="235" y="46" width="150" height="46" rx="8" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.5"></rect>
+        <text x="310" y="66" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">LinkLogMiddleware</text>
+        <text x="310" y="82" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">capture + re-raise</text>
+
+        <line x1="385" y1="69" x2="470" y2="69" stroke="#46b1e0" stroke-width="1.5" marker-end="url(#de-arrow)"></line>
+        <rect x="470" y="46" width="150" height="46" rx="6" fill="#0a1b28" stroke="#f0a15a" stroke-width="1.5"></rect>
+        <text x="545" y="68" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">{uuid}.llog</text>
+        <text x="545" y="83" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">checkpoint committed</text>
+
+        <line x1="360" y1="180" x2="360" y2="180" stroke="#244a63" stroke-width="1"></line>
+        <line x1="20" y1="165" x2="700" y2="165" stroke="#244a63" stroke-width="1" stroke-dasharray="4 4"></line>
+
+        <!-- BOTTOM: swallowed -> 500 -->
+        <text x="20" y="205" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="11">SHAPE B — framework swallows it, returns a 5xx</text>
+        <rect x="30" y="222" width="120" height="46" rx="8" fill="#0a1b28" stroke="#ef6a6a" stroke-width="1.5"></rect>
+        <text x="90" y="244" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">handler</text>
+        <text x="90" y="259" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">raises</text>
+
+        <line x1="150" y1="245" x2="225" y2="245" stroke="#ef6a6a" stroke-width="1.5" marker-end="url(#de-arrow)"></line>
+        <rect x="225" y="222" width="110" height="46" rx="8" fill="#0a1b28" stroke="#5b7d92" stroke-width="1.5"></rect>
+        <text x="280" y="242" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">framework</text>
+        <text x="280" y="258" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">catches → 500</text>
+
+        <line x1="335" y1="245" x2="410" y2="245" stroke="#f0a15a" stroke-width="1.5" marker-end="url(#de-arrow)"></line>
+        <rect x="410" y="222" width="150" height="46" rx="8" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.5"></rect>
+        <text x="485" y="242" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">LinkLogMiddleware</text>
+        <text x="485" y="258" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">sees status ≥ 500</text>
+
+        <line x1="560" y1="245" x2="625" y2="245" stroke="#46b1e0" stroke-width="1.5" marker-end="url(#de-arrow)"></line>
+        <rect x="625" y="222" width="70" height="46" rx="6" fill="#0a1b28" stroke="#f0a15a" stroke-width="1.5"></rect>
+        <text x="660" y="243" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">.llog</text>
+        <text x="660" y="259" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="8" text-anchor="middle">committed</text>
+
+        <text x="20" y="300" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="10">No exception reaches the middleware in Shape B — the status code IS the only evidence a failure happened.</text>
+      </svg>
+      <figcaption>Two failure shapes, one middleware. The exception in A; the status code in B.</figcaption>
+    </figure>
+
+    <h2 data-anchor="de-h-mw">The primary path: one line of middleware</h2>
+    <p data-anchor="de-p-mw1">Install it on the app object once, at startup. There's a convenience wrapper and the explicit form — they do the same thing:</p>
+
+    <pre data-anchor="de-code-install"><code><span class="cm"># demo/refund_api.py — the PRIMARY detection path</span>
+<span class="kw">import</span> llog
+<span class="kw">from</span> fastapi <span class="kw">import</span> FastAPI
+<span class="kw">from</span> refund <span class="kw">import</span> process_refund
+
+llog.<span class="fn">init</span>(service=<span class="str">"refund-api"</span>, mode=<span class="str">"anonymous"</span>)
+
+app = <span class="ty">FastAPI</span>()
+llog.<span class="fn">instrument_fastapi</span>(app)   <span class="cm"># convenience wrapper</span>
+
+<span class="cm"># …or the explicit form, identical effect:</span>
+<span class="cm"># app.add_middleware(llog.LinkLogMiddleware, capture_5xx=True)</span>
+
+<span class="dec">@app.get</span>(<span class="str">"/refund"</span>)
+<span class="kw">def</span> <span class="fn">refund</span>():
+    <span class="cm"># divisor=0 → ZeroDivisionError deep inside SettleLedger.</span>
+    <span class="cm"># FastAPI turns the unhandled exception into a 500;</span>
+    <span class="cm"># the middleware is what notices and commits.</span>
+    result = <span class="fn">process_refund</span>(amount=<span class="num">42.00</span>, divisor=<span class="num">0</span>)
+    <span class="kw">return</span> {<span class="str">"refunded"</span>: result}   <span class="cm"># never reached</span></code></pre>
+
+    <p data-anchor="de-p-mw2">Two things about this middleware are worth understanding, because they explain <em>why</em> it's built the way it is.</p>
+    <p data-anchor="de-p-mw3"><strong>It's pure ASGI, not <code>BaseHTTPMiddleware</code>.</strong> That means it works with FastAPI <em>and</em> any other ASGI framework — Starlette, Quart, your own — and it deliberately avoids FastAPI's HTTP-middleware base class, which wraps responses in a way that breaks streaming. The rule LinkLog holds itself to is never to change the behaviour of the app it observes.</p>
+    <p data-anchor="de-p-mw4"><strong>It must sit OUTSIDE the framework's exception handlers.</strong> This is the whole reason it can be primary. If it sat inside, the framework would have already swallowed the exception before the middleware ran, and there'd be nothing to see. From its position on the outside, it opens a session automatically for every HTTP request, named <code>"{METHOD} {path}"</code> — so <code>GET /refund</code> becomes the intent, with no decorator from you.</p>
+
+    <h2 data-anchor="de-h-shapes">The two shapes it catches</h2>
+    <p data-anchor="de-p-shapes1">From outside the framework, a request can fail in two visibly different ways, and the middleware handles both. Here is its core, lightly trimmed:</p>
+
+    <pre data-anchor="de-code-core"><code><span class="cm"># llog/hooks.py — inside LinkLogMiddleware.__call__</span>
+status = {<span class="str">"code"</span>: <span class="num">200</span>}
+
+<span class="kw">async def</span> <span class="fn">send_wrapper</span>(message):
+    <span class="kw">if</span> message[<span class="str">"type"</span>] == <span class="str">"http.response.start"</span>:
+        status[<span class="str">"code"</span>] = message.<span class="fn">get</span>(<span class="str">"status"</span>, <span class="num">200</span>)
+    <span class="kw">await</span> <span class="fn">send</span>(message)
+
+<span class="kw">try</span>:
+    <span class="kw">await</span> self.<span class="fn">app</span>(scope, receive, send_wrapper)
+<span class="kw">except</span> <span class="ty">BaseException</span> <span class="kw">as</span> exc:
+    tracker.<span class="fn">_fail</span>(s, exc)          <span class="cm"># SHAPE A: it propagated → capture</span>
+    <span class="kw">raise</span>                         <span class="cm"># …then re-raise, unchanged</span>
+<span class="kw">else</span>:
+    <span class="kw">if</span> self.capture_5xx <span class="kw">and</span> status[<span class="str">"code"</span>] &gt;= <span class="num">500</span>:
+        <span class="cm"># SHAPE B: the framework caught it and returned a 500.</span>
+        <span class="cm"># No exception out here — the status IS the failure signal.</span>
+        tracker.<span class="fn">_capture_and_commit</span>(
+            s, <span class="ty">RuntimeError</span>(<span class="str">f"HTTP {status['code']} returned by {name}"</span>)
+        )
+    <span class="kw">else</span>:
+        s.buffer.<span class="fn">discard</span>()          <span class="cm"># success → buffer vanishes</span></code></pre>
+
+    <ul data-anchor="de-list-shapes">
+      <li><strong>Shape A — the handler raises and it propagates.</strong> The middleware catches it, commits the checkpoint, and <strong>re-raises</strong> so the framework's own error handling still runs exactly as before. You don't lose the 500 response your client expects.</li>
+      <li><strong>Shape B — the framework swallows it and emits a 5xx.</strong> No exception ever reaches the middleware. All it sees is <code>status &gt;= 500</code>, and from out here that status code is the <em>only</em> evidence a failure happened. So a synthetic <code>RuntimeError</code> carries the checkpoint. This is the common case in production.</li>
+    </ul>
+
+    <div class="callout note" data-anchor="de-note-5xx">
+      <span class="ct">The capture_5xx switch</span>
+      <p>Pass <code>capture_5xx=False</code> to capture <em>only</em> exceptions that propagate (Shape A) and ignore swallowed 500s (Shape B). Useful if another layer already returns intentional 500s you don't consider failures. The default, <code>True</code>, is what you want in most services — the swallowed 500 is precisely the failure you can't see any other way.</p>
+    </div>
+
+    <div class="callout warn" data-anchor="de-warn-double">
+      <span class="ct">Gotcha — don't open a second buffer</span>
+      <p>The middleware <strong>owns the request's session</strong>. Do <em>not</em> also decorate your top-level route handler with <code>@llog.intent</code> — that opens a <em>second</em> buffer competing with the one the middleware already opened. With middleware in place, let the request <em>be</em> the intent, and reach only for <code>llog.scope()</code> and <code>llog.snapshot()</code> inside your handlers and service code. Save <code>@llog.intent</code> for code paths <em>outside</em> an HTTP request — CLIs, workers, background jobs, sub-tasks.</p>
+    </div>
+
+    <h2 data-anchor="de-h-fallback">The fallback: the global excepthook</h2>
+    <p data-anchor="de-p-fallback1">Now the other half. A CLI or a worker has no framework standing between your exception and the interpreter — so when something goes genuinely unhandled, <code>sys.excepthook</code> <em>does</em> fire. That's where <code>install_excepthook()</code> earns its keep:</p>
+
+    <pre data-anchor="de-code-cli"><code><span class="cm"># demo/refund_cli.py — the FALLBACK detection path</span>
+<span class="kw">import</span> llog
+<span class="kw">from</span> refund <span class="kw">import</span> process_refund
+
+llog.<span class="fn">init</span>(service=<span class="str">"refund-cli"</span>, mode=<span class="str">"anonymous"</span>)
+llog.<span class="fn">install_excepthook</span>()
+
+<span class="kw">if</span> __name__ == <span class="str">"__main__"</span>:
+    <span class="cm"># NOT wrapped in try/except — the whole point of the fallback</span>
+    <span class="cm"># is an UNHANDLED exception reaching sys.excepthook.</span>
+    <span class="fn">print</span>(<span class="str">"refund-cli: processing a refund with a bad gateway retry count..."</span>)
+    result = <span class="fn">process_refund</span>(amount=<span class="num">42.00</span>, divisor=<span class="num">0</span>)
+    <span class="fn">print</span>(<span class="str">f"refund-cli: refunded {result}"</span>)   <span class="cm"># never reached</span></code></pre>
+
+    <p data-anchor="de-p-fallback2">The important behaviour here is what it <em>doesn't</em> change. <code>install_excepthook()</code> <strong>chains to the previous hook</strong>: LinkLog commits the checkpoint first, then calls the hook that was already installed — so the traceback still prints to stderr and the process still exits non-zero, exactly as it did before you added a single line. You never swallow a traceback the developer expected to see. Call <code>llog.uninstall_excepthook()</code> to put the original hook back.</p>
+
+    <div class="callout key" data-anchor="de-key-chain">
+      <span class="ct">The key guarantee</span>
+      <p>Neither path alters your app's behaviour. Shape A re-raises; the excepthook chains and still exits non-zero. LinkLog observes; it never intervenes. That's the invariant that lets you install it in production without holding your breath.</p>
+    </div>
+
+    <h2 data-anchor="de-h-manual">When nothing raises: manual commit</h2>
+    <p data-anchor="de-p-manual1">Some failures never throw. You computed a result that is perfectly valid Python and completely wrong — a refund of the wrong amount, a total that doesn't reconcile. No exception, no 500, so neither detection path fires. For that, commit the current session's checkpoint deliberately:</p>
+
+    <pre data-anchor="de-code-manual"><code><span class="kw">if</span> reconciled_total != expected_total:
+    llog.<span class="fn">snapshot</span>(<span class="str">"reconciled_total"</span>, reconciled_total)
+    path = llog.<span class="fn">commit</span>()   <span class="cm"># keep this context — a failure that never raised</span>
+    <span class="kw">if</span> path:
+        log.<span class="fn">warning</span>(<span class="str">"ledger drift; checkpoint at %s"</span>, path)</code></pre>
+
+    <p data-anchor="de-p-manual2"><code>llog.commit()</code> returns the artifact path, or <code>None</code> if there was nothing to commit or the commit was rate-limited. And that's the quiet unifying detail: every failure path — the <code>@llog.intent</code> decorator, the excepthook, the 5xx middleware, and this manual commit — routes through the <em>same</em> rate-limited capture (<code>_capture_and_commit</code>). One code path decides whether an artifact is written, so a failure storm is contained identically no matter which door it came through. We'll pull that thread in Chapter 7.</p>
+
+    <div class="callout note" data-anchor="de-note-uncatchable">
+      <span class="ct">What neither path can cover</span>
+      <p>An OOM-kill, a <code>SIGKILL</code>, a native segfault — these run <strong>no Python at all</strong>, so no hook, middleware, or manual commit can fire, and the in-memory buffer dies with the process. That entire class is out of reach of any handler by definition. Catching it needs a different mechanism, where the buffer <em>outlives</em> the process — which is exactly what Chapter 5's STAGING mode is for.</p>
+    </div>
+
+    <p class="soft" data-anchor="de-p-next">You now have both live detection paths and the manual escape hatch. Next, we cover the one failure they can't see from inside the process — and the buffer mode built to survive it.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-instrumenting.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-buffer-modes.html">Next: Buffer Modes ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>

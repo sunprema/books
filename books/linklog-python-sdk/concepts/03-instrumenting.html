@@ -1,0 +1,220 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instrumenting Code: intent, scope, snapshot — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="in-eyebrow">Chapter 03</p>
+    <h1 data-anchor="in-title">Instrumenting Code: intent, scope, snapshot</h1>
+    <p class="lede" data-anchor="in-lede">Chapter 2 got a <code>.llog</code> on disk. Now let's earn the detail inside it. Three primitives — <strong>a decorator, a context manager, and a one-liner</strong> — draw the causality graph the reader reconstructs downstream. You don't build the tree by hand; you write ordinary Python and the tree falls out of your call structure.</p>
+
+    <p data-anchor="in-lead1">Here is the whole canonical example first, then we'll take it apart line by line. This is <code>demo/refund.py</code> — the flow every other chapter reuses. Read it once as plain code; every LinkLog call is designed to disappear into how you'd structure a refund anyway.</p>
+
+    <pre data-anchor="in-code-full"><code><span class="cap">demo/refund.py — the canonical flow</span><span class="kw">import</span> llog
+
+
+<span class="dec">@llog.intent</span>(<span class="str">"ProcessRefund"</span>)
+<span class="kw">def</span> <span class="fn">_process_refund</span>(amount: <span class="ty">float</span>, divisor: <span class="ty">int</span>) -&gt; <span class="ty">float</span>:
+    llog.<span class="fn">snapshot</span>(<span class="str">"input"</span>, {<span class="str">"amount"</span>: amount, <span class="str">"divisor"</span>: divisor})
+
+    <span class="kw">with</span> llog.<span class="fn">scope</span>(<span class="str">"ValidateCard"</span>):
+        llog.<span class="fn">snapshot</span>(<span class="str">"request"</span>, {<span class="str">"amount"</span>: amount, <span class="str">"currency"</span>: <span class="str">"USD"</span>})
+        <span class="kw">if</span> amount &lt;= <span class="num">0</span>:
+            <span class="kw">raise</span> <span class="ty">ValueError</span>(<span class="str">"refund amount must be positive"</span>)
+
+    <span class="kw">with</span> llog.<span class="fn">scope</span>(<span class="str">"ChargeGateway"</span>, replay_boundary=<span class="kw">True</span>):
+        llog.<span class="fn">snapshot</span>(<span class="str">"gateway_request"</span>, {<span class="str">"amount"</span>: amount, <span class="str">"retries"</span>: divisor})
+        charge = <span class="fn">charge_gateway</span>(amount)
+        <span class="cm"># the captured response — becomes the stub's return value on replay</span>
+        llog.<span class="fn">snapshot</span>(<span class="str">"gateway_response"</span>, charge)
+
+    <span class="kw">with</span> llog.<span class="fn">scope</span>(<span class="str">"SettleLedger"</span>):
+        <span class="cm"># divisor=0 → ZeroDivisionError, two scopes down from the intent</span>
+        fee = amount / divisor
+        <span class="kw">return</span> charge[<span class="str">"net"</span>] - fee</code></pre>
+
+    <p data-anchor="in-lead2">Run it with <code>divisor=0</code> and it dies in <code>SettleLedger</code>. The checkpoint won't say "ZeroDivisionError at refund.py:69" — it'll say <em>the goal was ProcessRefund; validation passed; the gateway returned this; and settlement divided by a zero retry-count</em>. Same three primitives produced all of that. Let's meet them.</p>
+
+    <h2 data-anchor="in-h-intent">intent — the root of the graph</h2>
+    <p data-anchor="in-p-intent1"><code>@llog.intent("ProcessRefund")</code> is a <strong>decorator</strong>. It names the business purpose, opens the in-memory buffer when the function is entered, and decides the buffer's fate on the way out: <strong>discard on success, commit on failure</strong>. It is the one <em>root</em> event — every other event in the checkpoint descends from it.</p>
+
+    <div class="callout key" data-anchor="in-key-async">
+      <span class="ct">Works on sync AND async</span>
+      <p>The decorator inspects the function with <code>inspect.iscoroutinefunction</code> and wraps it either way. That matters: <strong>FastAPI handlers are async</strong>, and they're the primary integration. You put <code>@llog.intent(...)</code> on an <code>async def</code> route exactly as you would on a plain worker function — no separate API, no <code>await</code> gymnastics.</p>
+    </div>
+
+    <p data-anchor="in-p-intent2">Under the hood the wrapper is almost boringly symmetrical — which is the point. On the happy path the buffer is discarded and nothing touches disk; on any <code>BaseException</code> the forensic capture runs and re-raises, so your exception still propagates unchanged:</p>
+
+    <pre data-anchor="in-code-intent"><code><span class="cap">llog/tracker.py — the async wrapper (abridged)</span><span class="dec">@functools.wraps</span>(fn)
+<span class="kw">async def</span> <span class="fn">awrapper</span>(*a, **kw):
+    s, ts, tp = <span class="fn">_begin</span>(name)          <span class="cm"># open buffer, emit T_INTENT (the root)</span>
+    <span class="kw">if</span> s <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> <span class="kw">await</span> <span class="fn">fn</span>(*a, **kw)     <span class="cm"># SDK disabled → zero overhead</span>
+    <span class="kw">try</span>:
+        r = <span class="kw">await</span> <span class="fn">fn</span>(*a, **kw)
+    <span class="kw">except</span> <span class="ty">BaseException</span> <span class="kw">as</span> exc:
+        <span class="fn">_fail</span>(s, exc)               <span class="cm"># ERROR → FRAMEs → TRAILER → commit</span>
+        <span class="kw">raise</span>                       <span class="cm"># your exception is never swallowed</span>
+    <span class="kw">else</span>:
+        s.buffer.<span class="fn">discard</span>()           <span class="cm"># success → close(fd), gone</span>
+        <span class="kw">return</span> r
+    <span class="kw">finally</span>:
+        <span class="fn">_end</span>(ts, tp)</code></pre>
+
+    <div class="callout note" data-anchor="in-note-eid">
+      <span class="ct">What "root" means, precisely</span>
+      <p><code>_begin</code> emits a <code>T_INTENT</code> event with parent <code>NO_PARENT</code> (the sentinel <code>0</code>). Every event carries its own <code>eid</code>; every event except the intent carries a <code>pid</code> pointing at its parent. The intent is the only event with no parent — so it is the single root the reader starts its one-pass walk from.</p>
+    </div>
+
+    <h2 data-anchor="in-h-scope">scope — a step, and a branch</h2>
+    <p data-anchor="in-p-scope1"><code>with llog.scope("ValidateCard"):</code> marks a logical step. A scope is a <strong>context manager</strong>, and here's the mechanism that makes the graph a <em>tree</em>: on entry it emits a <code>SCOPE_START</code> whose parent is the <em>current</em> parent, then <strong>sets itself as the new current parent</strong> for everything inside the <code>with</code> block. Nest a scope inside another and it points at the outer one — that's how branches form.</p>
+
+    <pre data-anchor="in-code-scope"><code><span class="cap">llog/tracker.py — scope() sets the parent</span>eid = s.<span class="fn">emit</span>(P.T_SCOPE_START, _parent.<span class="fn">get</span>(), a)
+token = _parent.<span class="fn">set</span>(eid)   <span class="cm"># this scope is now the parent for everything inside</span>
+<span class="kw">try</span>:
+    <span class="kw">yield</span>
+<span class="kw">except</span> <span class="ty">BaseException</span>:
+    <span class="kw">if</span> s.error_pid <span class="kw">is</span> <span class="kw">None</span>:
+        s.error_pid = eid    <span class="cm"># innermost scope wins — remember WHERE, then re-raise</span>
+    <span class="kw">raise</span>                    <span class="cm"># NO SPAN_END — the scope never completed</span>
+<span class="kw">else</span>:
+    s.<span class="fn">emit</span>(P.T_SPAN_END, eid, {P.A_DURATION: ...})   <span class="cm"># clean exit only</span>
+<span class="kw">finally</span>:
+    _parent.<span class="fn">reset</span>(token)   <span class="cm"># restore the parent for the next sibling</span></code></pre>
+
+    <p data-anchor="in-p-scope2">Two extras worth knowing. You may pass arbitrary <code>**attrs</code> keywords — they ride along on the <code>SCOPE_START</code> as structured attributes. And <code>replay_boundary=True</code> tags a scope as an <strong>external-call seam</strong>: on <code>ChargeGateway</code> it marks the point the replay generator will later stub with the captured snapshots instead of hitting a real gateway. That's a preview — the full replay story is Chapter 9. Here it's just a flag on the event.</p>
+
+    <div class="callout warn" data-anchor="in-warn-manual">
+      <span class="ct">Gotcha — no manual open/close</span>
+      <p>There is no <code>scope.open()</code> / <code>scope.close()</code> in the public API, and that's deliberate. Internally every scope is a lifecycle-managed handle with a parent pointer, but that's <em>architecture, not interface</em>. Hand-balancing open/close would invite unbalanced lifetimes on exactly the failure path where correctness matters most — so the SDK uses the decorator and the <code>with</code> block, and lets Python guarantee the balance for you.</p>
+    </div>
+
+    <h2 data-anchor="in-h-snapshot">snapshot — a labelled value on the current parent</h2>
+    <p data-anchor="in-p-snap1"><code>llog.snapshot("request", value)</code> captures one labelled value and attaches it to whatever the current parent is — a scope if you're inside one, the intent if you're not. It's how state gets into the checkpoint: the arguments you came in with, the gateway's response, a computed total. Cheap, structured, and it never raises.</p>
+
+    <div class="callout trap" data-anchor="in-trap-orphan">
+      <span class="ct">Trap — snapshot outside an intent is a no-op</span>
+      <p>Call <code>snapshot()</code> when no intent is active and it's a <strong>counted no-op</strong> — it increments <code>stats.dropped_no_buffer</code> and returns. There's no trace to attach to, and guessing an implicit intent would invent a business purpose nobody declared. If a library-level <code>snapshot()</code> seems to vanish, check that it actually ran inside an <code>@llog.intent</code> call stack.</p>
+    </div>
+
+    <div class="callout note" data-anchor="in-note-vocab">
+      <span class="ct">Naming is an API</span>
+      <p>Scope names (<code>"SettleLedger"</code>) and snapshot keys (<code>"gateway_response"</code>) become the vocabulary of every checkpoint this code ever writes — they're what you'll grep, group, and read at 3 a.m. Keep them stable and meaningful. Renaming a scope changes the shape of your forensic history.</p>
+    </div>
+
+    <h2 data-anchor="in-h-graph">The graph the refund draws</h2>
+    <p data-anchor="in-p-graph1">Put the three together and the refund flow produces this tree. Notice where the error lands: not on the intent, but on <strong>SettleLedger</strong> — the innermost scope the exception passed through — and that <code>SettleLedger</code> scope is left <strong>OPEN</strong>, with no <code>SPAN_END</code>. That dangling <code>SCOPE_START</code> is the truthful record: it marks exactly where execution was standing when it failed.</p>
+
+    <figure class="diagram" data-anchor="in-fig-tree">
+      <svg viewBox="0 0 720 430" role="img" aria-label="Causality graph for the failed refund: intent ProcessRefund, three scopes, error in SettleLedger, stack frames">
+        <defs>
+          <marker id="edge" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+          <marker id="edgeRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#ef6a6a"></path>
+          </marker>
+        </defs>
+
+        <!-- INTENT root -->
+        <rect x="250" y="16" width="220" height="46" rx="8" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.8"></rect>
+        <text x="360" y="36" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="12" font-weight="700" text-anchor="middle">INTENT · ProcessRefund</text>
+        <text x="360" y="52" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">eid 1 · pid 0 (root)</text>
+
+        <!-- spine down -->
+        <line x1="360" y1="62" x2="360" y2="86" stroke="#46b1e0" stroke-width="1.4"></line>
+        <line x1="360" y1="86" x2="130" y2="86" stroke="#46b1e0" stroke-width="1.4"></line>
+        <line x1="360" y1="86" x2="590" y2="86" stroke="#46b1e0" stroke-width="1.4"></line>
+        <line x1="130" y1="86" x2="130" y2="104" stroke="#46b1e0" stroke-width="1.4" marker-end="url(#edge)"></line>
+        <line x1="360" y1="86" x2="360" y2="104" stroke="#46b1e0" stroke-width="1.4" marker-end="url(#edge)"></line>
+        <line x1="590" y1="86" x2="590" y2="104" stroke="#46b1e0" stroke-width="1.4" marker-end="url(#edge)"></line>
+
+        <!-- ValidateCard (clean) -->
+        <rect x="40" y="106" width="180" height="44" rx="7" fill="#0a1b28" stroke="#9fd35a" stroke-width="1.5"></rect>
+        <text x="130" y="125" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">SCOPE · ValidateCard</text>
+        <text x="130" y="140" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9.5" text-anchor="middle">SPAN_END ✓ · pid 1</text>
+        <line x1="130" y1="150" x2="130" y2="168" stroke="#8fb0c4" stroke-width="1.2" marker-end="url(#edge)"></line>
+        <rect x="52" y="170" width="156" height="30" rx="6" fill="#0a1b28" stroke="#244a63" stroke-width="1.2"></rect>
+        <text x="130" y="189" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9.5" text-anchor="middle">snapshot "request"</text>
+
+        <!-- ChargeGateway (clean, replay_boundary) -->
+        <rect x="270" y="106" width="180" height="44" rx="7" fill="#0a1b28" stroke="#9fd35a" stroke-width="1.5"></rect>
+        <text x="360" y="123" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">SCOPE · ChargeGateway</text>
+        <text x="360" y="137" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">replay_boundary · SPAN_END ✓</text>
+        <line x1="360" y1="150" x2="360" y2="168" stroke="#8fb0c4" stroke-width="1.2" marker-end="url(#edge)"></line>
+        <rect x="282" y="170" width="156" height="46" rx="6" fill="#0a1b28" stroke="#244a63" stroke-width="1.2"></rect>
+        <text x="360" y="188" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9.5" text-anchor="middle">snapshot "gateway_request"</text>
+        <text x="360" y="205" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9.5" text-anchor="middle">snapshot "gateway_response"</text>
+
+        <!-- SettleLedger (OPEN) -->
+        <rect x="500" y="106" width="180" height="44" rx="7" fill="#0a1b28" stroke="#ef6a6a" stroke-width="1.8" stroke-dasharray="6 4"></rect>
+        <text x="590" y="125" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">SCOPE · SettleLedger</text>
+        <text x="590" y="140" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="9.5" text-anchor="middle">OPEN — no SPAN_END</text>
+
+        <!-- error edge -->
+        <line x1="590" y1="150" x2="590" y2="170" stroke="#ef6a6a" stroke-width="1.6" marker-end="url(#edgeRed)"></line>
+        <rect x="500" y="172" width="180" height="42" rx="7" fill="#0a1b28" stroke="#ef6a6a" stroke-width="1.6"></rect>
+        <text x="590" y="190" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11" font-weight="700" text-anchor="middle">ERROR</text>
+        <text x="590" y="205" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">ZeroDivisionError · pid = SettleLedger</text>
+
+        <!-- frames -->
+        <line x1="590" y1="214" x2="590" y2="232" stroke="#ef6a6a" stroke-width="1.2" marker-end="url(#edgeRed)"></line>
+        <rect x="500" y="234" width="180" height="30" rx="6" fill="#0a1b28" stroke="#244a63" stroke-width="1.2"></rect>
+        <text x="590" y="253" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9.5" text-anchor="middle">FRAME · refund.py:68 fee=…</text>
+        <line x1="590" y1="264" x2="590" y2="280" stroke="#244a63" stroke-width="1.2"></line>
+        <rect x="500" y="282" width="180" height="30" rx="6" fill="#0a1b28" stroke="#244a63" stroke-width="1.2"></rect>
+        <text x="590" y="301" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9.5" text-anchor="middle">FRAME · … structured frames</text>
+
+        <!-- legend -->
+        <rect x="40" y="360" width="640" height="52" rx="8" fill="rgba(18,48,73,0.4)" stroke="#244a63" stroke-width="1"></rect>
+        <circle cx="70" cy="378" r="5" fill="none" stroke="#9fd35a" stroke-width="1.6"></circle>
+        <text x="84" y="382" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10">clean scope (SPAN_END)</text>
+        <circle cx="290" cy="378" r="5" fill="none" stroke="#ef6a6a" stroke-width="1.6" stroke-dasharray="4 3"></circle>
+        <text x="304" y="382" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10">OPEN scope — where it failed</text>
+        <text x="70" y="402" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10">every event: own eid, parent pid → one root (the intent), one-pass walk</text>
+      </svg>
+      <figcaption>The refund's causality graph: three branches off one intent, the error attributed to the innermost open scope.</figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="in-key-where">
+      <span class="ct">The whole product claim, in one line</span>
+      <p>The error's <code>pid</code> is <code>SettleLedger</code>'s eid — not the intent's. The SDK records <code>error_pid</code> in the <em>innermost</em> scope's <code>except</code>, before any <code>finally</code> unwinds the parent stack. So the checkpoint says "failed in <strong>SettleLedger</strong>," preserving the exact execution path — the difference between a symptom and a story.</p>
+    </div>
+
+    <p data-anchor="in-p-order">Read as a sequence, the events land in exactly execution order, so the reader replays your run top to bottom:</p>
+
+    <table data-anchor="in-table-order">
+      <tr><th>#</th><th>Event</th><th>parent (pid)</th><th>meaning</th></tr>
+      <tr><td>1</td><td><code>INTENT</code> ProcessRefund</td><td>0 (root)</td><td>the goal</td></tr>
+      <tr><td>2</td><td><code>SNAPSHOT</code> input</td><td>intent</td><td>the arguments</td></tr>
+      <tr><td>3</td><td><code>SCOPE_START</code> ValidateCard</td><td>intent</td><td>step 1 opens</td></tr>
+      <tr><td>4</td><td><code>SPAN_END</code></td><td>ValidateCard</td><td>step 1 clean ✓</td></tr>
+      <tr><td>5</td><td><code>SCOPE_START</code> ChargeGateway</td><td>intent</td><td>step 2 (boundary)</td></tr>
+      <tr><td>6</td><td><code>SPAN_END</code></td><td>ChargeGateway</td><td>step 2 clean ✓</td></tr>
+      <tr><td>7</td><td><code>SCOPE_START</code> SettleLedger</td><td>intent</td><td>step 3 opens…</td></tr>
+      <tr><td>8</td><td><code>ERROR</code> ZeroDivisionError</td><td><strong>SettleLedger</strong></td><td>…and never closes</td></tr>
+    </table>
+
+    <p class="soft" data-anchor="in-p-next">You've drawn the graph. But nothing above <em>decided</em> the refund failed — the decorator caught a raised exception. What happens when a framework swallows it and quietly returns a 500? Chapter 4 is how a failure is actually detected.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-getting-started.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-detection.html">Next: Catching Failures ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>

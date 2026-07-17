@@ -1,0 +1,129 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheatsheet — Integrating LinkLog</title>
+<link rel="stylesheet" href="assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="index.html">Contents</a>
+  <a href="cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="cs-eyebrow">Quick Reference</p>
+    <h1 data-anchor="cs-title">The LinkLog Cheatsheet</h1>
+
+    <div class="callout key" data-anchor="cs-30sec">
+      <span class="ct">30-second summary</span>
+      <p>Record everything on every request into an invisible in-memory buffer → <strong>discard it on success</strong> (no file, ever) → <strong>commit a forensic checkpoint on failure</strong>. Core path is Linux-only (<code>O_TMPFILE</code>, <code>/dev/shm</code>); a hidden-temp-file fallback runs elsewhere for local dev.</p>
+    </div>
+
+    <h2 data-anchor="cs-h-install">Install &amp; set up</h2>
+    <pre data-anchor="cs-pre-install"><code><span class="cap">package: llog · python ≥ 3.9 · deps: msgspec, xxhash · Apache-2.0</span><span class="sh">$</span> pip install ./sdk/python
+
+<span class="kw">import</span> llog
+llog.<span class="fn">init</span>(service=<span class="str">"payment-api"</span>)   <span class="cm"># once, at process start</span></code></pre>
+    <p data-anchor="cs-p-init">Before <code>init()</code> runs, every <code>llog</code> call is a silent no-op. Full signature:</p>
+    <pre data-anchor="cs-pre-sig"><code>llog.<span class="fn">init</span>(service, mode=<span class="str">"anonymous"</span>, root=<span class="str">"/dev/shm/llog"</span>, *,
+          capture_mode=<span class="str">"full"</span>, allow_fields=<span class="kw">None</span>,
+          allow_config=<span class="kw">None</span>, max_commits_per_min=<span class="num">10</span>)</code></pre>
+    <table data-anchor="cs-tbl-init">
+      <tr><th>Param</th><th>Meaning</th><th>Default</th></tr>
+      <tr><td><code>service</code></td><td>Service name stamped on every artifact.</td><td>—</td></tr>
+      <tr><td><code>mode</code></td><td><code>"anonymous"</code> or <code>"staging"</code> (see modes below).</td><td><code>"anonymous"</code></td></tr>
+      <tr><td><code>root</code></td><td>tmpfs root for buffers &amp; events. Keep it on <code>/dev/shm</code>.</td><td><code>/dev/shm/llog</code></td></tr>
+      <tr><td><code>capture_mode</code></td><td><code>"full"</code> or <code>"allowlist"</code>.</td><td><code>"full"</code></td></tr>
+      <tr><td><code>allow_fields</code></td><td>Set/list of safe leaf field names (allowlist mode).</td><td><code>None</code></td></tr>
+      <tr><td><code>allow_config</code></td><td>Path to a JSON file <code>{"allow_fields":[...]}</code>.</td><td><code>None</code></td></tr>
+      <tr><td><code>max_commits_per_min</code></td><td>Per-signature commit cap (storm control).</td><td><code>10</code></td></tr>
+    </table>
+
+    <h2 data-anchor="cs-h-instrument">Instrument</h2>
+    <div class="api" data-anchor="cs-api-intent"><span class="sig"><span class="mac">@llog.</span><b>intent</b>(name)</span><p>Decorator marking the business purpose; root of the graph. Opens the buffer; discards on success, commits on failure. Works on sync <em>and</em> async functions.</p></div>
+    <div class="api" data-anchor="cs-api-scope"><span class="sig"><b>with</b> llog.<b>scope</b>(name, replay_boundary=False, **attrs):</span><p>A logical step; nests, and becomes the parent for everything inside. <code>replay_boundary=True</code> marks an external-call seam for the replay generator.</p></div>
+    <div class="api" data-anchor="cs-api-snap"><span class="sig">llog.<b>snapshot</b>(name, value)</span><p>Capture a labelled value under the current parent. Bounded &amp; safe; no-op outside an intent.</p></div>
+    <div class="api" data-anchor="cs-api-commit"><span class="sig">llog.<b>commit</b>() <span class="sh">-&gt;</span> str | None</span><p>Manually commit the current session (a failure that never raised). Returns the artifact path or <code>None</code>.</p></div>
+
+    <h2 data-anchor="cs-h-detect">Detect failures</h2>
+    <pre data-anchor="cs-pre-detect"><code><span class="cap">PRIMARY — web: pure-ASGI middleware, auto-opens an intent "{METHOD} {path}"</span>llog.<span class="fn">instrument_fastapi</span>(app, capture_5xx=<span class="kw">True</span>)
+<span class="cm"># or, on any ASGI app:</span>
+app.<span class="fn">add_middleware</span>(llog.<span class="ty">LinkLogMiddleware</span>, capture_5xx=<span class="kw">True</span>)
+
+<span class="cap">FALLBACK — CLIs / workers</span>
+llog.<span class="fn">install_excepthook</span>()      <span class="cm"># chains to the previous hook; process still exits non-zero</span>
+llog.<span class="fn">uninstall_excepthook</span>()</code></pre>
+    <p data-anchor="cs-p-detect">Middleware is primary because frameworks swallow exceptions into 500s and <code>sys.excepthook</code> never fires for them. It catches both a raised exception <em>and</em> a swallowed 5xx (when <code>capture_5xx=True</code>).</p>
+
+    <h2 data-anchor="cs-h-introspect">Introspect</h2>
+    <table data-anchor="cs-tbl-introspect">
+      <tr><th>API</th><th>Returns</th></tr>
+      <tr><td><code>llog.stats</code></td><td>Counters: <code>buffers_created</code>, <code>commits</code>, <code>discards</code>, <code>write_errors</code>, <code>commit_errors</code>, <code>cap_truncations</code>, <code>dropped_no_buffer</code>, <code>suppressed</code>.</td></tr>
+      <tr><td><code>llog.config</code></td><td>The effective configuration.</td></tr>
+      <tr><td><code>llog.current_session()</code></td><td>The active <code>Session</code>, or <code>None</code>.</td></tr>
+      <tr><td><code>llog.__version__</code></td><td>SDK version string.</td></tr>
+    </table>
+
+    <h2 data-anchor="cs-h-modes">Buffer modes</h2>
+    <table data-anchor="cs-tbl-modes">
+      <tr><th></th><th>anonymous <span class="pill default">default</span></th><th>staging <span class="pill">opt-in</span></th></tr>
+      <tr><td>Buffer</td><td><code>O_TMPFILE</code> (unnamed)</td><td>named <code>staging/{pid}-{uuid}.llog</code></td></tr>
+      <tr><td>Success</td><td><code>close(fd)</code></td><td><code>unlink()</code> then <code>close()</code></td></tr>
+      <tr><td>Failure</td><td>hard-link → <code>events/</code></td><td><code>rename()</code> → <code>events/</code></td></tr>
+      <tr><td>Hard crash (OOM/SIGKILL)</td><td><strong>lost — no checkpoint</strong></td><td>sidecar reaps orphan → <code>TRUNCATED</code>, open scope shown</td></tr>
+      <tr><td>Success-path trace</td><td>zero, ever</td><td>brief exposure window</td></tr>
+    </table>
+    <p data-anchor="cs-p-modes"><code>mode="staging"</code> auto-starts a watchdog that heartbeats <code>/dev/shm/llog/live/{pid}</code>; the sidecar reaps by heartbeat <em>staleness</em>, not pid. Choose staging when OOM-kills are failures you must capture.</p>
+
+    <h2 data-anchor="cs-h-privacy">Privacy — allowlist capture</h2>
+    <pre data-anchor="cs-pre-privacy"><code>llog.<span class="fn">init</span>(service=<span class="str">"payment-api"</span>, capture_mode=<span class="str">"allowlist"</span>,
+          allow_fields={<span class="str">"amount"</span>, <span class="str">"currency"</span>, <span class="str">"order_id"</span>},
+          allow_config=<span class="str">"llog.allow.json"</span>)</code></pre>
+    <ul data-anchor="cs-ul-privacy">
+      <li>Ceiling = <code>allow_fields</code> ∪ <code>allow_config</code> JSON ∪ <code>LLOG_ALLOW_FIELDS</code> env (CSV).</li>
+      <li><strong>Gate leaves, not containers</strong> — declaring <code>"user"</code> does <em>not</em> expose <code>user.ssn</code>. Structure is always kept; declare the safe leaf names.</li>
+      <li>Withheld values render as <code>&lt;withheld: str len=16&gt;</code> (type + shape, never the value).</li>
+      <li>Fails <strong>closed</strong>: a malformed config narrows capture, never widens it, never crashes <code>init</code>.</li>
+    </ul>
+
+    <h2 data-anchor="cs-h-storms">Storm control</h2>
+    <p data-anchor="cs-p-storms">Per-<strong>signature</strong> token bucket (signature = exception type + top frame + intent name), capped at <code>max_commits_per_min</code> (default 10). Over-cap commits are <em>discarded but counted</em>; the suppressed count rides the next committed <code>ERROR</code> event. Read <code>llog.stats.suppressed</code>. Distinct bugs have distinct signatures, so they never starve each other.</p>
+
+    <h2 data-anchor="cs-h-env">Environment variables</h2>
+    <table data-anchor="cs-tbl-env">
+      <tr><th>Var</th><th>Effect</th></tr>
+      <tr><td><code>LLOG_ALLOW_FIELDS</code></td><td>CSV of allowlist leaf fields, unioned into the ceiling. <span class="pill">real SDK env</span></td></tr>
+      <tr><td><code>LLOG_MODE</code></td><td>A <em>demo</em> convention only — <strong>not</strong> read by the SDK. In real code pass <code>mode=</code> to <code>init()</code>.</td></tr>
+    </table>
+
+    <h2 data-anchor="cs-h-traps">Traps to avoid</h2>
+    <div class="callout trap" data-anchor="cs-trap">
+      <span class="ct">Foot-guns</span>
+      <ul>
+        <li><strong>Verify on disk.</strong> The SDK swallows its own errors — assert the artifact exists in <code>events/</code>, never trust a return value.</li>
+        <li><strong>Linux for real / benchmarks.</strong> macOS runs the fallback; numbers and behavior there don't reflect the mechanism.</li>
+        <li><strong>Don't double-wrap.</strong> With the middleware owning the request, don't also put <code>@llog.intent</code> on the route handler — use <code>scope()</code>/<code>snapshot()</code> inside instead.</li>
+        <li><strong><code>snapshot()</code> outside an intent</strong> is a counted no-op — there's no trace to attach to.</li>
+        <li><strong>Same tmpfs.</strong> Keep the buffer and <code>events/</code> on one filesystem (never <code>/tmp</code>) — links &amp; renames can't cross it (<code>EXDEV</code>).</li>
+        <li><strong>Declare leaves, not containers</strong> in the allowlist.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="cs-h-cli">Inspect an artifact (downstream)</h2>
+    <pre data-anchor="cs-pre-cli"><code><span class="sh">$</span> llog-ctl inspect events/&lt;uuid&gt;.llog   <span class="cm"># human-readable graph, intent, error, frames</span>
+<span class="sh">$</span> llog-ctl verify  events/&lt;uuid&gt;.llog   <span class="cm"># checksum + classification</span>
+<span class="sh">$</span> llog-ctl cat     events/&lt;uuid&gt;.llog   <span class="cm"># JSON envelope</span></code></pre>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="concepts/09-downstream.html">‹ Prev</a>
+  <a rel="home" href="index.html">Contents</a>
+  <span class="book-pageno"></span>
+</nav>
+
+<script src="assets/book.js"></script>

@@ -1,0 +1,237 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy: Allowlist Capture & the Write-Only Wall — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="pv-eyebrow">Chapter 06</p>
+    <h1 data-anchor="pv-title">Privacy: Allowlist Capture &amp; the Write-Only Wall</h1>
+    <p class="lede" data-anchor="pv-lede">An instrument that records your program's execution state is, by definition, standing next to your most sensitive data. LinkLog gives you <strong>two guarantees</strong> that keep it from becoming a liability: it never hands that state back to your own code, and — when you ask it to — it only ever captures the fields you have named as safe. Let's earn both.</p>
+
+    <h2 data-anchor="pv-h-writeonly">Guarantee A — the write-only wall</h2>
+    <p data-anchor="pv-p-wo1">Start with the smallest possible surprise. Call <code>snapshot()</code> and look at what you get back:</p>
+
+    <pre data-anchor="pv-code-wo"><code><span class="cm"># snapshot() records state — it does not return it</span>
+<span class="pr">result</span> = llog.<span class="fn">snapshot</span>(<span class="str">"amount"</span>, <span class="num">42.0</span>)   <span class="cm"># -&gt; None. Always.</span>
+
+<span class="cm"># There is no llog.read(), no llog.dump(), no session.events[...].</span>
+<span class="cm"># Whatever you capture goes INTO the buffer and never comes back out.</span></code></pre>
+
+    <p data-anchor="pv-p-wo2">That is the whole of invariant&nbsp;6, and it is deliberately boring. Nothing in the public API — not <code>snapshot</code>, not <code>scope</code>, not <code>intent</code> — returns captured execution state to application code. Snapshots flow one way, into the in-memory buffer, and the only thing that ever reads them back is the SDK's own checksum routine, reading from its <em>own</em> file descriptor (invariant&nbsp;2 forbids keeping a heap copy at all).</p>
+    <p data-anchor="pv-p-wo3">Why insist on this? Because the failure mode it forecloses is subtle. If instrumentation could return the values it captured, then any code path in your process — a plugin, a dependency, a compromised handler — could ask the observability layer to replay a customer's card number back into memory it controls. The instrument would have quietly become a data-exfiltration surface <em>inside your own process</em>. A write-only wall means there is no such API to abuse: the values are inert the moment they land.</p>
+
+    <figure class="diagram" data-anchor="pv-fig-wall">
+      <svg viewBox="0 0 720 220" role="img" aria-label="Snapshots flow one way from application code into the buffer; there is no return path">
+        <defs>
+          <marker id="pv-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+        </defs>
+        <!-- app code -->
+        <rect x="36" y="82" width="180" height="60" rx="8" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.5"></rect>
+        <text x="126" y="108" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">application code</text>
+        <text x="126" y="126" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">snapshot("amount", …)</text>
+        <!-- one-way in -->
+        <line x1="220" y1="100" x2="470" y2="100" stroke="#46b1e0" stroke-width="1.6" marker-end="url(#pv-arrow)"></line>
+        <text x="345" y="90" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">captured →</text>
+        <!-- blocked return -->
+        <line x1="470" y1="126" x2="230" y2="126" stroke="#ef6a6a" stroke-width="1.4" stroke-dasharray="5 5"></line>
+        <line x1="342" y1="112" x2="358" y2="140" stroke="#ef6a6a" stroke-width="2.2"></line>
+        <line x1="358" y1="112" x2="342" y2="140" stroke="#ef6a6a" stroke-width="2.2"></line>
+        <text x="345" y="158" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">no read-back API</text>
+        <!-- buffer -->
+        <rect x="474" y="76" width="210" height="72" rx="8" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.5"></rect>
+        <text x="579" y="104" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">in-memory buffer</text>
+        <text x="579" y="122" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">write-only, /dev/shm</text>
+        <text x="579" y="138" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">values are inert here</text>
+      </svg>
+      <figcaption>Invariant 6 in one picture: state goes in, nothing comes back to your code.</figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="pv-key-wo">
+      <span class="ct">The key idea</span>
+      <p>Instrumentation you cannot query is instrumentation nobody can turn into a leak. <code>snapshot()</code> returns <code>None</code> on purpose — the absence of a getter is the feature.</p>
+    </div>
+
+    <h2 data-anchor="pv-h-why-allow">Guarantee B — why scrub-after-capture isn't enough</h2>
+    <p data-anchor="pv-p-allow1">The write-only wall stops the data leaving through <em>your</em> process. The next question is what the SDK captures in the first place. The tempting answer is "capture everything, then scrub the sensitive bits later in the sidecar." For regulated data, that answer quietly fails.</p>
+    <p data-anchor="pv-p-allow2">Pattern-based scrubbing catches things that <em>look</em> like secrets — a 16-digit run, an <code>SSN</code>-shaped string, a high-entropy token. It cannot catch <strong>contextual PII in free text</strong>. A customer's name sitting in a <code>note</code> field has no pattern. An address in a prose comment has no pattern. Scrub-after-capture will sail right past them, because there is nothing to match. So for regulated deployments LinkLog inverts the default: <strong>capture only the fields you have declared, and never capture the rest at all.</strong></p>
+
+    <pre data-anchor="pv-code-init"><code><span class="kw">import</span> llog
+
+llog.<span class="fn">init</span>(
+    service=<span class="str">"payment-api"</span>,
+    capture_mode=<span class="str">"allowlist"</span>,                 <span class="cm"># default is "full"</span>
+    allow_fields={<span class="str">"amount"</span>, <span class="str">"currency"</span>, <span class="str">"order_id"</span>},
+    allow_config=<span class="str">"llog.allow.json"</span>,           <span class="cm"># optional {"allow_fields": [...]}</span>
+)</code></pre>
+
+    <p data-anchor="pv-p-allow3">The ceiling on what may <em>ever</em> be captured is the <strong>union of three sources</strong> — the init argument, the JSON config file, and an environment variable. All three feed one frozen set:</p>
+
+    <pre data-anchor="pv-code-sources"><code><span class="cm"># 1. the init argument — set literal</span>
+allow_fields={<span class="str">"amount"</span>, <span class="str">"currency"</span>, <span class="str">"order_id"</span>}
+
+<span class="cm"># 2. llog.allow.json — ops/security-ownable, auditable as one file</span>
+{ <span class="at">"allow_fields"</span>: [<span class="str">"shipping_country"</span>, <span class="str">"line_count"</span>] }
+
+<span class="cm"># 3. the LLOG_ALLOW_FIELDS env var — comma-separated</span>
+<span class="pr">export</span> LLOG_ALLOW_FIELDS=<span class="str">"amount,currency,order_id"</span>
+
+<span class="cm"># ceiling  =  argument  ∪  config file  ∪  env var</span></code></pre>
+
+    <div class="callout note" data-anchor="pv-note-owner">
+      <span class="ct">Why three sources</span>
+      <p>They map to who owns the decision. Engineers declare fields inline; a security team owns <code>llog.allow.json</code> as a single reviewable artifact; ops sets <code>LLOG_ALLOW_FIELDS</code> per environment. The SDK unions whatever loads — but as you'll see next, "union" here can only ever <em>narrow</em> the surface, never widen it past intent.</p>
+    </div>
+
+    <h2 data-anchor="pv-h-rules">The three rules that make it a real control</h2>
+    <p data-anchor="pv-p-rules-intro">An allowlist is only worth trusting if its edges are sharp. Three rules from <code>snapshot.py</code> and DR-010 turn it from a control-shaped suggestion into an actual control.</p>
+
+    <h3 data-anchor="pv-h-rule1">1 — Gate every leaf, keep the structure</h3>
+    <p data-anchor="pv-p-rule1">The walker <strong>always traverses containers</strong>, so the <em>shape</em> of your data stays visible: a reader of the checkpoint can see the request <em>had</em> an <code>ssn</code> field. But a scalar value is captured only if <strong>its own key</strong> is declared. Structure comes free; values are earned. Crucially, declaring a <em>container</em> does not expose the secrets inside it — the allow decision is made on each leaf's own key, not on the subtree it lives in:</p>
+
+    <pre data-anchor="pv-code-leaf"><code><span class="cm"># from snapshot.py — the leaf gate</span>
+<span class="kw">if</span> <span class="kw">isinstance</span>(v, _ATOMIC):
+    <span class="kw">if</span> allow <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> key <span class="kw">not</span> <span class="kw">in</span> allow:
+        <span class="kw">return</span> <span class="fn">_withheld</span>(v)      <span class="cm"># undeclared leaf -&gt; type + shape only</span>
+    <span class="kw">return</span> v                    <span class="cm"># declared leaf -&gt; kept</span></code></pre>
+
+    <h3 data-anchor="pv-h-rule2">2 — Withheld = type + shape, never value</h3>
+    <p data-anchor="pv-p-rule2">An undeclared value is not dropped to <code>null</code> — that would erase the fact it existed. It becomes a placeholder that records what was there without what it held. Length is the "shape" for strings and bytes (enough to know a 16-char string sat here); for anything else the type name alone is the shape:</p>
+
+    <pre data-anchor="pv-code-withheld"><code><span class="kw">def</span> <span class="fn">_withheld</span>(v):
+    t = <span class="kw">type</span>(v).__name__
+    <span class="kw">if</span> <span class="kw">isinstance</span>(v, (<span class="ty">str</span>, <span class="ty">bytes</span>)):
+        <span class="kw">return</span> <span class="str">f"&lt;withheld: {t} len={</span><span class="kw">len</span><span class="str">(v)}&gt;"</span>
+    <span class="kw">return</span> <span class="str">f"&lt;withheld: {t}&gt;"</span></code></pre>
+
+    <h3 data-anchor="pv-h-rule3">3 — The allowlist is a ceiling, and errors fail closed</h3>
+    <p data-anchor="pv-p-rule3">Here is the mental flip that matters. Capture runs the <em>opposite</em> direction from redaction: <strong>more declaration is <em>less</em> safe.</strong> A redaction list is a floor you add to; an allowlist is a ceiling you narrow from. So less-trusted sources may only ever <strong>narrow</strong> the set — no code path exists to widen it per call, because a silent widen is exactly the leak. And a malformed config file <strong>fails closed</strong>: it yields a narrower set, never a crash of <code>init</code> (invariant&nbsp;7), never a wider capture surface.</p>
+
+    <pre data-anchor="pv-code-failclosed"><code><span class="cm"># from _load_allow_fields — a broken config narrows, never crashes, never widens</span>
+<span class="kw">if</span> config_path:
+    <span class="kw">try</span>:
+        <span class="kw">with</span> <span class="fn">open</span>(config_path) <span class="kw">as</span> fh:
+            doc = json.<span class="fn">load</span>(fh)
+        <span class="kw">for</span> f <span class="kw">in</span> doc.<span class="fn">get</span>(<span class="str">"allow_fields"</span>, []):
+            fields.<span class="fn">add</span>(<span class="kw">str</span>(f))
+    <span class="kw">except</span> <span class="ty">Exception</span>:
+        <span class="kw">pass</span>              <span class="cm"># fail closed: no field added, init still succeeds</span></code></pre>
+
+    <div class="callout trap" data-anchor="pv-trap-container">
+      <span class="ct">Gotcha</span>
+      <p>Declare <strong>leaf field names, not container names</strong>. Adding <code>"user"</code> to <code>allow_fields</code> does <em>not</em> expose <code>user.ssn</code> — the container is traversed either way, and each leaf inside is still gated by its own key. To keep a value, name the exact leaf key you consider safe (e.g. <code>"amount"</code>, <code>"currency"</code>), never the object that wraps it.</p>
+    </div>
+
+    <h2 data-anchor="pv-h-concrete">A concrete before &amp; after</h2>
+    <p data-anchor="pv-p-concrete1">Put the three rules together on one snapshot. We declare a single safe leaf — <code>amount</code> — and hand the walker a dict with a card number and a nested user object:</p>
+
+    <pre data-anchor="pv-code-before"><code>llog.<span class="fn">init</span>(service=<span class="str">"payment-api"</span>,
+          capture_mode=<span class="str">"allowlist"</span>,
+          allow_fields={<span class="str">"amount"</span>})
+
+llog.<span class="fn">snapshot</span>(<span class="str">"payment"</span>, {
+    <span class="str">"amount"</span>: <span class="num">42.0</span>,
+    <span class="str">"card_number"</span>: <span class="str">"4111111111111111"</span>,
+    <span class="str">"user"</span>: {<span class="str">"ssn"</span>: <span class="str">"123-45-6789"</span>, <span class="str">"email"</span>: <span class="str">"ana@example.com"</span>},
+})</code></pre>
+
+    <p data-anchor="pv-p-concrete2">The <code>amount</code> leaf is declared, so it survives. Every other leaf is withheld down to type-and-shape — including the two inside <code>user</code>, even though <code>user</code> itself was traversed so the structure remains legible. This is what actually lands in the buffer:</p>
+
+    <pre data-anchor="pv-code-after"><code>{
+  <span class="at">"amount"</span>: <span class="num">42.0</span>,
+  <span class="at">"card_number"</span>: <span class="str">"&lt;withheld: str len=16&gt;"</span>,
+  <span class="at">"user"</span>: {
+    <span class="at">"ssn"</span>: <span class="str">"&lt;withheld: str len=11&gt;"</span>,
+    <span class="at">"email"</span>: <span class="str">"&lt;withheld: str len=15&gt;"</span>
+  }
+}</code></pre>
+
+    <figure class="diagram" data-anchor="pv-fig-tree">
+      <svg viewBox="0 0 720 300" role="img" aria-label="Object tree with the declared leaf lit green and undeclared leaves shown as withheld in red">
+        <defs>
+          <marker id="pv-edge" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5b7d92"></path>
+          </marker>
+        </defs>
+        <!-- root -->
+        <rect x="24" y="122" width="140" height="56" rx="8" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.5"></rect>
+        <text x="94" y="146" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">snapshot</text>
+        <text x="94" y="164" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">"payment"</text>
+        <!-- edges to level 1 -->
+        <line x1="164" y1="140" x2="300" y2="60"  stroke="#5b7d92" stroke-width="1.3" marker-end="url(#pv-edge)"></line>
+        <line x1="164" y1="150" x2="300" y2="140" stroke="#5b7d92" stroke-width="1.3" marker-end="url(#pv-edge)"></line>
+        <line x1="164" y1="160" x2="300" y2="228" stroke="#5b7d92" stroke-width="1.3" marker-end="url(#pv-edge)"></line>
+        <!-- amount: LIT -->
+        <rect x="302" y="36" width="188" height="50" rx="7" fill="rgba(159,211,90,.10)" stroke="#9fd35a" stroke-width="1.6"></rect>
+        <text x="316" y="58" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="12">amount</text>
+        <text x="316" y="76" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="12">42.0</text>
+        <text x="474" y="52" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="14" text-anchor="end">●</text>
+        <!-- card_number: WITHHELD -->
+        <rect x="302" y="116" width="230" height="50" rx="7" fill="rgba(239,106,106,.09)" stroke="#ef6a6a" stroke-width="1.4"></rect>
+        <text x="316" y="138" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="12">card_number</text>
+        <text x="316" y="156" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11">&lt;withheld: str len=16&gt;</text>
+        <!-- user container: traversed -->
+        <rect x="302" y="204" width="150" height="48" rx="7" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.4" stroke-dasharray="4 3"></rect>
+        <text x="377" y="226" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">user { }</text>
+        <text x="377" y="242" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">traversed</text>
+        <!-- edges to level 2 -->
+        <line x1="452" y1="220" x2="520" y2="196" stroke="#5b7d92" stroke-width="1.3" marker-end="url(#pv-edge)"></line>
+        <line x1="452" y1="234" x2="520" y2="262" stroke="#5b7d92" stroke-width="1.3" marker-end="url(#pv-edge)"></line>
+        <!-- ssn: WITHHELD -->
+        <rect x="522" y="172" width="180" height="46" rx="7" fill="rgba(239,106,106,.09)" stroke="#ef6a6a" stroke-width="1.4"></rect>
+        <text x="534" y="192" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11">ssn</text>
+        <text x="534" y="209" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="10">&lt;withheld: str len=11&gt;</text>
+        <!-- email: WITHHELD -->
+        <rect x="522" y="240" width="180" height="46" rx="7" fill="rgba(239,106,106,.09)" stroke="#ef6a6a" stroke-width="1.4"></rect>
+        <text x="534" y="260" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11">email</text>
+        <text x="534" y="277" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="10">&lt;withheld: str len=15&gt;</text>
+      </svg>
+      <figcaption>One declared leaf lit; every undeclared value withheld to type + shape — structure intact, secrets gone.</figcaption>
+    </figure>
+
+    <h2 data-anchor="pv-h-full">When "full" is the right call</h2>
+    <p data-anchor="pv-p-full1">Allowlist mode is a recommendation, not a mandate. The default is <code>capture_mode="full"</code>, and it is <strong>byte-identical to pre-allowlist behavior</strong> — no filtering, every value captured within the usual depth and size bounds. The filtering is a single set lookup per leaf inside the walk the SDK already runs, so there is no measurable success-path cost either way; the choice is purely about what the data is.</p>
+
+    <table data-anchor="pv-table-modes">
+      <thead>
+        <tr><th>capture_mode</th><th>What it captures</th><th>Reach for it when</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>"full"</code> <span class="pill default">default</span></td><td>Every value, bounded by depth/size only</td><td>Non-sensitive services, internal tools, local dev</td></tr>
+        <tr><td><code>"allowlist"</code></td><td>Only declared leaf values; the rest → type + shape</td><td>Regulated data — payments, PII, health, anything audited</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="pv-h-bigpicture">The bigger picture — two barriers, not one</h2>
+    <p data-anchor="pv-p-big1">Allowlist capture is the <strong>capture-side barrier</strong>: it decides what raw data is ever recorded. It is not the only barrier. Invariant&nbsp;5 draws a hard security boundary around the host — <strong>raw execution data never leaves it</strong>. All sanitization (key filtering, pattern detection, entropy detection) happens in the Go sidecar, on the same machine, <em>before</em> any external transmission; and the sidecar-to-platform link is mTLS.</p>
+    <p data-anchor="pv-p-big2">So think of it as defense in depth. Allowlist capture keeps the contextual PII a scrubber can't catch from ever entering the buffer; sidecar scrubbing catches the pattern-shaped secrets on the way out. Either alone is a barrier; together they are the reason instrumentation this deep is safe to run against regulated traffic at all.</p>
+
+    <div class="callout note" data-anchor="pv-note-depth">
+      <span class="ct">Defense in depth</span>
+      <p>Allowlist capture is the first barrier, not the sole one. Even in <code>"full"</code> mode the sidecar still scrubs before anything leaves the host — but for regulated data you want <em>both</em>: declare your safe leaves, and let the sidecar be the backstop.</p>
+    </div>
+
+    <p class="soft" data-anchor="pv-p-next">You now control both <em>whether</em> captured state can escape and <em>what</em> gets captured at all. Next we pull the other way — what happens when failures arrive not one at a time but ten thousand at once. Chapter 7: Failure Storms.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-buffer-modes.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-storms.html">Next: Failure Storms ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
