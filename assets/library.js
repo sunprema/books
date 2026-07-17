@@ -29,4 +29,10 @@
       apply();
     });
   });
+
+  // PWA: register the service worker (resolves to <site>/sw.js under the
+  // shelf's own path, so the scope covers the whole library incl. books/).
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(function () {});
+  }
 })();
