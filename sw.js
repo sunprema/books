@@ -3,8 +3,9 @@ var VERSION = 'bookbank-0c9188f0fd';
 // Persistent cache holding user-requested full-book downloads (the shelf's
 // "⤓ Offline" button fills it). Never dropped on version bumps.
 var OFFLINE = 'bookbank-offline';
-var SHELL = ['./', 'assets/library.css', 'assets/library.js', 'catalog.json',
-             'manifest.webmanifest', 'assets/icon-192.png', 'assets/icon-512.png'];
+var SHELL = ['./', 'assets/library.css?v=9621580cc4', 'assets/library.js?v=9621580cc4',
+             'catalog.json', 'manifest.webmanifest',
+             'assets/icon-192.png', 'assets/icon-512.png'];
 
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(VERSION).then(function (c) { return c.addAll(SHELL); })
