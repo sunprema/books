@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>chroot &amp; pivot_root: Rebuilding the Prisoner's World · Sandboxing &amp; Process Isolation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="bolt">&gt;_</span> Sandboxing &amp; Process Isolation</div>
+  <div class="spacer"></div>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapno">Chapter 06</div>
+    <div class="eyebrow">Rebuilding the world</div>
+    <h1 data-anchor="ch6-h1">chroot &amp; pivot_root: Rebuilding the Prisoner's World</h1>
+
+    <p class="lead" data-anchor="ch6-p1">We've walled off what the inmate can see and confiscated their keys. Now we rebuild the ground under their feet: the filesystem. The inmate should open <code class="inl">/</code> and find only <em>their</em> world — their libraries, their files — with no path leading back to the host's real root. The old tool for this is <code class="inl">chroot()</code>. It is also, I must warn you, one of the most misunderstood locks in the building. People think it's a cell. It's a painted line on the floor.</p>
+
+    <h2 data-anchor="ch6-h2a">Why chroot is not a cell</h2>
+
+    <p data-anchor="ch6-p2"><code class="inl">chroot()</code> changes what a process calls <code class="inl">/</code>. That's <em>all</em> it does. Two things it deliberately does not do, and both are escape hatches:</p>
+
+    <ul data-anchor="ch6-list1">
+      <li>It does <strong>not change your current working directory</strong>. If you were standing outside the new root when you called it, you're still standing there.</li>
+      <li>It does <strong>not close file descriptors</strong> opened before the call. An open handle to a directory outside the jail is a rope over the wall.</li>
+    </ul>
+
+    <div class="escape" data-anchor="ch6-escape1">
+      <span class="case">Case file · classic technique · not a CVE</span>
+      <h4>The fchdir walk-out</h4>
+      <p>A process holding <code class="inl">CAP_SYS_CHROOT</code> saves a file descriptor to a directory, chroots into a subdirectory, then uses that saved fd to <code class="inl">fchdir()</code> <em>back outside</em> the new root — and simply walks <code class="inl">../../..</code> up to the real filesystem root. The jail never closed the door behind it.</p>
+    </div>
+
+    <pre class="code" data-anchor="ch6-code1"><span class="ty">int</span> saved = <span class="fn">open</span>(<span class="str">"/"</span>, O_RDONLY | O_DIRECTORY); <span class="cm">// a rope, kept from before</span>
+<span class="fn">mkdir</span>(<span class="str">"jail"</span>, <span class="num">0755</span>);
+<span class="fn">chroot</span>(<span class="str">"jail"</span>);        <span class="cm">// "/" now means .../jail — but cwd didn't move</span>
+<span class="fn">fchdir</span>(saved);          <span class="cm">// step back outside using the old handle</span>
+<span class="kw">for</span> (<span class="ty">int</span> i = <span class="num">0</span>; i &lt; <span class="num">64</span>; i++) <span class="fn">chdir</span>(<span class="str">".."</span>); <span class="cm">// climb to the real root</span>
+<span class="fn">chroot</span>(<span class="str">"."</span>);           <span class="cm">// re-root at the top: escaped</span></pre>
+
+    <div class="warden" data-anchor="ch6-warden1">This is the lesson that humbles every new guard: <b>chroot was never designed to hold a hostile inmate.</b> It was built in the 1970s to give a build or a service a tidy view of the world, back when the process wasn't your enemy. A program that wants to jail <em>itself</em> honestly can — drop <code class="inl">CAP_SYS_CHROOT</code>, chdir into the new root, close stray fds — but you cannot use it to hold code that's actively trying to leave.</div>
+
+    <h2 data-anchor="ch6-h2b">pivot_root: swap the ground, then remove it</h2>
+
+    <p data-anchor="ch6-p3">This is why real containers don't rely on <code class="inl">chroot</code>. They use <code class="inl">pivot_root(2)</code> <strong>inside a private mount namespace</strong> (Chapter 2's mount wall). Instead of merely renaming <code class="inl">/</code>, <code class="inl">pivot_root</code> swaps the process's entire root <em>mount</em> for the container's rootfs and moves the old root aside — so you can then <code class="inl">umount</code> it and leave <strong>no mount, and no path, back to the host tree</strong>. There's no rope because the old world is unmounted entirely.</p>
+
+    <figure class="diagram" data-anchor="ch6-fig1">
+      <svg viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ch6fig1title">
+        <title id="ch6fig1title">chroot leaves the host filesystem reachable via saved handles, while pivot_root plus unmount removes the old root entirely.</title>
+        <text x="230" y="34" fill="#f0a15a" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="12" text-anchor="middle">chroot: host still mounted</text>
+        <rect x="60" y="50" width="340" height="160" rx="8" fill="#0e2740" stroke="#244a63"/>
+        <rect x="90" y="80" width="120" height="100" rx="6" fill="#123a56" stroke="#f0a15a"/>
+        <text x="150" y="115" fill="#dbeaf4" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="11" text-anchor="middle">jail /</text>
+        <rect x="250" y="80" width="120" height="100" rx="6" fill="#10314c" stroke="#e0708a" stroke-dasharray="4 3"/>
+        <text x="310" y="112" fill="#e0708a" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="11" text-anchor="middle">host /</text>
+        <text x="310" y="132" fill="#8fb0c4" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="9" text-anchor="middle">reachable via</text>
+        <text x="310" y="146" fill="#8fb0c4" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="9" text-anchor="middle">saved fd</text>
+        <path d="M210,130 L250,130" stroke="#e0708a" stroke-width="1.5" marker-end="url(#arr6)"/>
+        <defs><marker id="arr6" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#e0708a"/></marker></defs>
+
+        <text x="680" y="34" fill="#9fd35a" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="12" text-anchor="middle">pivot_root + umount: no way back</text>
+        <rect x="510" y="50" width="340" height="160" rx="8" fill="#0e2740" stroke="#244a63"/>
+        <rect x="600" y="80" width="160" height="100" rx="6" fill="#123a56" stroke="#9fd35a"/>
+        <text x="680" y="120" fill="#dbeaf4" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="11" text-anchor="middle">container /</text>
+        <text x="680" y="140" fill="#8fb0c4" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="9" text-anchor="middle">old root unmounted</text>
+      </svg>
+      <figcaption>Left: chroot renames the root but the host stays mounted and reachable. Right: pivot_root swaps the root mount, then unmounts the old one — no rope remains.</figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch6-callout1">
+      <span class="tag">Key idea</span>
+      <code class="inl">pivot_root</code> plus a mount namespace gives a filesystem boundary that actually holds — but it is <em>only</em> the filesystem. Network, IPC, syscalls, and privilege still need their own walls from the previous chapters. Rebuilding the prisoner's world is one job of many, which is exactly why the next chapter assembles all of them into a single cell.
+    </div>
+
+    <p class="subtle" data-anchor="ch6-sources">Sources: <a href="https://man7.org/linux/man-pages/man2/chroot.2.html">chroot(2)</a>; <a href="https://man7.org/linux/man-pages/man2/pivot_root.2.html">pivot_root(2)</a>; <a href="https://some-natalie.dev/container-escapes-chroot/">Container Escapes 101 — chroot escapes</a>.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-seccomp-visiting-rules.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-the-container-assembled.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
