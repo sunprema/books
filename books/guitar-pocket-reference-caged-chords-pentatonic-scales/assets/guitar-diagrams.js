@@ -19,6 +19,64 @@
   var SVGNS = "http://www.w3.org/2000/svg";
   var STR_LETTERS = ["E","A","D","G","B","e"]; // pos 0..5 (low->high)
 
+  /* ---- audio: self-contained Karplus–Strong pluck, no network ----
+     Pitches are derived straight from each diagram's data attributes:
+     a string at pos p (0=low E .. 5=high e) fretted at f sounds OPEN[p]+f. */
+  var OPEN = [40,45,50,55,59,64]; // MIDI of open strings, low E .. high e
+  var actx=null, master=null, kcache={};
+  function audio(){
+    if(!actx){
+      var AC = window.AudioContext||window.webkitAudioContext;
+      if(!AC) return null;
+      actx = new AC();
+      master = actx.createGain(); master.gain.value = 0.9;
+      var comp = actx.createDynamicsCompressor();
+      master.connect(comp); comp.connect(actx.destination);
+    }
+    if(actx.state==="suspended") actx.resume();
+    return actx;
+  }
+  function midiToFreq(m){ return 440*Math.pow(2,(m-69)/12); }
+  function pluck(freq){
+    var key=Math.round(freq); if(kcache[key]) return kcache[key];
+    var c=actx, sr=c.sampleRate, dur=2.4;
+    var N=Math.max(2,Math.round(sr/freq)), len=Math.floor(sr*dur);
+    var buf=new Float32Array(N), i, prev=0;
+    for(i=0;i<N;i++){ var w=Math.random()*2-1; prev=(w+prev)*0.5; buf[i]=prev; }
+    var out=c.createBuffer(1,len,sr), data=out.getChannelData(0), idx=0, rho=0.9955;
+    for(i=0;i<len;i++){ var cur=buf[idx], nxt=buf[(idx+1)%N]; buf[idx]=(cur+nxt)*0.5*rho; data[i]=cur; idx=(idx+1)%N; }
+    var fade=Math.min(1200,len); for(i=0;i<fade;i++) data[len-1-i]*=i/fade;
+    kcache[key]=out; return out;
+  }
+  function playMidi(m, when, gain){
+    var c=audio(); if(!c) return;
+    var src=c.createBufferSource(); src.buffer=pluck(midiToFreq(m));
+    var g=c.createGain(); g.gain.value=(gain==null?0.7:gain);
+    src.connect(g); g.connect(master); src.start(when||c.currentTime);
+  }
+  function strumChord(midis){ // near-simultaneous, low->high
+    var c=audio(); if(!c) return; var t=c.currentTime+0.02;
+    for(var i=0;i<midis.length;i++) playMidi(midis[i], t+i*0.03, 0.6);
+  }
+  function playRun(midis){ // one note at a time, ascending
+    var c=audio(); if(!c) return; var t=c.currentTime+0.04, step=0.32;
+    for(var i=0;i<midis.length;i++) playMidi(midis[i], t+i*step, 0.62);
+  }
+  function addPlay(fig, label, playFn){
+    var btn=document.createElement("button");
+    btn.className="diag-play"; btn.type="button";
+    btn.setAttribute("aria-label", label);
+    btn.innerHTML='<span class="dp-ico" aria-hidden="true">&#9654;</span>'+
+                  '<span class="dp-txt">'+label+'</span>';
+    btn.addEventListener("click", function(e){
+      e.preventDefault();
+      playFn();
+      btn.classList.add("is-playing");
+      setTimeout(function(){ btn.classList.remove("is-playing"); }, 480);
+    });
+    fig.appendChild(btn);
+  }
+
   function cvar(name, fb){
     var v = getComputedStyle(document.documentElement).getPropertyValue(name);
     v = (v||"").trim(); return v || fb;
@@ -119,6 +177,11 @@
         class:"cd-strlabel", fill:C.soft}, STR_LETTERS[s]));
     }
     fig.insertBefore(svg, fig.firstChild);
+
+    // play button: strum every sounding string, low -> high
+    var midis=[];
+    for(var p=0;p<6;p++){ var fv=frets[p]; if(typeof fv==="number" && fv>=0) midis.push(OPEN[p]+fv); }
+    if(midis.length) addPlay(fig, "Play chord", function(){ strumChord(midis); });
   }
 
   function scaleBoard(fig){
@@ -172,6 +235,11 @@
       }
     });
     fig.insertBefore(svg, fig.firstChild);
+
+    // play button: sound the box ascending (matches the ascending tab)
+    var midis=dots.map(function(d){ return OPEN[d.pos]+d.fret; })
+                  .sort(function(a,b){ return a-b; });
+    if(midis.length) addPlay(fig, "Play scale", function(){ playRun(midis); });
   }
 
   function render(){
