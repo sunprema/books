@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "researched": "2026-07-18",
+  "sources": [
+    { "id": "beambook-sched", "url": "https://github.com/happi/theBeamBook/blob/master/chapters/scheduling.asciidoc", "title": "The BEAM Book — Scheduling (Erik Stenman)", "kind": "reference", "accessed": "2026-07-18" },
+    { "id": "erts-gc", "url": "https://www.erlang.org/doc/apps/erts/garbagecollection.html", "title": "Erlang Garbage Collector (ERTS docs)", "kind": "official-docs", "accessed": "2026-07-18" },
+    { "id": "otp-msg-passing", "url": "https://www.erlang.org/blog/message-passing/", "title": "A few notes on message passing (Erlang/OTP blog)", "kind": "official-blog", "accessed": "2026-07-18" },
+    { "id": "erl-nif", "url": "https://www.erlang.org/doc/apps/erts/erl_nif.html", "title": "erl_nif — NIFs and dirty schedulers (ERTS docs)", "kind": "official-docs", "accessed": "2026-07-18" },
+    { "id": "eff-binaries", "url": "https://www.erlang.org/doc/system/binaryhandling.html", "title": "Efficiency Guide — Constructing and Matching Binaries", "kind": "official-docs", "accessed": "2026-07-18" },
+    { "id": "eff-processes", "url": "https://www.erlang.org/doc/system/eff_guide_processes.html", "title": "Efficiency Guide — Processes", "kind": "official-docs", "accessed": "2026-07-18" },
+    { "id": "erlang-in-anger", "url": "https://github.com/heroku/erlang-in-anger", "title": "Erlang in Anger, ch. 7 — Memory leaks (Fred Hébert)", "kind": "reference", "accessed": "2026-07-18" },
+    { "id": "hamidreza-gc", "url": "https://hamidreza-s.github.io/erlang%20garbage%20collection%20memory%20layout%20soft%20realtime/2015/08/24/erlang-garbage-collection-details-and-why-it-matters.html", "title": "Erlang GC Details and Why It Matters", "kind": "blog", "accessed": "2026-07-18" },
+    { "id": "phoenix-2m", "url": "https://www.phoenixframework.org/blog/the-road-to-2-million-websocket-connections", "title": "The Road to 2 Million Websocket Connections in Phoenix (Gary Rennie, 2015)", "kind": "official-blog", "accessed": "2026-07-18" },
+    { "id": "dist-erlang", "url": "https://www.erlang.org/doc/system/distributed.html", "title": "Distributed Erlang (System docs)", "kind": "official-docs", "accessed": "2026-07-18" },
+    { "id": "net-kernel", "url": "https://www.erlang.org/doc/apps/kernel/net_kernel.html", "title": "net_kernel — net_ticktime, monitor_nodes (Kernel docs)", "kind": "official-docs", "accessed": "2026-07-18" },
+    { "id": "dist-mesh-paper", "url": "https://dl.acm.org/doi/10.1145/3331542.3342572", "title": "Scaling Erlang distribution: beyond the fully connected mesh (Erlang Workshop 2019)", "kind": "paper", "accessed": "2026-07-18" },
+    { "id": "erl-cmd", "url": "https://www.erlang.org/doc/apps/erts/erl_cmd.html", "title": "erl(1) — emulator flags (+S, +SDcpu, +SDio, +sbwt)", "kind": "official-docs", "accessed": "2026-07-18" },
+    { "id": "stressgrid-cpu", "url": "https://stressgrid.com/blog/beam_cpu_usage/", "title": "The Curious Case of BEAM CPU Usage (Stressgrid)", "kind": "blog", "accessed": "2026-07-18" },
+    { "id": "otp26-notes", "url": "https://www.erlang.org/patches/otp-26.0", "title": "Erlang/OTP 26.0 Release Notes", "kind": "official-docs", "accessed": "2026-07-18" }
+  ],
+  "structure": {
+    "audience": "Experienced Elixir/Phoenix developers who ship LiveView daily and want runtime-level intuition about the BEAM.",
+    "rationale": "Start from the one load-bearing idea (share-nothing isolated processes), then descend through the machinery that makes it cheap and fair: scheduling (reductions/preemption), private heaps and per-process GC, message passing, the binary exception, native code and dirty schedulers, and node-to-node distribution. Close by assembling those parts into an explanation of LiveView-scale concurrency and the production symptoms (scheduler collapse, large-binary leaks, mailbox bloat) each design choice produces. Every chapter names the problem the mechanism solves and the price it charges, per the issue's brief."
+  },
+  "concepts": {
+    "the-process-model": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "A BEAM process is not an OS process or thread; it is a lightweight bookkeeping structure inside the VM with its own private heap/stack and mailbox.", "sources": ["eff-processes", "hamidreza-gc"] },
+        { "text": "Processes are share-nothing: no process can read another's memory; the only interaction is asynchronous message passing.", "sources": ["otp-msg-passing", "dist-erlang"] },
+        { "text": "Processes are cheap: a fresh process starts around 233 words of heap and spawns in microseconds, so hundreds of thousands can run at once.", "sources": ["erts-gc", "eff-processes"] },
+        { "text": "Isolation makes failure local: a crashing process's heap is discarded without corrupting others, which is what makes 'let it crash' plus supervision safe.", "sources": ["hamidreza-gc"] },
+        { "text": "The primitive layer is spawn (create, returns a pid), send (deliver to a pid's mailbox, returns immediately), receive (pattern-match the next matching message from one's own mailbox).", "sources": ["eff-processes", "otp-msg-passing"] }
+      ],
+      "pitfalls": ["Share-nothing means data sent between processes is copied — cheap for small terms, not free for large ones.", "An unbounded mailbox is a slow memory leak."]
+    },
+    "schedulers": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "By default the BEAM runs one scheduler thread per logical CPU core (+S), and each scheduler has its own run queue split into priority sub-queues (max/high/normal/low).", "sources": ["beambook-sched", "erl-cmd"] },
+        { "text": "Preemption is by reduction counting: each process gets a budget of reductions and is descheduled when it runs out, giving fair preemptive multitasking without an OS thread per process.", "sources": ["beambook-sched"] },
+        { "text": "The reduction budget (CONTEXT_REDS) is 4000 since OTP 20; it was 2000 before OTP 20. A reduction is roughly one function call, but BIFs/NIFs/port operations cost a variable number of reductions.", "sources": ["beambook-sched"] },
+        { "text": "Function calls, BIFs, and sends all consume reductions; this reduction accounting is the mechanism behind the BEAM's soft-real-time fairness.", "sources": ["beambook-sched", "eff-processes"] },
+        { "text": "Load is balanced by task-stealing (an idle scheduler steals work from busier ones) and periodic migration-path recalculation.", "sources": ["beambook-sched"] },
+        { "text": "Scheduler collapse is a historical phenomenon where, under bursty low load, schedulers sleep and fail to re-wake, concentrating load; busy-wait threshold flags (+sbwt, +sbwtdcpu, +sbwtdio) and forced-wakeup interval (+sfwi) tune this.", "sources": ["beambook-sched", "stressgrid-cpu"] }
+      ],
+      "pitfalls": ["A long-running NIF/BIF that never bumps reductions or yields blocks its scheduler for the whole call (keep NIFs under ~1 ms).", "A single hogged scheduler is distinct from scheduler collapse, though both stem from work that doesn't yield."]
+    },
+    "heaps-gc": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "Each process has a private heap and stack allocated in one contiguous block, growing toward each other; the default initial and min_heap_size is 233 words.", "sources": ["erts-gc", "hamidreza-gc"] },
+        { "text": "GC is per-process, generational, and a semi-space copying collector (Cheney's algorithm) with a young and an old heap.", "sources": ["erts-gc", "hamidreza-gc"] },
+        { "text": "Because each heap is private and usually small, a collection stops only that one process — there is no global stop-the-world pause; one process's GC never pauses the others.", "sources": ["erts-gc", "hamidreza-gc"] },
+        { "text": "Minor (young-generation) collections are frequent and cheap; data surviving repeated minor collections is promoted to the old heap.", "sources": ["erts-gc"] },
+        { "text": "{fullsweep_after, N} sets how many young collections happen before a full sweep of both generations (global default 65535, tunable per process); min_heap_size sets a heap floor to reduce early GCs.", "sources": ["erts-gc"] },
+        { "text": "Large binaries are not on the process heap; they live in a separate global binary space, so per-process GC pauses stay short regardless of binary payload size.", "sources": ["erts-gc", "eff-binaries"] }
+      ],
+      "pitfalls": ["A process that GCs rarely can hold on to garbage longer than expected; hibernate/min_heap_size/fullsweep_after are the tuning knobs.", "Raising min_heap_size trades memory for fewer early collections — measure before tuning."]
+    },
+    "message-passing": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "Intra-node messages are deep-copied from the sender's heap onto the receiver's heap; copying is deliberate so the GC never has to trace pointers between processes.", "sources": ["otp-msg-passing"] },
+        { "text": "By default a message is copied directly onto the receiver's heap (via a heap fragment/message buffer if it arrives during the receiver's GC); off-heap message storage is opt-in via the message_queue_data = off_heap process flag.", "sources": ["otp-msg-passing"] },
+        { "text": "The exception to copying is refc binaries (> 64 bytes): the payload is shared and reference-counted, and only a small reference is copied to the receiver.", "sources": ["otp-msg-passing", "eff-binaries"] },
+        { "text": "receive scans the mailbox in arrival order and matches the first message fitting any clause, leaving others in place, so a large mailbox makes selective receive O(n) and slow.", "sources": ["otp-msg-passing"] },
+        { "text": "A receive that matches on a newly created reference is optimized to skip messages older than that reference (a receive marker), avoiding a full mailbox scan — this is why GenServer.call is fast even with a busy mailbox.", "sources": ["otp-msg-passing"] }
+      ],
+      "pitfalls": ["Sending large non-binary terms copies them in full — cost grows with term size.", "An unbounded or slowly-drained mailbox both leaks memory and slows every selective receive; prefer back-pressure (call over cast) when a sender outruns a server."]
+    },
+    "binaries": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "Binaries of 64 bytes or less are heap binaries: stored on the process heap and copied like any term.", "sources": ["eff-binaries"] },
+        { "text": "Binaries larger than 64 bytes are refc (reference-counted) binaries: the payload lives off-heap in a shared binary allocator, reference-counted, with a small ProcBin on the process heap pointing to it.", "sources": ["eff-binaries", "otp-msg-passing"] },
+        { "text": "A refc binary is freed only when every process holding a ProcBin to it has garbage-collected; a process that seldom GCs (small heap, idle) can pin large off-heap binaries alive, causing off-heap memory bloat — the classic 'binary leak'.", "sources": ["erlang-in-anger", "erts-gc"] },
+        { "text": "A sub-binary or match context is a reference into a larger binary and copies no data, so keeping a tiny slice alive keeps the whole underlying refc binary alive.", "sources": ["eff-binaries", "erlang-in-anger"] },
+        { "text": "Mitigations for binary leaks: binary:copy/1 to detach a small retained slice into a heap binary, erlang:hibernate/process hibernation, a forced erlang:garbage_collect/0, and diagnosis with recon:bin_leak/1.", "sources": ["erlang-in-anger"] }
+      ],
+      "pitfalls": ["Off-heap binary memory does not show up in a process's normal heap size and won't come down until the holding process GCs.", "Storing many tiny slices of a big response can pin the whole response in memory."]
+    },
+    "dirty-schedulers": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "A NIF runs native C code on the scheduler thread and does not bump reductions, so a long-running NIF blocks that scheduler and harms soft-real-time behaviour; the guideline is to keep a NIF under about 1 ms.", "sources": ["erl-nif"] },
+        { "text": "Dirty schedulers were experimental in OTP 17 and enabled by default from OTP 20; they provide separate thread pools so long or blocking native work runs off the normal schedulers.", "sources": ["erl-nif"] },
+        { "text": "There are two dirty pools: dirty-CPU schedulers (default count equals the number of normal schedulers, +SDcpu/+SDPcpu) and dirty-I/O schedulers (default 10, +SDio).", "sources": ["erl-nif", "erl-cmd"] },
+        { "text": "The cooperative alternative to dirty schedulers is a yielding NIF: call enif_consume_timeslice to report time used and chunk long work, rescheduling with enif_schedule_nif.", "sources": ["erl-nif"] }
+      ],
+      "pitfalls": ["A CPU-bound NIF put on a dirty-I/O scheduler (or vice versa) uses the wrong pool.", "Dirty schedulers remove the soft-real-time hazard but don't make the underlying work cheap; heavy native work still competes for cores."]
+    },
+    "distribution": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "Distributed Erlang nodes form a fully connected mesh by default: connecting to one visible node triggers connections to all other visible nodes.", "sources": ["dist-erlang"] },
+        { "text": "Each node is named name@host, authenticates peers with a shared 'magic cookie', and epmd (the Erlang Port Mapper Daemon) maps node names to TCP ports on each host.", "sources": ["dist-erlang"] },
+        { "text": "Sending to a remote pid is location-transparent and syntactically identical to a local send; the message is copied over a TCP distribution link — same semantics, but a different failure and latency profile because the network is not reliable.", "sources": ["dist-erlang"] },
+        { "text": "net_kernel sends tick heartbeats; net_ticktime defaults to 60 seconds, a missed tick triggers nodedown, and processes can subscribe to nodeup/nodedown via net_kernel:monitor_nodes/1. Detection takes roughly net_ticktime give or take 25%.", "sources": ["net-kernel"] },
+        { "text": "The full mesh is O(N^2) in connections, which limits practical clusters to tens or low hundreds of nodes.", "sources": ["dist-mesh-paper", "dist-erlang"] },
+        { "text": "There is a single distribution connection per node pair; head-of-line blocking on it was mitigated in OTP 22 by message fragmentation and interleaving (large messages are chunked so small ones aren't stuck behind them). There is no core 'multiple connections per node pair' feature in OTP 26; going beyond the mesh is an ecosystem concern (e.g. Partisan).", "sources": ["dist-mesh-paper", "otp26-notes"] }
+      ],
+      "pitfalls": ["A single very large distributed message can still delay others despite fragmentation.", "Full-mesh clusters don't scale to thousands of nodes; design for tens, or use a non-mesh topology."]
+    },
+    "why-liveview-scales": {
+      "researched": "2026-07-18",
+      "claims": [
+        { "text": "Phoenix LiveView holds one stateful BEAM process per connected client; the cheap-process, private-heap, per-process-GC model is what lets a single machine hold very large numbers of live stateful connections.", "sources": ["phoenix-2m", "eff-processes"] },
+        { "text": "The famous 2 million websocket benchmark was Phoenix Channels in 2015 (Gary Rennie), on a single 40-core / 128 GB machine and ultimately bound by OS ulimits; it predates LiveView, which is a later demonstration of the same underlying property.", "sources": ["phoenix-2m"] },
+        { "text": "Production symptoms map directly to internals: mailbox bloat causes slow O(n) selective receive; refc-binary leaks cause off-heap growth; scheduler collapse/busy-wait is tuned with +sbwt; reduction accounting keeps processes fair.", "sources": ["erlang-in-anger", "beambook-sched", "stressgrid-cpu"] },
+        { "text": "Diagnostic tooling for these symptoms includes :observer, :recon (recon:bin_leak, recon:proc_count), and telemetry.", "sources": ["erlang-in-anger"] }
+      ],
+      "pitfalls": ["Per-connection process count is bounded first by OS limits (file descriptors/ports), then by memory, not by the BEAM's process table.", "Fan-out to many processes still copies messages to each — broadcast cost grows with subscriber count."]
+    }
+  },
+  "volatile": [
+    "CONTEXT_REDS reduction budget (4000 since OTP 20)",
+    "dirty scheduler default counts (+SDio = 10, dirty CPU = normal scheduler count)",
+    "net_ticktime default (60 s)",
+    "fullsweep_after global default (65535)",
+    "OTP version-specific distribution behaviour (OTP 22 message fragmentation)"
+  ]
+}

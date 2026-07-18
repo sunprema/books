@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Per-Process Heaps &amp; Garbage Collection — The BEAM Under the Hood</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">The BEAM<span class="dot">.</span></span>
+  <span class="chip">03 · Heaps &amp; GC</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 03 · Memory</p>
+    <h1>Per-Process Heaps &amp; Garbage Collection</h1>
+    <p class="dek">A great many tiny gardens, each weeded on its own.</p>
+
+    <p class="lead">Most runtimes you've met have one big heap, and when it fills up, everything stops
+    while the collector tidies it — the dreaded stop-the-world pause. The BEAM does almost the opposite,
+    and the difference is the reason your Elixir stays responsive under load. Instead of one enormous
+    shared garden that must be weeded all at once, every process gets its own tiny private plot. When one
+    plot needs weeding, only that one process pauses — for a fraction of a millisecond — and everybody
+    else keeps growing.</p>
+
+    <h2>What a process's memory actually looks like</h2>
+    <p>When you spawn a process, the BEAM hands it a small contiguous block of memory. At one end sits the
+    <strong>stack</strong>; at the other end sits the <strong>heap</strong>; and they grow <em>toward each
+    other</em>, like two people filling a shelf from opposite ends. When they meet in the middle — when the
+    block is full — it's time to collect. A fresh process starts astonishingly small: about
+    <strong>233 words</strong> (a word is 8 bytes on a 64-bit machine, so we're talking a couple of
+    kilobytes). That tininess is exactly why you can afford a hundred thousand of them.</p>
+
+    <figure class="svg-card">
+      <svg viewBox="0 0 700 170" role="img" aria-label="One memory block per process: stack grows leftward from the right end, heap grows rightward from the left end, and they meet in the middle when a collection is triggered.">
+        <rect x="40" y="55" width="620" height="52" rx="8" class="chalk-stroke" stroke-width="2"/>
+        <rect x="40" y="55" width="200" height="52" class="chalk-accent" fill="rgba(168,224,138,.12)" stroke="none"/>
+        <rect x="460" y="55" width="200" height="52" fill="rgba(159,208,232,.12)" stroke="none"/>
+        <text x="140" y="86" text-anchor="middle" font-size="13" font-family="var(--font-mono)" style="fill:var(--en)">heap →</text>
+        <text x="560" y="86" text-anchor="middle" font-size="13" font-family="var(--font-mono)" style="fill:var(--ty)">← stack</text>
+        <text x="350" y="86" text-anchor="middle" font-size="12" class="chalk-soft">free</text>
+        <line x1="350" y1="45" x2="350" y2="117" class="chalk-stroke" stroke-width="1" stroke-dasharray="3 4"/>
+        <text x="350" y="135" text-anchor="middle" font-size="11" class="chalk-soft">they meet here → collect</text>
+        <text x="40" y="40" font-size="12" class="chalk-label">one contiguous block · starts ~233 words</text>
+      </svg>
+      <figcaption>Stack and heap share one block and grow toward each other. A collection happens when
+      they'd collide — and it only ever pauses this one process.</figcaption>
+    </figure>
+
+    <h2>Generational, copying, and quick</h2>
+    <p>The collector itself is a <strong>generational copying collector</strong> — Cheney's algorithm, if
+    you want the textbook name. Two ideas do the heavy lifting. First, <em>copying</em>: instead of hunting
+    for dead objects, the collector copies the <em>live</em> ones to fresh space and then throws the old
+    space away whole. If most of your data is garbage — and in a busy process it usually is — you copy a
+    little and discard a lot, which is fast. Second, <em>generational</em>: the observation that most
+    values die young. So the heap is split into a <strong>young</strong> generation and an
+    <strong>old</strong> one. Minor collections sweep just the young part, cheaply and often. Data that
+    survives a few minor collections is assumed to be long-lived and gets <strong>promoted</strong> to the
+    old generation, where it's checked far less often.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p>Because a heap is <strong>private and small</strong>, collecting it is a local, brief event.
+      There is no global lock, no whole-VM freeze. One process stops, its little plot is weeded in
+      microseconds, and it resumes — while a hundred thousand siblings never even paused. That property —
+      <em>one process's GC never pauses another</em> — is the quiet engine under every low-latency Erlang
+      system you've admired.</p>
+    </div>
+
+    <h2>The knobs, and when to touch them</h2>
+    <p>You will almost never tune GC, and that's the correct default. But two spawn options exist for the
+    rare day you must. <code>min_heap_size</code> sets a floor on a process's heap, so a process you
+    <em>know</em> will handle big bursts doesn't waste time collecting tiny heaps over and over on its way
+    up. <code>fullsweep_after</code> sets how many minor collections happen before the collector does a
+    <strong>full sweep</strong> of both generations (the global default is 65535 — effectively "rarely").
+    Lowering it makes a process give memory back sooner, at the cost of more work; you'd do that for a
+    process holding onto something big you want released promptly.</p>
+
+    <pre><span class="cap">iex — tuning a process that you've measured</span><code><span class="co"># Give a known-bursty worker a bigger starting heap and eager full sweeps.</span>
+pid = <span class="fn">spawn_opt</span>(<span class="k">fn</span> -&gt; <span class="mod">Worker</span>.<span class="fn">loop</span>() <span class="k">end</span>,
+  [<span class="op">{</span><span class="at">:min_heap_size</span>, <span class="num">4_000</span><span class="op">}</span>,       <span class="co"># words — fewer early collections</span>
+   <span class="op">{</span><span class="at">:fullsweep_after</span>, <span class="num">10</span><span class="op">}</span>])    <span class="co"># sweep both gens often → release memory sooner</span>
+
+<span class="mod">Process</span>.<span class="fn">info</span>(pid, <span class="at">:garbage_collection</span>)   <span class="co"># inspect the current settings</span>
+<span class="mod">:erlang</span>.<span class="fn">garbage_collect</span>(pid)             <span class="co"># force a collection right now</span></code></pre>
+
+    <div class="callout warn">
+      <span class="tag">Measure first, always</span>
+      <p>These knobs are for problems you have <em>observed</em>, not problems you imagine. Raising
+      <code>min_heap_size</code> trades memory for speed on every such process, and you may have a lot of
+      them. The honest rule: leave GC alone until <code>:observer</code> or <code>:recon</code> shows you a
+      real cost, then change one thing and measure again.</p>
+    </div>
+
+    <h2>The one thing that isn't on the heap</h2>
+    <p>There's a deliberate exception to "each process weeds its own plot," and it's important enough to get
+    its own chapter. <strong>Large binaries do not live on the process heap.</strong> They sit in a separate
+    shared area, and the process heap holds only a small pointer to them. This keeps per-process collections
+    short no matter how much binary data you're shuffling — you never copy a megabyte during a GC. But it
+    also means a process's real memory footprint can be much larger than its heap suggests, and it sets up
+    the single most famous memory surprise in all of Erlang. We'll walk right into it in Chapter 05.</p>
+
+    <div class="reflect">So what did private heaps buy us? The end of the stop-the-world pause. By refusing to
+    share memory, the BEAM turned garbage collection from a global event the whole system dreads into a
+    <b>private chore</b> each process does quietly on its own. The cost is that data must be copied when it
+    moves between processes — which is the very next chapter — and that big binaries need a home of their own,
+    which is the chapter after. Every gain has its bill; here the bill is cheap and the gain is enormous.</div>
+
+    <h3>Try it yourself</h3>
+    <ol class="challenges">
+      <li>In <code>iex</code>, build a big list in a process and call
+      <code>Process.info(self(), :memory)</code> before and after. Then <code>:erlang.garbage_collect()</code>
+      and measure again.</li>
+      <li>Read <code>Process.info(self(), :garbage_collection)</code> and find <code>minor_gcs</code>. Do some
+      work and watch it climb.</li>
+      <li>Spawn a process with <code>{:min_heap_size, 1_000_000}</code> and compare its starting memory to a
+      default one. Feel the trade in your hands.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Erlang/OTP ERTS docs, "Erlang Garbage Collector" ·
+    Hamidreza Soleimani, "Erlang GC Details and Why It Matters" · Efficiency Guide, "Processes." Links on
+    the cheatsheet.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="02-schedulers.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="04-message-passing.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
