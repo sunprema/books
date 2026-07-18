@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Message Passing &amp; Mailboxes — The BEAM Under the Hood</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">The BEAM<span class="dot">.</span></span>
+  <span class="chip">04 · Message Passing</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 04 · Talking</p>
+    <h1>Message Passing &amp; Mailboxes</h1>
+    <p class="dek">If nobody shares memory, how does anyone say anything?</p>
+
+    <p class="lead">We've built a world of hermits — millions of processes, each in its own room, unable to
+    touch anyone else's things. A charming world, but a useless one unless they can talk. They talk by
+    posting letters. One process sends a message; it lands in the other's mailbox and waits to be read.
+    Simple. But <em>how</em> the letter travels — that's where the interesting decisions and the honest
+    costs live, and it's what this chapter is about.</p>
+
+    <h2>Copy, don't share</h2>
+    <p>Here's the rule, and it follows straight from private heaps: when you send a message, the BEAM
+    <strong>copies</strong> it. The whole term — your tuple, your map, your list — is deep-copied out of
+    the sender's heap and onto the receiver's heap. Nothing is shared. The sender can change its own copy,
+    or die, or garbage-collect, and the receiver's message is entirely unaffected, because it was never the
+    same bytes.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p>Copying looks wasteful until you see what it buys: the garbage collector <strong>never has to
+      trace a pointer from one process into another</strong>. Each heap is a closed world. That's what keeps
+      GC private and brief (Chapter 03) and what lets a process die without dangling anyone else's data
+      (Chapter 01). Copying isn't a compromise the BEAM tolerates — it's the price that makes isolation
+      cheap, paid on purpose.</p>
+    </div>
+
+    <figure class="svg-card">
+      <svg viewBox="0 0 700 210" role="img" aria-label="Sender's map is deep-copied across into the receiver's mailbox, then moved onto the receiver's heap when received. A large binary is not copied — only a reference is.">
+        <rect x="30" y="45" width="150" height="120" rx="10" class="chalk-stroke" stroke-width="2"/>
+        <text x="105" y="38" text-anchor="middle" class="chalk-label" font-size="12">SENDER heap</text>
+        <text x="105" y="95" text-anchor="middle" font-size="13" font-family="var(--font-mono)" class="chalk-fill">%{a: 1}</text>
+        <rect x="520" y="45" width="150" height="120" rx="10" class="chalk-stroke" stroke-width="2"/>
+        <text x="595" y="38" text-anchor="middle" class="chalk-label" font-size="12">RECEIVER heap + mailbox</text>
+        <text x="595" y="95" text-anchor="middle" font-size="13" font-family="var(--font-mono)" class="chalk-fill">%{a: 1}</text>
+        <text x="595" y="120" text-anchor="middle" font-size="11" class="chalk-soft">(a fresh copy)</text>
+        <line x1="180" y1="90" x2="520" y2="90" class="chalk-accent" stroke-width="2" marker-end="url(#a4)" stroke-dasharray="6 5"/>
+        <text x="350" y="80" text-anchor="middle" font-size="12" style="fill:var(--accent)" font-family="var(--font-mono)">deep copy</text>
+
+        <rect x="300" y="150" width="100" height="40" rx="8" class="chalk-stroke" stroke-width="2"/>
+        <text x="350" y="175" text-anchor="middle" font-size="12" font-family="var(--font-mono)" style="fill:var(--str)">big binary</text>
+        <line x1="150" y1="150" x2="300" y2="168" class="chalk-stroke" stroke-width="1.4" marker-end="url(#a4b)"/>
+        <line x1="550" y1="150" x2="400" y2="168" class="chalk-stroke" stroke-width="1.4" marker-end="url(#a4b)"/>
+        <text x="350" y="205" text-anchor="middle" font-size="11" class="chalk-soft">&gt; 64 bytes: shared, only a reference is copied</text>
+        <defs>
+          <marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="var(--accent)"/></marker>
+          <marker id="a4b" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--ink)"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Ordinary terms are copied whole into the receiver. The single exception — a large binary —
+      is shared, and only a small reference travels. That exception is Chapter 05.</figcaption>
+    </figure>
+
+    <h2>The one exception, foreshadowed</h2>
+    <p>There is exactly one common thing the BEAM does <em>not</em> copy: a large binary — more than 64
+    bytes. Those live in the shared off-heap area we met at the end of Chapter 03, so sending one just copies
+    a small reference and bumps a counter. Send a 5&nbsp;MB binary to a thousand processes and you do not
+    copy 5&nbsp;GB; you share one blob and hand out a thousand little pointers. It's a lovely optimisation
+    with a sting in its tail, which is why it gets its own chapter next.</p>
+
+    <h2>The mailbox, and the cost of a crowded one</h2>
+    <p>Every process has a <strong>mailbox</strong> — a queue of messages in arrival order. <code>receive</code>
+    walks that queue from the front and takes the first message that matches one of its patterns, leaving
+    the rest exactly where they are. This is <em>selective receive</em>, and it's genuinely useful: you can
+    wait for one specific reply while unrelated messages pile up harmlessly behind it.</p>
+
+    <p>But look closely at "walks the queue from the front." If your mailbox has ten thousand messages and
+    the one you want is a rare pattern, <code>receive</code> may scan past thousands of non-matching letters
+    every single time. Selective receive is <strong>O(n) in the mailbox size</strong>. A process that falls
+    behind — receiving faster than it handles — doesn't just leak memory as the queue grows; it gets
+    <em>slower</em>, because every receive has more junk to wade through. This is the symptom people call
+    <em>mailbox bloat</em>, and now you can see it's two problems wearing one coat: growing memory and
+    degrading speed.</p>
+
+    <div class="callout note">
+      <span class="tag">Why GenServer.call stays fast anyway</span>
+      <p>You might worry that <code>GenServer.call</code> — which waits for a reply — would suffer from this.
+      It doesn't, thanks to a neat trick. <code>call</code> tags its request with a freshly made
+      <em>reference</em>, and the BEAM optimises a <code>receive</code> that matches on a brand-new reference
+      so it <strong>skips every message older than that reference</strong> — they can't possibly be the reply.
+      So the scan starts from the right place instead of the front. Selective receive is O(n) in general, but
+      this one extremely common case is made cheap on purpose.</p>
+    </div>
+
+    <h2>Back-pressure: the cure for bloat</h2>
+    <p>If a mailbox grows without bound, the deep cause is almost always that a sender is outrunning a
+    receiver. The fix isn't a bigger mailbox — there's no such setting, and there shouldn't be. The fix is
+    <strong>back-pressure</strong>: make the sender wait. <code>GenServer.cast</code> is fire-and-forget, so
+    a hot loop of casts can bury a slow server. <code>GenServer.call</code> blocks the caller until the
+    server answers, which naturally throttles the sender to the server's pace. When in doubt, prefer
+    <code>call</code>, precisely because its waiting <em>is</em> the flow control.</p>
+
+    <pre><span class="cap">iex — watch a mailbox, and apply back-pressure</span><code><span class="co"># How many letters are waiting for a process right now?</span>
+<span class="mod">Process</span>.<span class="fn">info</span>(pid, <span class="at">:message_queue_len</span>)
+<span class="co">#=&gt; {:message_queue_len, 24_817}   # uh oh — this server is drowning</span>
+
+<span class="co"># cast floods; the caller never waits:</span>
+<span class="k">for</span> _ &lt;- <span class="num">1</span>..<span class="num">1_000_000</span>, <span class="k">do</span>: <span class="mod">GenServer</span>.<span class="fn">cast</span>(srv, <span class="at">:work</span>)
+
+<span class="co"># call throttles; the caller waits for each reply, so it can't outrun the server:</span>
+<span class="k">for</span> _ &lt;- <span class="num">1</span>..<span class="num">1_000_000</span>, <span class="k">do</span>: <span class="mod">GenServer</span>.<span class="fn">call</span>(srv, <span class="at">:work</span>)</code></pre>
+
+    <div class="callout warn">
+      <span class="tag">A tuning knob you'll rarely need</span>
+      <p>For a process that genuinely must hold a huge mailbox, the <code>message_queue_data: :off_heap</code>
+      flag stores messages off the process heap, so a giant queue doesn't drag its garbage collections down.
+      It's a real tool for a real edge case — but reach for back-pressure first. A huge mailbox is usually a
+      design telling you something, not a thing to accommodate.</p>
+    </div>
+
+    <div class="reflect">So what did copying buy us? A world where talking is safe — where a message, once
+    posted, belongs wholly to the receiver, and no amount of chaos in the sender can reach across to spoil it.
+    The bill comes in two parts: big terms cost real time to copy, and a mailbox you let grow will both swell
+    and slow. Both are <b>visible, measurable, and fixable</b> — which is the whole promise of understanding
+    the machine instead of fearing it.</div>
+
+    <h3>Try it yourself</h3>
+    <ol class="challenges">
+      <li>Spawn a slow server and flood it with <code>cast</code>. Watch <code>:message_queue_len</code> climb.
+      Now switch to <code>call</code> and watch it stay near zero.</li>
+      <li>Send a large map to a process and use <code>:erts_debug.size/1</code> (words) to see how much got
+      copied. Then send a 1&nbsp;MB binary and compare — the binary barely moves.</li>
+      <li>Write a <code>receive</code> that only matches <code>:rare</code>, pre-load the mailbox with 100&nbsp;000
+      <code>:common</code> messages, and time how long grabbing the rare one takes. Feel the O(n).</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Erlang/OTP blog, "A few notes on message passing" · Efficiency Guide,
+    "Constructing and Matching Binaries" · Erlang in Anger (mailbox &amp; back-pressure). Links on the cheatsheet.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="03-heaps-gc.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="05-binaries.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Why LiveView Scales — The BEAM Under the Hood</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">The BEAM<span class="dot">.</span></span>
+  <span class="chip">08 · Why LiveView Scales</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 08 · It All Adds Up</p>
+    <h1>Why LiveView Scales</h1>
+    <p class="dek">Seven chapters of machinery, assembled into one answer.</p>
+
+    <p class="lead">You ship LiveView. Every connected user holds an open websocket and a little server-side process
+    that remembers their state, and somehow one ordinary machine can hold an enormous crowd of them at once. This
+    isn't luck, and it isn't a framework trick painted over a slow runtime. It's every idea in this book, stacked.
+    Let's put them together and watch the whole thing stand up — and then, because I promised honesty, let's name the
+    ways it falls down, because those are your production pages at 2&nbsp;a.m.</p>
+
+    <h2>One process per user, and why that's affordable</h2>
+    <p>A LiveView connection is <strong>a stateful BEAM process</strong> — one per connected client. Say that to
+    someone from a thread-per-connection world and they wince, imagining a thread and its megabyte of stack per user.
+    But you know better now. A BEAM process starts at about <strong>233 words</strong> (Chapter 03), a couple of
+    kilobytes. Fifty thousand of them is a hundred-odd megabytes of process memory — pocket change. The reason "a
+    process per user" is sane is the reason from Chapter 01: these aren't OS threads, they're tiny cheap isolated
+    things, and we stopped rationing them long ago.</p>
+
+    <div class="callout key">
+      <span class="tag">The stack, top to bottom</span>
+      <p>Cheap <strong>processes</strong> (Ch 1) mean one per user is fine. Reduction-counted
+      <strong>scheduling</strong> (Ch 2) means no one user's work can freeze the others — everyone gets a fair,
+      frequent slice. Private <strong>heaps</strong> and per-process <strong>GC</strong> (Ch 3) mean fifty thousand
+      users means fifty thousand tiny independent collections, never one giant stop-the-world freeze. And
+      <strong>isolation</strong> (Ch 1) means one user's crash takes down one user's process — a supervisor restarts
+      it, the other 49,999 never notice. Scale isn't one feature. It's all of them at once.</p>
+    </div>
+
+    <h2>The famous number, told straight</h2>
+    <p>You've probably heard "Phoenix did 2 million connections on one box." It's true, and it's worth getting right.
+    In 2015 the Phoenix team (Gary Rennie and friends) pushed <strong>Phoenix Channels</strong> to
+    <strong>2 million</strong> simultaneous websocket connections on a single 40-core, 128&nbsp;GB machine — and what
+    finally capped them wasn't the BEAM running out of processes but the <em>operating system's</em> limits on file
+    descriptors and ports. Note the two honest footnotes: that was <em>Channels</em>, a few years before LiveView
+    existed, and LiveView is heavier per connection because each process holds real UI state, not just a pipe. So
+    LiveView won't hit 2 million on the same box. But it stands on the identical foundation, and that foundation is
+    why "hundreds of thousands of live, stateful connections per node" is a normal Tuesday rather than a heroic
+    feat.</p>
+
+    <figure class="svg-card">
+      <svg viewBox="0 0 700 200" role="img" aria-label="A single machine fanning out thin threads to a large crowd of tiny process dots, one per connected user, each collected and scheduled independently.">
+        <rect x="30" y="80" width="90" height="60" rx="10" class="chalk-stroke" stroke-width="2"/>
+        <text x="75" y="105" text-anchor="middle" font-size="12" font-family="var(--font-mono)" class="chalk-fill">1 box</text>
+        <text x="75" y="124" text-anchor="middle" font-size="10" class="chalk-soft">N schedulers</text>
+        <g class="chalk-accent" stroke-width="1.1" stroke-dasharray="3 4">
+          <line x1="120" y1="100" x2="320" y2="40"/>
+          <line x1="120" y1="105" x2="320" y2="70"/>
+          <line x1="120" y1="110" x2="320" y2="100"/>
+          <line x1="120" y1="115" x2="320" y2="130"/>
+          <line x1="120" y1="120" x2="320" y2="160"/>
+        </g>
+        <g font-family="var(--font-mono)" font-size="10" class="chalk-fill">
+          <circle cx="335" cy="40" r="9" class="chalk-stroke" stroke-width="1.5"/>
+          <circle cx="335" cy="70" r="9" class="chalk-stroke" stroke-width="1.5"/>
+          <circle cx="335" cy="100" r="9" class="chalk-stroke" stroke-width="1.5"/>
+          <circle cx="335" cy="130" r="9" class="chalk-stroke" stroke-width="1.5"/>
+          <circle cx="335" cy="160" r="9" class="chalk-stroke" stroke-width="1.5"/>
+        </g>
+        <text x="430" y="90" font-size="12" class="chalk-soft" font-family="var(--font-mono)">…× hundreds</text>
+        <text x="430" y="112" font-size="12" class="chalk-soft" font-family="var(--font-mono)">of thousands</text>
+        <text x="360" y="192" text-anchor="middle" font-size="11" class="chalk-soft">one tiny stateful process per live connection</text>
+      </svg>
+      <figcaption>The whole book in one picture: a few schedulers on one machine, fanning out to a vast crowd of
+      cheap, isolated, independently-collected processes — one per user.</figcaption>
+    </figure>
+
+    <h2>Where it bites, and the chapter that explains each bite</h2>
+    <p>Here's the payoff for reading the machine instead of fearing it: every scary production symptom now has a name,
+    a cause, and a chapter. When the pager goes off, you'll know which floor to visit.</p>
+
+    <table>
+      <tr><th>Symptom you'll see</th><th>What's really happening</th><th>Chapter</th></tr>
+      <tr><td>Memory climbs, process heaps look tiny</td><td>Refc <strong>binary leak</strong> — idle processes pinning off-heap blobs that won't free until they GC</td><td>05</td></tr>
+      <tr><td>One process slows to a crawl, memory up</td><td><strong>Mailbox bloat</strong> — a swamped process; selective receive is O(n) in the queue</td><td>04</td></tr>
+      <tr><td>Cores idle but latency spikes under bursty load</td><td><strong>Scheduler collapse</strong> / busy-wait sleeping — tune with <code>+sbwt</code></td><td>02</td></tr>
+      <tr><td>Whole node stutters when a NIF runs</td><td>A long <strong>NIF</strong> freezing a scheduler — move it to a dirty pool</td><td>06</td></tr>
+      <tr><td>A node vanishes but peers don't notice for a minute</td><td><code>net_ticktime</code> — the 60&nbsp;s heartbeat</td><td>07</td></tr>
+    </table>
+
+    <div class="callout note">
+      <span class="tag">The three tools to keep close</span>
+      <p><code>:observer</code> for the live picture — schedulers, memory, the busiest processes. <code>:recon</code>
+      for the surgical questions — <code>recon:bin_leak/1</code> for hoarded binaries, <code>recon:proc_count/2</code>
+      for who's using the most of anything. And <code>telemetry</code> to make the metrics that matter visible before
+      the pager rings. Together they turn every symptom in that table from a mystery into a measurement.</p>
+    </div>
+
+    <div class="callout warn">
+      <span class="tag">Know the real ceiling</span>
+      <p>What actually limits connections-per-node is, in order: the <strong>OS</strong> (file descriptors, ports —
+      raise your <code>ulimit</code>), then <strong>memory</strong>, and only much later the BEAM itself. And remember
+      fan-out isn't free: broadcasting to 100,000 LiveView processes copies the message 100,000 times (Chapter 04).
+      Scaling out to more nodes brings in distribution's costs (Chapter 07). The BEAM makes the <em>process</em>
+      cheap; it can't make physics free.</p>
+    </div>
+
+    <div class="reflect">So here's the whole thing, in one breath. LiveView scales because the BEAM made a
+    <b>process</b> cheap enough to spend one per user, <b>scheduling</b> fair enough that none can starve the rest,
+    <b>garbage collection</b> private enough that a crowd never freezes together, and <b>failure</b> local enough that
+    one broken session is just one restart. None of it is magic. It's a handful of stubborn, honest design choices —
+    each with a price you can now name — stacked until they hold up something that looks, from the outside, like
+    magic. That's the machine. Now you can read it.</div>
+
+    <h3>Try it yourself</h3>
+    <ol class="challenges">
+      <li>Open <code>:observer</code> on a running Phoenix app, sort processes by memory and by message queue length,
+      and put names to the busiest few. You now understand every column.</li>
+      <li>Raise a dev machine's <code>ulimit -n</code>, then load-test websockets upward until something gives. Notice
+      what breaks first — it won't be the process table.</li>
+      <li>Pick one symptom from the table above, reproduce it deliberately in a scratch app, then fix it with the tool
+      from its chapter. Do it once in calm and you'll do it in your sleep at 2&nbsp;a.m.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Phoenix blog, "The Road to 2 Million Websocket Connections in Phoenix"
+    (Gary Rennie, 2015) · Efficiency Guide, "Processes" · Erlang in Anger (production diagnostics with recon/observer).
+    Links on the cheatsheet.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="07-distribution.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="../cheatsheet.html">Cheatsheet ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
