@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Idempotency &amp; the Exactly-Once Illusion — Durable Execution</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Durable Execution<span class="dot">.</span></span>
+  <span class="chip">04 · Idempotency</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 04 · The Honest Illusion</p>
+    <h1>Idempotency &amp; the Exactly-Once Illusion</h1>
+    <p class="dek">You cannot deliver a message exactly once. You can, however, make it not matter.</p>
+
+    <p class="lead" data-anchor="id-lead">Let me be blunt about something the brochures are coy about.
+    <strong>Exactly-once delivery is not achievable</strong> over an unreliable network. It is not hard;
+    it is impossible, and for the reason we met in Chapter 1: when you send a request and hear nothing
+    back, you cannot tell whether it was lost on the way <em>there</em> or the reply was lost on the way
+    <em>back</em>. Your only recovery is to send it again — which means the receiver must be prepared to
+    see the same request twice. So the honest engineering does not chase exactly-once <em>delivery</em>.
+    It builds exactly-once <em>effect</em> out of two humble parts.</p>
+
+    <div class="callout key" data-anchor="id-callout-formula">
+      <span class="tag">The whole subject in one line</span>
+      <p style="font-size:1.02rem"><strong>at&#8209;least&#8209;once delivery&nbsp;&nbsp;+&nbsp;&nbsp;idempotent
+      processing&nbsp;&nbsp;=&nbsp;&nbsp;exactly&#8209;once effect.</strong></p>
+      <p>We give up on the network ever being tidy — we let it deliver a message one-or-more times, and
+      we retry freely. Then we make the <em>processing</em> of that message idempotent, so that seeing
+      it twice lands exactly the same as seeing it once. The duplicate still <em>arrives</em>; it simply
+      does nothing the second time. That is the illusion, and it is a perfectly honest one.</p>
+    </div>
+
+    <h2 data-anchor="id-h-def">What "idempotent" really asks of you</h2>
+    <p data-anchor="id-p-def">An operation is <strong>idempotent</strong> if applying it twice leaves
+    the world in the same state as applying it once. Some operations are born that way. "Set the balance
+    to 500" is idempotent — do it a hundred times, the balance is 500. "Cancel order 7" is idempotent —
+    already cancelled, stays cancelled. The troublemakers are the <em>accumulating</em> ones: "add 100
+    to the balance," "charge the card," "send the email." Run those twice and the customer is out
+    another hundred dollars and cross about it. Durable execution lives or dies on turning that second
+    kind into the first.</p>
+
+    <h2 data-anchor="id-h-key">The idempotency key: a receipt you check first</h2>
+    <p data-anchor="id-p-key">The standard device — Stripe's public design is the canonical write-up —
+    is the <strong>idempotency key</strong>. The <em>client</em> generates a unique token (a random
+    V4&nbsp;UUID has plenty of entropy) and attaches it to the request. The server keeps a table keyed
+    by that token. The first time it sees the key, it does the work and records, under that key, the
+    outcome — the status and the response body — whether it succeeded <em>or</em> failed. Every later
+    request bearing the same key skips the work entirely and replays the stored outcome. The operation
+    takes effect <strong>at most once</strong>; combined with the client's willingness to retry until it
+    gets an answer, that is exactly once, felt from the outside.</p>
+
+    <pre data-anchor="id-pre-key"><span class="cap">charge, made safe to repeat</span><code><span class="fn">POST</span> /charges     <span class="at">Idempotency-Key:</span> <span class="str">"5f2b9c…"</span>
+
+<span class="k">if</span> key <span class="k">in</span> receipts:                 <span class="co"># seen this exact request before</span>
+    <span class="k">return</span> receipts[key]           <span class="co"># replay the stored (status, body) — do NOT charge</span>
+<span class="k">else</span>:
+    result = <span class="fn">charge_card</span>(...)       <span class="co"># do the real, dangerous work once</span>
+    receipts[key] = result             <span class="co"># record the outcome under the key…</span>
+    <span class="k">return</span> result                     <span class="co"># …see the next callout for the crucial caveat</span></code></pre>
+
+    <div class="callout crash" data-anchor="id-callout-atomic">
+      <span class="tag">The subtlety that ruins naïve implementations</span>
+      <p>Look hard at those last two lines. If you <em>charge the card</em> and then, in a separate
+      step, <em>record the key</em>, a crash in between is a disaster: the charge happened, the receipt
+      didn't, and the next retry charges again. The key and the business effect must be committed
+      <strong>in the same atomic transaction</strong> — one commit, both or neither. This is why
+      idempotency and the transactional log of Chapter 2 are the same story: the receipt is only
+      trustworthy if it becomes durable at the very instant the effect does. Get this ordering wrong and
+      you have merely moved the double-charge window, not closed it.</p>
+    </div>
+
+    <h2 data-anchor="id-h-engines">Why durable engines cannot escape this</h2>
+    <p data-anchor="id-p-engines">Recall from Chapter 3 that a workflow engine runs each activity
+    <strong>at least once</strong>. Picture a worker that charges the card, and then dies in the
+    millisecond before it could record "charge completed" into the history. The engine, seeing no
+    result, does the only safe thing it can: it schedules the activity again. Your <em>charge activity
+    just ran twice.</em> The engine did nothing wrong — it cannot possibly know the first attempt got
+    through — and so the burden lands, unavoidably, on <em>you</em>: the activity, or the payment
+    system it calls, must tolerate the repeat. The engine guarantees the work will happen; only your
+    idempotency guarantees it happens once.</p>
+
+    <figure class="svg-card" data-anchor="id-fig-dedup">
+      <svg viewBox="0 0 720 210" role="img" aria-label="Two identical requests carrying the same idempotency key arrive; the first performs the charge and stores a receipt, the second is short-circuited to the stored receipt with no second charge.">
+        <rect x="20" y="34" width="150" height="46" rx="8" class="ln-stroke" stroke-width="2"/>
+        <text x="95" y="55" text-anchor="middle" class="ln-fill" font-size="11" font-family="var(--font-mono)">req · key K</text>
+        <text x="95" y="71" text-anchor="middle" class="ln-soft" font-size="10">(1st try)</text>
+        <rect x="20" y="120" width="150" height="46" rx="8" class="ln-stroke" stroke-width="2" stroke-dasharray="5 4"/>
+        <text x="95" y="141" text-anchor="middle" class="ln-fill" font-size="11" font-family="var(--font-mono)">req · key K</text>
+        <text x="95" y="157" text-anchor="middle" class="ln-soft" font-size="10">(retry — same K)</text>
+
+        <rect x="280" y="70" width="150" height="70" rx="10" class="ln-accent" stroke-width="2"/>
+        <text x="355" y="100" text-anchor="middle" font-size="11" font-family="var(--font-mono)" style="fill:var(--accent)">receipts[K]?</text>
+        <text x="355" y="120" text-anchor="middle" class="ln-soft" font-size="10">check first</text>
+
+        <line x1="170" y1="57" x2="280" y2="95" class="ln-stroke" stroke-width="1.6" marker-end="url(#a4)"/>
+        <line x1="170" y1="143" x2="280" y2="115" class="ln-stroke" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#a4)"/>
+
+        <rect x="540" y="30" width="160" height="52" rx="8" class="ln-danger" stroke-width="2"/>
+        <text x="620" y="55" text-anchor="middle" font-size="11" font-family="var(--font-mono)" style="fill:var(--danger)">CHARGE once</text>
+        <text x="620" y="72" text-anchor="middle" class="ln-soft" font-size="10">+ store receipt (atomic)</text>
+        <rect x="540" y="128" width="160" height="52" rx="8" class="ln-ok" stroke-width="2"/>
+        <text x="620" y="153" text-anchor="middle" font-size="11" font-family="var(--font-mono)" style="fill:var(--ok)">replay receipt</text>
+        <text x="620" y="170" text-anchor="middle" class="ln-soft" font-size="10">no second charge</text>
+
+        <line x1="430" y1="95" x2="540" y2="60" class="ln-danger" stroke-width="1.8" marker-end="url(#a4)"/>
+        <line x1="430" y1="115" x2="540" y2="150" class="ln-ok" stroke-width="1.8" marker-end="url(#a4)"/>
+        <defs>
+          <marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 z" fill="var(--ink-soft)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>Same key, two arrivals. The first does the dangerous work once and writes a receipt in
+      the same breath; the second finds the receipt and returns it. The duplicate arrived — it just
+      couldn't do any damage.</figcaption>
+    </figure>
+
+    <div class="callout note" data-anchor="id-note-natural">
+      <span class="tag">The cheapest idempotency is design, not machinery</span>
+      <p>Before you reach for a key table, ask whether the operation can simply be made
+      <em>naturally</em> idempotent. "Set status = shipped" needs no receipt; "increment ships by one"
+      does. Modelling effects as <em>assignments to a known target</em> rather than <em>blind
+      increments</em> removes whole categories of double-apply bugs for free. When you can choose the
+      shape of the operation, choose the idempotent one.</p>
+    </div>
+
+    <div class="reflect" data-anchor="id-reflect">So we do not defeat the unreliable network — nobody
+    does. We <b>disarm</b> it. We accept that our messages will sometimes arrive twice and simply make
+    the second arrival a no-op. "Exactly once" was never a property of the wire; it is a property we
+    <b>construct</b>, out of cheerful retries below and careful idempotence above. Name your operations
+    honestly — which are naturally idempotent, which need a receipt — and the exactly-once illusion
+    becomes something you can actually promise.</div>
+
+    <div class="envelope" data-anchor="id-env">
+      <span class="tag">Back of the envelope</span>
+      <p>A receipt is small — a key, a status, a body, a timestamp. Keep them for as long as a client
+      might retry: minutes to a day, rarely more. Too short and a late retry slips through and
+      double-applies; keep them forever and the table grows without bound. The right expiry is just
+      "longer than any sane retry, shorter than forever" — a knob, set deliberately, like every other
+      durability knob in this book.</p>
+    </div>
+
+    <h3 data-anchor="id-try">Think it through</h3>
+    <ol class="challenges">
+      <li>List five write operations in your system. Label each <em>naturally idempotent</em> or
+      <em>needs a key</em>. The second list is your retry-safety backlog.</li>
+      <li>For one "needs a key" operation, write the pseudo-transaction that commits the effect and the
+      receipt together. Find the line where a crash used to double-apply, and confirm it can't anymore.</li>
+      <li>Explain why an engine's "at-least-once activity" is not a weakness but an honest admission —
+      and why the alternative ("exactly-once, promise!") would be a lie.</li>
+    </ol>
+
+    <div class="sources" data-anchor="id-sources"><b>Sources</b> · Stripe, <em>Designing robust and
+    predictable APIs with idempotency</em> · Stripe API reference, <em>Idempotent requests</em> · Learn
+    Temporal, <em>Develop code that durably executes</em> (at-least-once activities). See the cheatsheet
+    for links.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="03-replay.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="05-timers.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
