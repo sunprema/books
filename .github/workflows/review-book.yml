@@ -1,0 +1,75 @@
+name: LLM review (book PR)
+
+# Advisory reviewer for book PRs, powered by GitHub Models — no API key, no
+# external secret. The job's `models: read` permission is what lets the
+# built-in GITHUB_TOKEN call the inference endpoint. It reviews the changed
+# book pages and maintains ONE sticky comment on the PR (updated per push,
+# never a new comment per run). It never blocks the PR: review failures are
+# reported inside the comment and the job stays green.
+#
+# Guard: runs only for same-repo branches (the routine's claude/book-* PRs).
+# Fork PRs get a read-only GITHUB_TOKEN that can't comment — skip them.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'books/**'
+
+concurrency:
+  group: llm-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  models: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Collect changed book pages
+        id: pages
+        run: |
+          gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate \
+            -q '.[] | select(.status != "removed") | .filename' \
+            | grep -E '^books/.+\.html$' > changed_pages.txt || true
+          echo "count=$(wc -l < changed_pages.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          cat changed_pages.txt
+
+      - uses: actions/setup-python@v5
+        if: steps.pages.outputs.count != '0'
+        with:
+          python-version: '3.12'
+
+      - name: Review pages via GitHub Models
+        if: steps.pages.outputs.count != '0'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEW_MODEL: openai/gpt-4.1-mini   # low-tier limits; swap freely
+        run: |
+          python3 .github/scripts/review_book.py --out review.md < changed_pages.txt
+
+      # Upsert the sticky comment: find our marker, PATCH it, else create it.
+      - name: Post / update review comment
+        if: steps.pages.outputs.count != '0'
+        run: |
+          marker='<!-- bookbank-llm-review -->'
+          cid=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate \
+                  -q ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+          if [ -n "$cid" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$cid" \
+              -F body=@review.md
+          else
+            gh api "repos/${{ github.repository }}/issues/$PR/comments" \
+              -F body=@review.md
+          fi

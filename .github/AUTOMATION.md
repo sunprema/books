@@ -92,3 +92,29 @@ the Ubuntu runner (cosmetic loss only).
 
 - `/publish-library` (kit skill) still does a full-library rebuild by hand.
 - `place_image.py` / `push-book-pr.sh` still work locally for one-off placement.
+
+## LLM reviewer (`review-book.yml`) — GitHub Models, no API key
+
+Every book PR gets an **advisory LLM review** of its changed pages, powered by
+GitHub Models — the workflow's `models: read` permission lets the built-in
+`GITHUB_TOKEN` call `https://models.github.ai/inference/chat/completions`
+directly, so there is **no external API key and no repo secret**.
+
+- **Trigger:** `pull_request` touching `books/**` (same-repo branches only —
+  fork PRs get a read-only token and are skipped).
+- **What it does:** `.github/scripts/review_book.py` strips each changed
+  `.html` page to plain text (drops `<header>`/`<nav>` chrome, preserves table
+  cell boundaries), sends it to the model (default `openai/gpt-4.1-mini`, set
+  via `REVIEW_MODEL`) with the book's `book.json` context, and asks for
+  factual red flags, broken code snippets, mojibake, persona drift. One
+  **sticky comment** per PR (marker `<!-- bookbank-llm-review -->`), updated
+  in place on each push.
+- **Advisory, never blocking:** per-page API failures are reported inside the
+  comment and the job always succeeds. A human still merges.
+- **Rate-limit posture:** GitHub Models free-tier limits are per-user/day —
+  the script caps at 10 pages per run, ~3s between calls, and retries one 429.
+  If a big book exceeds the cap, the comment says how many pages were skipped.
+- **Prompt-injection note:** the model only *reads* page text and *writes* a
+  comment — it has no tools and the workflow grants no write access beyond
+  `pull-requests: write` for the comment itself. Content in a malicious page
+  could at worst skew its own review.
