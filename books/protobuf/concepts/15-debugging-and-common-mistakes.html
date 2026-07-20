@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging and Common Mistakes — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="dbg-kicker">Chapter 15 &middot; Production &amp; Beyond</span>
+    <h1 data-anchor="dbg-h1">Debugging and Common Mistakes</h1>
+
+    <p class="lede" data-anchor="dbg-lede">
+      Here's a scene you will eventually live through: a service on the far end of a socket is getting your
+      messages, and the values are <em>wrong</em>. A name comes through as gibberish, a timestamp lands in
+      1970, an enum you never chose shows up as <code>0</code>. Nobody threw an exception &mdash; that's the
+      cruel part. Protobuf is a schema-driven format, and when the schema on one side quietly disagrees with
+      the bytes on the wire, you don't get a crash. You get a plausible, silent lie. So this chapter is two
+      things at once. First, the one tool that cuts through all of it: how to open up the raw bytes and
+      <em>look</em>, with and without the <code>.proto</code> in hand. And second, a field guide to the
+      mistakes that produce those silent lies in the first place &mdash; nearly all of which we've foreshadowed
+      in earlier chapters, now gathered in one place where you can recognize them on sight. We'll end with a
+      checklist you can actually run down at 2&nbsp;a.m.
+    </p>
+
+    <h2 data-anchor="dbg-h2-look">Rule one: stop guessing, look at the bytes</h2>
+    <p data-anchor="dbg-p-look-1">
+      When a message decodes wrong, the temptation is to stare at your code &mdash; the serializer, the field
+      you just added, the network layer. Resist it. The bytes on the wire are the ground truth, and protobuf
+      ships a tool that reads them straight back to you. It lives inside <code>protoc</code>, the same compiler
+      you've used since Chapter&nbsp;5, and it has two modes that differ by one crucial question: <em>do you
+      have the schema or not?</em>
+    </p>
+    <p data-anchor="dbg-p-look-2">
+      If you <strong>have</strong> the <code>.proto</code>, use <code>--decode</code>. You name the fully
+      qualified message type and pass the file; <code>protoc</code> reads the binary from standard input and
+      prints it as human-readable text with real field names and typed values. This is your first move whenever
+      you suspect the sender and you disagree about the schema &mdash; decode the exact bytes you received and
+      see what <em>your</em> schema makes of them.
+    </p>
+    <pre data-anchor="dbg-code-decode"><code><span class="cm"># You HAVE the schema: named, typed fields come back out.</span>
+<span class="fn">protoc</span> --decode=tutorial.Person addressbook.proto &lt; person.bin
+
+<span class="cm"># name: "Ada Lovelace"</span>
+<span class="cm"># id: 4</span>
+<span class="cm"># phones { number: "555-1234" type: HOME }</span>
+
+<span class="cm"># The same tool round-trips the other way (text -&gt; bytes),</span>
+<span class="cm"># which is gold for building a known-good fixture by hand:</span>
+<span class="fn">protoc</span> --encode=tutorial.Person addressbook.proto &lt; person.txt &gt; person.bin</code></pre>
+    <p data-anchor="dbg-p-look-3">
+      But the really magical mode is the one for when you <strong>don't</strong> have the schema &mdash; a
+      capture off the wire, a blob in a database column, a payload from a service whose <code>.proto</code> you
+      can't find. <code>--decode_raw</code> takes <em>no</em> proto file at all. It reads arbitrary bytes from
+      stdin and prints the raw field-number/value pairs it can recover, nesting sub-messages in braces. How is
+      that possible without the schema? Because &mdash; and this is the payoff of everything we learned about
+      the wire format in Chapter&nbsp;4 &mdash; every field on the wire is a self-describing tag: a field
+      <em>number</em> and a <em>wire type</em>, glued to its value. You don't need names to walk that
+      structure; the structure is in the bytes.
+    </p>
+    <pre data-anchor="dbg-code-decoderaw"><code><span class="cm"># You have NO schema. See the shape anyway:</span>
+<span class="fn">protoc</span> --decode_raw &lt; message.bin
+
+<span class="num">1</span>: <span class="num">4</span>
+<span class="num">2</span>: <span class="str">"Ada Lovelace"</span>
+<span class="num">5</span> {                 <span class="cm"># a nested message — protoc guessed wire-type 2 is a submessage</span>
+  <span class="num">1</span>: <span class="str">"555-1234"</span>
+  <span class="num">2</span>: <span class="num">1</span>
+}</code></pre>
+
+    <figure class="figbox" data-anchor="dbg-fig-decode">
+      <svg viewBox="0 0 720 250" role="img" aria-labelledby="dbg-fig-decode-title">
+        <title id="dbg-fig-decode-title">Raw bytes flow into protoc; with --decode plus a .proto you get named typed fields, with --decode_raw alone you get field numbers and untyped values</title>
+        <text x="360" y="22" text-anchor="middle" font-family="var(--font-display)" font-size="15" fill="var(--ink)">One pipe, two views of the same bytes</text>
+
+        <!-- bytes -->
+        <rect x="24" y="96" width="120" height="60" rx="8" fill="var(--code-bg)" stroke="var(--rule)" stroke-width="1.3"/>
+        <text x="84" y="120" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ink)">message.bin</text>
+        <text x="84" y="139" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">08 04 12 0c …</text>
+
+        <!-- protoc -->
+        <rect x="250" y="86" width="120" height="80" rx="8" fill="none" stroke="var(--ty)" stroke-width="1.4"/>
+        <text x="310" y="112" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ty)">protoc</text>
+        <text x="310" y="132" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">reads stdin,</text>
+        <text x="310" y="144" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">writes stdout</text>
+
+        <!-- with schema -->
+        <rect x="474" y="44" width="222" height="66" rx="8" fill="none" stroke="var(--en)" stroke-width="1.4"/>
+        <text x="585" y="64" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--en)">--decode=Person  +  .proto</text>
+        <text x="585" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">name: "Ada Lovelace"</text>
+        <text x="585" y="96" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">type: HOME   (named + typed)</text>
+
+        <!-- raw -->
+        <rect x="474" y="142" width="222" height="66" rx="8" fill="none" stroke="var(--num)" stroke-width="1.4"/>
+        <text x="585" y="162" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--num)">--decode_raw  (no .proto)</text>
+        <text x="585" y="180" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">1: 4      2: "Ada Lovelace"</text>
+        <text x="585" y="194" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">numbers only, wire-type guesses</text>
+
+        <g stroke="var(--rule)" stroke-width="1.3" fill="none">
+          <path d="M144 126 L248 126" marker-end="url(#dbg-arrow)"/>
+          <path d="M370 116 L472 82" marker-end="url(#dbg-arrow)"/>
+          <path d="M370 136 L472 172" marker-end="url(#dbg-arrow)"/>
+        </g>
+        <defs>
+          <marker id="dbg-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0 0 L6 3 L0 6 z" fill="var(--rule)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        The wire format is self-describing enough to walk without a schema &mdash; that's why
+        <code>--decode_raw</code> can exist at all. Add the <code>.proto</code> and
+        <code>--decode</code> upgrades those bare numbers into names and real types.
+      </figcaption>
+    </figure>
+
+    <div class="callout warning" data-anchor="dbg-callout-rawtypes">
+      <span class="callout-label">--decode_raw shows you structure, not truth</span>
+      Trust <code>--decode_raw</code> for the <em>shape</em> of a message &mdash; which field numbers are
+      present, how they nest &mdash; but not for the exact <em>types</em>. Recall from Chapter&nbsp;4 that the
+      wire carries a wire type, not the declared type. Wire type&nbsp;0 (varint) could be an
+      <code>int32</code>, <code>int64</code>, <code>uint32</code>, <code>bool</code>, an <code>enum</code>, or
+      a ZigZag <code>sint32</code> &mdash; and <code>protoc</code> can't tell which, so a negative
+      <code>sint32</code> will print as a big meaningless unsigned number. Likewise a length-delimited
+      (wire&nbsp;type&nbsp;2) field might be a <code>string</code>, raw <code>bytes</code>, a
+      <em>packed</em> repeated field, or an embedded message &mdash; <code>protoc</code> guesses, and
+      sometimes guesses wrong. When the value matters, get the <code>.proto</code> and use
+      <code>--decode</code>.
+    </div>
+
+    <hr class="chalk-rule">
+
+    <h2 data-anchor="dbg-h2-numbers">The original sin: touching a live field number</h2>
+    <p data-anchor="dbg-p-num-1">
+      Now to the mistakes. If you remember one from this whole chapter, make it this one, because it's the
+      mistake that produces the silent-lie scenario from the opening. <strong>A field number, once it has
+      shipped, is permanent.</strong> Reusing a number for a different field, or renumbering an existing one,
+      corrupts deserialization for every peer still running the old schema &mdash; and it does so exactly the
+      way changing a field's type would, which is to say quietly and catastrophically. The old reader sees the
+      old number, applies the old type, and confidently decodes your new field's bytes as something it is not.
+    </p>
+    <p data-anchor="dbg-p-num-2">
+      The trap is that nothing stops you at compile time. You delete <code>string email = 2;</code>, everything
+      builds, and six months later a teammate who's never heard of the old <code>email</code> field innocently
+      writes <code>bool is_verified = 2;</code>. The compiler is delighted. The wire is not. The defense is the
+      <code>reserved</code> keyword you met in Chapter&nbsp;7 &mdash; when you retire a field, reserve its number
+      (and its name, so nobody re-adds the name either) and the compiler will now reject the collision for you.
+    </p>
+    <pre data-anchor="dbg-code-reserved"><code><span class="kw">message</span> <span class="ty">User</span> {
+  <span class="kw">reserved</span> <span class="num">2</span>, <span class="num">15</span>, <span class="num">9</span> <span class="kw">to</span> <span class="num">11</span>;      <span class="cm">// numbers of removed fields — never reuse</span>
+  <span class="kw">reserved</span> <span class="str">"email"</span>, <span class="str">"legacy_id"</span>;  <span class="cm">// and their names, so they can't come back either</span>
+
+  <span class="ty">string</span> id   = <span class="num">1</span>;
+  <span class="ty">string</span> name = <span class="num">3</span>;                <span class="cm">// note: NOT 2 — that number is retired forever</span>
+}</code></pre>
+    <div class="callout key-idea" data-anchor="dbg-callout-numbers">
+      <span class="callout-label">The rule in one line</span>
+      Field numbers are addresses, not labels. You can rename a field freely (the name is a local convenience),
+      but the <em>number</em> is the identity every serialized byte agrees on. Change a name, and nothing on the
+      wire notices. Change or reuse a number, and everything on the wire lies.
+    </div>
+
+    <h2 data-anchor="dbg-h2-proto2">Ghosts of proto2: <code>required</code> and the tyranny of zero</h2>
+    <p data-anchor="dbg-p-p2-1">
+      A cluster of mistakes comes from the seam between proto2 and proto3, and from proto3's central design
+      choice about <em>presence</em>. These are worth understanding together, because they all trace back to the
+      same question: "how does the reader know whether a field was actually set?"
+    </p>
+
+    <h3 data-anchor="dbg-h3-required">Don't write <code>required</code> &mdash; and be wary of code that did</h3>
+    <p data-anchor="dbg-p-req-1">
+      In proto2 you could label a field <code>required</code>, and it felt responsible &mdash; "this field must
+      always be present, so I'll enforce it." proto3 <em>removed the label entirely</em>, and not by accident.
+      <code>required</code> turned out to be a one-way door. Once a required field is deployed, you can never
+      relax it: making it optional later means every reader and writer everywhere has to be upgraded in a single
+      synchronized rollout, or an old reader will reject a new message that omits the field. That's precisely the
+      lockstep-deploy nightmare the entire schema-evolution discipline from Chapter&nbsp;7 exists to prevent.
+      Google's own retrospective is blunt: adding <code>required</code> was a mistake. If you're on proto2 or
+      Editions, treat the option as if it doesn't exist.
+    </p>
+
+    <h3 data-anchor="dbg-h3-enum">Give the enum a zero value, and make it mean nothing</h3>
+    <p data-anchor="dbg-p-enum-1">
+      proto3 <em>requires</em> that the first value of every enum be <code>0</code>. This isn't bureaucracy &mdash;
+      the zero value is the enum's implicit default, the thing you get when the field is absent. And here's the
+      subtler reason it must be a harmless sentinel: because of the forward-compatibility we discussed in
+      Chapter&nbsp;7, when a newer peer sends an enum value your older schema has never heard of, many runtimes
+      surface it to you as the <em>zero</em> value (or preserve it as an unknown number you have to check for). So
+      if you make <code>0</code> mean something real &mdash; say <code>ACTIVE</code> &mdash; then both "field was
+      never set" and "value I don't recognize yet" collapse into "ACTIVE," and you will ship a bug that looks like
+      data corruption. Make zero an inert <code>*_UNSPECIFIED</code>, always.
+    </p>
+    <pre data-anchor="dbg-code-enum"><code><span class="cm">// GOOD: zero is a sentinel that means "I don't know," not a real state.</span>
+<span class="kw">enum</span> <span class="ty">Status</span> {
+  <span class="en">STATUS_UNSPECIFIED</span> = <span class="num">0</span>;  <span class="cm">// absent OR unknown-to-me decodes to this</span>
+  <span class="en">STATUS_ACTIVE</span>      = <span class="num">1</span>;
+  <span class="en">STATUS_CLOSED</span>      = <span class="num">2</span>;
+  <span class="kw">reserved</span> <span class="num">3</span>;              <span class="cm">// a removed value's number — reserve it, same as a field</span>
+}
+<span class="cm">// Note the STATUS_ prefix on every value: enum value names live in the</span>
+<span class="cm">// ENCLOSING scope, not inside the enum, so unprefixed names collide across enums.</span></code></pre>
+    <p data-anchor="dbg-p-enum-2">
+      Two follow-on traps hide here. First, enum values share the same reuse hazard as field numbers: delete
+      <code>CLOSED = 2</code> and a future edit can reclaim <code>2</code> for something else, silently
+      reinterpreting old data &mdash; so <code>reserved</code> the number just as you would a field's. Second,
+      enum value names are scoped to the <em>enclosing</em> namespace, not to the enum, which is why the
+      convention is to prefix every value with the enum's name. Two enums in one file that both define a bare
+      <code>ACTIVE = 1</code> simply won't compile.
+    </p>
+
+    <h3 data-anchor="dbg-h3-presence">Default value is not the same as "present"</h3>
+    <p data-anchor="dbg-p-pres-1">
+      This is the single most common conceptual mistake in proto3, and we flagged it back in Chapter&nbsp;2.
+      In proto3, a plain scalar field that equals its zero value &mdash; <code>0</code>, <code>""</code>,
+      <code>false</code> &mdash; is <em>indistinguishable</em> from a field that was never set. There's no
+      <code>has_retries()</code> for a bare <code>int32 retries</code>. So the classic bug: an API takes an
+      <code>int32 page_size</code>, a client that wants the server default simply doesn't set it &mdash; and the
+      server, unable to tell "unset" from "explicitly zero," reads <code>0</code> and returns an empty page.
+    </p>
+    <p data-anchor="dbg-p-pres-2">
+      The fix is to opt back into explicit presence when you need it. Adding the <code>optional</code> label in
+      proto3 (yes, the keyword came back for exactly this) restores a real <code>has_</code> accessor. A
+      <code>oneof</code> or a wrapper message (<code>google.protobuf.Int32Value</code>) does the same job. The
+      rule of thumb: if the difference between "set to zero" and "not set" is meaningful in your domain, you must
+      model presence explicitly &mdash; the zero value will not carry that distinction for you.
+    </p>
+    <pre data-anchor="dbg-code-presence"><code><span class="kw">message</span> <span class="ty">ListRequest</span> {
+  <span class="ty">int32</span> page_size = <span class="num">1</span>;            <span class="cm">// 0 could mean "unset" OR "the client asked for 0" — ambiguous</span>
+  <span class="kw">optional</span> <span class="ty">int32</span> max_results = <span class="num">2</span>;  <span class="cm">// proto3 presence: has_max_results() distinguishes the two</span>
+}</code></pre>
+    <div class="callout note" data-anchor="dbg-callout-editions">
+      <span class="callout-label">Editions makes this a choice, not a guess</span>
+      Mixing proto2 and proto3 in your head is a mistake all its own &mdash; the two dialects genuinely disagree
+      about "set vs. zero," so a field that behaves one way in a proto2 file behaves differently in a proto3 one.
+      Protobuf <strong>Editions</strong>, which the next chapter covers, exists partly to end this: instead of
+      inheriting presence and default behavior implicitly from the <code>syntax</code> line, you select it
+      per-field as an explicit <em>feature</em>. Same wire format, but the semantics stop being a thing you have
+      to remember and become a thing you declare.
+    </div>
+
+    <hr class="chalk-rule">
+
+    <h2 data-anchor="dbg-h2-encoding">Encoding traps: signed ints, maps, and giant messages</h2>
+    <p data-anchor="dbg-p-enc-1">
+      The last cluster of mistakes is about the encoding fighting your assumptions &mdash; cases where the code
+      is correct but the <em>bytes</em> misbehave in ways that only surface under load or under a signature check.
+    </p>
+
+    <h3 data-anchor="dbg-h3-sint">Negative numbers in an <code>int32</code> are a size bomb</h3>
+    <p data-anchor="dbg-p-sint-1">
+      From Chapter&nbsp;4: varints are efficient for <em>small</em> non-negative numbers. But a plain
+      <code>int32</code> or <code>int64</code> encodes a negative value by sign-extending it to the full width,
+      which means <code>-1</code> costs a full <strong>ten bytes</strong> on the wire, every single time. Store a
+      field of temperatures or deltas or geo-offsets as <code>int32</code> and you've quietly made every negative
+      reading maximally expensive. The fix is <code>sint32</code>/<code>sint64</code>, which ZigZag-encode so that
+      small-magnitude negatives stay small. The catch &mdash; and it's a real one &mdash; is that
+      <code>sint32</code> is a <em>different, wire-incompatible type</em> from <code>int32</code>: they share
+      wire&nbsp;type&nbsp;0 but decode the same bytes to different numbers, so you cannot swap one for the other on
+      a field that's already in use. Choose it up front for fields you know will hold negatives.
+    </p>
+
+    <h3 data-anchor="dbg-h3-maps">Maps don't have an order, and your bytes aren't a fingerprint</h3>
+    <p data-anchor="dbg-p-maps-1">
+      Here's one that burns people building caches, signatures, and content-addressed storage. It is tempting to
+      serialize a message and use the resulting bytes as a hash key or sign them &mdash; "same message, same
+      bytes, right?" <strong>Wrong.</strong> Protobuf's default serialization is <em>not deterministic</em>. The
+      biggest culprit is maps: map iteration order and the wire order of map entries are explicitly undefined, so
+      two serializations of the same message can differ byte-for-byte. Even setting maps aside, the library makes
+      no promise that repeated serializations are identical.
+    </p>
+    <p data-anchor="dbg-p-maps-2">
+      Most mature libraries offer a <em>deterministic</em> serialization option that, among other things, sorts
+      map keys &mdash; and you should turn it on for anything that hashes or signs bytes. But even then, know the
+      limits the docs are careful to spell out: deterministic serialization is <strong>not canonical</strong>. The
+      byte output can still differ across languages, across versions of the same library, and in the presence of
+      unknown fields carried through from a peer. So: never treat a serialized proto as a stable fingerprint
+      across time or across services. If you need a canonical identity, define one explicitly.
+    </p>
+    <div class="callout warning" data-anchor="dbg-callout-large">
+      <span class="callout-label">Protobuf is not a file format for large blobs</span>
+      One more assumption to shed: protobuf is built to hold the <em>whole</em> message in memory, and during
+      parse or serialize it may transiently hold several copies. That's fine for the kilobyte-to-low-megabyte
+      messages it's designed for, and miserable for multi-megabyte payloads or unbounded streams &mdash; you'll
+      spike memory and, in some runtimes, hit hard size limits. The idiom is to <strong>chunk</strong> a large
+      blob into a sequence of smaller messages, or stream them (Chapter&nbsp;13), rather than stuffing a
+      100&nbsp;MB video into a single <code>bytes</code> field.
+    </div>
+
+    <h2 data-anchor="dbg-h2-checklist">The 2 a.m. troubleshooting checklist</h2>
+    <p data-anchor="dbg-p-check-1">
+      When a message decodes wrong and you need a path, not a lecture, run down this list roughly in order. It's
+      built from every mistake above, arranged as symptoms.
+    </p>
+    <table class="cmp" data-anchor="dbg-table-checklist">
+      <thead><tr><th>Symptom</th><th>First thing to check</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Values are garbage / shifted / nonsensical</td>
+          <td><code>protoc --decode_raw</code> the exact received bytes. Do the <em>field numbers</em> match what
+          you expect? A mismatch means the two sides disagree about the schema &mdash; almost always a reused or
+          renumbered field.</td>
+        </tr>
+        <tr>
+          <td>One field is wrong; the rest are fine</td>
+          <td>That field's <em>number</em> was probably reused or its type changed. Diff the two
+          <code>.proto</code>s at that number. Reserve retired numbers going forward.</td>
+        </tr>
+        <tr>
+          <td>An enum shows up as <code>0</code> / <code>UNSPECIFIED</code> unexpectedly</td>
+          <td>Either the field was never set, or the sender used a value newer than your schema knows. Both funnel
+          to zero &mdash; confirm your zero value is a harmless sentinel, and check for unknown-enum handling.</td>
+        </tr>
+        <tr>
+          <td>Can't tell "unset" from "zero / empty / false"</td>
+          <td>That's proto3 default-vs-presence. Add <code>optional</code>, a wrapper, or a <code>oneof</code> to
+          the field so a <code>has_</code> accessor exists.</td>
+        </tr>
+        <tr>
+          <td>Old readers reject new messages / a rollout is stuck</td>
+          <td>Look for a <code>required</code> field (proto2) or a field whose semantics you can't relax without a
+          synchronized deploy. This is the required-is-forever trap.</td>
+        </tr>
+        <tr>
+          <td>A signed field is huge on the wire</td>
+          <td>It's an <code>int32</code>/<code>int64</code> holding negatives (10 bytes each). Use
+          <code>sint32</code>/<code>sint64</code> &mdash; but only on a new field, since it's wire-incompatible.</td>
+        </tr>
+        <tr>
+          <td>Signatures / hashes / cache keys intermittently break</td>
+          <td>You're hashing non-deterministic bytes &mdash; almost certainly a map. Enable deterministic
+          serialization, and stop treating serialized protos as canonical fingerprints.</td>
+        </tr>
+        <tr>
+          <td>A relay/proxy drops fields it doesn't know</td>
+          <td>It's rebuilding a new message or round-tripping through JSON instead of re-serializing the parsed
+          object. Unknown fields survive a straight re-serialize; they don't survive a manual copy.</td>
+        </tr>
+        <tr>
+          <td>Memory spikes / hard failures on big payloads</td>
+          <td>The message is too large for protobuf's whole-in-memory model. Chunk or stream it.</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="callout note" data-anchor="dbg-callout-diff">
+      <span class="callout-label">The fastest diagnosis is a diff of two decodes</span>
+      When two services disagree, capture the same bytes and run them through <em>both</em> schemas:
+      <code>--decode</code> with the sender's <code>.proto</code>, then <code>--decode</code> with the receiver's.
+      The place the two text dumps diverge is, almost every time, the exact field whose number or type drifted
+      between them. It turns a philosophical argument about "who's right" into a two-line shell command.
+    </div>
+
+    <div class="callout key-idea" data-anchor="dbg-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      A way to stop guessing. Protobuf's great strength &mdash; that it's a compact, schema-driven binary format
+      &mdash; is also the source of its signature failure mode: when the schemas drift, you get silent wrong
+      answers instead of loud errors. The cure is to remember that the bytes are self-describing, and that
+      <code>protoc --decode</code> and <code>--decode_raw</code> will read them back to you with or without the
+      <code>.proto</code> in hand. Around that one tool we gathered the recurring mistakes, and notice they nearly
+      all share a shape: they're places where something feels safe to change but isn't &mdash; a field number, an
+      enum value, a <code>required</code> label, an <code>int32</code> that "obviously" holds a small number, a
+      map you assumed had an order. Protobuf's whole discipline, the thread running through this book, is knowing
+      which changes the wire forgives and which it silently punishes. Learn to <em>see</em> the bytes, and you can
+      always find out which kind you're looking at.
+    </div>
+
+    <div class="callout note" data-anchor="dbg-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>You capture a message off the wire, run <code>protoc --decode_raw</code>, and one field prints as
+        <code>18446744073709551615</code>. Nothing in your schema has a number that large. Explain what type that
+        field probably is and why <code>--decode_raw</code> can't show it correctly &mdash; then say what you'd run
+        instead to see the real value.</li>
+        <li>A teammate deletes <code>string nickname = 4;</code> from a message and ships it. Six months later
+        someone adds <code>int64 created_at = 4;</code>. Walk through exactly what an old client that still knows
+        <code>nickname</code> does when it receives a message from the new server, and name the one keyword that
+        would have made the compiler stop the second developer.</li>
+        <li>An enum <code>Color { COLOR_RED = 0; COLOR_GREEN = 1; }</code> is deployed. A newer service sends
+        <code>COLOR_BLUE = 2</code> to an older reader. What value does the older reader most likely observe, and
+        why does that make picking a meaningful <code>0</code> value dangerous?</li>
+        <li>Your service signs serialized protobuf messages and verifies the signature downstream. It works in
+        tests and fails ~30% of the time in production. The message contains a <code>map&lt;string, string&gt;</code>.
+        Diagnose it, and describe the two changes you'd make.</li>
+        <li>Give a one-sentence rule for when to reach for <code>sint32</code> instead of <code>int32</code>, and
+        explain why you can't fix a mis-chosen <code>int32</code> field by simply editing it to
+        <code>sint32</code> in place.</li>
+      </ol>
+    </div>
+
+    <p data-anchor="dbg-sources" style="margin-top:2rem;font-size:.82em;color:var(--ink-soft);border-top:1px solid var(--rule);padding-top:.8rem;">
+      Sources: the <code>protoc</code> man page (via
+      <a href="https://www.mankier.com/1/protoc">ManKier</a>, and corroborated by WebSearch snippets) for the
+      exact <code>--decode</code>, <code>--decode_raw</code>, and <code>--encode</code> behavior (read stdin,
+      write text to stdout; <code>--decode_raw</code> needs no <code>.proto</code>); Kreya's and David Vassallo's
+      wire-format walkthroughs for why <code>--decode_raw</code> can recover structure but not exact types; the
+      protobuf Encoding guide for varint sign-extension and the <code>sint</code>/ZigZag fix and the
+      wire-type-vs-declared-type ambiguity; the Proto Best Practices (Do's and Don'ts) and proto3 Language Guide
+      for never-reuse-field-numbers, <code>reserved</code>, the removal of <code>required</code>, and the
+      enum-first-value-zero rule; the Field Presence guide for default-vs-presence and proto3 <code>optional</code>;
+      &ldquo;Proto Serialization Is Not Canonical&rdquo; and the deterministic-serialization discussion for the map
+      non-determinism and hashing pitfall; Buf's enum-prefix tip for value-name scoping; and the protobuf
+      Editions overview for the proto2/proto3 semantic seam. (protobuf.dev and grpc.io were unreachable from this
+      build's sandbox; their claims were corroborated via reachable GitHub raw mirrors, the ManKier man page, and
+      WebSearch result snippets.)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="14-custom-extensions-and-plugins.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="16-future-of-protobuf.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
