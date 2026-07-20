@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modeling Real Data — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="mrd-kicker">Chapter 06 &middot; Encoding &amp; Tooling</span>
+    <h1 data-anchor="mrd-h1">Modeling Real Data</h1>
+
+    <p class="lede" data-anchor="mrd-lede">
+      Back in Chapter 2 we left a few threads dangling on purpose:
+      <code>Timestamp</code>, <code>Any</code>, <code>Struct</code>,
+      <code>FieldMask</code>, the wrapper types &mdash; a &ldquo;small standard
+      vocabulary,&rdquo; we called it, and moved on. That was fair while
+      <code>Product</code> only had a name and a quantity. It stops being fair
+      the moment your schema needs a price, a creation time, an update that
+      should touch exactly three fields and no others, or a payload whose
+      exact shape won't be known until runtime. This chapter cashes in that
+      promise. It's less about new syntax &mdash; you already know
+      <code>message</code>, <code>enum</code>, <code>repeated</code>,
+      <code>map</code> &mdash; and more about judgment: which type actually
+      fits the data you have, and which of protobuf's own escape hatches are
+      worth reaching for versus worth avoiding.
+    </p>
+
+    <h2 data-anchor="mrd-h2-scalars">Picking scalar types like you mean it</h2>
+    <p data-anchor="mrd-p-scalars-1">
+      Start with the field type every tutorial glosses over: money. It's
+      tempting to reach for <code>double</code> &mdash; it's a number, prices
+      are numbers, done. Don't. Binary floating point can't represent common
+      decimal fractions like 0.10 exactly, and that inexactness compounds
+      every time you add, multiply, or sum a column of prices. The standard
+      fix is fixed-point: store an integer count of the currency's smallest
+      unit. A single-currency field can just be <code>int64
+      total_amount_minor_units</code> (cents, for USD); a
+      currency-aware field follows the shape Google's own
+      <code>google.type.Money</code> uses &mdash; an <code>int64 units</code>,
+      an <code>int32 nanos</code> for the sub-unit remainder, and a
+      <code>string currency_code</code>. Either way, the arithmetic happens in
+      integers, where it's exact.
+    </p>
+    <p data-anchor="mrd-p-scalars-2">
+      The same instinct &mdash; prefer the type that can't quietly lie to you
+      &mdash; applies elsewhere. Reach for <code>int64</code> over
+      <code>int32</code> for IDs and counters; the extra headroom against
+      overflow costs you nothing you'd notice and saves you a very bad day
+      later. Reach for <code>bytes</code> instead of <code>string</code> for
+      an identifier that isn't guaranteed to be text &mdash; raw UUID bytes, a
+      hash, an opaque token &mdash; because a proto3 <code>string</code> field
+      is validated as UTF-8, and binary data either fails that check or pays
+      for a pointless text re-encoding to satisfy it. <code>string</code>
+      stays exactly right for identifiers that really are human-readable text.
+      None of this is new mechanism; it's just the field-type table from
+      Chapter 2, read with an eye for which row actually matches the data.
+    </p>
+    <div class="callout warning" data-anchor="mrd-callout-money">
+      <span class="callout-label">The bug that ships quietly</span>
+      A <code>double price</code> field will work fine in every demo, every
+      unit test with round numbers, and most of production &mdash; right up
+      until someone sums ten thousand line items and the total is off by a
+      cent. By then it's shipped, and it's in an invoice.
+    </div>
+
+    <h2 data-anchor="mrd-h2-time">Time: Timestamp and Duration</h2>
+    <p data-anchor="mrd-p-time-1">
+      The same &ldquo;don't roll your own&rdquo; instinct applies to time even
+      more strongly, because a bare integer field is ambiguous in ways a
+      comment can't fully fix: is <code>created_at</code> seconds or
+      milliseconds? UTC or local? What happens at the year 2038 boundary if
+      it's a 32-bit field? <code>google.protobuf.Timestamp</code> answers all
+      of that once, in one place, so every consumer inherits the same answer.
+      It's a point in time &mdash; seconds since the Unix epoch, plus
+      non-negative nanosecond fractions &mdash; valid from
+      <code>0001-01-01T00:00:00Z</code> to
+      <code>9999-12-31T23:59:59.999999999Z</code>, with leap seconds
+      &ldquo;smeared&rdquo; linearly over 24 hours so no reader needs a
+      leap-second table to make sense of it. In JSON it's an RFC&nbsp;3339
+      string: <code>"2017-01-15T01:30:15.01Z"</code> is exactly
+      15.01&nbsp;seconds past 01:30 UTC on that date.
+    </p>
+    <p data-anchor="mrd-p-time-2">
+      <code>google.protobuf.Duration</code> is <code>Timestamp</code>'s
+      companion, not a competitor: a signed, calendar-independent span of time
+      (again seconds plus nanos, range roughly &plusmn;10,000 years) rather
+      than a point on the calendar. The two compose the way you'd hope &mdash;
+      subtract two <code>Timestamp</code>s and you get a <code>Duration</code>;
+      add a <code>Duration</code> to a <code>Timestamp</code> and you get
+      another <code>Timestamp</code>. In JSON, a <code>Duration</code> is a
+      string ending in <code>s</code>: <code>"3s"</code>, or
+      <code>"3.000000001s"</code> for three seconds and one nanosecond.
+    </p>
+    <p data-anchor="mrd-p-time-3">
+      One sign rule is easy to get backwards the first time you hand-build a
+      <code>Duration</code>: whenever <code>seconds</code> is non-zero,
+      <code>nanos</code> must be zero or share its sign. A duration of
+      &minus;1.5&nbsp;seconds is <code>seconds=-1, nanos=-500000000</code>
+      &mdash; not <code>nanos=+500000000</code>, which would mix signs. Only
+      for sub-second durations does <code>seconds</code> sit at zero while
+      <code>nanos</code> alone carries the sign.
+    </p>
+    <table class="cmp" data-anchor="mrd-table-time-examples">
+      <thead><tr><th>Value</th><th>Timestamp / Duration fields</th><th>JSON</th></tr></thead>
+      <tbody>
+        <tr><td>Jan 15, 2017, 01:30:15.01 UTC</td><td><code>seconds=1484443815, nanos=10000000</code></td><td><code>"2017-01-15T01:30:15.01Z"</code></td></tr>
+        <tr><td>3 seconds, 1 nanosecond</td><td><code>seconds=3, nanos=1</code></td><td><code>"3.000000001s"</code></td></tr>
+        <tr><td>&minus;1.5 seconds</td><td><code>seconds=-1, nanos=-500000000</code></td><td><code>"-1.5s"</code></td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="mrd-h2-wrappers">The presence problem, revisited: wrapper types are legacy now</h2>
+    <p data-anchor="mrd-p-wrappers-1">
+      Chapter 2 mentioned the wrapper messages &mdash; <code>Int32Value</code>,
+      <code>StringValue</code>, <code>BoolValue</code>, and their siblings
+      &mdash; as the &ldquo;old-fashioned way&rdquo; to get presence on a
+      scalar: wrap it in a message, since message fields always have explicit
+      presence. That was true, and for years it was the <em>only</em> way. It
+      isn't anymore. Protobuf's own doc comments on the wrapper types are
+      blunt about it: they were &ldquo;needed for legacy reasons&rdquo; and
+      are &ldquo;not recommended for use in new APIs,&rdquo; now that proto3's
+      <code>optional</code> keyword gives a plain scalar field real, native
+      presence &mdash; no wrapping required, no <code>.value</code> field to
+      unwrap on every read. The same doc comments go further: a wrapper has
+      <em>no</em> meaningful use inside a <code>repeated</code> field, a
+      <code>map</code>, or a <code>oneof</code>, because each of those already
+      has its own way to detect presence per element, per entry, or per
+      member.
+    </p>
+    <p data-anchor="mrd-p-wrappers-2">
+      So when would you still reach for one? Exactly one place: packing a bare
+      scalar into an <code>Any</code>, which is coming up next.
+      <code>Any</code> can only hold a message, so a lone <code>int32</code>
+      or <code>string</code> has nowhere to live unless it's wrapped in
+      something message-shaped first &mdash; and protobuf's guidance, even
+      there, is to prefer a small, purpose-documented wrapper message of your
+      own over the generic <code>Int32Value</code> for that job going forward.
+      Outside of that one corner, if you're writing a new proto3 field and you
+      want presence, write <code>optional int32</code>, not
+      <code>Int32Value</code>.
+    </p>
+    <div class="callout key-idea" data-anchor="mrd-callout-wrapper-legacy">
+      <span class="callout-label">A promise, kept a little differently</span>
+      Chapter 2's dangling thread said wrappers solve presence &ldquo;the
+      old-fashioned way.&rdquo; That phrasing was earning its keep: it's now
+      genuinely the old way. The new way is a keyword you already know.
+    </div>
+
+    <h2 data-anchor="mrd-h2-any">Any: honest extensibility, or an escape hatch?</h2>
+    <p data-anchor="mrd-p-any-1">
+      <code>google.protobuf.Any</code> holds two fields: a <code>type_url</code>
+      string naming the message type it contains (something like
+      <code>type.googleapis.com/google.protobuf.StringValue</code> &mdash; the
+      part after the last <code>/</code> is the type's fully-qualified name,
+      which is the only part that actually matters), and a <code>bytes
+      value</code> holding that message's serialized bytes. Three operations
+      cover everything you do with one: <strong>pack</strong> wraps a message
+      into an <code>Any</code>; <strong>unpack</strong> reads it back into a
+      typed message, checking <code>type_url</code> first; <strong>is</strong>
+      tests the type without unpacking. The URL prefix is bookkeeping only
+      &mdash; protobuf never built a type-resolution service that actually
+      lives at those URLs, and every implementation is explicitly told not to
+      try contacting one.
+    </p>
+    <figure data-anchor="mrd-fig-any">
+      <svg viewBox="0 0 700 190" role="img" aria-labelledby="mrd-fig-any-title">
+        <title id="mrd-fig-any-title">An Any message holds a type_url string and a bytes value; pack writes both, unpack checks type_url then decodes value, is checks type_url alone</title>
+        <rect x="20" y="40" width="230" height="110" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.5"/>
+        <text x="135" y="65" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--fn)">google.protobuf.Any</text>
+        <text x="135" y="95" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent)">type_url:</text>
+        <text x="135" y="110" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">"...&#47;catalog.v1.Product"</text>
+        <text x="135" y="132" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent)">value: &lt;serialized bytes&gt;</text>
+
+        <path d="M250 95 L330 95" stroke="var(--kw)" stroke-width="1.5" fill="none" marker-end="url(#mrd-arrow-any)"/>
+        <text x="290" y="83" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--kw)">unpack()</text>
+
+        <rect x="330" y="40" width="200" height="110" rx="8" fill="none" stroke="var(--ty)" stroke-dasharray="3 4" stroke-width="1.5"/>
+        <text x="430" y="70" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--ty)">Product</text>
+        <text x="430" y="92" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">the typed message,</text>
+        <text x="430" y="108" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">only if type_url</text>
+        <text x="430" y="124" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">matched first</text>
+
+        <path d="M578 40 L578 150" stroke="var(--rule)" stroke-width="1" stroke-dasharray="2 4"/>
+        <text x="640" y="98" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">is() checks</text>
+        <text x="640" y="114" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">type_url only,</text>
+        <text x="640" y="130" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">no decode</text>
+
+        <defs>
+          <marker id="mrd-arrow-any" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="var(--kw)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        pack/unpack/is are the entire surface area of Any &mdash; a type tag
+        and a byte blob, nothing more exotic underneath.
+      </figcaption>
+    </figure>
+    <p data-anchor="mrd-p-any-2">
+      Its JSON form has a matching two-tier shape: for a type without a
+      special-cased JSON encoding, an <code>Any</code> looks like that
+      message's own JSON with an extra <code>@type</code> key holding the type
+      URL; for a well-known type that <em>does</em> have a special JSON form
+      (<code>Timestamp</code>, the wrappers, <code>Struct</code>, and so on),
+      the <code>Any</code>'s JSON instead carries <code>@type</code> plus a
+      <code>value</code> key holding that special form.
+    </p>
+    <p data-anchor="mrd-p-any-3">
+      Here's the part worth actually weighing before you reach for
+      <code>Any</code>: it discards the static type safety protobuf otherwise
+      gives you for free. Every consumer still has to know the closed set of
+      types it might receive to do anything useful with the unpacked result
+      &mdash; so the &ldquo;openness&rdquo; is frequently an illusion. If that
+      set is known and controlled by one schema, a <code>oneof</code> of
+      concrete message types beats <code>Any</code> almost every time: you
+      get compiler-checked exhaustiveness and a direct typed accessor instead
+      of string-matching a <code>type_url</code>. <code>Any</code> earns its
+      place when producer and consumer genuinely don't share one schema
+      &mdash; an event envelope on a bus where publishers evolve
+      independently of subscribers, a multi-tenant system injecting
+      different payloads per tenant, a plugin point the schema author can't
+      enumerate in advance.
+    </p>
+    <div class="callout note" data-anchor="mrd-callout-any-vs-oneof">
+      <span class="callout-label">The question to ask first</span>
+      Before reaching for <code>Any</code>: &ldquo;do I actually know every
+      type that could show up here, and do I own that list?&rdquo; If yes,
+      that's a <code>oneof</code>. <code>Any</code> is for when the honest
+      answer is no.
+    </div>
+
+    <h2 data-anchor="mrd-h2-struct">Struct and Value: the JSON-shaped escape hatch</h2>
+    <p data-anchor="mrd-p-struct-1">
+      <code>Struct</code> is an unordered <code>map&lt;string, Value&gt;</code>;
+      <code>Value</code> is a <code>oneof</code> over
+      <code>null_value</code>, <code>number_value</code>,
+      <code>string_value</code>, <code>bool_value</code>,
+      <code>struct_value</code> (recursive), and <code>list_value</code>. Put
+      those together and you can round-trip an arbitrary JSON object through
+      a protobuf field &mdash; which is exactly, and only, the job it exists
+      for. Protobuf's own doc comment doesn't hedge about this: <em>&ldquo;If
+      you do not intend to parse arbitrary JSON into your message, a custom
+      typed message should be preferred instead of using this type.&rdquo;</em>
+      It also inherits JSON's own limits, since it's modeled on RFC&nbsp;8259
+      &mdash; no <code>NaN</code>, no <code>Infinity</code>, and no large
+      <code>int64</code> values that JSON's number type can't carry exactly.
+    </p>
+    <p data-anchor="mrd-p-struct-2">
+      The cost shows up the moment the shape <em>is</em> known. Every field
+      access through a <code>Struct</code> is a string-keyed map lookup
+      followed by a <code>oneof</code> kind-check, instead of a direct typed
+      field read &mdash; you've traded away the exact thing a schema is
+      supposed to buy you. The practitioner consensus matches the doc
+      comment: reserve <code>Struct</code>/<code>Value</code> for data that's
+      genuinely dynamic or arriving as passthrough from somewhere you don't
+      control &mdash; a config blob, a feature-flag payload, a third-party
+      webhook body &mdash; and define a real message the moment you can
+      describe the shape in a sentence.
+    </p>
+
+    <h2 data-anchor="mrd-h2-fieldmask">FieldMask: naming which fields you actually touched</h2>
+    <p data-anchor="mrd-p-fieldmask-1">
+      <code>FieldMask</code> is almost aggressively simple &mdash; one field,
+      <code>repeated string paths</code> &mdash; and it earns its whole
+      chapter entry from how that one field gets used. In a get or list
+      response, a mask filters the result down to just those paths (everything
+      else reads back at its default and is dropped from proto text output).
+      In an update, it's the mechanism behind partial updates: the request
+      carries a full message plus a mask naming exactly which fields to
+      write, and the server is expected to leave every field <em>not</em>
+      named in the mask untouched, even if the request message happens to
+      carry other populated values. This is the standard shape behind a
+      PATCH-style RPC &mdash; formalized in Google's own API design guidance
+      as the update-mask pattern &mdash; and it's the cleanest answer to a
+      question every CRUD-shaped service eventually asks: how do you update
+      three fields on a hundred-field resource without re-sending, and
+      risking overwriting, the other ninety-seven?
+    </p>
+    <p data-anchor="mrd-p-fieldmask-2">
+      Two structural rules matter once the target has nested messages or
+      repeated fields. A <code>repeated</code> field named by a path gets
+      new values <em>appended</em> to what's already there, not replaced
+      wholesale &mdash; and a repeated field is only legal at the
+      <em>last</em> position of a path, never in the middle. A sub-message
+      named at the last position is <em>merged</em> into the existing
+      sub-message rather than replacing it outright. Both defaults can be
+      overridden by a particular implementation, but that's the behavior to
+      assume unless you're told otherwise.
+    </p>
+    <pre data-anchor="mrd-code-fieldmask"><code><span class="cm">// target before:</span> f { b { d: 1  x: 2 }  c: [1] }
+<span class="cm">// update message:</span>   f { b { d: 10 }       c: [2] }
+<span class="cm">// mask:</span> paths: ["f.b", "f.c"]
+
+<span class="cm">// result:</span> f { b { d: 10  x: 2 }  c: [1, 2] }
+<span class="cm">//         (b merged, keeping x=2; c appended, not replaced)</span></code></pre>
+    <div class="callout warning" data-anchor="mrd-callout-fieldmask-casing">
+      <span class="callout-label">The casing gotcha that ships anyway</span>
+      A path uses the field's real <code>lower_snake_case</code> name in a
+      proto message &mdash; but the JSON encoding of a <code>FieldMask</code>
+      is one comma-separated string with each path converted to
+      <strong>lowerCamelCase</strong>: <code>mask: "user.displayName,photo"</code>,
+      not <code>"user.display_name,photo"</code>. A path built in the wrong
+      casing for its transport doesn't error &mdash; it just quietly fails to
+      match anything, and that's a real, recurring class of bug at REST/JSON
+      gateway boundaries.
+    </div>
+    <p data-anchor="mrd-p-fieldmask-3">
+      Two more edges worth knowing before you ship an update RPC. Google's own
+      API guidance expects update methods to support the special path
+      <code>"*"</code> to mean &ldquo;replace every field,&rdquo; and to treat
+      a wholly omitted mask as &ldquo;replace only the fields present in the
+      request&rdquo; &mdash; but different <code>FieldMask</code> library
+      implementations handle an empty mask or <code>"*"</code> inconsistently
+      in practice, so confirm your library's actual behavior rather than
+      assume it matches the spec's intent. And a well-behaved server is
+      expected to validate every incoming path against the target message's
+      real fields, returning an error for one that doesn't map to anything
+      &mdash; skip that check, and a typo'd path silently does nothing instead
+      of failing loudly.
+    </p>
+
+    <h2 data-anchor="mrd-h2-maps">Maps: convenient, with real limits</h2>
+    <p data-anchor="mrd-p-maps-1">
+      You met <code>map&lt;K, V&gt;</code> in Chapter 2 as sugar over a
+      repeated key/value message. The restrictions on <code>K</code> and
+      <code>V</code> are worth having memorized before you design around one.
+      A key must be an integral or <code>string</code>/<code>bool</code>
+      scalar &mdash; no floating point, no <code>bytes</code>, no message, no
+      enum. A value can be almost anything <em>except</em> another map:
+      <code>map&lt;string, map&lt;string, int32&gt;&gt;</code> simply doesn't
+      compile. Need nested maps anyway? Wrap the inner one in a message and
+      map to <em>that</em>.
+    </p>
+    <table class="cmp" data-anchor="mrd-table-map-restrictions">
+      <thead><tr><th></th><th>Allowed</th><th>Not allowed</th></tr></thead>
+      <tbody>
+        <tr><td>Key type</td><td>integral types, <code>string</code>, <code>bool</code></td><td><code>float</code>/<code>double</code>, <code>bytes</code>, message, enum</td></tr>
+        <tr><td>Value type</td><td>any scalar, message, or enum</td><td>another <code>map</code> (wrap it in a message instead)</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="mrd-p-maps-2">
+      The other limit is about behavior, not syntax: a map's iteration and
+      wire order are unspecified, and language runtimes don't agree on how
+      they fill that gap. Go's protobuf library only sorts map entries when a
+      caller explicitly asks for deterministic serialization; that guarantee
+      has been inconsistent, or missing outright, in other language
+      implementations at various points. If a field genuinely needs stable,
+      repeatable iteration order or ordered output, don't fight the map for
+      it &mdash; model it as <code>repeated SomeEntry</code> with explicit key
+      and value fields, the same shape a map compiles down to anyway, minus
+      the ordering ambiguity.
+    </p>
+
+    <h2 data-anchor="mrd-h2-repeated">Repeated fields don't have opinions about presence</h2>
+    <p data-anchor="mrd-p-repeated-1">
+      Chapter 2 established that a plain scalar field can't tell &ldquo;never
+      set&rdquo; apart from &ldquo;set to the zero value&rdquo; &mdash; that's
+      implicit presence. A <code>repeated</code> field has the exact same
+      blind spot, just one level up: an empty repeated field and a repeated
+      field that was never touched are wire-indistinguishable, for
+      <code>repeated int32</code> just as much as for
+      <code>repeated SomeMessage</code>. There's no such thing as
+      <code>repeated optional int32</code>, and there never will be &mdash;
+      presence, in protobuf, is a property of a field slot, and a repeated
+      field is a list of values with no individual slots to be absent from.
+    </p>
+    <p data-anchor="mrd-p-repeated-2">
+      So what do you do when a <em>list</em> needs presence &mdash; a list of
+      measurements where some readings are missing, a list of settings that
+      will eventually need more per-entry metadata than a bare value can
+      carry? You give each element its own slot by making the element a
+      message: <code>repeated Reading</code>, where <code>Reading</code>
+      itself has an <code>optional double value</code>, instead of
+      <code>repeated double</code>. A repeated <em>message</em> field gets
+      per-element presence and per-element room to grow for free, because
+      each element is now a whole message with its own field-presence rules
+      &mdash; something a repeated scalar field structurally cannot offer, no
+      matter how you squint at it.
+    </p>
+
+    <h2 data-anchor="mrd-h2-enums">Zero means &ldquo;didn't say&rdquo; &mdash; enums, done right</h2>
+    <p data-anchor="mrd-p-enums-1">
+      Chapter 2's <code>Status</code> enum started its list at
+      <code>STATUS_UNSPECIFIED = 0</code> rather than, say,
+      <code>IN_STOCK = 0</code>, and we noted the compiler requires <em>some</em>
+      value at zero. Here's the design reasoning behind reserving it for an
+      explicit sentinel instead of spending it on a real business value: an
+      unset enum field silently reads back as its zero value, exactly like an
+      unset scalar. If zero also means something &mdash; &ldquo;in
+      stock,&rdquo; say &mdash; then &ldquo;the caller never set a status&rdquo;
+      and &ldquo;the caller explicitly said in stock&rdquo; become the same
+      bit pattern, and there is no way, ever, for downstream code to tell
+      them apart. Reserving zero for <code>_UNSPECIFIED</code>/
+      <code>_UNKNOWN</code> is the enum version of the same discipline
+      <code>optional</code> gives you for scalars &mdash; it just can't be
+      opted out of, because the compiler makes you pick a zero value one way
+      or the other.
+    </p>
+    <p data-anchor="mrd-p-enums-2">
+      There's a second reason this convention matters, and it's about the
+      future, not just today: proto3 enums are <strong>open</strong>. A field
+      declared as an enum can legally hold any <code>int32</code>, not only
+      the values named in your <code>.proto</code> &mdash; which is what lets
+      a newer peer add <code>DISCONTINUED = 5</code> without breaking an older
+      reader that's never heard of it. What that older reader actually
+      <em>sees</em> depends on its language, and this is worth knowing before
+      it surprises you in production: C++ and Go simply hand back the raw,
+      out-of-range integer through the normal accessor &mdash; not coerced to
+      <code>UNSPECIFIED</code>, just an int your switch statement doesn't have
+      a case for. Java's generated enums are effectively closed by comparison
+      and instead surface a synthetic <code>UNRECOGNIZED</code> constant for
+      any value they don't recognize, while still exposing the real integer
+      through a separate accessor if you go looking for it. Either way, the
+      original number survives a round trip through re-serialization
+      untouched &mdash; it's only a rebuild-from-scratch, field-by-field copy
+      that would lose it, the same caveat unknown fields carried back in
+      Chapter&nbsp;4.
+    </p>
+    <div class="callout key-idea" data-anchor="mrd-callout-enum-open">
+      <span class="callout-label">Design for the reader who hasn't updated yet</span>
+      An <code>UNSPECIFIED</code> zero value and an open enum together mean:
+      old code degrades to &ldquo;I don't recognize this value&rdquo; instead
+      of crashing, misreading, or quietly treating a new value as the default.
+      That's the whole point &mdash; and it only works if you actually reserved
+      zero for it.
+    </div>
+
+    <h2 data-anchor="mrd-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="mrd-p-reflect-1">
+      Put together, everything in this chapter is one habit wearing different
+      outfits: before reaching for a type, ask what it can't tell you.
+      <code>double</code> can't tell you it rounded your money.
+      Plain <code>int32</code> can't tell you whether a status was set on
+      purpose. A bare <code>repeated double</code> can't tell you an entry is
+      missing rather than zero. <code>Any</code> can't tell your compiler what
+      it actually contains. <code>Struct</code> can't tell a reader what
+      shape to expect. Protobuf's well-known types and language features
+      &mdash; <code>Timestamp</code>, <code>Duration</code>,
+      <code>optional</code>, <code>oneof</code>, the
+      <code>UNSPECIFIED</code> convention &mdash; exist specifically to close
+      those gaps, one at a time, and each one is worth its small ceremony
+      exactly when the data genuinely needs what it buys.
+    </p>
+    <p data-anchor="mrd-p-reflect-2">
+      None of this stays true forever without discipline, though. A schema
+      that models today's data well can still break tomorrow's readers if a
+      field number gets reused or a type quietly changes shape. That's
+      exactly the discipline the next chapter is about.
+    </p>
+
+    <div class="callout note" data-anchor="mrd-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>A teammate proposes <code>double balance</code> for a ledger
+        field and argues &ldquo;doubles have plenty of precision for
+        dollars.&rdquo; Explain specifically what goes wrong, and name the
+        two fixed-point shapes from this chapter that fix it.</li>
+        <li>You're deciding between a <code>oneof</code> of three known
+        message types and an <code>Any</code> for an event payload field.
+        What single question about your producers and consumers should
+        decide it?</li>
+        <li>A <code>FieldMask</code>-driven update RPC works perfectly in
+        your Go backend's tests but silently no-ops every field when called
+        through the JSON/REST gateway. Given what you know about how
+        <code>FieldMask</code> paths are encoded in each format, name the
+        likely bug.</li>
+        <li>Why is <code>repeated optional int32</code> not a thing, and what
+        would you write instead if you needed a list of optionally-present
+        integers?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-code-generation-and-tooling.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-schema-evolution.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
