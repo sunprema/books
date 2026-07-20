@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="find-eyebrow">Chapter 13 &middot; Part V — Search &amp; Highlighting</p>
+    <h1 data-anchor="find-h1">Search</h1>
+
+    <p class="lead" data-anchor="find-lead">Every chapter so far has added one piece to a single, always-on
+    picture: the editor draws the file, and you move around and change it. Search is the first thing in this
+    book that isn't that. Press Ctrl-F and, for a little while, Kilo stops being a text editor and becomes a
+    tiny, purpose-built search prompt &mdash; a different loop, a different set of keys that do anything, and a
+    promise to hand you back exactly where you started if you back out. That promise, and the small pile of
+    state it takes to keep it, is the real subject of this chapter. The searching itself is nine lines and one
+    library call.</p>
+
+    <h2 data-anchor="find-h2-motivation">Motivation: a mode is a loop, not a flag</h2>
+    <p data-anchor="find-p-motivation-1">It would be easy to imagine "search mode" as a boolean somewhere in
+    <code class="inl">struct editorConfig</code> &mdash; <code class="inl">E.searching = 1</code> &mdash; checked
+    here and there by the ordinary keypress handler. Kilo doesn't do that. <code class="inl">editorFind(int
+    fd)</code> is called once, from one <code class="inl">case</code> in
+    <code class="inl">editorProcessKeypress</code>, and it does not return until you're done searching. Inside
+    it, there's a second <code class="inl">while(1)</code> loop with the exact same shape as
+    <code class="inl">main()</code>'s own &mdash; show something, read a key, act on it, repeat &mdash; except
+    this one shows a search prompt instead of the file, and reads keys for a much smaller vocabulary: type to
+    extend the query, arrows to jump between matches, Backspace to shrink it, Escape or Enter to leave. While
+    that inner loop is running, the outer one <em>isn't</em>. Ordinary movement, editing, save, and quit are
+    simply not being checked. A mode, in Kilo, is not a flag threaded through the normal dispatch &mdash; it's
+    its own event loop, borrowed and returned.</p>
+    <div class="callout key" data-anchor="find-callout-onlyloop">
+      <span class="tag">The only other while(1) in the file</span>
+      <p><code class="inl">main()</code>'s loop is <code class="inl">while(1){ editorRefreshScreen();
+      editorProcessKeypress(fd); }</code>. <code class="inl">editorFind</code>'s is the same two moves,
+      reordered and specialized: set the status line to the query, refresh, read one key, decide. Across the
+      roughly one thousand lines of kilo.c, these are the only two top-level loops that exist. Search isn't
+      layered on top of the main loop with extra bookkeeping &mdash; it's a second, smaller loop that
+      temporarily takes over.</p>
+    </div>
+
+    <h2 data-anchor="find-h2-design">Design: four numbers saved, so Escape can lie about time</h2>
+    <p data-anchor="find-p-design-1">Before that inner loop even starts, <code class="inl">editorFind</code>
+    saves the entire on-screen situation:</p>
+    <pre class="tab"><span class="ty">int</span> saved_cx = E.cx, saved_cy = E.cy;
+<span class="ty">int</span> saved_coloff = E.coloff, saved_rowoff = E.rowoff;</pre>
+    <p data-anchor="find-p-design-2">Four integers &mdash; the exact same four fields Chapter 09 built the whole
+    navigation and scrolling model around. That's the entire mechanism behind "cancel and go back to where I
+    was." There's no undo stack, no snapshot of the buffer &mdash; search never edits anything, so the buffer
+    needs no protecting. It only ever moves the cursor and the viewport, and those are four
+    <code class="inl">int</code>s. Save them going in; if you press Escape, write them straight back on the
+    way out, and the screen redraws next frame as if the search had never happened.</p>
+    <p data-anchor="find-p-design-3">Alongside those four, three more locals track the search itself:
+    <code class="inl">query</code> (a fixed 256-byte buffer, <code class="inl">KILO_QUERY_LEN</code>) and
+    <code class="inl">qlen</code> hold what you've typed; <code class="inl">last_match</code> is the row index
+    of the most recent hit, or <code class="inl">-1</code> for "no search has run yet against this query."
+    That <code class="inl">-1</code> does double duty as both "haven't searched" and "the query just changed,
+    search fresh" &mdash; both Backspace and typing a new character reset it, so the very next loop iteration
+    always re-searches rather than reusing a stale match.</p>
+
+    <h2 data-anchor="find-h2-impl">Implementation: editorFind, start to finish</h2>
+    <p data-anchor="find-p-impl-1">Here is the whole function. It's worth reading top to bottom once before the
+    chapter picks it apart, because nothing here is hidden behind another call &mdash; this <em>is</em> Kilo's
+    search, all of it:</p>
+    <pre class="tab"><span class="mac">#define</span> KILO_QUERY_LEN 256
+
+<span class="ty">void</span> <span class="fn">editorFind</span>(<span class="ty">int</span> fd) {
+    <span class="ty">char</span> query[KILO_QUERY_LEN+1] = {0};
+    <span class="ty">int</span> qlen = 0;
+    <span class="ty">int</span> last_match = -1; <span class="cm">/* Last line where a match was found. -1 for none. */</span>
+    <span class="ty">int</span> find_next = 0; <span class="cm">/* if 1 search next, if -1 search prev. */</span>
+    <span class="ty">int</span> saved_hl_line = -1;  <span class="cm">/* No saved HL */</span>
+    <span class="ty">char</span> *saved_hl = NULL;
+
+<span class="mac">#define</span> FIND_RESTORE_HL <span class="kw">do</span> { \
+    <span class="kw">if</span> (saved_hl) { \
+        memcpy(E.row[saved_hl_line].hl,saved_hl, E.row[saved_hl_line].rsize); \
+        free(saved_hl); \
+        saved_hl = NULL; \
+    } \
+} <span class="kw">while</span> (0)
+
+    <span class="cm">/* Save the cursor position in order to restore it later. */</span>
+    <span class="ty">int</span> saved_cx = E.cx, saved_cy = E.cy;
+    <span class="ty">int</span> saved_coloff = E.coloff, saved_rowoff = E.rowoff;
+
+    <span class="kw">while</span>(1) {
+        <span class="fn">editorSetStatusMessage</span>(
+            <span class="str">"Search: %s (Use ESC/Arrows/Enter)"</span>, query);
+        <span class="fn">editorRefreshScreen</span>();
+
+        <span class="ty">int</span> c = <span class="fn">editorReadKey</span>(fd);
+        <span class="kw">if</span> (c == DEL_KEY || c == CTRL_H || c == BACKSPACE) {
+            <span class="kw">if</span> (qlen != 0) query[--qlen] = <span class="str">'\0'</span>;
+            last_match = -1;
+        } <span class="kw">else if</span> (c == ESC || c == ENTER) {
+            <span class="kw">if</span> (c == ESC) {
+                E.cx = saved_cx; E.cy = saved_cy;
+                E.coloff = saved_coloff; E.rowoff = saved_rowoff;
+            }
+            FIND_RESTORE_HL;
+            <span class="fn">editorSetStatusMessage</span>(<span class="str">""</span>);
+            <span class="kw">return</span>;
+        } <span class="kw">else if</span> (c == ARROW_RIGHT || c == ARROW_DOWN) {
+            find_next = 1;
+        } <span class="kw">else if</span> (c == ARROW_LEFT || c == ARROW_UP) {
+            find_next = -1;
+        } <span class="kw">else if</span> (isprint(c)) {
+            <span class="kw">if</span> (qlen &lt; KILO_QUERY_LEN) {
+                query[qlen++] = c;
+                query[qlen] = <span class="str">'\0'</span>;
+                last_match = -1;
+            }
+        }
+
+        <span class="cm">/* Search occurrence. */</span>
+        <span class="kw">if</span> (last_match == -1) find_next = 1;
+        <span class="kw">if</span> (find_next) {
+            <span class="ty">char</span> *match = NULL;
+            <span class="ty">int</span> match_offset = 0;
+            <span class="ty">int</span> i, current = last_match;
+
+            <span class="kw">for</span> (i = 0; i &lt; E.numrows; i++) {
+                current += find_next;
+                <span class="kw">if</span> (current == -1) current = E.numrows-1;
+                <span class="kw">else if</span> (current == E.numrows) current = 0;
+                match = strstr(E.row[current].render,query);
+                <span class="kw">if</span> (match) {
+                    match_offset = match-E.row[current].render;
+                    <span class="kw">break</span>;
+                }
+            }
+            find_next = 0;
+
+            <span class="cm">/* Highlight */</span>
+            FIND_RESTORE_HL;
+
+            <span class="kw">if</span> (match) {
+                erow *row = &amp;E.row[current];
+                last_match = current;
+                <span class="kw">if</span> (row-&gt;hl) {
+                    saved_hl_line = current;
+                    saved_hl = malloc(row-&gt;rsize);
+                    memcpy(saved_hl,row-&gt;hl,row-&gt;rsize);
+                    memset(row-&gt;hl+match_offset,HL_MATCH,qlen);
+                }
+                E.cy = 0;
+                E.cx = match_offset;
+                E.rowoff = current;
+                E.coloff = 0;
+                <span class="cm">/* Scroll horizontally as needed. */</span>
+                <span class="kw">if</span> (E.cx &gt; E.screencols) {
+                    <span class="ty">int</span> diff = E.cx - E.screencols;
+                    E.cx -= diff;
+                    E.coloff += diff;
+                }
+            }
+        }
+    }
+}</pre>
+    <p data-anchor="find-p-impl-2">Walk it in three parts: what a keystroke does to the query, how a query
+    becomes a match, and what a match does to the screen.</p>
+
+    <h3 data-anchor="find-h3-keys">1. One keystroke, six possible outcomes</h3>
+    <p data-anchor="find-p-keys-1">Every trip through the loop reads exactly one key and falls into exactly one
+    branch. Delete/Backspace shrinks the query and invalidates <code class="inl">last_match</code>. Escape and
+    Enter both leave &mdash; the difference is entirely in the four lines guarded by <code class="inl">if (c ==
+    ESC)</code>, which restore the saved position; Enter skips that and simply accepts wherever the last match
+    left the cursor. The four arrow keys don't touch the query at all &mdash; they just set
+    <code class="inl">find_next</code> to <code class="inl">1</code> or <code class="inl">-1</code> and let the
+    search block below re-run from the current match in that direction. Anything else printable extends the
+    query. That's the whole vocabulary; every other key you might press &mdash; Ctrl-S, Ctrl-Q, a Page
+    Up/Down &mdash; simply falls through every <code class="inl">else if</code> and does nothing.</p>
+    <div class="callout warn" data-anchor="find-callout-escvsenter">
+      <span class="tag">Escape rewinds. Enter keeps.</span>
+      <p>It's tempting to think of Escape and Enter as two spellings of "close the search box," but they leave
+      you in different places. Enter accepts the match you're looking at as your new cursor position &mdash; the
+      saved <code class="inl">cx</code>/<code class="inl">cy</code>/<code class="inl">coloff</code>/<code
+      class="inl">rowoff</code> are simply discarded. Escape is the only key that writes them back. Search for
+      something, land on a match, and press Enter: you're there. Press Escape instead, after the exact same
+      search: you're back where you started, as if you'd never searched at all.</p>
+    </div>
+
+    <h3 data-anchor="find-h3-search">2. The search itself: a bounded, wrapping walk</h3>
+    <p data-anchor="find-p-search-1">Everything above only decides <em>whether</em> to search this iteration
+    (<code class="inl">find_next</code> nonzero) and in which direction. The actual search is nine lines: start
+    at <code class="inl">last_match</code>, step by <code class="inl">find_next</code>, and wrap around the
+    ends of the file &mdash; <code class="inl">current == -1</code> becomes the last row,
+    <code class="inl">current == E.numrows</code> becomes row zero. The loop runs <code class="inl">for (i = 0;
+    i &lt; E.numrows; i++)</code>, so it visits at most every row once and always terminates, whether or not the
+    query matches anywhere. Each row is tested with one call: <code class="inl">strstr(E.row[current].render,
+    query)</code>.</p>
+    <p data-anchor="find-p-search-2">Two things about that call are easy to assume wrong. First,
+    <code class="inl">strstr</code> is a plain C standard-library substring search &mdash; case-sensitive,
+    literal, no regular expressions, no wildcards, no whole-word matching. Second, it searches
+    <code class="inl">row-&gt;render</code>, not <code class="inl">row-&gt;chars</code>. Chapter 08 drew that
+    line carefully: <code class="inl">chars</code> is the raw bytes you typed or loaded, <code class="inl">
+    render</code> is the tab-expanded copy built purely so columns line up on screen. Search runs against the
+    on-screen version.</p>
+    <div class="callout key" data-anchor="find-callout-cyclic">
+      <span class="tag">Search wraps &mdash; in both directions</span>
+      <p>Because <code class="inl">current</code> is explicitly wrapped rather than clamped, searching forward
+      past the last line continues at line 0, and searching backward past line 0 continues at the last line.
+      There's no "not found, stop at the end" message distinct from an ordinary miss &mdash; if the query isn't
+      anywhere in the file, the loop simply runs its full <code class="inl">E.numrows</code> iterations, finds
+      nothing, and <code class="inl">match</code> stays <code class="inl">NULL</code>. The cursor and screen
+      just don't move that iteration; the prompt stays up, waiting for you to keep typing or give up.</p>
+    </div>
+
+    <h3 data-anchor="find-h3-highlight">3. Marking the match: borrow one row's highlight, briefly</h3>
+    <p data-anchor="find-p-highlight-1">A found match gets a visual cue: the matched span turns blue. Kilo
+    reaches for the machinery it already has &mdash; <code class="inl">row-&gt;hl</code>, the per-character
+    highlight-type array that Chapter 14 will cover in full &mdash; and repurposes it for exactly one iteration.
+    <code class="inl">HL_MATCH</code> (value 8, the last entry in the highlight-type list) is defined for this
+    single purpose, and <code class="inl">editorSyntaxToColor()</code> maps it to ANSI color 34, blue. Before
+    overwriting anything, <code class="inl">editorFind</code> copies the matched row's <em>current</em>
+    <code class="inl">hl</code> bytes into <code class="inl">saved_hl</code>, then
+    <code class="inl">memset()</code>s <code class="inl">HL_MATCH</code> across just the matched span:
+    <code class="inl">memset(row-&gt;hl+match_offset, HL_MATCH, qlen)</code>.</p>
+    <p data-anchor="find-p-highlight-2">The <code class="inl">FIND_RESTORE_HL</code> macro undoes exactly that
+    &mdash; copies <code class="inl">saved_hl</code> back over <code class="inl">row-&gt;hl</code> and frees it.
+    It's called twice: once at the top of every new match (so moving to match two restores match one's row
+    before touching anything else), and once more on the way out through Escape or Enter (so no stray blue
+    survives after the prompt closes). Notice the shape: <code class="inl">saved_hl_line</code> and
+    <code class="inl">saved_hl</code> are single variables, not a stack. Kilo only ever remembers one patched row
+    at a time, because only one match is ever highlighted at once.</p>
+    <div class="callout warn" data-anchor="find-callout-notanewfeature">
+      <span class="tag">Not a new highlighting feature &mdash; a one-row memset</span>
+      <p>It's easy to read <code class="inl">HL_MATCH</code> and assume the syntax highlighter has learned about
+      search results as a category it understands. It hasn't. <code class="inl">editorUpdateSyntax()</code> (Chapter
+      14) never emits <code class="inl">HL_MATCH</code> itself; nothing about parsing keywords, strings, or
+      comments knows search exists. <code class="inl">editorFind</code> just borrows the array those functions
+      already fill, overwrites a few bytes of it directly, and puts them back. It's a display trick riding on
+      top of the highlighter's storage, not a change to the highlighter.</p>
+    </div>
+
+    <h2 data-anchor="find-h2-viewport">Landing on a match: search moves the viewport, not just the cursor</h2>
+    <p data-anchor="find-p-viewport-1">Once a match is found, four assignments reposition the screen:
+    <code class="inl">E.cy = 0; E.cx = match_offset; E.rowoff = current; E.coloff = 0;</code>. Recall from
+    Chapter 09 that the row actually on screen is always <code class="inl">E.rowoff + E.cy</code> &mdash; so
+    setting <code class="inl">E.cy</code> to zero and <code class="inl">E.rowoff</code> to the matched row's
+    index doesn't just bring that row into view, it puts it on the very <em>first</em> visible screen line,
+    every time, no matter where it was before. That's a genuinely different scrolling policy from
+    <code class="inl">editorMoveCursor</code>, which only scrolls the minimum amount needed to keep the cursor
+    somewhere on screen. Search doesn't nudge the viewport &mdash; it recenters it, hard, on every single match.</p>
+    <div class="callout warn" data-anchor="find-callout-offbyone">
+      <span class="tag">Callback to Chapter 09: a one-column difference from the established pattern</span>
+      <p>Right after repositioning, <code class="inl">editorFind</code> does its own horizontal-scroll check for
+      a match that lands past the right edge: <code class="inl">if (E.cx &gt; E.screencols) { int diff = E.cx -
+      E.screencols; E.cx -= diff; E.coloff += diff; }</code>. Work through the arithmetic and
+      <code class="inl">E.cx</code> ends up at exactly <code class="inl">E.screencols</code>. Compare that to
+      <code class="inl">editorMoveCursor</code>'s equivalent clamp, established back in Chapter 09:
+      <code class="inl">if (E.cx &gt; E.screencols-1) { E.coloff = E.cx-E.screencols+1; E.cx =
+      E.screencols-1; }</code> &mdash; which lands one column earlier. Chapter 09 fixed
+      <code class="inl">[0, E.screencols)</code> as the valid on-screen range for <code class="inl">E.cx</code>;
+      this branch in <code class="inl">editorFind</code> can leave it one past that. It's a narrow inconsistency,
+      only reachable when a match sits right at the screen's right edge &mdash; not a documented feature, just
+      two independent pieces of clamping code that don't quite agree.</p>
+    </div>
+    <p data-anchor="find-p-viewport-2">There's a second, quieter subtlety in that same block, worth having once
+    you already know the render/chars split from Chapter 08. <code class="inl">match_offset</code> is computed
+    against <code class="inl">row-&gt;render</code> &mdash; the tab-expanded string, where one tab byte can occupy
+    up to eight screen columns. But <code class="inl">E.cx</code>, everywhere else it's used (the cursor-drawing
+    loop inside <code class="inl">editorRefreshScreen</code>, for one), is counted against
+    <code class="inl">row-&gt;chars</code> &mdash; the raw, un-expanded bytes, from <code class="inl">
+    E.coloff</code>. For a line with no tabs before the match, <code class="inl">chars</code> and
+    <code class="inl">render</code> agree byte-for-byte and nothing goes wrong. For a match on a line that
+    <em>does</em> have a tab earlier in it, the two indices diverge, and <code class="inl">E.cx</code> ends up
+    counted in the wrong unit for that row. It's a real gap, and a narrow one &mdash; it only shows up on tabbed
+    lines, and Kilo's own source files rarely mix tabs with the kind of text you'd search for.</p>
+
+    <h2 data-anchor="find-h2-edge">Edge cases: what editorFind quietly guarantees (and doesn't)</h2>
+    <ul data-anchor="find-ul-edge">
+      <li data-anchor="find-li-edge-1"><strong>Search is fully modal.</strong> While
+      <code class="inl">editorFind</code>'s loop runs, <code class="inl">editorProcessKeypress</code>'s normal
+      switch never executes. You cannot save, move with Page Up/Down, or start editing while the search prompt
+      is open &mdash; only the keys editorFind explicitly checks do anything.</li>
+      <li data-anchor="find-li-edge-2"><strong>An empty query always "matches" the current position.</strong>
+      Before you've typed anything, <code class="inl">last_match == -1</code> forces a forward search with
+      <code class="inl">query</code> empty; <code class="inl">strstr(anything, "")</code> returns the haystack
+      itself at offset 0, so the very first row scanned counts as a hit at column 0. Opening search and
+      immediately pressing Enter jumps you to the top of whichever row the scan starts from.</li>
+      <li data-anchor="find-li-edge-3"><strong>No match anywhere leaves you exactly where you are.</strong> The
+      scan loop always terminates after at most <code class="inl">E.numrows</code> steps; if nothing matches,
+      <code class="inl">match</code> stays <code class="inl">NULL</code>, the cursor/viewport block is skipped
+      entirely, and the prompt just keeps showing your query, waiting.</li>
+      <li data-anchor="find-li-edge-4"><strong>Search is case-sensitive and literal.</strong> It's
+      <code class="inl">strstr()</code>, nothing more &mdash; no case folding, no regex metacharacters treated
+      specially. A query of <code class="inl">"."</code> matches a literal period, not "any character."</li>
+      <li data-anchor="find-li-edge-5"><strong>The highlight patch never outlives the search.</strong>
+      <code class="inl">FIND_RESTORE_HL</code> runs on both exit paths, so no row keeps a phantom
+      <code class="inl">HL_MATCH</code> span after you leave search mode &mdash; whether you left by finding
+      something (Enter) or backing out (Escape).</li>
+      <li data-anchor="find-li-edge-6"><strong>The query has a hard ceiling.</strong>
+      <code class="inl">KILO_QUERY_LEN</code> is 256; typing past it is silently ignored (the
+      <code class="inl">qlen &lt; KILO_QUERY_LEN</code> guard just stops appending), not truncated with a warning
+      or rejected with a bell.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="find-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>Two ideas, and they're both small. First: a temporary UI mode doesn't need a flag threaded through the
+      main dispatch loop &mdash; it can just be its own tiny event loop, called once, returning when it's done.
+      Everything about "how do I get back to normal editing" falls out of that shape for free: normal editing
+      resumes automatically the instant <code class="inl">editorFind</code> returns, because it's the same
+      <code class="inl">editorProcessKeypress</code> call stack that invoked it in the first place. Second: state
+      that a mode needs to <em>undo</em> is just data you save before you start and restore if you bail &mdash;
+      here, four integers already defined by Chapter 09's navigation model, no new struct required. The search
+      algorithm itself, strip away all of that scaffolding, is a single <code class="inl">strstr()</code> call in
+      a wrapping loop. Everything genuinely interesting in this chapter was about the mode, not the matching.</p>
+    </div>
+
+    <div class="challenges" data-anchor="find-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Add case-insensitive search: what would have to change in the scan loop, given that
+        <code class="inl">strstr</code> itself has no case-insensitive variant in the standard library? (Hint:
+        look at what <code class="inl">strcasestr</code> offers on systems that have it, and what you'd write if
+        it didn't.)</li>
+        <li><code class="inl">editorFind</code> fixes the one-column difference from
+        <code class="inl">editorMoveCursor</code>'s horizontal-scroll clamp described above. Write the corrected
+        version, and explain what visible symptom the current code could produce &mdash; and how narrow a case
+        it would take to actually see it.</li>
+        <li>Kilo has no "search and replace." Sketch what you'd add to <code class="inl">editorFind</code>'s key
+        handling to support it &mdash; a new key that types a replacement into a second buffer, and a case that
+        performs the substitution on the currently highlighted match. What has to happen to
+        <code class="inl">row-&gt;chars</code>, <code class="inl">row-&gt;render</code>, and
+        <code class="inl">E.dirty</code> when a replacement actually lands?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="find-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — editorFind, FIND_RESTORE_HL, HL_MATCH, editorSyntaxToColor, editorProcessKeypress (CTRL_F), editorMoveCursor</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="12-saving-files.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="14-syntax-highlighting-basics.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

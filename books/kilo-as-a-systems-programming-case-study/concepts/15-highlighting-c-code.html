@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Highlighting C Code — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="hlc-eyebrow">Chapter 15 &middot; Part V — Search &amp; Highlighting</p>
+    <h1 data-anchor="hlc-h1">Highlighting C Code</h1>
+
+    <p class="lead" data-anchor="hlc-lead">Last chapter built the scaffolding and elided one block: the actual
+    body of <code class="inl">editorUpdateSyntax</code>'s <code class="inl">while(*p)</code> loop, the part that
+    decides &mdash; one character at a time &mdash; whether you're looking at a comment, a string, a number, or a
+    keyword. That block is not a lexer in the sense a compiler course would teach you the word. It's about a
+    hundred lines of C, four <code class="inl">if</code> chains stacked in a fixed order, three scalars of memory,
+    and a single NULL-terminated array of strings. No tokens are ever allocated. No tree is ever built. And it
+    correctly colors real C and C++ source, keywords and types in different colors, strings that survive an
+    escaped quote, comments that survive a line break. This chapter is that block, read slowly, in the order its
+    author had to write it in: what has to be checked first, and why.</p>
+
+    <h2 data-anchor="hlc-h2-motivation">Motivation: one language, one table, one array of strings</h2>
+    <p data-anchor="hlc-p-motivation-1">Kilo ships exactly one entry in its language table, and it's for C and
+    C++. Everything this chapter walks through lives in two file-scope arrays and a two-field struct, all defined
+    together, above <code class="inl">main()</code>:</p>
+    <pre class="tab">char *C_HL_extensions[] = {<span class="str">".c"</span>,<span class="str">".h"</span>,<span class="str">".cpp"</span>,<span class="str">".hpp"</span>,<span class="str">".cc"</span>,NULL};
+char *C_HL_keywords[] = {
+	<span class="cm">/* C Keywords */</span>
+	<span class="str">"auto"</span>,<span class="str">"break"</span>,<span class="str">"case"</span>,<span class="str">"continue"</span>,<span class="str">"default"</span>,<span class="str">"do"</span>,<span class="str">"else"</span>,<span class="str">"enum"</span>,
+	<span class="str">"extern"</span>,<span class="str">"for"</span>,<span class="str">"goto"</span>,<span class="str">"if"</span>,<span class="str">"register"</span>,<span class="str">"return"</span>,<span class="str">"sizeof"</span>,<span class="str">"static"</span>,
+	<span class="str">"struct"</span>,<span class="str">"switch"</span>,<span class="str">"typedef"</span>,<span class="str">"union"</span>,<span class="str">"volatile"</span>,<span class="str">"while"</span>,<span class="str">"NULL"</span>,
+
+	<span class="cm">/* C++ Keywords */</span>
+	<span class="str">"alignas"</span>,<span class="str">"alignof"</span>,<span class="str">"and"</span>, <span class="cm">/* ...45 more... */</span> <span class="str">"xor_eq"</span>,
+
+	<span class="cm">/* C types */</span>
+        <span class="str">"int|"</span>,<span class="str">"long|"</span>,<span class="str">"double|"</span>,<span class="str">"float|"</span>,<span class="str">"char|"</span>,<span class="str">"unsigned|"</span>,<span class="str">"signed|"</span>,
+        <span class="str">"void|"</span>,<span class="str">"short|"</span>,<span class="str">"auto|"</span>,<span class="str">"const|"</span>,<span class="str">"bool|"</span>,NULL
+};
+
+struct editorSyntax HLDB[] = {
+    {
+        <span class="cm">/* C / C++ */</span>
+        C_HL_extensions,
+        C_HL_keywords,
+        <span class="str">"//"</span>,<span class="str">"/*"</span>,<span class="str">"*/"</span>,
+        HL_HIGHLIGHT_STRINGS | HL_HIGHLIGHT_NUMBERS
+    }
+};</pre>
+    <p data-anchor="hlc-p-motivation-2">Read <code class="inl">C_HL_keywords</code> closely and it's actually
+    three lists taped end to end with no struct boundary between them: plain C keywords, then C++ keywords, then
+    C/C++ type names &mdash; <code class="inl">int</code>, <code class="inl">char</code>, <code
+    class="inl">unsigned</code> and friends. The only thing marking that third group as different is a trailing
+    <code class="inl">|</code> baked into the string itself: <code class="inl">"int|"</code>, not
+    <code class="inl">"int"</code>. That one extra byte is the entire mechanism this chapter is going to spend a
+    section on, because it's the thing that lets <code class="inl">int</code> come out green (a type) and
+    <code class="inl">return</code> come out yellow (a keyword) from what is, structurally, the exact same
+    matching loop.</p>
+    <div class="callout key" data-anchor="hlc-callout-onelanguage">
+      <span class="tag">One HLDB entry, not a plugin system</span>
+      <p><code class="inl">HLDB</code> (Chapter 14 read it as <code class="inl">E.syntax</code>, already
+      selected) is declared as an array with exactly one element. Nothing about the mechanism you're reading this
+      chapter forces that &mdash; the struct has a <code class="inl">char **extensions</code> field precisely so a
+      second entry, for Python or JSON or Markdown, could sit right next to this one. Chapter 16 is where that
+      door gets opened. For now, every filename that isn't <code class="inl">.c</code>, <code class="inl">.h</code>,
+      <code class="inl">.cpp</code>, <code class="inl">.hpp</code>, or <code class="inl">.cc</code> gets
+      <code class="inl">E.syntax == NULL</code> and, per Chapter 14, no highlighting at all.</p>
+    </div>
+
+    <h2 data-anchor="hlc-h2-design">Design: a fixed order of checks, not a grammar</h2>
+    <p data-anchor="hlc-p-design-1">Here's the whole scan body &mdash; the block Chapter 14 folded down to a
+    comment. It's one <code class="inl">while(*p)</code> loop, and every character of the row passes through it
+    exactly once, landing in exactly one of five branches before the loop's bottom is ever reached:</p>
+    <pre class="tab"><span class="kw">while</span>(*p) {
+    <span class="cm">/* Handle // comments. */</span>
+    <span class="kw">if</span> (prev_sep &amp;&amp; *p == scs[0] &amp;&amp; *(p+1) == scs[1]) {
+        <span class="cm">/* From here to end is a comment */</span>
+        memset(row-&gt;hl+i,HL_COMMENT,row-&gt;size-i);
+        <span class="kw">return</span>;
+    }
+
+    <span class="cm">/* Handle multi line comments. */</span>
+    <span class="kw">if</span> (in_comment) {
+        row-&gt;hl[i] = HL_MLCOMMENT;
+        <span class="kw">if</span> (*p == mce[0] &amp;&amp; *(p+1) == mce[1]) {
+            row-&gt;hl[i+1] = HL_MLCOMMENT;
+            p += 2; i += 2;
+            in_comment = 0;
+            prev_sep = 1;
+            <span class="kw">continue</span>;
+        } <span class="kw">else</span> {
+            prev_sep = 0;
+            p++; i++;
+            <span class="kw">continue</span>;
+        }
+    } <span class="kw">else if</span> (*p == mcs[0] &amp;&amp; *(p+1) == mcs[1]) {
+        row-&gt;hl[i] = HL_MLCOMMENT;
+        row-&gt;hl[i+1] = HL_MLCOMMENT;
+        p += 2; i += 2;
+        in_comment = 1;
+        prev_sep = 0;
+        <span class="kw">continue</span>;
+    }
+
+    <span class="cm">/* Handle "" and '' */</span>
+    <span class="kw">if</span> (in_string) {
+        row-&gt;hl[i] = HL_STRING;
+        <span class="kw">if</span> (*p == <span class="str">'\\'</span>) {
+            row-&gt;hl[i+1] = HL_STRING;
+            p += 2; i += 2;
+            prev_sep = 0;
+            <span class="kw">continue</span>;
+        }
+        <span class="kw">if</span> (*p == in_string) in_string = 0;
+        p++; i++;
+        <span class="kw">continue</span>;
+    } <span class="kw">else</span> {
+        <span class="kw">if</span> (*p == <span class="str">'"'</span> || *p == <span class="str">'\''</span>) {
+            in_string = *p;
+            row-&gt;hl[i] = HL_STRING;
+            p++; i++;
+            prev_sep = 0;
+            <span class="kw">continue</span>;
+        }
+    }
+
+    <span class="cm">/* Handle non printable chars. */</span>
+    <span class="kw">if</span> (!isprint(*p)) {
+        row-&gt;hl[i] = HL_NONPRINT;
+        p++; i++;
+        prev_sep = 0;
+        <span class="kw">continue</span>;
+    }
+
+    <span class="cm">/* Handle numbers */</span>
+    <span class="kw">if</span> ((isdigit(*p) &amp;&amp; (prev_sep || row-&gt;hl[i-1] == HL_NUMBER)) ||
+        (*p == <span class="str">'.'</span> &amp;&amp; i &gt;0 &amp;&amp; row-&gt;hl[i-1] == HL_NUMBER)) {
+        row-&gt;hl[i] = HL_NUMBER;
+        p++; i++;
+        prev_sep = 0;
+        <span class="kw">continue</span>;
+    }
+
+    <span class="cm">/* Handle keywords and lib calls */</span>
+    <span class="kw">if</span> (prev_sep) {
+        <span class="ty">int</span> j;
+        <span class="kw">for</span> (j = 0; keywords[j]; j++) {
+            <span class="ty">int</span> klen = strlen(keywords[j]);
+            <span class="ty">int</span> kw2 = keywords[j][klen-1] == <span class="str">'|'</span>;
+            <span class="kw">if</span> (kw2) klen--;
+
+            <span class="kw">if</span> (!memcmp(p,keywords[j],klen) &amp;&amp;
+                is_separator(*(p+klen)))
+            {
+                <span class="cm">/* Keyword */</span>
+                memset(row-&gt;hl+i,kw2 ? HL_KEYWORD2 : HL_KEYWORD1,klen);
+                p += klen;
+                i += klen;
+                <span class="kw">break</span>;
+            }
+        }
+        <span class="kw">if</span> (keywords[j] != NULL) {
+            prev_sep = 0;
+            <span class="kw">continue</span>; <span class="cm">/* We had a keyword match */</span>
+        }
+    }
+
+    <span class="cm">/* Not special chars */</span>
+    prev_sep = is_separator(*p);
+    p++; i++;
+}</pre>
+    <p data-anchor="hlc-p-design-2">Notice the order, because the order <em>is</em> the design. Comments are
+    checked before strings, strings before numbers, numbers before keywords, and anything left over falls through
+    to "not special chars" at the very bottom. That's not arbitrary &mdash; it's a priority list for a genuinely
+    ambiguous character stream. A <code class="inl">"</code> inside a <code class="inl">/* */</code> comment must
+    not open a string; a digit inside a string literal must not get colored as a number; a keyword-shaped
+    substring inside a comment must not get colored as a keyword. Checking comment state first, then string
+    state, then everything else, is what guarantees each of those. Get the order wrong and <code
+    class="inl">"don't"</code> would try to open a second string at the apostrophe.</p>
+    <div class="callout warn" data-anchor="hlc-callout-order">
+      <span class="tag">The order is load-bearing, not stylistic</span>
+      <p>Every branch that fires ends in a <code class="inl">continue</code> (or, for the single-line-comment
+      case, a <code class="inl">return</code>) &mdash; it never falls through to a later check in the same
+      iteration. That's what makes "comments before strings before numbers before keywords" an actual guarantee
+      instead of a suggestion: once <code class="inl">in_comment</code> or <code class="inl">in_string</code> is
+      true, the loop's very first two <code class="inl">if</code>s intercept the character before the number or
+      keyword branches ever see it. Reorder those blocks and you change what's allowed to nest inside what.</p>
+    </div>
+
+    <h2 data-anchor="hlc-h2-comments">Comments: one line ends the function, one line waits for its closer</h2>
+    <p data-anchor="hlc-p-comments-1">Single-line comments get the simplest treatment in the whole scan, because
+    a <code class="inl">//</code> answers every remaining question about the row at once: <code
+    class="inl">memset(row-&gt;hl+i,HL_COMMENT,row-&gt;size-i); return;</code>. One call paints everything from here
+    to the end of the row, and the function returns immediately &mdash; it never reaches the multi-line-comment
+    propagation logic at the bottom (Chapter 14's <code class="inl">hl_oc</code> machinery) for this row, because
+    a row that ends inside a <code class="inl">//</code> comment can't also be ending inside an unterminated
+    <code class="inl">/* */</code> comment; the two are mutually exclusive by construction.</p>
+    <div class="callout warn" data-anchor="hlc-callout-size-vs-rsize">
+      <span class="tag">row-&gt;size, not row-&gt;rsize</span>
+      <p>Look closely at that memset: <code class="inl">row->size-i</code>. Every other branch in this function
+      writes into <code class="inl">row->hl</code> using offsets measured against <code
+      class="inl">row->rsize</code> (the tab-expanded, on-screen length Chapter 08 introduced) &mdash; because
+      <code class="inl">hl</code> is allocated to <code class="inl">rsize</code>, and the scan pointer <code
+      class="inl">p</code> walks <code class="inl">row->render</code>. This one line reaches for <code
+      class="inl">row->size</code>, the raw <code class="inl">chars</code> length, instead. On a row with no
+      tabs the two are equal and nothing goes wrong; on one with tabs before a trailing <code
+      class="inl">//</code>, <code class="inl">size</code> can undercount how far into <code class="inl">hl</code>
+      needs painting. It's a real inconsistency in kilo.c's source, not a subtlety to smooth over &mdash; worth
+      noticing precisely because the surrounding code is so consistent about the <code class="inl">chars</code>
+      vs. <code class="inl">render</code> split everywhere else.</p>
+    </div>
+    <p data-anchor="hlc-p-comments-2">Multi-line comments need more state because they can't be resolved in one
+    memset &mdash; the loop has to keep scanning to find the closer, or run off the end of the row still open (and
+    hand that fact to the next row via <code class="inl">hl_oc</code>, exactly as Chapter 14 described). Three
+    branches cover it. Already inside one (<code class="inl">in_comment</code> true): color the current character
+    <code class="inl">HL_MLCOMMENT</code>, then check whether it and the next character spell the closer
+    (<code class="inl">mce</code>, <code class="inl">"*/"</code> for C) &mdash; if so, color both characters,
+    advance past both, and clear <code class="inl">in_comment</code>; if not, color just this one character and
+    keep going. Not yet inside one: check whether the current pair spells the opener (<code
+    class="inl">mcs</code>, <code class="inl">"/*"</code>), and if so, color both opener characters immediately
+    and set <code class="inl">in_comment = 1</code>.</p>
+    <p data-anchor="hlc-p-comments-3">One asymmetry is easy to miss on a first read: the single-line-comment check
+    is gated on <code class="inl">prev_sep</code>, but opening a multi-line comment is not. <code
+    class="inl">x/*comment*/</code>, with no space before the <code class="inl">/*</code>, still opens a comment
+    correctly &mdash; the <code class="inl">*p == mcs[0] && *(p+1) == mcs[1]</code> check runs regardless of
+    what came before. A stray <code class="inl">//</code> glued onto an identifier, by contrast, only counts as a
+    comment start if the scan is sitting at a token boundary when it sees it.</p>
+
+    <h2 data-anchor="hlc-h2-strings">Strings: a two-state machine that remembers which quote it opened with</h2>
+    <p data-anchor="hlc-p-strings-1"><code class="inl">in_string</code> isn't a boolean &mdash; it's declared
+    <code class="inl">int</code> and holds either <code class="inl">0</code> (not in a string) or the literal
+    quote character currently open, <code class="inl">'"'</code> or <code class="inl">'\''</code>. That single
+    design choice is what makes <code class="inl">"it's fine"</code> highlight correctly: the apostrophe inside
+    the double-quoted string doesn't close anything, because closing only happens when <code
+    class="inl">*p == in_string</code> &mdash; and <code class="inl">in_string</code> is holding <code
+    class="inl">'"'</code>, not <code class="inl">'\''</code>. A single-quoted string started with <code
+    class="inl">'</code> can only be closed by another <code class="inl">'</code>; a double-quoted one, only by
+    another <code class="inl">"</code>.</p>
+    <p data-anchor="hlc-p-strings-2">Entering a string colors the opening quote and records which one it was:
+    <code class="inl">if (*p == '"' || *p == '\'') { in_string = *p; row-&gt;hl[i] = HL_STRING; p++; i++; prev_sep
+    = 0; continue; }</code>. Once inside, every character is colored <code class="inl">HL_STRING</code>
+    unconditionally &mdash; except a backslash, which is special-cased to consume itself <em>and</em> the
+    character right after it as a pair: <code class="inl">if (*p == '\\') { row-&gt;hl[i+1] = HL_STRING; p += 2; i
+    += 2; prev_sep = 0; continue; }</code>. That's the entire escape mechanism. It doesn't check whether the
+    escaped character is a real C escape sequence &mdash; <code class="inl">\n</code>, <code
+    class="inl">\"</code>, and the nonsense <code class="inl">\q</code> are all treated identically, colored and
+    skipped as a pair. The highlighter isn't validating your escapes; it's only making sure a backslash-quote
+    can't be mistaken for the string's actual closer.</p>
+    <div class="callout key" data-anchor="hlc-callout-quote-identity">
+      <span class="tag">Closing checks identity, not "a quote"</span>
+      <p><code class="inl">if (*p == in_string) in_string = 0;</code> &mdash; this line is why mismatched quotes
+      can't accidentally close each other. It isn't asking "is this character a quote mark", it's asking "is this
+      character <em>the specific</em> quote mark that opened the string I'm currently in." The backslash branch
+      above it runs first and <code class="inl">continue</code>s past this line entirely for an escaped
+      character, so an escaped quote never even reaches this identity check.</p>
+    </div>
+
+    <h2 data-anchor="hlc-h2-numbers">Numbers: no lookahead, just "was the last thing also a digit"</h2>
+    <p data-anchor="hlc-p-numbers-1">The number rule is the shortest branch in the scan and the one with the
+    least state: <code class="inl">if ((isdigit(*p) && (prev_sep || row-&gt;hl[i-1] == HL_NUMBER)) || (*p == '.'
+    && i &gt;0 && row-&gt;hl[i-1] == HL_NUMBER))</code>. Read it as two separate permissions. A digit is allowed
+    to become <code class="inl">HL_NUMBER</code> if either it's the first character of a new token (<code
+    class="inl">prev_sep</code>) or the character right before it was already classified <code
+    class="inl">HL_NUMBER</code> &mdash; that second clause is what lets a multi-digit run like <code
+    class="inl">1024</code> continue past its first digit without <code class="inl">prev_sep</code> being true
+    the whole way through (after the first <code class="inl">1</code>, <code class="inl">prev_sep</code> gets set
+    to 0 by that branch's own last line). A literal <code class="inl">.</code> is allowed to become <code
+    class="inl">HL_NUMBER</code> only under the second condition &mdash; it can extend a number already in
+    progress (<code class="inl">3.14</code>), but it can never <em>start</em> one on its own.</p>
+    <p data-anchor="hlc-p-numbers-2">There's no separate state variable for "am I inside a number" the way
+    there is for strings and comments &mdash; the previous character's own <code class="inl">hl</code> byte
+    <em>is</em> the state. That's a genuinely different technique from the other three branches, and it's cheap
+    exactly because a number, unlike a string or comment, can never span more than the current row and never
+    needs anything remembered past the character immediately behind it.</p>
+    <div class="callout warn" data-anchor="hlc-callout-number-gaps">
+      <span class="tag">What this rule can't do</span>
+      <p>Read literally, the number rule has no concept of a number as a unit, only "does this one character
+      extend the previous one." Two consequences worth naming rather than glossing over: a standalone <code
+      class="inl">.</code> (a struct member access like <code class="inl">p.x</code>) is never colored as a
+      number, because it only qualifies by following a digit already marked <code class="inl">HL_NUMBER</code> —
+      correct here, but incidentally so. And a leading minus sign is never part of the number at all: in <code
+      class="inl">-5</code>, the <code class="inl">-</code> is just punctuation (it satisfies <code
+      class="inl">is_separator</code>), so only the <code class="inl">5</code> is colored. An exponent like <code
+      class="inl">1e10</code> breaks the rule outright &mdash; <code class="inl">1</code> is colored, <code
+      class="inl">e</code> is not a digit so the run stops, and <code class="inl">10</code> never resumes
+      because <code class="inl">prev_sep</code> is false at that point and <code class="inl">hl[i-1]</code>
+      (the <code class="inl">e</code>'s slot) isn't <code class="inl">HL_NUMBER</code>. These aren't bugs to
+      patch here &mdash; they're the shape of what "one character of lookbehind, no more" buys and costs.</p>
+    </div>
+
+    <h2 data-anchor="hlc-h2-keywords">Keywords: a table scan, a trailing pipe, and a boundary check</h2>
+    <p data-anchor="hlc-p-keywords-1">The keyword branch is the most machinery of the five, and it's worth
+    reading top to bottom. First, it only even runs when <code class="inl">prev_sep</code> is true &mdash; the
+    scan has to be sitting at the start of a token before it bothers checking the keyword table at all. That's
+    what stops <code class="inl">"reprintf"</code> from being flagged partway through as containing <code
+    class="inl">"printf"</code>: by the time the scan reaches the <code class="inl">p</code> in the middle of the
+    word, <code class="inl">prev_sep</code> is already false.</p>
+    <p data-anchor="hlc-p-keywords-2">Given <code class="inl">prev_sep</code>, it walks <code
+    class="inl">keywords[]</code> from the front, computing for each candidate:</p>
+    <pre class="tab"><span class="ty">int</span> klen = strlen(keywords[j]);
+<span class="ty">int</span> kw2 = keywords[j][klen-1] == <span class="str">'|'</span>;
+<span class="kw">if</span> (kw2) klen--;
+
+<span class="kw">if</span> (!memcmp(p,keywords[j],klen) &amp;&amp;
+    is_separator(*(p+klen)))
+{
+    <span class="cm">/* Keyword */</span>
+    memset(row-&gt;hl+i,kw2 ? HL_KEYWORD2 : HL_KEYWORD1,klen);
+    p += klen;
+    i += klen;
+    <span class="kw">break</span>;
+}</pre>
+    <p data-anchor="hlc-p-keywords-3"><code class="inl">kw2</code> is read off the <em>last</em> character of the
+    keyword string, not tracked anywhere else &mdash; <code class="inl">"int|"</code> has <code
+    class="inl">kw2 == true</code>, <code class="inl">"return"</code> has <code class="inl">kw2 ==
+    false</code>. When it's true, <code class="inl">klen</code> is immediately shortened by one, so the trailing
+    <code class="inl">|</code> is never part of what gets compared against the row's text and never counted into
+    how far <code class="inl">p</code> and <code class="inl">i</code> advance on a match. It exists purely to be
+    read once, at the top of this loop body, and then forgotten.</p>
+    <p data-anchor="hlc-p-keywords-4">The match test itself is two conditions, both required. <code
+    class="inl">memcmp(p,keywords[j],klen)</code> alone would let <code class="inl">"int"</code> match the first
+    three bytes of <code class="inl">"internal"</code> or <code class="inl">"interval"</code> &mdash; it's a raw
+    byte comparison with no notion of word boundaries. <code class="inl">is_separator(*(p+klen))</code> is what
+    rejects that: it demands that the character sitting immediately after the candidate match is itself a
+    separator (whitespace, punctuation, or the row's terminating <code class="inl">'\0'</code>) &mdash; the exact
+    same <code class="inl">is_separator</code> helper Chapter 14 introduced for deciding "is this a token
+    boundary" everywhere else in the file. One function, reused as the boundary check on both sides of a
+    keyword: <code class="inl">prev_sep</code> gates where a keyword can start, and this call gates where it's
+    allowed to end.</p>
+    <div class="callout key" data-anchor="hlc-callout-onememset">
+      <span class="tag">A keyword is painted in one memset, not a per-character loop</span>
+      <p>Every other branch in this scan advances one character (or one escaped pair) at a time. A matched
+      keyword is different: <code class="inl">memset(row-&gt;hl+i,kw2 ? HL_KEYWORD2 : HL_KEYWORD1,klen);</code>
+      paints the whole matched span in one call, then <code class="inl">p</code> and <code class="inl">i</code>
+      both jump forward by <code class="inl">klen</code> in one step. <code class="inl">int</code> (green,
+      <code class="inl">HL_KEYWORD2</code>) and <code class="inl">return</code> (yellow, <code
+      class="inl">HL_KEYWORD1</code>) are colored by this exact same line &mdash; the only thing that differs
+      between them is which list entry matched and what <code class="inl">kw2</code> evaluated to for it.</p>
+    </div>
+    <p data-anchor="hlc-p-keywords-5">On a match, the inner <code class="inl">for</code> loop <code
+    class="inl">break</code>s immediately &mdash; it doesn't keep scanning the rest of the keyword table once it's
+    found one. That's exactly why the line right after the loop works as a match test at all: <code
+    class="inl">if (keywords[j] != NULL) { prev_sep = 0; continue; }</code>. If the loop broke early on a match,
+    <code class="inl">j</code> is left pointing at the matched entry &mdash; not NULL. If the loop ran all the way
+    off the end of the array without matching anything, <code class="inl">j</code> lands on the sentinel itself,
+    and <code class="inl">keywords[j]</code> <em>is</em> NULL. It's the same NULL-terminated-array idiom
+    <code class="inl">is_separator</code> and the loop's own iteration already lean on, reused here to answer
+    "did we match" without a separate boolean flag.</p>
+
+    <div class="callout warn" data-anchor="hlc-callout-fallthrough">
+      <span class="tag">If nothing above matched: the fallthrough</span>
+      <p>An ordinary character &mdash; one that isn't a comment delimiter, a quote, a digit continuing a number,
+      or the start of a matched keyword &mdash; falls all the way to the loop's last two lines: <code
+      class="inl">prev_sep = is_separator(*p); p++; i++;</code>. Its <code class="inl">hl</code> byte is never
+      touched here, so it keeps whatever <code class="inl">editorUpdateSyntax</code>'s opening <code
+      class="inl">memset(row->hl,HL_NORMAL,row->rsize)</code> already set it to (Chapter 14): <code
+      class="inl">HL_NORMAL</code>. This is the branch that colors the vast majority of any real C file &mdash;
+      identifiers that aren't keywords, operators, braces, whitespace &mdash; and it's also the one line every
+      other branch was careful to <code class="inl">continue</code> past, so it only ever runs for genuinely
+      plain characters.</p>
+    </div>
+
+    <h2 data-anchor="hlc-h2-worked">Worked example: one line, five decisions</h2>
+    <p data-anchor="hlc-p-worked-1">Trace a single realistic line through the scan to see all five branches
+    cooperate: <code class="inl">int x = 10; // set default</code>.</p>
+    <pre class="tab"><span class="ty">int</span> x = <span class="num">10</span>; <span class="cm">// set default</span></pre>
+    <ul data-anchor="hlc-ul-worked">
+      <li data-anchor="hlc-li-worked-1"><code class="inl">int</code> &mdash; <code class="inl">prev_sep</code> is
+      true at the start of the row, so the keyword branch runs; <code class="inl">"int|"</code> matches with
+      <code class="inl">kw2</code> true, and all three characters are painted <code
+      class="inl">HL_KEYWORD2</code> in one <code class="inl">memset</code>.</li>
+      <li data-anchor="hlc-li-worked-2">The space &mdash; falls through every branch (it's not a comment starter,
+      quote, digit, or keyword start) to the bottom two lines; <code class="inl">is_separator(' ')</code> is
+      true, so <code class="inl">prev_sep</code> becomes true again.</li>
+      <li data-anchor="hlc-li-worked-3"><code class="inl">x</code> &mdash; <code class="inl">prev_sep</code> is
+      true, so the keyword table is searched and nothing matches; it falls to the bottom fallthrough and stays
+      <code class="inl">HL_NORMAL</code>. <code class="inl">is_separator('x')</code> is false, so <code
+      class="inl">prev_sep</code> becomes false.</li>
+      <li data-anchor="hlc-li-worked-4"><code class="inl">= </code> &mdash; both separators, both fall through,
+      both set <code class="inl">prev_sep</code> true again by the time the scan reaches <code
+      class="inl">1</code>.</li>
+      <li data-anchor="hlc-li-worked-5"><code class="inl">10</code> &mdash; <code class="inl">1</code> is a digit
+      with <code class="inl">prev_sep</code> true, so it's colored <code class="inl">HL_NUMBER</code>; <code
+      class="inl">0</code> is a digit whose predecessor is already <code class="inl">HL_NUMBER</code>, so it
+      extends the run.</li>
+      <li data-anchor="hlc-li-worked-6"><code class="inl">;</code> &mdash; falls through, <code
+      class="inl">HL_NORMAL</code>, and being in <code class="inl">is_separator</code>'s punctuation set, sets
+      <code class="inl">prev_sep</code> true.</li>
+      <li data-anchor="hlc-li-worked-7">The space, then <code class="inl">//</code> &mdash; the space falls
+      through as before; at <code class="inl">/</code>, <code class="inl">prev_sep</code> is true and the next
+      character is also <code class="inl">/</code>, matching <code class="inl">scs</code>, so the comment branch
+      fires: everything from here to end of row is painted <code class="inl">HL_COMMENT</code> in one <code
+      class="inl">memset</code>, and the function returns without ever looking at the rest of the characters
+      individually.</li>
+    </ul>
+    <p data-anchor="hlc-p-worked-2">Seven decisions, five different branches, zero backtracking &mdash; the scan
+    never revisits a character or reconsiders a choice it already made. That's the whole story of why this can be
+    "the entire highlighter" and still run comfortably on every keystroke: it's linear in the length of the row,
+    once, no matter how deeply nested the punctuation looks.</p>
+
+    <div class="reflect" data-anchor="hlc-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A working C/C++ highlighter that fits in about a hundred lines, built from four techniques you can name:
+      a fixed priority order between comment, string, number, and keyword checks so ambiguous characters resolve
+      unambiguously; a two-state <code class="inl">in_string</code> variable that remembers <em>which</em> quote
+      is open, not just <em>that</em> one is; a number rule with no memory beyond "was the last character also a
+      number," cheap precisely because numbers can't span lines; and a keyword table that's really two tables
+      overlaid by a one-byte sigil, matched with a boundary check that reuses the same <code
+      class="inl">is_separator</code> helper the rest of the scanner already depends on. None of it is a lexer in
+      the formal sense &mdash; there's no grammar, no token stream handed to anything downstream, just <code
+      class="inl">hl</code> bytes filled in as a side effect of one pass. That's also exactly why Chapter 16 can
+      swap in a second language by supplying a new keyword list and comment delimiters without touching a single
+      line of the scan you just read: the scan is generic over <em>which</em> keywords and delimiters,
+      it only assumes C-shaped tokens (identifiers, quoted strings, <code class="inl">//</code> and <code
+      class="inl">/* */</code> comments) exist at all.</p>
+    </div>
+
+    <div class="challenges" data-anchor="hlc-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Kilo's number rule doesn't handle a leading minus sign or an exponent (<code
+        class="inl">1e10</code>). Sketch the smallest change to the number branch that would make <code
+        class="inl">1e10</code> highlight as a single number, without breaking <code class="inl">p.x</code>
+        (which must stay un-highlighted) or <code class="inl">3.14</code> (which must keep working).</li>
+        <li>Why does the keyword-matching loop need <code class="inl">is_separator(*(p+klen))</code> in addition
+        to <code class="inl">memcmp</code>, but the number rule needs no equivalent "boundary after" check?
+        What's different about how numbers and keywords end?</li>
+        <li>Trace what happens if a file's very first character is a digit that's part of a preprocessor
+        directive like <code class="inl">#define X 42</code>. Which branch colors the <code class="inl">42</code>,
+        and does <code class="inl">#define</code> itself get colored as anything, given that neither <code
+        class="inl">#</code> nor <code class="inl">define</code> appears in <code class="inl">C_HL_keywords</code>?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="hlc-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — C_HL_extensions, C_HL_keywords, HLDB, is_separator, the editorUpdateSyntax scan body (comments, strings, numbers, keywords)</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="14-syntax-highlighting-basics.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="16-file-types-and-highlight-rules.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
