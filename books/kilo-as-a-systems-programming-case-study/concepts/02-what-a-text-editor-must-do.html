@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What a Text Editor Must Do — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="what-eyebrow">Chapter 02 &middot; Part I — Orientation</p>
+    <h1 data-anchor="what-h1">What a Text Editor Must Do</h1>
+
+    <p class="lead" data-anchor="what-lead">Before we read a single line of <code class="inl">kilo.c</code>,
+    it's worth asking a question that sounds too simple to bother with: what does <em>any</em> text editor
+    actually have to do? Not Kilo specifically — Vim, nano, VS Code, a Notepad clone, all of them. Strip away
+    the toolkit, the plugins, the theme, and every editor that has ever existed is doing the same five jobs.
+    Kilo just does them in the open, in about a thousand lines, where you can watch it happen.</p>
+
+    <div class="callout key" data-anchor="what-callout-loop">
+      <span class="tag">The whole program, in eight lines</span>
+      <p>Skip to the very bottom of <code class="inl">kilo.c</code> and you'll find <code
+      class="inl">main()</code>. After one-time setup, it does exactly one thing, forever:</p>
+      <pre class="tab"><span class="ty">int</span> <span class="fn">main</span>(<span class="ty">int</span> argc, <span class="ty">char</span> **argv) {
+    <span class="fn">initEditor</span>();
+    <span class="fn">editorSelectSyntaxHighlight</span>(argv[1]);
+    <span class="fn">editorOpen</span>(argv[1]);
+    <span class="fn">enableRawMode</span>(STDIN_FILENO);
+    <span class="fn">editorSetStatusMessage</span>(<span class="str">"HELP: Ctrl-S = save..."</span>);
+    <span class="kw">while</span>(1) {
+        <span class="fn">editorRefreshScreen</span>();
+        <span class="fn">editorProcessKeypress</span>(STDIN_FILENO);
+    }
+}</pre>
+      <p>Two function calls, looping. <em class="term-def">Refresh the screen, then process one
+      keypress.</em> Everything Kilo does — every feature in every chapter still ahead of us — happens
+      because of what those two calls, and the state they share, do underneath.<sup>[1]</sup></p>
+    </div>
+
+    <h2 data-anchor="what-h2-motivation">Motivation: name the shape before you build it</h2>
+    <p data-anchor="what-p-motivation-1">It's tempting to start reading <code class="inl">kilo.c</code> top
+    to bottom and let the structure reveal itself function by function. That works, eventually — but it's
+    slow, and it's easy to mistake an implementation detail for a fundamental requirement. Better to fix the
+    skeleton first: five responsibilities every text editor must satisfy, in some form, or it isn't a text
+    editor. Once you can name them, every function in Kilo sorts itself into one of five buckets, and the
+    rest of this book is just: which bucket, how, and why this way and not another.</p>
+    <p data-anchor="what-p-motivation-2">Here they are, plainly:</p>
+
+    <table class="grid" data-anchor="what-table-five">
+      <thead><tr><th>Responsibility</th><th>The question it answers</th><th>Kilo's answer, roughly</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Input</strong></td><td>How do keystrokes reach the program at all?</td><td>Raw-mode <code class="inl">read()</code> of the terminal, one byte at a time</td></tr>
+        <tr><td><strong>Buffer</strong></td><td>What does &ldquo;the text&rdquo; live in, in memory?</td><td>An array of <code class="inl">erow</code> structs, one per line</td></tr>
+        <tr><td><strong>Render</strong></td><td>How does memory become pixels/glyphs the user sees?</td><td>VT100 escapes, batched into one write per frame</td></tr>
+        <tr><td><strong>Navigate</strong></td><td>Where is the cursor, and what part of the buffer is visible?</td><td>Cursor coordinates + a scroll offset into the row array</td></tr>
+        <tr><td><strong>Persist</strong></td><td>How does memory become a file, and back again?</td><td><code class="inl">getline()</code> in, one flattened <code class="inl">write()</code> out</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="what-p-motivation-3">Notice what's <em>not</em> on that list: syntax highlighting, search,
+    undo, multiple buffers, a mouse. Those are real features, and Kilo has some of them — but they're built
+    <em>on top of</em> the five above, not alongside them. A program that has all five in some minimal form is
+    already a text editor. Everything else is enrichment.</p>
+
+    <h2 data-anchor="what-h2-loop">Design: the read-react-repaint cycle</h2>
+    <p data-anchor="what-p-loop-1">The <code class="inl">main()</code> loop above names the pattern that ties
+    all five responsibilities together: <strong>read a keystroke, react to it, repaint the screen, repeat.</strong>
+    It is worth being precise about what kind of loop this is, because it's simpler — and stricter — than you
+    might expect from something that feels this responsive. <code class="inl">editorProcessKeypress()</code>
+    calls a helper that blocks on a single <code class="inl">read()</code> of the terminal until exactly one
+    keypress arrives, then dispatches on it with one large <code class="inl">switch</code>: distinct cases for
+    <span class="kbd">Enter</span>, <span class="kbd">Ctrl-Q</span> (quit), <span class="kbd">Ctrl-S</span>
+    (save), <span class="kbd">Ctrl-F</span> (find), the delete keys, the four arrow keys, page up/down,
+    <span class="kbd">Ctrl-L</span>, and <span class="kbd">Esc</span>.<sup>[1]</sup> There is no timer. No idle
+    callback. No background thread quietly reflowing text while you think. Kilo only does work in direct
+    response to a key you pressed — which is exactly why its whole architecture can be a two-line
+    loop instead of an event system.</p>
+    <p data-anchor="what-p-loop-2">That single design choice cascades outward. Because nothing happens between
+    keystrokes, the buffer can never be &ldquo;mid-update&rdquo; when you look at it — every repaint sees a
+    fully-settled state. Because the loop is synchronous, there's no race between &ldquo;the user typed
+    another key&rdquo; and &ldquo;the screen finished drawing&rdquo;. Simplicity here isn't a missing feature;
+    it's what makes the rest of the program simple enough to hold in your head, which was the entire premise
+    of Chapter 01.</p>
+
+    <h2 data-anchor="what-h2-buffer">The buffer: what &ldquo;the text&rdquo; actually is</h2>
+    <p data-anchor="what-p-buffer-1">Every editor has to answer one hard question honestly: when you're
+    editing a 50,000-line file and you insert one character on line 30,000, what actually moves in memory?
+    The naive answer — one giant string, shift everything after the cursor — is correct but slow at scale.
+    Over the decades editors have converged on a handful of standard answers, each trading simplicity for
+    performance differently:</p>
+    <ul data-anchor="what-ul-buffer-models">
+      <li><strong>Array of lines.</strong> One string per line, in an array. Simple to reason about; cheap for
+      small files; gets expensive when a structural edit has to shift many lines.</li>
+      <li><strong>Gap buffer.</strong> One contiguous allocation with a movable empty &ldquo;gap&rdquo; sitting
+      right at the cursor; typing just writes into the gap. Because real editing is usually clustered near
+      wherever you last typed, a gap buffer's locality tends to beat a rope in practice on small-to-medium
+      files.<sup>[4]</sup></li>
+      <li><strong>Rope.</strong> A balanced tree of text chunks. Every operation — insert, delete, even
+      concatenating two huge documents — is <span class="mono">O(log n)</span> worst case, anywhere in the
+      document. The cost is real implementation complexity, which only pays for itself at large scale or under
+      non-local editing patterns like collaborative editing.<sup>[4]</sup></li>
+      <li><strong>Piece table.</strong> Never move the original bytes at all — index small, mostly-immutable
+      &ldquo;pieces&rdquo; instead. Popular where cheap, unlimited undo matters as much as edit speed.</li>
+    </ul>
+    <p data-anchor="what-p-buffer-2">Kilo picks the first option, on purpose, and doesn't apologize for it: an
+    array of <code class="inl">erow</code> structs, one per line of the file, that grows with
+    <code class="inl">realloc()</code> as you insert rows. For a program built to teach raw terminal I/O in
+    under a thousand lines, a gap buffer or rope would be scope creep — the array is the right amount of
+    engineering for the job in front of it, and we'll feel exactly where that choice starts to cost something
+    once we get to Chapter 10, <em>Editing Text</em>.</p>
+
+    <div class="callout warn" data-anchor="what-callout-erow">
+      <span class="tag">Look closer at one erow</span>
+      <p>Here's the actual struct, unmodified. Notice it holds <em>two</em> copies of a line's text, not
+      one:</p>
+      <pre class="tab"><span class="kw">typedef</span> <span class="kw">struct</span> erow {
+    <span class="ty">int</span> idx;            <span class="cm">/* Row index in the file, zero-based. */</span>
+    <span class="ty">int</span> size;           <span class="cm">/* Size excluding null term. */</span>
+    <span class="ty">int</span> rsize;          <span class="cm">/* Rendered row size (after TAB expansion). */</span>
+    <span class="ty">char</span> *chars;        <span class="cm">/* Raw row content. */</span>
+    <span class="ty">char</span> *render;       <span class="cm">/* Content rendered for display. */</span>
+    <span class="ty">unsigned</span> <span class="ty">char</span> *hl;  <span class="cm">/* Syntax highlight type per character. */</span>
+    <span class="ty">int</span> hl_oc;          <span class="cm">/* Open comment state flag. */</span>
+} erow;</pre>
+      <p><code class="inl">chars</code> is exactly what you typed or loaded from disk — the file's ground
+      truth. <code class="inl">render</code> is a second, derived buffer with tabs expanded into spaces,
+      rebuilt from <code class="inl">chars</code> after every edit, that exists purely so the screen has
+      something byte-aligned to draw. Editing operates on <code class="inl">chars</code>; the screen only ever
+      reads <code class="inl">render</code>. Keep that split straight now — it's the difference between
+      &ldquo;the file&rdquo; and &ldquo;what you see&rdquo;, and later, <code class="inl">hl</code> (one
+      highlight-color byte per rendered character) hangs off <code class="inl">render</code> too, not
+      <code class="inl">chars</code>.<sup>[1]</sup></p>
+    </div>
+
+    <h2 data-anchor="what-h2-render">Rendering: memory becomes a screen, in one write</h2>
+    <p data-anchor="what-p-render-1">&ldquo;Render&rdquo; is easy to picture wrong. It's tempting to imagine
+    <code class="inl">editorRefreshScreen()</code> writing to the terminal as it goes — draw this row, then
+    that row, then the status bar. It doesn't. It hides the cursor, walks every visible row applying whatever
+    highlight colors that row currently has, writes the status bar and a message line, and repositions the
+    cursor — but every one of those steps only <em>appends</em> escape sequences and text to an in-memory
+    buffer (Kilo calls it <code class="inl">struct abuf</code>, an append buffer). Only after the whole frame
+    is assembled does the function make a single <code class="inl">write()</code> syscall to flush it to the
+    terminal.<sup>[1]</sup></p>
+    <p data-anchor="what-p-render-2">That batching is not incidental polish — it's the difference between a
+    screen that redraws cleanly and one that visibly flickers. Many small writes to a terminal each cost a
+    round-trip through the kernel and the terminal emulator; if the screen were cleared with one write and
+    repainted with a hundred more, you'd see the blank flash between them. One write, one frame, no flicker.
+    We'll build this exact append-buffer pattern by hand in Chapter 05.</p>
+
+    <h2 data-anchor="what-h2-persist">Persistence: the buffer is not the file</h2>
+    <p data-anchor="what-p-persist-1">Opening and saving are mirror images of each other, and Kilo keeps them
+    almost suspiciously simple. <code class="inl">editorOpen()</code> reads the target file line by line with
+    <code class="inl">getline()</code>, strips the trailing newline, and calls
+    <code class="inl">editorInsertRow()</code> once per line to build up the <code class="inl">erow</code>
+    array — a file that doesn't exist yet (<code class="inl">ENOENT</code>) is tolerated and just starts an
+    empty buffer, which is how <code class="inl">kilo newfile.txt</code> works at all. Saving reverses it:
+    <code class="inl">editorRowsToString()</code> flattens every row back into one contiguous byte buffer, and
+    <code class="inl">editorSave()</code> writes that buffer to disk.<sup>[1]</sup></p>
+    <p data-anchor="what-p-persist-2">Read that save path closely, though, because it's a genuinely instructive
+    piece of honesty from the source itself:</p>
+    <pre class="tab"><span class="ty">int</span> fd = <span class="fn">open</span>(E.filename,O_RDWR|O_CREAT,0644);
+<span class="kw">if</span> (fd == -1) <span class="kw">goto</span> writeerr;
+
+<span class="cm">/* Use truncate + a single write(2) call in order to make saving
+ * a bit safer, under the limits of what we can do in a small editor. */</span>
+<span class="kw">if</span> (<span class="fn">ftruncate</span>(fd,len) == -1) <span class="kw">goto</span> writeerr;
+<span class="kw">if</span> (<span class="fn">write</span>(fd,buf,len) != len) <span class="kw">goto</span> writeerr;</pre>
+    <p data-anchor="what-p-persist-3">That comment is antirez talking directly to future readers of his own
+    code. There's no write-to-a-temp-file-then-rename here — the industry-standard way to make a save crash-safe
+    — just a truncate and a direct write to the real file, with an honest label on the trade-off: <q>a bit
+    safer, under the limits of what we can do in a small editor.</q> If <code class="inl">write()</code> fails
+    partway through, you can be left with a shorter file than you started with. That's not a bug we're going
+    to pretend isn't there; it's a limitation we'll come back to by name in Chapter 17 (<em>Error Handling and
+    Cleanup</em>) and Chapter 18 (<em>Portability and Limitations</em>), once we've built the machinery to talk
+    about it precisely.</p>
+
+    <div class="reflect" data-anchor="what-reflect">
+      <h4>So what did we actually get out of this?</h4>
+      <p>A map, before the territory. Input, buffer, render, navigate, persist — five jobs, one blocking
+      read-react-repaint loop tying them together, and a buffer that deliberately keeps &ldquo;what you typed&rdquo;
+      (<code class="inl">chars</code>) separate from &ldquo;what's drawn&rdquo; (<code class="inl">render</code>).
+      Every chapter from here on is one of those five buckets, built out in real C. When you hit a function
+      later and aren't sure why it exists, come back to this table — it almost always answers the question.</p>
+    </div>
+
+    <div class="challenges" data-anchor="what-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Open <code class="inl">kilo.c</code> and find <code class="inl">editorProcessKeypress()</code>.
+        Without reading the whole function, just list every <code class="inl">case</code> label in its
+        <code class="inl">switch</code>. Which of the five responsibilities does each one belong to?</li>
+        <li>Find every place in the file that mentions <code class="inl">.render</code> versus
+        <code class="inl">.chars</code>. Before this chapter, could you have explained why a single row needs
+        both?</li>
+        <li>Picture editing a 500 MB log file in Kilo. Which of the five responsibilities would strain first —
+        and would an array of <code class="inl">erow</code>s, a gap buffer, or a rope handle it best? You don't
+        need the answer yet; just form a guess to test against Chapter 08.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="what-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — main(), erow, editorRefreshScreen, editorOpen, editorSave</a> &middot;
+      <a href="https://github.com/antirez/kilo" target="_blank" rel="noopener">[2] antirez/kilo — GitHub repository &amp; README</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[3] Build Your Own Text Editor — snaptoken</a> &middot;
+      <a href="https://coredumped.dev/2023/08/09/text-showdown-gap-buffers-vs-ropes/" target="_blank" rel="noopener">[4] Text showdown: Gap Buffers vs Ropes — Core Dumped</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-why-build-kilo.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-c-and-terminal-prerequisites.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

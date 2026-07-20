@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moving Around the File — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="mv-eyebrow">Chapter 09 &middot; Part III — Data &amp; Navigation</p>
+    <h1 data-anchor="mv-h1">Moving Around the File</h1>
+
+    <p class="lead" data-anchor="mv-lead">Chapter 08 gave every line two buffers, <code class="inl">chars</code> for
+    truth and <code class="inl">render</code> for the screen. This chapter puts the same split to work on a
+    different problem: where is the cursor? It turns out &ldquo;where&rdquo; is also two numbers wearing one hat
+    &mdash; a position on the screen, and a position in the file &mdash; and arrow keys spend most of their time
+    deciding which of the two should actually move.</p>
+
+    <h2 data-anchor="mv-h2-motivation">Motivation: the screen is a window, not the document</h2>
+    <p data-anchor="mv-p-motivation-1">A terminal is small. A file is not obligated to be. The moment a document has
+    more lines than <code class="inl">E.screenrows</code> or a line wider than <code class="inl">E.screencols</code>,
+    &ldquo;draw the whole thing&rdquo; stops being an option, and the editor needs a notion of a <em>viewport</em>
+    &mdash; a rectangle of the file currently visible &mdash; that can slide independently of where the cursor sits
+    inside it. Kilo's answer is to give the cursor two coordinate systems instead of one: <code class="inl">E.cx</code>/<code class="inl">E.cy</code>,
+    the cursor's position <em>on screen</em>, always somewhere inside <code class="inl">[0, E.screencols)</code>
+    &times; <code class="inl">[0, E.screenrows)</code>; and <code class="inl">E.rowoff</code>/<code class="inl">E.coloff</code>,
+    the file row and column sitting in the screen's top-left corner. Add them together and you get the cursor's real
+    position in the document: <code class="inl">filerow = E.rowoff+E.cy</code>, <code class="inl">filecol =
+    E.coloff+E.cx</code>. That one line of arithmetic, repeated at the top of nearly every function in this chapter,
+    is the whole idea.</p>
+    <p data-anchor="mv-p-motivation-2">Think of it as a camera and an actor. <code class="inl">rowoff</code>/<code class="inl">coloff</code>
+    are where the camera is pointed at the document; <code class="inl">cx</code>/<code class="inl">cy</code> are
+    where the actor stands inside the camera's frame. Press an arrow key near the middle of the screen and only the
+    actor moves. Press it at the very edge of the frame and the camera has to pan instead &mdash; the actor stays put
+    (or nearly), and the offsets change underneath it. Every branch you're about to read is one of those two
+    decisions, made once per key.</p>
+
+    <h2 data-anchor="mv-h2-design">Design: no scroll function, just edge cases inside cursor movement</h2>
+    <p data-anchor="mv-p-design-1">Search kilo.c for <code class="inl">editorScroll</code> and you'll find nothing.
+    There is no separate scrolling subsystem. Scrolling isn't a feature bolted alongside cursor movement &mdash; it's
+    a fallthrough case <em>inside</em> it. One function, <code class="inl">editorMoveCursor(int key)</code>, handles
+    all four arrow keys, and each of its four branches independently decides: are we still inside the visible
+    screen, or did we just walk off the edge of it?</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorMoveCursor</span>(<span class="ty">int</span> key) {
+    <span class="ty">int</span> filerow = E.rowoff+E.cy;
+    <span class="ty">int</span> filecol = E.coloff+E.cx;
+    <span class="ty">int</span> rowlen;
+    erow *row = (filerow &gt;= E.numrows) ? NULL : &amp;E.row[filerow];
+
+    <span class="kw">switch</span>(key) {
+    <span class="kw">case</span> ARROW_LEFT:
+        <span class="kw">if</span> (E.cx == 0) {
+            <span class="kw">if</span> (E.coloff) {
+                E.coloff--;
+            } <span class="kw">else</span> {
+                <span class="kw">if</span> (filerow &gt; 0) {
+                    E.cy--;
+                    E.cx = E.row[filerow-1].size;
+                    <span class="kw">if</span> (E.cx &gt; E.screencols-1) {
+                        E.coloff = E.cx-E.screencols+1;
+                        E.cx = E.screencols-1;
+                    }
+                }
+            }
+        } <span class="kw">else</span> {
+            E.cx -= 1;
+        }
+        <span class="kw">break</span>;
+    <span class="kw">case</span> ARROW_RIGHT:
+        <span class="kw">if</span> (row &amp;&amp; filecol &lt; row-&gt;size) {
+            <span class="kw">if</span> (E.cx == E.screencols-1) {
+                E.coloff++;
+            } <span class="kw">else</span> {
+                E.cx += 1;
+            }
+        } <span class="kw">else if</span> (row &amp;&amp; filecol == row-&gt;size) {
+            E.cx = 0;
+            E.coloff = 0;
+            <span class="kw">if</span> (E.cy == E.screenrows-1) {
+                E.rowoff++;
+            } <span class="kw">else</span> {
+                E.cy += 1;
+            }
+        }
+        <span class="kw">break</span>;
+    <span class="kw">case</span> ARROW_UP:
+        <span class="kw">if</span> (E.cy == 0) {
+            <span class="kw">if</span> (E.rowoff) E.rowoff--;
+        } <span class="kw">else</span> {
+            E.cy -= 1;
+        }
+        <span class="kw">break</span>;
+    <span class="kw">case</span> ARROW_DOWN:
+        <span class="kw">if</span> (filerow &lt; E.numrows) {
+            <span class="kw">if</span> (E.cy == E.screenrows-1) {
+                E.rowoff++;
+            } <span class="kw">else</span> {
+                E.cy += 1;
+            }
+        }
+        <span class="kw">break</span>;
+    }
+    <span class="cm">/* Fix cx if the current line has not enough chars. */</span>
+    filerow = E.rowoff+E.cy;
+    filecol = E.coloff+E.cx;
+    row = (filerow &gt;= E.numrows) ? NULL : &amp;E.row[filerow];
+    rowlen = row ? row-&gt;size : 0;
+    <span class="kw">if</span> (filecol &gt; rowlen) {
+        E.cx -= filecol-rowlen;
+        <span class="kw">if</span> (E.cx &lt; 0) {
+            E.coloff += E.cx;
+            E.cx = 0;
+        }
+    }
+}</pre>
+    <p data-anchor="mv-p-design-2">Four cases, then one shared cleanup at the bottom. Read them slowly &mdash; the
+    logic is simple arithmetic, but each branch is answering a slightly different question, and it's worth being
+    able to state each one in a sentence before moving on.</p>
+
+    <h2 data-anchor="mv-h2-leftright">Implementation: Left and Right cross line boundaries</h2>
+    <p data-anchor="mv-p-leftright-1"><strong><code class="inl">ARROW_LEFT</code></strong> asks: is the cursor
+    already at the left edge of the current line's visible slice (<code class="inl">E.cx == 0</code>)? If not, it's
+    the easy case &mdash; <code class="inl">E.cx -= 1</code> and done. If it <em>is</em> at the left edge, the
+    branch first tries to spend horizontal scroll before spending anything else: if <code class="inl">E.coloff</code>
+    is nonzero (the viewport has panned right of column 0), decrement it &mdash; the camera pans back, the actor
+    doesn't move at all. Only once <code class="inl">coloff</code> is also back to zero, and only if there's a
+    previous line to go to (<code class="inl">filerow &gt; 0</code>), does Left actually cross a line boundary:
+    <code class="inl">E.cy--</code>, and <code class="inl">E.cx</code> jumps to
+    <code class="inl">E.row[filerow-1].size</code> &mdash; the end of the previous line. Kilo treats the file as one
+    continuous stream of characters with newlines woven in, not a grid of independent rows; pressing Left at column
+    zero is <em>never</em> a no-op once you're past the first line. A clamp right after that jump
+    (<code class="inl">if (E.cx &gt; E.screencols-1)</code>) handles the case where that previous line is wider
+    than the screen &mdash; it sets <code class="inl">coloff</code> to bring the new cursor position on screen rather
+    than leaving <code class="inl">E.cx</code> pointing past the visible area.</p>
+    <p data-anchor="mv-p-leftright-2"><strong><code class="inl">ARROW_RIGHT</code></strong> is the mirror image, and
+    it only runs at all if a row exists at the cursor's file row (<code class="inl">row</code> isn't
+    <code class="inl">NULL</code>). Two sub-cases, split on where <code class="inl">filecol</code> sits relative to
+    <code class="inl">row-&gt;size</code>. <strong>Still inside the line</strong>
+    (<code class="inl">filecol &lt; row-&gt;size</code>): same edge logic as Left, mirrored &mdash; bump
+    <code class="inl">E.cx</code> normally, or bump <code class="inl">E.coloff</code> instead once
+    <code class="inl">E.cx</code> is sitting on the rightmost visible column. <strong>Exactly at the end of the
+    line</strong> (<code class="inl">filecol == row-&gt;size</code> &mdash; one position past the last character,
+    which is a valid, ordinary cursor position, not an error): Right wraps down to the start of the <em>next</em>
+    line, resetting both <code class="inl">E.cx</code> and <code class="inl">E.coloff</code> to zero and either
+    bumping <code class="inl">E.cy</code> or panning <code class="inl">E.rowoff</code> depending on whether the
+    screen's bottom row is already showing.</p>
+    <div class="callout key" data-anchor="mv-callout-camera-actor">
+      <span class="tag">The camera moves only when the actor hits the frame</span>
+      <p>Notice the shape repeated in both branches: try the cheap move first (slide within the current screen row),
+      and only touch the offset (<code class="inl">rowoff</code>/<code class="inl">coloff</code>) once the cursor is
+      already pinned to the edge of what's visible. Every scroll in Kilo happens this way &mdash; one line, one edge
+      check, one offset increment. There is no code path that scrolls by more than one row or one column in response
+      to a single arrow key.</p>
+    </div>
+
+    <h2 data-anchor="mv-h2-updown">Implementation: Up and Down never look sideways</h2>
+    <p data-anchor="mv-p-updown-1"><code class="inl">ARROW_UP</code> and <code class="inl">ARROW_DOWN</code> are
+    shorter, and deliberately don't do what Left and Right do. Up: if the cursor is already on the top visible screen
+    row (<code class="inl">E.cy == 0</code>), pan the camera up by decrementing <code class="inl">E.rowoff</code>
+    (only if there's room &mdash; <code class="inl">if (E.rowoff)</code> guards against panning above line 0);
+    otherwise just move the actor, <code class="inl">E.cy -= 1</code>. Down is the same shape flipped: refuse to move
+    at all once <code class="inl">filerow</code> would run past <code class="inl">E.numrows</code> (there's no line
+    to move onto), otherwise either pan <code class="inl">E.rowoff</code> forward or bump
+    <code class="inl">E.cy</code>, depending on whether the screen's last row is already in view.</p>
+    <p data-anchor="mv-p-updown-2">Neither branch touches <code class="inl">E.coloff</code> or
+    <code class="inl">E.cx</code> at all. Move from a long line to a short one with the Down key, and
+    <code class="inl">E.cx</code> is left exactly where it was &mdash; possibly now pointing well past the shorter
+    line's last character. That's not a bug left for you to find; it's intentional, and the function's last few
+    lines exist entirely to resolve it.</p>
+
+    <h2 data-anchor="mv-h2-clamp">Implementation: one shared clamp, no memory of where you've been</h2>
+    <p data-anchor="mv-p-clamp-1">After the <code class="inl">switch</code>, <code class="inl">editorMoveCursor()</code>
+    recomputes <code class="inl">filerow</code>/<code class="inl">filecol</code> one more time (they may have changed
+    inside the branch that just ran), looks up whatever row the cursor now sits on, and applies a single rule: if
+    <code class="inl">filecol</code> is past that row's length, pull <code class="inl">E.cx</code> back by the
+    overshoot, and if that pulls it negative, absorb the remainder into <code class="inl">E.coloff</code> instead and
+    pin <code class="inl">E.cx</code> to zero. This is the entire mechanism behind &ldquo;arrow down from a long line
+    onto a short one snaps the cursor to end-of-line&rdquo; &mdash; and it's worth being precise about what it
+    <em>isn't</em>: there is no <code class="inl">preferred_cx</code> field, no remembered &ldquo;the column I was
+    really trying to stay on.&rdquo; Every move recomputes and reclamps from scratch. Arrow back up onto the original
+    long line and the cursor lands at whatever column the clamp left it at last time &mdash; not necessarily where
+    you started.</p>
+    <div class="callout warn" data-anchor="mv-callout-no-memory">
+      <span class="tag">A feature many editors have that Kilo doesn't</span>
+      <p>Editors that <em>do</em> remember a &ldquo;preferred column&rdquo; let you arrow down through several short
+      lines and back up through them without losing your original horizontal position. Kilo's clamp has no memory
+      across calls &mdash; <code class="inl">E.cx</code> is genuinely wherever the last clamp left it, full stop.
+      That's a legitimate, deliberate simplicity trade for a ~1000-line editor, not an oversight; just don't expect
+      the behavior if you've gotten used to a bigger editor's version of vertical movement.</p>
+    </div>
+
+    <h2 data-anchor="mv-h2-page">Implementation: Page Up / Page Down are a loop, not a jump</h2>
+    <p data-anchor="mv-p-page-1">You might expect paging to reassign <code class="inl">E.rowoff</code> directly
+    &mdash; jump the camera by a whole screen's height in one write. That's not what happens. The
+    <code class="inl">PAGE_UP</code>/<code class="inl">PAGE_DOWN</code> handler lives in
+    <code class="inl">editorProcessKeypress()</code>, not <code class="inl">editorMoveCursor()</code>, and it's built
+    entirely out of the single-step logic you just read:</p>
+    <pre class="tab"><span class="kw">case</span> PAGE_UP:
+<span class="kw">case</span> PAGE_DOWN:
+    <span class="kw">if</span> (c == PAGE_UP &amp;&amp; E.cy != 0)
+        E.cy = 0;
+    <span class="kw">else if</span> (c == PAGE_DOWN &amp;&amp; E.cy != E.screenrows-1)
+        E.cy = E.screenrows-1;
+    {
+    <span class="ty">int</span> times = E.screenrows;
+    <span class="kw">while</span>(times--)
+        <span class="fn">editorMoveCursor</span>(c == PAGE_UP ? ARROW_UP:
+                                        ARROW_DOWN);
+    }
+    <span class="kw">break</span>;</pre>
+    <p data-anchor="mv-p-page-2">Two steps. First, snap <code class="inl">E.cy</code> to whichever edge of the screen
+    the page motion is heading toward &mdash; top for Page Up, bottom for Page Down &mdash; if it isn't already
+    there. Then run a loop that calls <code class="inl">editorMoveCursor(ARROW_UP)</code> or
+    <code class="inl">editorMoveCursor(ARROW_DOWN)</code> exactly <code class="inl">E.screenrows</code> times in a
+    row. A page motion, in kilo.c, <em>is</em> a screenful of ordinary single-line moves executed back to back,
+    reusing every edge check and every clamp already written for the arrow keys. There's no second scrolling
+    implementation to keep in sync with the first &mdash; a deliberate echo of Chapter 08's lesson about not
+    duplicating logic that has to stay consistent.</p>
+
+    <h2 data-anchor="mv-h2-homeend">Edge case: Home and End are parsed, but not wired up</h2>
+    <p data-anchor="mv-p-homeend-1"><code class="inl">editorReadKey()</code> genuinely recognizes Home and End.
+    Both keys arrive as multi-byte escape sequences &mdash; <code class="inl">ESC [ H</code> / <code class="inl">ESC
+    O H</code> for Home, <code class="inl">ESC [ F</code> / <code class="inl">ESC O F</code> for End, the two
+    forms different terminal emulators favor &mdash; and the parser correctly turns either form into a soft key code,
+    <code class="inl">HOME_KEY</code> or <code class="inl">END_KEY</code> (both defined at 1000+, alongside the arrow
+    keys, in the same enum):</p>
+    <pre class="tab"><span class="cm">/* ESC [ sequences (subset). */</span>
+<span class="kw">switch</span>(seq[1]) {
+<span class="kw">case</span> <span class="str">'A'</span>: <span class="kw">return</span> ARROW_UP;
+<span class="kw">case</span> <span class="str">'B'</span>: <span class="kw">return</span> ARROW_DOWN;
+<span class="kw">case</span> <span class="str">'C'</span>: <span class="kw">return</span> ARROW_RIGHT;
+<span class="kw">case</span> <span class="str">'D'</span>: <span class="kw">return</span> ARROW_LEFT;
+<span class="kw">case</span> <span class="str">'H'</span>: <span class="kw">return</span> HOME_KEY;
+<span class="kw">case</span> <span class="str">'F'</span>: <span class="kw">return</span> END_KEY;
+}
+<span class="cm">/* ESC O sequences. */</span>
+<span class="kw">else if</span> (seq[0] == <span class="str">'O'</span>) {
+    <span class="kw">switch</span>(seq[1]) {
+    <span class="kw">case</span> <span class="str">'H'</span>: <span class="kw">return</span> HOME_KEY;
+    <span class="kw">case</span> <span class="str">'F'</span>: <span class="kw">return</span> END_KEY;
+    }
+}</pre>
+    <p data-anchor="mv-p-homeend-2">But walk through <code class="inl">editorProcessKeypress()</code>'s dispatch
+    switch &mdash; the one this book has already shown you for Page Up/Down and the arrow keys &mdash; and there is
+    no <code class="inl">case HOME_KEY:</code>, no <code class="inl">case END_KEY:</code>, anywhere in it. Both
+    values fall straight through to the switch's <code class="inl">default:</code> branch, which calls
+    <code class="inl">editorInsertChar(c)</code> on whatever integer <code class="inl">c</code> happens to be.
+    <code class="inl">editorInsertChar()</code> hands that value down to <code class="inl">editorRowInsertChar()</code>,
+    which writes it into a one-byte <code class="inl">char</code> slot &mdash; <code class="inl">row-&gt;chars[at] =
+    c;</code> &mdash; silently truncating a code like 1005 or 1006 down to whatever byte survives the cast.</p>
+    <div class="callout warn" data-anchor="mv-callout-home-end-bug">
+      <span class="tag">Recognized, but never acted on</span>
+      <p>In the shipped source, pressing Home or End does not move the cursor to the start or end of the current
+      line. The key is correctly identified two layers down in the input pipeline &mdash; the escape-sequence parsing
+      is not the problem &mdash; and then simply has nowhere to go once it reaches the dispatcher, so it falls into
+      the same bucket as an ordinary typed character and inserts a stray byte into the document instead. This is the
+      same species of finding as Chapter 08's backwards <code class="inl">.idx</code> renumbering: a small, verifiable
+      gap in a celebrated, widely-read program, worth noticing rather than assuming away. Confirm it yourself against
+      a fresh clone before repeating it as fact &mdash; that's the right instinct, not just for this book.</p>
+    </div>
+
+    <h2 data-anchor="mv-h2-edge">Edge cases: what the offset arithmetic quietly guarantees</h2>
+    <ul data-anchor="mv-ul-edge">
+      <li data-anchor="mv-li-edge-1"><strong><code class="inl">E.cx</code>/<code class="inl">E.cy</code> are always
+      screen coordinates, never file coordinates.</strong> Any code that needs to know &ldquo;where is the cursor in
+      the document&rdquo; must compute <code class="inl">filerow = E.rowoff+E.cy</code> and
+      <code class="inl">filecol = E.coloff+E.cx</code> itself &mdash; there is no single field to read that already
+      holds that answer.</li>
+      <li data-anchor="mv-li-edge-2"><strong>Scrolling only ever moves one row or one column per key press.</strong>
+      Every offset change in <code class="inl">editorMoveCursor()</code> is a bare <code class="inl">++</code> or
+      <code class="inl">--</code>. Page Up/Down don't violate this &mdash; they just call the single-step function
+      many times.</li>
+      <li data-anchor="mv-li-edge-3"><strong>Left and Right cross line boundaries; Up and Down never adjust
+      <code class="inl">coloff</code>.</strong> The two pairs of keys are not symmetric in what they touch. Left/Right
+      own line-wrapping and horizontal scroll; Up/Down own vertical scroll and rely entirely on the shared post-switch
+      clamp to fix up anything horizontal.</li>
+      <li data-anchor="mv-li-edge-4"><strong>There is no remembered preferred column.</strong> The post-switch clamp
+      recomputes <code class="inl">E.cx</code> fresh from <code class="inl">filecol</code> and the current row's
+      length on every single move &mdash; nothing here is intended to reproduce &ldquo;editors that hold your column
+      steady while arrowing through blank lines&rdquo; behavior.</li>
+      <li data-anchor="mv-li-edge-5"><strong>Home and End are a genuine gap between input parsing and input
+      handling.</strong> They're recognized correctly and then never dispatched &mdash; a reminder that
+      &ldquo;the terminal sends the right bytes&rdquo; and &ldquo;the editor does the right thing with them&rdquo;
+      are two separate claims, and this codebase only fully backs one of them for these two keys.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="mv-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A cursor that never has to know how big the file is. By splitting position into a screen half
+      (<code class="inl">cx</code>/<code class="inl">cy</code>, always small, always in range) and a file half
+      (<code class="inl">rowoff</code>/<code class="inl">coloff</code>, unbounded, tracking the document), Kilo turns
+      &ldquo;scroll a gigantic file smoothly&rdquo; into &ldquo;increment or decrement one integer at the right
+      moment&rdquo; &mdash; the same instinct Chapter 08 used to turn &ldquo;render a tab correctly&rdquo; into a
+      second buffer. And you've now seen the trade-off up close: this design buys simplicity by giving up any memory
+      of past cursor state, which is exactly why arrowing back up a column you just arrowed down through doesn't
+      always put you back where you started, and exactly why a correctly-parsed key can still do nothing useful if
+      nobody remembered to give it a case in the dispatcher. Chapter 10 builds on this same
+      <code class="inl">filerow</code>/<code class="inl">filecol</code> pair to do the thing navigation was always in
+      service of: actually changing what's in the file.</p>
+    </div>
+
+    <div class="challenges" data-anchor="mv-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Trace a cursor sitting at the last column of a long line, then press Down twice in a row onto two
+        progressively shorter lines, then Up twice back to the original line. At each step, write down
+        <code class="inl">E.cx</code>, <code class="inl">E.coloff</code>, and the row's actual length. Where does the
+        cursor end up relative to where it started, and why?</li>
+        <li>Write the two missing <code class="inl">case</code> labels that would make Home and End actually work
+        &mdash; jump to <code class="inl">filecol = 0</code> for Home, <code class="inl">filecol = row-&gt;size</code>
+        for End &mdash; reusing the same <code class="inl">rowoff</code>/<code class="inl">coloff</code> adjustments
+        <code class="inl">editorMoveCursor()</code>'s ARROW_LEFT/RIGHT cases already make when a cursor lands outside
+        the visible screen width.</li>
+        <li>Page Up/Page Down move by calling <code class="inl">editorMoveCursor()</code>
+        <code class="inl">E.screenrows</code> times. On a 1,000-line file with a 40-row terminal, roughly how many
+        individual function calls does holding Page Down for ten pages make? Is that a real performance concern for
+        the file sizes Kilo targets, or a cost worth paying for reusing one already-correct function instead of
+        writing a second one?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="mv-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — editorMoveCursor, the PAGE_UP/PAGE_DOWN case in editorProcessKeypress, editorReadKey's escape-sequence parsing, struct editorConfig</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-text-storage.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-editing-text.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

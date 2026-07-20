@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Refactoring Kilo — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="rk-eyebrow">Chapter 19 &middot; Part VII — Beyond the Tutorial</p>
+    <h1 data-anchor="rk-h1">Refactoring Kilo</h1>
+
+    <p class="lead" data-anchor="rk-lead">Chapter 18 ended with a promise: that after cataloguing what kilo.c
+    assumes and what it leaves out on purpose, the next question is what changes if you refactor this code for
+    maintainability. So let's actually do it &mdash; or rather, let's do the part that matters more than typing
+    the new code: deciding, with evidence from the source itself, what a refactor of kilo.c would touch, what it
+    would buy, and what it would cost. Every chapter so far has read kilo.c as it is. This one reads it as a
+    starting point.</p>
+
+    <h2 data-anchor="rk-h2-motivation">Motivation: refactor is not a synonym for rewrite</h2>
+    <p data-anchor="rk-p-motivation-1">It's worth being precise about the word before we use it forty more
+    times. Martin Fowler's <em>Catalog of Refactorings</em> defines refactoring as a disciplined sequence of
+    <em>small, behavior-preserving</em> transformations &mdash; each one verified before the next is attempted.
+    Not "restructure until it feels better." Not "rewrite from scratch with better judgment this time." The
+    whole point is that the program does exactly the same thing before and after, and you can prove it at every
+    step along the way.</p>
+    <div class="callout warn" data-anchor="rk-callout-notests">
+      <span class="tag">The catch, for this specific program</span>
+      <p>"Verified before the next step" needs something to verify against. A direct check of the antirez/kilo
+      repository for the usual places a test suite or CI config would live &mdash; <code
+      class="inl">.travis.yml</code>, <code class="inl">.github/workflows</code>, <code class="inl">tests/</code>,
+      <code class="inl">test.c</code>, <code class="inl">CMakeLists.txt</code> &mdash; turns up nothing. Every
+      one of those paths 404s. So every refactor idea in this chapter carries an asterisk: without an automated
+      way to confirm a keystroke still does what it did before, "behavior-preserving" is a promise you keep by
+      careful manual re-checking, not one the toolchain checks for you. Chapter 21 exists to close exactly this
+      gap &mdash; read this chapter as "here's what we'd change," and that one as "here's how we'd know it still
+      works."</p>
+    </div>
+    <p data-anchor="rk-p-motivation-2">With that caveat named honestly, we can go looking for real candidates.
+    And kilo.c, read as a whole rather than one function at a time the way the last eighteen chapters did it,
+    turns out to have exactly two structural properties worth talking about: everything lives in one file, and
+    almost everything shares one global. Let's take them one at a time.</p>
+
+    <h2 data-anchor="rk-h2-design">Design: the module map that's already there</h2>
+    <p data-anchor="rk-p-design-1">kilo.c's build system is about as simple as build systems get:</p>
+    <pre class="tab"><span class="kw">all</span>: kilo
+
+kilo: kilo.c
+	$(CC) -o kilo kilo.c -Wall -W -pedantic -std=c99
+
+<span class="kw">clean</span>:
+	rm kilo</pre>
+    <p data-anchor="rk-p-design-2">One file compiled as one translation unit, no headers, no dependency
+    graph to reason about. That simplicity is real and it's worth naming before we start proposing to break it:
+    there's nothing here to accidentally get wrong at build time. But "one file" and "no internal structure"
+    aren't the same claim. Counting the top-level function definitions in the shipped source turns up 34
+    functions, and they sort themselves into eight groups with almost no effort:</p>
+    <table class="grid" data-anchor="rk-table-modules">
+      <tr><th>Module</th><th>Representative functions</th><th>Depends on</th></tr>
+      <tr><td class="mono">terminal</td><td class="mono">enableRawMode, disableRawMode, editorReadKey, getWindowSize</td><td>&mdash; (the floor everything else stands on)</td></tr>
+      <tr><td class="mono">row</td><td class="mono">editorInsertRow, editorRowInsertChar, editorRowsToString</td><td>&mdash;</td></tr>
+      <tr><td class="mono">highlight</td><td class="mono">editorUpdateSyntax, editorSelectSyntaxHighlight</td><td>row</td></tr>
+      <tr><td class="mono">edit</td><td class="mono">editorInsertChar, editorInsertNewline, editorDelChar</td><td>row, highlight</td></tr>
+      <tr><td class="mono">file</td><td class="mono">editorOpen, editorSave</td><td>row</td></tr>
+      <tr><td class="mono">screen</td><td class="mono">abAppend, editorRefreshScreen, editorSetStatusMessage</td><td>terminal, row, highlight</td></tr>
+      <tr><td class="mono">search</td><td class="mono">editorFind</td><td>row, screen</td></tr>
+      <tr><td class="mono">input</td><td class="mono">editorMoveCursor, editorProcessKeypress</td><td>edit, file, search, screen</td></tr>
+    </table>
+    <p data-anchor="rk-p-design-3">Look at that left column next to this book's own table of contents. Terminal
+    control is Part II. The row model and syntax highlighting are Parts III and V. File I/O is Part IV. Search
+    is also Part V. That's not a coincidence and it's not this book imposing order after the fact &mdash; it's
+    evidence that the seams a refactor would cut along are the same seams a reader already crosses, chapter by
+    chapter, to understand the program. The module boundaries were there all along; they just weren't drawn in
+    the file system.</p>
+
+    <h2 data-anchor="rk-h2-impl-globals">Implementation: the global that touches everything</h2>
+    <p data-anchor="rk-p-globals-1">Chapter 7 introduced <code class="inl">static struct editorConfig E</code>
+    as the one struct that runs the show, and nearly every function in the file reads or writes a field of it
+    directly. That's convenient &mdash; no parameter lists to thread state through &mdash; and it's also exactly
+    the kind of thing general refactoring literature on C programs calls out by name: a function that reads a
+    global can't be tested on its own, and it can't be run twice, independently, in the same process. A function
+    that takes its state as an explicit argument can be both. Here's the transformation on the smallest function
+    in the file that touches <code class="inl">E</code> at all:</p>
+    <div class="diff" data-anchor="rk-diff-global">
+      <pre class="tab"><span class="diff-del">int editorFileWasModified(void) {</span>
+<span class="diff-del">    return E.dirty;</span>
+<span class="diff-del">}</span>
+<span class="diff-add">int editorFileWasModified(const struct editorConfig *ed) {</span>
+<span class="diff-add">    return ed-&gt;dirty;</span>
+<span class="diff-add">}</span></pre>
+    </div>
+    <p data-anchor="rk-p-globals-2">Three lines, one new parameter, and the function no longer cares that
+    <code class="inl">E</code> exists. Now imagine doing that to all 34 functions. The payoff scales with the
+    program: you could construct two independent <code class="inl">editorConfig</code>s in a test harness and
+    exercise them without one leaking into the other &mdash; which is precisely the setup Chapter 21 will want.
+    The cost scales too, in the least interesting way possible: every one of those 34 call sites grows an
+    argument, and every one of the (currently effortless) direct reads of <code class="inl">E.cy</code> or
+    <code class="inl">E.numrows</code> becomes <code class="inl">ed-&gt;cy</code>, <code
+    class="inl">ed-&gt;numrows</code>. Mechanical, not clever &mdash; which is exactly what a refactoring step is
+    supposed to be.</p>
+
+    <h2 data-anchor="rk-h2-impl-switch">Implementation: the switch that decides everything</h2>
+    <p data-anchor="rk-p-switch-1">The other standout candidate is <code class="inl">editorProcessKeypress</code>
+    itself &mdash; one switch, twelve case groups, deciding what every single keystroke means:</p>
+    <pre class="tab"><span class="ty">void</span> editorProcessKeypress(<span class="ty">int</span> fd) {
+    <span class="kw">static</span> <span class="ty">int</span> quit_times = KILO_QUIT_TIMES;
+    <span class="ty">int</span> c = editorReadKey(fd);
+    <span class="kw">switch</span>(c) {
+    <span class="kw">case</span> ENTER: editorInsertNewline(); <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_C: <span class="kw">break</span>; <span class="cm">/* ignored on purpose */</span>
+    <span class="kw">case</span> CTRL_Q:
+        <span class="kw">if</span> (E.dirty &amp;&amp; quit_times) { <span class="cm">/* ...warn, decrement, return... */</span> }
+        exit(0); <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_S: editorSave(); <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_F: editorFind(fd); <span class="kw">break</span>;
+    <span class="kw">case</span> BACKSPACE: <span class="kw">case</span> CTRL_H: <span class="kw">case</span> DEL_KEY:
+        editorDelChar(); <span class="kw">break</span>;
+    <span class="kw">case</span> PAGE_UP: <span class="kw">case</span> PAGE_DOWN: { <span class="cm">/* ...loop calling editorMoveCursor... */</span> } <span class="kw">break</span>;
+    <span class="kw">case</span> ARROW_UP: <span class="kw">case</span> ARROW_DOWN:
+    <span class="kw">case</span> ARROW_LEFT: <span class="kw">case</span> ARROW_RIGHT:
+        editorMoveCursor(c); <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_L: <span class="kw">break</span>;
+    <span class="kw">case</span> ESC: <span class="kw">break</span>;
+    <span class="kw">default</span>: editorInsertChar(c); <span class="kw">break</span>;
+    }
+    quit_times = KILO_QUIT_TIMES;
+}</pre>
+    <p data-anchor="rk-p-switch-2">Fowler's catalog has a name for the general shape of this move: <em>Replace
+    Conditional with Polymorphism</em> &mdash; when a switch keeps growing on the same discriminant, replace the
+    branches with dispatch instead of a chain of cases. C has no classes to be polymorphic with, so the
+    idiomatic C version swaps the switch for data: an array mapping each key to a function pointer, walked in a
+    loop instead of matched in a case list.</p>
+    <pre class="tab"><span class="cm">/* Illustrative sketch — not in antirez's source. */</span>
+<span class="kw">typedef</span> <span class="ty">void</span> (*KeyHandler)(<span class="kw">struct</span> editorConfig *ed, <span class="ty">int</span> key);
+
+<span class="kw">static</span> <span class="kw">const</span> <span class="kw">struct</span> { <span class="ty">int</span> key; KeyHandler fn; } KEYMAP[] = {
+    { ENTER,  handle_enter }, { CTRL_Q, handle_quit }, { CTRL_S, handle_save },
+    { CTRL_F, handle_find }, <span class="cm">/* ... */</span>
+    { <span class="num">0</span>, NULL } <span class="cm">/* sentinel */</span>
+};
+
+<span class="ty">void</span> editorProcessKeypress(<span class="kw">struct</span> editorConfig *ed, <span class="ty">int</span> fd) {
+    <span class="ty">int</span> c = editorReadKey(fd);
+    <span class="kw">for</span> (<span class="ty">int</span> i = <span class="num">0</span>; KEYMAP[i].fn; i++)
+        <span class="kw">if</span> (KEYMAP[i].key == c) { KEYMAP[i].fn(ed, c); <span class="kw">return</span>; }
+    handle_insert(ed, c); <span class="cm">/* the old default: case */</span>
+}</pre>
+    <p data-anchor="rk-p-switch-3">Whether this is actually an improvement depends entirely on what you're
+    optimizing for. Adding a new key binding to the table version means appending one line to <code
+    class="inl">KEYMAP</code> and writing one small handler function &mdash; no editing a 70-line function to
+    find the right spot. But the switch version has something the table quietly gives up: you can read every
+    single thing a keystroke can mean in kilo.c in one scroll, top to bottom, in the order the cases are checked,
+    with the PAGE_UP/PAGE_DOWN special case sitting right there in context. The table trades that at-a-glance
+    completeness for per-entry extensibility. Neither is free.</p>
+
+    <h2 data-anchor="rk-h2-edge">Edge cases: what a refactor is not for</h2>
+    <p data-anchor="rk-p-edge-1">Two things in kilo.c look, at first glance, like refactoring targets and
+    aren't &mdash; and it's worth being as precise about what to leave alone as about what to change.</p>
+    <div class="callout key" data-anchor="rk-callout-goto">
+      <span class="tag">The goto labels are not a bug</span>
+      <p><code class="inl">enableRawMode</code>'s <code class="inl">goto fatal:</code> and <code
+      class="inl">editorSave</code>'s <code class="inl">goto writeerr:</code> are a recognized, idiomatic C
+      pattern &mdash; one shared cleanup block at the bottom of a function, reached from several failure points,
+      instead of repeating the same three cleanup lines at each one. Chapter 17 already named the real gap here:
+      it's that every function invents its own version instead of sharing one <code class="inl">die()</code>
+      helper, not that <code class="inl">goto</code> appears at all. "Remove the gotos" would make this code
+      worse, not more maintainable &mdash; it would mean duplicating the cleanup logic at every failure point
+      instead of jumping to one copy of it.</p>
+    </div>
+    <p data-anchor="rk-p-edge-2">The other trap is treating "one file" itself as the defect. Splitting kilo.c
+    into eight files buys real things &mdash; parallel work by more than one person without merge conflicts on
+    every line, and a compiler that only has to look at <code class="inl">row.c</code> to know whether
+    <code class="inl">editorInsertRow</code> typechecks. It also spends something Chapter 1 named as the actual
+    point of this program: a reader can hold the whole thing in their head and read it start to finish in an
+    afternoon. Eight files means eight headers, decisions about whether <code class="inl">struct
+    editorConfig</code> and <code class="inl">erow</code> get exposed across each new boundary or hidden behind
+    an opaque pointer (an indirection this program has never needed before), and a program that's no longer one
+    thing you open and read &mdash; it's eight things you navigate between. For a 1,000-line teaching program,
+    that's not obviously a win. For a program that's still growing &mdash; which is exactly Chapter 20's premise
+    &mdash; it starts to look different.</p>
+
+    <div class="reflect" data-anchor="rk-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>Not a rewrite &mdash; a short, honest list of two specific, mechanical changes and two specific things
+      deliberately left untouched. Threading <code class="inl">editorConfig</code> through as a parameter instead
+      of reaching for a global buys testability at the cost of one new argument on every one of 34 functions.
+      Replacing the keypress switch with a dispatch table buys per-entry extensibility at the cost of the
+      one-scroll readability the switch gave for free. The goto-based cleanup stays exactly as it is, because
+      it was never the problem. And splitting the file itself is the one move this chapter deliberately doesn't
+      recommend outright &mdash; not because it's wrong, but because whether it's worth it depends on a question
+      this chapter can't answer alone: is this program going to keep growing? Chapter 20 answers that question by
+      actually growing it, and Chapter 21 builds the safety net &mdash; the tests this chapter kept having to
+      caveat around &mdash; that any of these changes would actually need before you'd trust them in the program
+      you use every day.</p>
+    </div>
+
+    <div class="challenges" data-anchor="rk-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Pick one more function from the <code class="inl">input</code> module &mdash; <code
+        class="inl">editorMoveCursor</code> &mdash; and write out its signature the way it would look after the
+        global-to-parameter refactor from this chapter. List every field of <code class="inl">E</code> the
+        function body would need to reach through the new pointer instead.</li>
+        <li>The dispatch-table sketch in this chapter drops the PAGE_UP/PAGE_DOWN case's special handling (the
+        loop calling <code class="inl">editorMoveCursor</code> <code class="inl">E.screenrows</code> times).
+        Sketch the small handler function that case would become, and decide whether it needs anything beyond
+        the <code class="inl">(ed, key)</code> signature every other entry in <code class="inl">KEYMAP</code>
+        uses.</li>
+        <li>Make the case for <em>not</em> refactoring kilo.c at all &mdash; using only claims this book has
+        already established (Chapters 1, 17, and 18 are good places to start) rather than general opinions about
+        small programs.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="rk-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — editorProcessKeypress, editorFileWasModified, function list</a> &middot;
+      <a href="https://raw.githubusercontent.com/antirez/kilo/master/Makefile" target="_blank" rel="noopener">[2] antirez/kilo — Makefile (raw)</a> &middot;
+      <a href="https://refactoring.com/catalog/" target="_blank" rel="noopener">[3] Refactoring.com — Martin Fowler's Catalog of Refactorings</a> &middot;
+      <a href="https://embeddedartistry.com/fieldatlas/the-problems-with-global-variables/" target="_blank" rel="noopener">[4] The Problems with Global Variables — Embedded Artistry</a> &middot;
+      <a href="https://github.com/antirez/kilo" target="_blank" rel="noopener">[5] antirez/kilo — GitHub repository</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="18-portability-and-limitations.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="20-adding-features-carefully.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rebuilding the Editor from Memory — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="rfm-eyebrow">Chapter 22 &middot; Part VII — Beyond the Tutorial</p>
+    <h1 data-anchor="rfm-h1">Rebuilding the Editor from Memory</h1>
+
+    <p class="lead" data-anchor="rfm-lead">Twenty-one chapters have taken kilo.c apart, one function group at a
+    time. This one closes the book &mdash; literally, for a minute. The exercise is simple to state: without
+    re-opening any earlier chapter, sketch the whole architecture from memory. Not every line. Just the shape:
+    what struct runs the show, what loop drives it, what the eight modules are, and which invariants keep them
+    from stepping on each other. Then check yourself against what's actually here.</p>
+
+    <h2 data-anchor="rfm-h2-motivation">Motivation: rebuilding beats rereading</h2>
+    <p data-anchor="rfm-p-motivation-1">Rereading Chapters 1&ndash;21 feels like progress, because the material
+    is instantly familiar. That familiarity is mostly an illusion &mdash; recognizing a sentence isn't the same
+    skill as producing the idea it describes when the page isn't in front of you. Over a century of research on
+    what's called the <em>testing effect</em> backs this up directly: recalling material from memory, not just
+    re-studying it, is what actually strengthens retention, inference, and the ability to transfer it to a new
+    problem &mdash; and the effect holds for closed-book reconstruction, not just formal quizzes. There's even a
+    second-order payoff: retrieving old material well changes how the next new thing you learn gets encoded in
+    the first place. That's the whole rationale for this chapter existing as an exercise instead of a summary.</p>
+    <div class="callout key" data-anchor="rfm-callout-kilo-itself">
+      <span class="tag">Kilo was built this way too</span>
+      <p>Chapter 1 established that antirez's own README says kilo.c was "written in just a few hours taking
+      code from my other two projects, load81 and linenoise." That's not a lookup-and-assemble process &mdash;
+      it's building from an internalized model of terminal handling he already carried in his head. Rebuilding
+      this book's version of that model, from memory, is the same move in reverse.</p>
+    </div>
+
+    <h2 data-anchor="rfm-h2-design">Design: one architecture, eight parts, one page</h2>
+    <p data-anchor="rfm-p-design-1">Before checking anything, try to fill this table in yourself &mdash; module,
+    job, one invariant it depends on &mdash; then compare. Chapter 19 counted 34 top-level functions in kilo.c's
+    1308 lines and found they sort into exactly these eight groups, in dependency order:</p>
+    <table class="grid" data-anchor="rfm-table-architecture">
+      <tr><th>Module</th><th>Job</th><th>Chapter(s)</th><th>Invariant it owns</th></tr>
+      <tr><td class="mono">terminal</td><td>enter/exit raw mode, read one keypress</td><td>3&ndash;4, 17</td>
+      <td>orig_termios is the only copy that can restore the user's shell</td></tr>
+      <tr><td class="mono">row</td><td>own the erow array, chars/render split</td><td>8</td>
+      <td>render is always rebuilt from chars, never the reverse</td></tr>
+      <tr><td class="mono">highlight</td><td>fill erow.hl from render</td><td>14&ndash;16</td>
+      <td>hl is parallel to render, one byte per rendered character</td></tr>
+      <tr><td class="mono">edit</td><td>insert/delete chars, split/merge rows</td><td>10</td>
+      <td>every mutation ends by calling editorUpdateRow</td></tr>
+      <tr><td class="mono">file</td><td>load and persist the buffer</td><td>11&ndash;12</td>
+      <td>save writes chars only, never render</td></tr>
+      <tr><td class="mono">screen</td><td>assemble one frame, one write()</td><td>5&ndash;6</td>
+      <td>nothing reaches the terminal until the append buffer is complete</td></tr>
+      <tr><td class="mono">search</td><td>incremental find, cancel restores state</td><td>13</td>
+      <td>saved_cx/cy/rowoff/coloff are captured before the query loop starts</td></tr>
+      <tr><td class="mono">input</td><td>dispatch a keypress to everything above</td><td>4, 9&ndash;10</td>
+      <td>E.cx/E.cy are screen-relative; filerow/filecol are recomputed, not stored</td></tr>
+    </table>
+    <p data-anchor="rfm-p-design-2">Every one of those eight rows reads or writes the same single instance:
+    <code class="inl">static struct editorConfig E</code> (Chapter 7). That's the one fact that makes the whole
+    table cohere &mdash; there's no handle, no context pointer, just one global every module touches directly.
+    If your own sketch didn't have a box for <code class="inl">E</code> sitting in the middle, that's the gap
+    worth noticing first.</p>
+
+    <h2 data-anchor="rfm-h2-loop">The rebuild: start from the loop, radiate outward</h2>
+    <p data-anchor="rfm-p-loop-1">The fastest way back to the whole architecture is the same one Chapter 6 used
+    to introduce it: main()'s steady state is two calls, forever.</p>
+    <div class="term" data-anchor="rfm-term-loop">
+      <div class="term-bar">
+        <span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span>
+        <span class="term-title">kilo.c — main(), steady state</span>
+      </div>
+      <pre><span class="kw">while</span> (<span class="num">1</span>) {
+    editorRefreshScreen();
+    editorProcessKeypress(STDIN_FILENO);
+}</pre>
+    </div>
+    <p data-anchor="rfm-p-loop-2">Refresh runs first on every pass, so each iteration paints whatever the
+    <em>previous</em> keypress produced before it blocks on the next one. From there the reconstruction is just
+    following what each call touches:</p>
+    <p data-anchor="rfm-p-loop-3"><code class="inl">editorProcessKeypress</code> calls
+    <code class="inl">editorReadKey</code>, which blocks on <code class="inl">read()</code> against a file
+    descriptor that <code class="inl">enableRawMode</code> (Chapter 4) put into raw mode &mdash; canonical mode
+    and echo off, so bytes arrive one at a time with no line buffering and nothing echoed back automatically.
+    The keypress lands in a twelve-case switch that either moves the cursor (<code class="inl">editorMoveCursor</code>,
+    reading and writing <code class="inl">E.cx/E.cy/E.rowoff/E.coloff</code>), mutates text
+    (<code class="inl">editorInsertChar</code>/<code class="inl">editorDelChar</code>/<code class="inl">editorInsertNewline</code>,
+    each ending in <code class="inl">editorUpdateRow</code> so <code class="inl">render</code> and
+    <code class="inl">hl</code> stay in sync with <code class="inl">chars</code>), opens a mode
+    (<code class="inl">editorFind</code>, which saves four cursor/scroll fields up front so Escape can restore
+    them exactly), or touches the file (<code class="inl">editorSave</code>, which flattens every row to one
+    string and writes it with <code class="inl">ftruncate</code> doing the work a missing
+    <code class="inl">O_TRUNC</code> doesn't). <code class="inl">editorRefreshScreen</code> then reads that same
+    state back &mdash; <code class="inl">E.row[]</code>, <code class="inl">E.cx/E.cy</code>,
+    <code class="inl">E.rowoff/E.coloff</code> &mdash; and assembles one append buffer before a single byte
+    reaches the terminal.</p>
+    <div class="callout warn" data-anchor="rfm-callout-selftest">
+      <span class="tag">Self-test before you read the next section</span>
+      <p>Close your eyes on the previous paragraph and answer these without looking back: (1) Is Kilo's text
+      buffer a gap buffer, a rope, or something simpler &mdash; and what is it? (2) What does
+      <code class="inl">E.cx</code> actually measure &mdash; a position in the file, or a position on the
+      screen? (3) Why does <code class="inl">editorSave</code> need <code class="inl">ftruncate</code> at all?
+      If any of those three come back fuzzy, that's exactly the piece worth re-reading, not the whole chapter it
+      came from.</p>
+    </div>
+
+    <h2 data-anchor="rfm-h2-edge">Edge cases: what a rebuild-from-memory tends to lose first</h2>
+    <p data-anchor="rfm-p-edge-1">Four specific details are the ones a from-memory sketch of this architecture
+    most often gets wrong, each one a case where the obvious-sounding guess is the incorrect one.</p>
+    <table class="grid" data-anchor="rfm-table-misremembered">
+      <tr><th>Easy guess</th><th>What's actually true</th><th>Chapter</th></tr>
+      <tr><td>Kilo uses a gap buffer or rope for text</td>
+      <td>a plain, dynamically-grown array of <code class="mono">erow</code> structs &mdash; O(n) realloc per
+      inserted line</td><td>8</td></tr>
+      <tr><td><code class="mono">E.cx</code>/<code class="mono">E.cy</code> are the file position</td>
+      <td>they're screen-relative; <code class="mono">filerow</code>/<code class="mono">filecol</code> are
+      recomputed from them plus the scroll offsets, every time</td><td>9</td></tr>
+      <tr><td><code class="mono">ftruncate</code> in <code class="mono">editorSave</code> is just defensive</td>
+      <td>it's load-bearing &mdash; the <code class="mono">open()</code> flags omit
+      <code class="mono">O_TRUNC</code>, so without it a shorter save leaves old trailing bytes behind</td>
+      <td>12</td></tr>
+      <tr><td>There's a dedicated <code class="mono">editorScroll()</code> function</td>
+      <td>there isn't one &mdash; scrolling is folded directly into each arrow-key branch of
+      <code class="mono">editorMoveCursor</code></td><td>9</td></tr>
+    </table>
+
+    <div class="reflect" data-anchor="rfm-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>Not new material &mdash; every fact in this chapter was established somewhere in the previous
+      twenty-one. What changes is whether it's <em>yours</em>: one <code class="inl">static struct editorConfig
+      E</code> that every one of 34 functions across eight modules reads or writes directly; one steady-state
+      loop, refresh then read, that drives all of it; one chars/render/hl triple per row that keeps what's on
+      disk, what's on screen, and how it's colored from ever tangling into each other. 1308 lines, no libraries,
+      no header files &mdash; and by now, ideally, no notes either. That's the actual test this book has been
+      building toward: not whether you can find the answer in a chapter, but whether you can reconstruct the
+      design without one. The same move works on the next unfamiliar codebase you read that isn't this one.</p>
+    </div>
+
+    <div class="challenges" data-anchor="rfm-challenges">
+      <span class="tag">Before you close the book</span>
+      <ol>
+        <li>On a blank page, draw the eight-module table from this chapter without looking at it &mdash; module,
+        job, one invariant &mdash; then check it against the one above and circle whatever you missed.</li>
+        <li>Pick one keystroke &mdash; say, pressing Backspace at the start of a line &mdash; and narrate, from
+        memory, every function it passes through from <code class="inl">editorReadKey</code> to the next
+        repainted frame.</li>
+        <li>Without opening Chapter 19, list the three refactors that chapter proposed and, for each, say what it
+        would cost and what it would buy. Then open Chapter 19 and see what you left out.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="rfm-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — raw source</a> &middot;
+      <a href="https://raw.githubusercontent.com/antirez/kilo/master/README.md" target="_blank" rel="noopener">[2] antirez/kilo — README.md</a> &middot;
+      <a href="https://github.com/antirez/kilo" target="_blank" rel="noopener">[3] antirez/kilo repository</a> &middot;
+      <a href="https://psychology.ucsd.edu/undergraduate-program/undergraduate-resources/academic-writing-resources/effective-studying/retrieval-practice.html" target="_blank" rel="noopener">[4] Retrieval Practice — UC San Diego</a> &middot;
+      <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3983480/" target="_blank" rel="noopener">[5] Retrieval practice enhances new learning: the forward effect of testing</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="21-testing-a-terminal-app.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

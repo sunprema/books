@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editing Text — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="edit-eyebrow">Chapter 10 &middot; Part III — Data &amp; Navigation</p>
+    <h1 data-anchor="edit-h1">Editing Text</h1>
+
+    <p class="lead" data-anchor="edit-lead">Chapter 09 gave the cursor two coordinate systems and a
+    lot of careful arithmetic for turning arrow keys into <code class="inl">filerow</code>/<code class="inl">filecol</code>
+    pairs &mdash; and then never once changed the document. This chapter spends that arithmetic. Typing a
+    character, pressing Enter, pressing Backspace: every one of them starts by computing the exact same
+    <code class="inl">filerow</code>/<code class="inl">filecol</code> pair navigation already taught you to
+    compute, and then does something navigation never had to &mdash; grow an array, split a string in half,
+    or glue two lines into one.</p>
+
+    <h2 data-anchor="edit-h2-motivation">Motivation: three keys, one job</h2>
+    <p data-anchor="edit-p-motivation-1">Look at <code class="inl">editorProcessKeypress()</code>'s dispatch
+    switch &mdash; the same one this book has already shown you for arrows and Page Up/Down &mdash; and every
+    key that changes the document funnels into exactly three functions. <code class="inl">case ENTER:</code>
+    calls <code class="inl">editorInsertNewline()</code>. <code class="inl">case BACKSPACE: case CTRL_H: case
+    DEL_KEY:</code> &mdash; three different key codes sharing one case block &mdash; all call
+    <code class="inl">editorDelChar()</code>. And the <code class="inl">default:</code> branch, the one that
+    catches anything not otherwise matched, calls <code class="inl">editorInsertChar(c)</code>. That default
+    branch is worth sitting with: in kilo.c, &ldquo;insert this character&rdquo; isn't a special case triggered
+    by looking ahead for printable ASCII &mdash; it's simply <em>what happens</em> to any byte the dispatcher
+    didn't already claim for something else. Search the whole file and you won't find a fourth entry point.
+    No word-delete, no line-delete, no undo. Three functions are the entire editing surface of this editor.</p>
+
+    <h2 data-anchor="edit-h2-design">Design: one primitive per layer, reused by all three</h2>
+    <p data-anchor="edit-p-design-1">Chapter 08 built two functions that mutate a single row's bytes &mdash;
+    <code class="inl">editorRowInsertChar()</code> and <code class="inl">editorRowDelChar()</code> &mdash;
+    plus <code class="inl">editorRowAppendString()</code> for gluing one row onto the end of another.
+    Chapter 08 also gave you the row-<em>array</em> primitives, <code class="inl">editorInsertRow()</code> and
+    <code class="inl">editorDelRow()</code>, for growing or shrinking the file by a whole line. This chapter
+    doesn't introduce a single new primitive. <code class="inl">editorInsertChar()</code>,
+    <code class="inl">editorInsertNewline()</code>, and <code class="inl">editorDelChar()</code> are all thin
+    dispatchers: each one recomputes <code class="inl">filerow</code>/<code class="inl">filecol</code>, decides
+    which of those five already-written primitives applies, calls it, and then repeats the exact one-column
+    scroll rule Chapter 09 already taught you for the arrow keys. Editing text, in kilo.c, is navigation plus
+    five function calls you've already read.</p>
+
+    <h2 data-anchor="edit-h2-insertchar">Implementation: editorRowInsertChar, the byte-level primitive</h2>
+    <p data-anchor="edit-p-insertchar-1">Everything that inserts a single character eventually calls this.
+    It has two branches, split on whether <code class="inl">at</code> lands inside the existing text or past
+    the end of it:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorRowInsertChar</span>(erow *row, <span class="ty">int</span> at, <span class="ty">int</span> c) {
+    <span class="kw">if</span> (at &gt; row-&gt;size) {
+        <span class="ty">int</span> padlen = at-row-&gt;size;
+        row-&gt;chars = realloc(row-&gt;chars,row-&gt;size+padlen+2);
+        memset(row-&gt;chars+row-&gt;size,<span class="str">' '</span>,padlen);
+        row-&gt;chars[row-&gt;size+padlen+1] = <span class="str">'\0'</span>;
+        row-&gt;size += padlen+1;
+    } <span class="kw">else</span> {
+        row-&gt;chars = realloc(row-&gt;chars,row-&gt;size+2);
+        memmove(row-&gt;chars+at+1,row-&gt;chars+at,row-&gt;size-at+1);
+        row-&gt;size++;
+    }
+    row-&gt;chars[at] = c;
+    <span class="fn">editorUpdateRow</span>(row);
+    E.dirty++;
+}</pre>
+    <p data-anchor="edit-p-insertchar-2">The ordinary case (<code class="inl">at &lt;= row-&gt;size</code>,
+    the <code class="inl">else</code> branch) is a textbook insert-in-the-middle-of-a-buffer: grow by two bytes
+    (one for the new character, one because a C string always needs room for its null terminator), then
+    <code class="inl">memmove</code> everything from <code class="inl">at</code> onward &mdash; the null
+    terminator included &mdash; one slot to the right, opening a gap. <code class="inl">row-&gt;chars[at] =
+    c</code>, common to both branches, then overwrites whatever got duplicated into that gap with the real
+    character.</p>
+    <p data-anchor="edit-p-insertchar-3">The other branch is the more interesting one, because it answers a
+    question navigation never had to: what happens if you try to insert past the last real character of a
+    line? This <code class="inl">if (at &gt; row-&gt;size)</code> block is the <em>only</em> place in the file
+    that handles it &mdash; not in <code class="inl">editorMoveCursor()</code>, not anywhere in Chapter 09.
+    Kilo's answer is to pad: fill the gap between the old end of the line and <code class="inl">at</code> with
+    literal ASCII space characters, place the new character right after the padding, and grow
+    <code class="inl">row-&gt;size</code> by <code class="inl">padlen+1</code>. Type a character past the visual
+    end of a short line and Kilo doesn't refuse, doesn't wrap, doesn't beep &mdash; it writes real spaces into
+    the file to get there.</p>
+
+    <h2 data-anchor="edit-h2-typing">Implementation: editorInsertChar wraps the primitive in file-growth and scroll</h2>
+    <p data-anchor="edit-p-typing-1"><code class="inl">editorInsertChar(int c)</code> opens exactly like every
+    function in the previous chapter &mdash; recompute <code class="inl">filerow</code>/<code class="inl">filecol</code>
+    from the four cursor fields &mdash; and then handles a case that's specific to editing: what if the cursor
+    is sitting on a row that doesn't exist yet? That happens whenever the file is shorter than the cursor's
+    current screen position (an empty file, or a cursor parked past the last line). The fix is a loop, not a
+    single call: <code class="inl">while(E.numrows &lt;= filerow) editorInsertRow(E.numrows,"",0);</code> &mdash;
+    append blank rows one at a time until a real row exists at <code class="inl">filerow</code>, <em>then</em>
+    call <code class="inl">editorRowInsertChar()</code> on it. After the character lands, the cursor advance
+    reuses Chapter 09's edge rule verbatim: if <code class="inl">E.cx</code> is already sitting on the rightmost
+    visible column, pan <code class="inl">E.coloff</code> forward instead of moving the cursor; otherwise, plain
+    <code class="inl">E.cx++</code>.</p>
+    <div class="callout key" data-anchor="edit-callout-reuse">
+      <span class="tag">Nothing new under the cursor</span>
+      <p>Compare this to <code class="inl">editorMoveCursor()</code>'s <code class="inl">ARROW_RIGHT</code>
+      case from Chapter 09: <em>same</em> edge check, <em>same</em> pan-or-bump choice. Kilo doesn't have a
+      separate &ldquo;cursor advances because I typed&rdquo; rule and a &ldquo;cursor advances because I
+      pressed Right&rdquo; rule &mdash; typing a character and pressing the Right arrow both end by asking the
+      identical question: is the actor at the edge of the frame, or can it just step forward?</p>
+    </div>
+
+    <h2 data-anchor="edit-h2-newline">Implementation: Enter splits, grows, or both</h2>
+    <p data-anchor="edit-p-newline-1"><code class="inl">editorInsertNewline()</code> is the first function in
+    this chapter that genuinely branches three ways, all keyed off where <code class="inl">filecol</code> sits
+    once it's been clamped to the row's length (a cursor conceptually past the last character is treated as
+    exactly at it):</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorInsertNewline</span>(<span class="ty">void</span>) {
+    <span class="ty">int</span> filerow = E.rowoff+E.cy;
+    <span class="ty">int</span> filecol = E.coloff+E.cx;
+    erow *row = (filerow &gt;= E.numrows) ? NULL : &amp;E.row[filerow];
+
+    <span class="kw">if</span> (!row) {
+        <span class="kw">if</span> (filerow == E.numrows) {
+            <span class="fn">editorInsertRow</span>(filerow,<span class="str">""</span>,0);
+            <span class="kw">goto</span> fixcursor;
+        }
+        <span class="kw">return</span>;
+    }
+    <span class="kw">if</span> (filecol &gt;= row-&gt;size) filecol = row-&gt;size;
+    <span class="kw">if</span> (filecol == 0) {
+        <span class="fn">editorInsertRow</span>(filerow,<span class="str">""</span>,0);
+    } <span class="kw">else</span> {
+        <span class="fn">editorInsertRow</span>(filerow+1,row-&gt;chars+filecol,row-&gt;size-filecol);
+        row = &amp;E.row[filerow];
+        row-&gt;chars[filecol] = <span class="str">'\0'</span>;
+        row-&gt;size = filecol;
+        <span class="fn">editorUpdateRow</span>(row);
+    }
+fixcursor:
+    <span class="kw">if</span> (E.cy == E.screenrows-1) {
+        E.rowoff++;
+    } <span class="kw">else</span> {
+        E.cy++;
+    }
+    E.cx = 0;
+    E.coloff = 0;
+}</pre>
+    <p data-anchor="edit-p-newline-2"><strong>Past the last row entirely</strong>
+    (<code class="inl">row == NULL</code>): only handled if the cursor sits <em>exactly</em> one past the last
+    row (<code class="inl">filerow == E.numrows</code>) &mdash; append one empty row and jump straight to the
+    shared cursor-fixup with <code class="inl">goto fixcursor</code>. Any farther out and the function just
+    returns, doing nothing.</p>
+    <p data-anchor="edit-p-newline-3"><strong>At the very start of a line</strong>
+    (<code class="inl">filecol == 0</code>): <code class="inl">editorInsertRow(filerow,"",0)</code> inserts a
+    blank row <em>before</em> the current one. There's no separate step that moves the existing line's text
+    down &mdash; <code class="inl">editorInsertRow()</code>'s own <code class="inl">memmove</code> already shifts
+    every row at or after <code class="inl">filerow</code> one slot down, so the original line's content simply
+    ends up one row lower, unchanged. &ldquo;Insert a blank line above the cursor&rdquo; and &ldquo;push my
+    current line down by one&rdquo; are not two different operations in this code &mdash; they're the same
+    memmove, described two ways.</p>
+    <p data-anchor="edit-p-newline-4"><strong>Anywhere else in the line</strong>: this is the actual split.
+    <code class="inl">editorInsertRow(filerow+1, row-&gt;chars+filecol, row-&gt;size-filecol)</code> copies
+    everything from the cursor onward into a brand-new row immediately below the current one. Then &mdash;
+    and this matters &mdash; <code class="inl">row</code> is re-fetched from <code class="inl">E.row[filerow]</code>
+    rather than reused, because <code class="inl">editorInsertRow()</code> just <code class="inl">realloc</code>'d
+    the whole <code class="inl">E.row</code> array and the old pointer may no longer be valid. Only then does
+    the original row get truncated in place &mdash; <code class="inl">row-&gt;chars[filecol] = '\0'; row-&gt;size =
+    filecol;</code> &mdash; followed by an explicit <code class="inl">editorUpdateRow(row)</code> call. That
+    call is not optional bookkeeping: writing directly into <code class="inl">chars</code>/<code class="inl">size</code>
+    bypasses every helper function that would normally trigger a render rebuild on its own, so the split's
+    first half needs its own manual refresh even though the second half already got one for free, inside
+    <code class="inl">editorInsertRow()</code>.</p>
+
+    <h2 data-anchor="edit-h2-delchar">Implementation: Backspace, Delete, and the line-merge</h2>
+    <p data-anchor="edit-p-delchar-1"><code class="inl">editorDelChar()</code> handles Backspace, Ctrl-H, and
+    the Delete key &mdash; all three arrive at the same case block in the dispatcher and all three call this
+    one function:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorDelChar</span>(<span class="ty">void</span>) {
+    <span class="ty">int</span> filerow = E.rowoff+E.cy;
+    <span class="ty">int</span> filecol = E.coloff+E.cx;
+    erow *row = (filerow &gt;= E.numrows) ? NULL : &amp;E.row[filerow];
+
+    <span class="kw">if</span> (!row || (filecol == 0 &amp;&amp; filerow == 0)) <span class="kw">return</span>;
+    <span class="kw">if</span> (filecol == 0) {
+        filecol = E.row[filerow-1].size;
+        <span class="fn">editorRowAppendString</span>(&amp;E.row[filerow-1],row-&gt;chars,row-&gt;size);
+        <span class="fn">editorDelRow</span>(filerow);
+        row = NULL;
+        <span class="kw">if</span> (E.cy == 0)
+            E.rowoff--;
+        <span class="kw">else</span>
+            E.cy--;
+        E.cx = filecol;
+        <span class="kw">if</span> (E.cx &gt;= E.screencols) {
+            <span class="ty">int</span> shift = (E.screencols-E.cx)+1;
+            E.cx -= shift;
+            E.coloff += shift;
+        }
+    } <span class="kw">else</span> {
+        <span class="fn">editorRowDelChar</span>(row,filecol-1);
+        <span class="kw">if</span> (E.cx == 0 &amp;&amp; E.coloff)
+            E.coloff--;
+        <span class="kw">else</span>
+            E.cx--;
+    }
+    <span class="kw">if</span> (row) <span class="fn">editorUpdateRow</span>(row);
+    E.dirty++;
+}</pre>
+    <p data-anchor="edit-p-delchar-2">The very first line is a guard: <code class="inl">if (!row || (filecol ==
+    0 &amp;&amp; filerow == 0)) return;</code>. Backspace at the first character of the file &mdash; nothing
+    before the cursor, nowhere to merge into &mdash; is a silent no-op. No error, no beep, nothing on the
+    status line. Past that guard there are exactly two paths.</p>
+    <p data-anchor="edit-p-delchar-3"><strong>Ordinary case, <code class="inl">filecol != 0</code>:</strong>
+    <code class="inl">editorRowDelChar(row, filecol-1)</code>. Notice the <code class="inl">-1</code> &mdash;
+    Backspace deletes the character <em>before</em> the cursor position, not the one at it (that's what Delete
+    would do, and this codebase doesn't distinguish the two: all three keys share this one function and this
+    one branch). The scroll-back that follows is, once again, the mirror of a rule you've already seen: give
+    back a column of scroll if there's any to give (<code class="inl">E.coloff--</code>), otherwise just step
+    the cursor left.</p>
+    <p data-anchor="edit-p-delchar-4"><strong>Line-merge case, <code class="inl">filecol == 0</code>:</strong>
+    Backspace at the very start of a line joins it to the line above. Three things happen in order. First,
+    <code class="inl">filecol</code> is repurposed to hold <code class="inl">E.row[filerow-1].size</code>
+    &mdash; the previous line's length, which is exactly the seam where the join will happen. Second,
+    <code class="inl">editorRowAppendString(&amp;E.row[filerow-1], row-&gt;chars, row-&gt;size)</code> glues the
+    <em>entire</em> current line onto the end of the previous one. Third, <code class="inl">editorDelRow(filerow)</code>
+    removes the now-redundant row and renumbers everything after it. The cursor then moves up
+    (<code class="inl">E.rowoff--</code> if it was already on the screen's top row, else plain
+    <code class="inl">E.cy--</code>) and lands at the captured seam &mdash; exactly between the old text and the
+    text that was just appended to it, which is where a cursor should be after &ldquo;typing over&rdquo; a
+    newline.</p>
+
+    <div class="callout warn" data-anchor="edit-callout-shiftbug">
+      <span class="tag">A sign error, verified by working the arithmetic</span>
+      <p>Look again at what happens right after the seam is computed: <code class="inl">if (E.cx &gt;=
+      E.screencols) { int shift = (E.screencols-E.cx)+1; E.cx -= shift; E.coloff += shift; }</code>. Work it
+      with numbers, screen width 80 columns. If the seam lands exactly one column past the edge
+      (<code class="inl">E.cx == 80</code>): <code class="inl">shift = (80-80)+1 = 1</code>, giving
+      <code class="inl">E.cx = 79</code> &mdash; correct, the cursor sits on the last visible column. But at
+      <code class="inl">E.cx == 81</code>: <code class="inl">shift = (80-81)+1 = 0</code> &mdash;
+      <code class="inl">E.cx</code> is left completely unchanged, still one column past the valid range. And at
+      <code class="inl">E.cx == 200</code> (backspacing at the start of a short line whose neighbor above is much
+      longer than the screen): <code class="inl">shift = (80-200)+1 = -119</code>, so
+      <code class="inl">E.cx -= shift</code> <em>adds</em> 119, pushing the cursor to 319 &mdash; further off
+      screen, not back onto it &mdash; while <code class="inl">E.coloff += shift</code> moves the viewport the
+      wrong way at the same time. The formula only happens to work at the single boundary case
+      <code class="inl">E.cx == E.screencols</code>; for any larger overflow the sign is backwards. Reproduce
+      it yourself against a fresh clone before repeating it as fact &mdash; the same habit this book has asked
+      of you since Chapter 09's Home/End gap.</p>
+    </div>
+
+    <div class="callout key" data-anchor="edit-callout-order">
+      <span class="tag">A quirk you've already met, recurring here</span>
+      <p><code class="inl">editorRowDelChar()</code>, called by the ordinary mid-line branch above, calls
+      <code class="inl">editorUpdateRow(row)</code> one line <em>before</em> decrementing
+      <code class="inl">row-&gt;size</code> &mdash; the opposite order from
+      <code class="inl">editorRowInsertChar()</code> and <code class="inl">editorRowAppendString()</code>,
+      both of which finish adjusting <code class="inl">size</code> before they're done. Chapter 08 already
+      traced through why: the preceding <code class="inl">memmove</code> shifts the null terminator one byte
+      left, so for one call <code class="inl">editorUpdateRow()</code> reads with the old, larger
+      <code class="inl">size</code> and copies that shifted-in null byte into <code class="inl">render</code>
+      as if it were content. It's self-correcting by the very next update and Chapter 08 called it harmless in
+      practice &mdash; but every Backspace in the middle of a line runs through it, so it's worth remembering
+      exactly where this chapter depends on that earlier finding.</p>
+    </div>
+
+    <h2 data-anchor="edit-h2-edge">Edge cases: what these three functions quietly guarantee (and don't)</h2>
+    <ul data-anchor="edit-ul-edge">
+      <li data-anchor="edit-li-edge-1"><strong>Typing past the end of a line writes real spaces, not a
+      refusal.</strong> <code class="inl">editorRowInsertChar()</code>'s padding branch is the only code path
+      that handles it, and what it does is pad the file with ASCII spaces up to the insertion point.</li>
+      <li data-anchor="edit-li-edge-2"><strong>Backspace deletes the character before the cursor, not at
+      it.</strong> The <code class="inl">filecol-1</code> passed to <code class="inl">editorRowDelChar()</code>
+      is easy to skim past; Delete and Backspace are not distinguished anywhere in this function.</li>
+      <li data-anchor="edit-li-edge-3"><strong>&ldquo;Insert a blank line above&rdquo; and &ldquo;split the
+      current line&rdquo; are the same primitive, called with different arguments.</strong>
+      <code class="inl">editorInsertNewline()</code> never special-cases the blank-line insertion separately
+      from the mid-line split &mdash; both go through <code class="inl">editorInsertRow()</code>.</li>
+      <li data-anchor="edit-li-edge-4"><strong>There is no undo, no word-delete, no line-delete.</strong> A
+      full-file search for writes to <code class="inl">row-&gt;chars</code> or <code class="inl">row-&gt;size</code>
+      turns up only the five primitives from Chapter 08 plus this chapter's three dispatchers &mdash; nothing
+      else in kilo.c ever mutates a row's text. Later chapters that add these features are building them from
+      nothing, not exposing something already half-there.</li>
+      <li data-anchor="edit-li-edge-5"><strong><code class="inl">E.dirty</code> is a counter, not a
+      flag.</strong> It's incremented &mdash; never just set to 1 &mdash; at the bottom of every row-mutating
+      primitive <em>and</em> again inside <code class="inl">editorInsertChar()</code>/<code class="inl">editorDelChar()</code>
+      themselves, so a single keystroke can bump it by more than one. Every place that reads it only checks
+      whether it's nonzero, so the exact count never surfaces &mdash; but Chapter 12 will lean on that
+      nonzero-ness to decide whether there's anything to save.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="edit-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A second use for arithmetic you'd already written. Every function in this chapter opens with the exact
+      same two lines Chapter 09 opened every navigation function with &mdash; recompute
+      <code class="inl">filerow</code>/<code class="inl">filecol</code> &mdash; and then spends that position
+      on a primitive from Chapter 08 instead of a cursor move. Insertion, deletion, splitting a line, merging
+      two lines: none of it required new state, a new coordinate system, or a new scrolling rule. It required
+      reusing the ones you already have. And you've also seen, close up, what that reuse doesn't buy you for
+      free &mdash; a re-clamp formula copied from one context can carry a sign error into another, and a
+      call-order quirk found in one chapter keeps mattering every time later code calls the function it lives
+      in. Chapter 11 picks up right where <code class="inl">editorInsertRow()</code> already pointed:
+      if you can build a file's rows one line at a time by hand, you can build them the same way from a file on
+      disk.</p>
+    </div>
+
+    <div class="challenges" data-anchor="edit-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Trace <code class="inl">editorInsertNewline()</code> for a cursor sitting in the exact middle of a
+        20-character line. Write out, step by step, what <code class="inl">editorInsertRow()</code> is called
+        with, what the original row's <code class="inl">chars</code>/<code class="inl">size</code> become, and
+        why the original row needs its own <code class="inl">editorUpdateRow()</code> call when the new row
+        doesn't.</li>
+        <li>Fix the sign error in <code class="inl">editorDelChar()</code>'s re-clamp. What should
+        <code class="inl">shift</code> actually be computed as so that any overflow &mdash; not just the
+        single-column boundary case &mdash; pulls <code class="inl">E.cx</code> back onto the visible
+        screen correctly? Work through your fix with the same <code class="inl">E.cx == 200</code>,
+        <code class="inl">screencols == 80</code> example this chapter used.</li>
+        <li>Backspacing at column 0 always merges the current line into the <em>previous</em> one, never the
+        other way around. What would have to change &mdash; in <code class="inl">editorDelChar()</code>, and
+        in how the cursor ends up positioned &mdash; to make Delete at the end of a line merge the
+        <em>next</em> line upward instead? Is that actually a different operation, or the same one viewed from
+        the opposite line?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="edit-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — editorRowInsertChar, editorInsertChar, editorInsertNewline, editorDelChar, editorRowDelChar, editorRowAppendString, editorProcessKeypress's ENTER/BACKSPACE/default cases</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-moving-around-the-file.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="11-opening-files.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

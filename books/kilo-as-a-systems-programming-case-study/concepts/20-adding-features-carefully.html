@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adding Features Carefully — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="afc-eyebrow">Chapter 20 &middot; Part VII — Beyond the Tutorial</p>
+    <h1 data-anchor="afc-h1">Adding Features Carefully</h1>
+
+    <p class="lead" data-anchor="afc-lead">Chapter 19 asked what a refactor of kilo.c would touch and, just as
+    carefully, what it would deliberately leave alone. This chapter asks the harder follow-up question: kilo.c's
+    own README doesn't just tolerate extension, it invites it &mdash; "a starting point to write other editors."
+    So let's actually grow it. Not by bolting on everything a modern editor has, but by taking five real,
+    frequently-requested features &mdash; line numbers, undo/redo, richer search, clipboard support, richer
+    highlighting &mdash; and asking of each one the same question: what does this cost, and where does that cost
+    actually land? Some of these features are cheap because kilo.c already built the seam they'd slot into.
+    Others are expensive in ways that don't show up until you measure them. Knowing which is which, before you
+    write a line of code, is what "carefully" means in this chapter's title.</p>
+
+    <h2 data-anchor="afc-h2-motivation">Motivation: an invitation with a budget attached</h2>
+    <p data-anchor="afc-p-motivation-1">It's worth reading the invitation precisely. Kilo's README says the
+    program is meant "as a starting point to write other editors or command line interfaces that are more
+    advanced than the usual REPL style CLI." That's not a hedge &mdash; antirez built Kilo assuming people would
+    extend it. But every chapter of this book so far has also shown what makes kilo.c worth extending in the
+    first place: one file, zero library dependencies, a size budget tight enough to fit in a name. A feature that
+    quietly triples memory use per keystroke, or that only works if you also link ncurses, wins the feature and
+    loses the thing that made this program worth studying. So the real design question for each feature below
+    isn't "can I add this?" &mdash; it's "can I add this without spending the budget every earlier chapter spent
+    eighteen chapters establishing?"</p>
+    <p data-anchor="afc-p-motivation-2">That's also why this chapter reads differently from Chapters 4 through
+    18. Those chapters explained code that exists. This one proposes code that doesn't &mdash; every snippet
+    below is an illustrative sketch, not a line from antirez's source, and each one is sized to show the shape of
+    a change, not to be a finished patch. Where a feature is cheap, we'll show why. Where a feature is expensive,
+    we'll show the actual cost, measured by someone who built it and paid for it.</p>
+
+    <h2 data-anchor="afc-h2-design">Design: four questions before the first line of code</h2>
+    <p data-anchor="afc-p-design-1">Every feature below gets asked the same four questions, in order, because
+    they're the ones that separate a change that stays small from one that quietly isn't:</p>
+    <table class="grid" data-anchor="afc-table-questions">
+      <tr><th>Question</th><th>Why it matters here</th></tr>
+      <tr><td>Does a paved path already exist?</td><td>Chapter 16 built HLDB precisely so new languages don't
+      touch the scanner. Not every feature gets a seam this generous.</td></tr>
+      <tr><td>Does it touch shared state or just add to it?</td><td>A new field on <code class="inl">erow</code>
+      is additive. A change to what <code class="inl">E.cx</code> means is not &mdash; it ripples through every
+      function that reads it.</td></tr>
+      <tr><td>What's the cost per keystroke, not per feature?</td><td>A feature that runs once per file open
+      (Chapter 16's syntax selection) has a completely different budget than one that runs on every character
+      typed.</td></tr>
+      <tr><td>Is there a smaller version that captures most of the value?</td><td>"Highlight the current match"
+      and "highlight every match" are both "richer search," at very different costs.</td></tr>
+    </table>
+    <p data-anchor="afc-p-design-2">With that framework in hand, here are the five features the brief for this
+    chapter names, taken one at a time.</p>
+
+    <h2 data-anchor="afc-h2-linenumbers">Line numbers</h2>
+    <p data-anchor="afc-p-ln-1">Chapter 9 established that <code class="inl">E.cx</code> and
+    <code class="inl">E.cy</code> are screen-relative coordinates, clamped into <code class="inl">[0,
+    E.screencols)</code> and <code class="inl">[0, E.screenrows)</code> &mdash; not positions in the file. That
+    single fact is the whole reason line numbers aren't a one-line change. Every column calculation in
+    <code class="inl">editorRefreshScreen</code> &mdash; the cx-to-render-column loop, the horizontal-scroll
+    check, the status bar's own width math &mdash; measures directly against <code class="inl">E.screencols</code>
+    with no margin reserved. Printing a number before each line is the easy five percent. Making every one of
+    those existing calculations agree on how many columns are left over is the rest of the feature.</p>
+    <div class="callout warn" data-anchor="afc-callout-gutterwidth">
+      <span class="tag">The width isn't a constant</span>
+      <p>Vim's own gutter width (<code class="inl">numberwidth</code>) is a value the user sets, not one Vim
+      recomputes automatically as the file grows. Neovim's own issue tracker carries an open request for a
+      reliable way to query the current gutter width at all, noting you can "do some log10 math and
+      heuristically compute how big the column probably is" from the line count &mdash; but that estimate breaks
+      the moment a minimum width is configured. A from-scratch Kilo gutter hits the identical problem: what
+      happens to every cached column offset the moment <code class="inl">E.numrows</code> crosses from 9 lines
+      to 10, or 99 to 100, and the gutter needs one more character of width mid-session?</p>
+    </div>
+    <pre class="tab"><span class="cm">/* Illustrative sketch — not in antirez's source. */</span>
+<span class="ty">int</span> gutter_width(<span class="ty">int</span> numrows) {
+    <span class="ty">int</span> digits = <span class="num">1</span>;
+    <span class="kw">for</span> (<span class="ty">int</span> n = numrows; n &gt;= <span class="num">10</span>; n /= <span class="num">10</span>) digits++;
+    <span class="kw">return</span> digits + <span class="num">1</span>; <span class="cm">/* +1 for the space before the text */</span>
+}
+<span class="cm">/* Every place that currently reads E.screencols for on-screen width
+   would instead read E.screencols - gutter_width(E.numrows), recomputed
+   wherever updateWindowSize() already runs. */</span></pre>
+    <p data-anchor="afc-p-ln-2">Notice what this sketch does <em>not</em> do: it doesn't touch
+    <code class="inl">E.cx</code>'s meaning at all. The cursor is still a screen column; the gutter just shrinks
+    what "the screen" means for text. That's the difference between a feature that's expensive because it's
+    structurally invasive and one that's merely tedious because it has several call sites &mdash; line numbers
+    are the second kind.</p>
+
+    <h2 data-anchor="afc-h2-undo">Undo/redo</h2>
+    <p data-anchor="afc-p-undo-1">This is the feature in this chapter with the clearest paper trail on what
+    happens when you skip the "measure first" step. Text-editor undo splits into two designs: a
+    <strong>command-based</strong> approach that stores the reverse of each edit &mdash; "delete these 5
+    characters at this position" to undo an insert of those same 5 characters &mdash; and a
+    <strong>state-based</strong> approach that snapshots the whole buffer before each edit and restores the
+    snapshot to undo. State-based is far less code. It is also, it turns out, far more expensive to run.</p>
+    <div class="callout key" data-anchor="afc-callout-mattduck">
+      <span class="tag">A measured example, not a guess</span>
+      <p>Developer Matt Duck added undo/redo to his own fork of kilo using periodic full-buffer snapshots, then
+      profiled it with <code class="inl">pmap</code>. Total heap grew by 132K and RSS by 184K after only a
+      handful of edits &mdash; to a file that was itself under 29K on disk. Each additional snapshot added
+      roughly 192KB, regardless of how small the actual edit was: a single inserted character and a thousand
+      inserted characters cost the same snapshot. For a program whose entire design budget is "less than 1000
+      lines" and an implicitly frugal memory footprint, that's not a rounding error &mdash; it's the concrete
+      price of choosing the design that was easy to write over the one that was cheap to run.</p>
+    </div>
+    <p data-anchor="afc-p-undo-2">The command-based alternative costs more up front &mdash; every editing
+    function (<code class="inl">editorInsertChar</code>, <code class="inl">editorDelChar</code>,
+    <code class="inl">editorInsertNewline</code>, all touched already by Chapter 10) needs a matching "here's how
+    to undo this specific call" record pushed onto a stack, rather than one generic snapshot call inserted
+    everywhere. But the cost scales with what actually changed, not with the size of the buffer it changed in
+    &mdash; which is exactly the property a program this size can't afford to give up by accident.</p>
+
+    <h2 data-anchor="afc-h2-search">Richer search</h2>
+    <p data-anchor="afc-p-search-1">Chapter 13 already gave <code class="inl">editorFind</code> a specific,
+    narrow limitation worth naming here: it restores at most <em>one</em> previous match's highlighting per
+    keystroke. The <code class="inl">FIND_RESTORE_HL</code> macro undoes exactly the single
+    <code class="inl">saved_hl</code>/<code class="inl">saved_hl_line</code> pair captured on the previous
+    iteration &mdash; not a list of them. "Highlight every match in the file, not just the current one" is a
+    real, common request, and it means replacing that single saved slot with an array: one saved-and-restored
+    entry per match, not one.</p>
+    <p data-anchor="afc-p-search-2">That gap isn't specific to Kilo, and neither is the fix. Vim's own
+    incremental search didn't originally highlight every match either &mdash; patch 8.0.1238, titled
+    "incremental search only shows one match," added the option to highlight all matches on top of the
+    pre-existing single-current-match behavior, years after incremental search itself had shipped. Kilo is, on
+    this specific point, exactly where Vim once was.</p>
+    <div class="callout warn" data-anchor="afc-callout-hlperf">
+      <span class="tag">The upgrade isn't free</span>
+      <p>The GNU Emacs manual documents that highlighting a large number of matches can measurably slow the
+      editor down while the search query is still being typed &mdash; and exposes a configurable cap on how many
+      matches get highlighted at once specifically to protect responsiveness during the same
+      keystroke-by-keystroke loop Chapter 13 already runs for a single match. An "improved" search that makes
+      every keystroke feel laggy on a large file is not, in the terms this chapter cares about, actually an
+      improvement.</p>
+    </div>
+
+    <h2 data-anchor="afc-h2-clipboard">Clipboard support</h2>
+    <p data-anchor="afc-p-clip-1">Chapter 3 established Kilo's zero-dependency constraint, and Chapter 18 named
+    the portability cost of leaning on anything platform-specific. Both rule out the obvious approach: shelling
+    out to <code class="inl">pbcopy</code>, <code class="inl">xclip</code>, or <code class="inl">wl-copy</code>
+    would work, but it would pick a platform, add a spawned process to a program that has never spawned one, and
+    quietly abandon the "any VT100-compatible terminal" story Chapter 5 built the whole rendering layer around.
+    OSC 52 sidesteps all three problems at once: it's a terminal escape sequence, not a system call &mdash;
+    <code class="inl">ESC ] 52 ; c ; &lt;base64-text&gt; BEL</code> &mdash; asking the terminal emulator itself
+    to set the system clipboard, delivered exactly the way Kilo already talks to the terminal for cursor
+    movement and screen clearing.</p>
+    <pre class="tab"><span class="cm">/* Illustrative sketch — not in antirez's source. */</span>
+<span class="ty">void</span> osc52CopyToClipboard(<span class="kw">const</span> <span class="ty">char</span> *text, <span class="ty">size_t</span> len) {
+    <span class="ty">char</span> *b64 = base64_encode(text, len); <span class="cm">/* small helper, not in kilo.c */</span>
+    printf(<span class="str">"\x1b]52;c;%s\x07"</span>, b64);
+    fflush(stdout);
+    free(b64);
+}</pre>
+    <p data-anchor="afc-p-clip-2">It has real limits, and they're worth naming before reaching for it rather than
+    after: one documented implementation caps the base64-encoded payload at 74994 bytes before truncating, so
+    this suits a selection or a line, not a whole large file. Inside tmux, the sequence is only forwarded to the
+    outer terminal if <code class="inl">set -s set-clipboard on</code> is configured (some setups also need
+    <code class="inl">allow-passthrough</code>). And VTE-based terminals &mdash; the base of many default Linux
+    desktop terminal emulators &mdash; don't support OSC 52 at all, and some will print the raw escape sequence
+    onto the screen instead of silently ignoring it.</p>
+    <div class="callout warn" data-anchor="afc-callout-osc52-read">
+      <span class="tag">Writing and reading are not the same operation</span>
+      <p>The sketch above only ever <em>sets</em> the clipboard &mdash; it's write-only from the editor's side.
+      OSC 52 also defines a query variant for <em>reading</em> the clipboard, and that's a materially more
+      sensitive operation: many terminals refuse it outright or gate it behind a user prompt, because a program
+      silently reading whatever's on your system clipboard is a real information-disclosure risk, not a
+      convenience. "Add clipboard support" quietly means two different features with two very different trust
+      levels, and this chapter is only recommending the first one.</p>
+    </div>
+
+    <h2 data-anchor="afc-h2-highlight">Richer syntax highlighting</h2>
+    <p data-anchor="afc-p-hl-1">This is the one feature in this chapter that Chapters 14 through 16 already did
+    most of the design work for. HLDB is a plain array holding exactly one populated
+    <code class="inl">struct editorSyntax</code>, matched by filename in
+    <code class="inl">editorSelectSyntaxHighlight</code>, and the source's own doc comment addresses a future
+    maintainer directly: "In order to add a new syntax, define two arrays..." Adding a second language is
+    appending one more HLDB entry &mdash; it never touches the character-by-character scanning logic in
+    <code class="inl">editorUpdateSyntax</code> at all. Of every feature in this chapter, this is the cheapest,
+    because the paved path was built three chapters ago.</p>
+    <div class="callout key" data-anchor="afc-callout-nopath">
+      <span class="tag">Where the paved path ends</span>
+      <p>That same doc comment is equally explicit about what isn't supported: "There is no support to highlight
+      patterns currently" &mdash; <code class="inl">filematch</code> is plain substring/suffix matching only. A
+      genuinely richer version of this feature &mdash; glob filename patterns like <code class="inl">*.conf</code>,
+      or per-token regex highlight rules &mdash; means changing
+      <code class="inl">editorSelectSyntaxHighlight</code>'s match loop itself, and possibly
+      <code class="inl">editorUpdateSyntax</code>'s scanner. That's a structurally different, more invasive
+      change than adding a table row, which is exactly why it's the one item on this list worth scoping down or
+      deferring rather than building first.</p>
+    </div>
+
+    <h2 data-anchor="afc-h2-edge">Edge cases: where features collide</h2>
+    <p data-anchor="afc-p-edge-1">None of these five features live in isolation once more than one of them
+    exists, and the collisions are worth naming rather than discovering later.</p>
+    <div class="callout warn" data-anchor="afc-callout-undo-hl">
+      <span class="tag">Undo meets highlighting</span>
+      <p>Chapter 14 established that a change to whether a row ends inside an open multi-line comment recurses
+      forward, rehighlighting every subsequent row until the state stops changing. An undo that reinserts a large
+      deleted block &mdash; or a redo that removes one &mdash; can trigger exactly that recursive rehighlight,
+      once per undo step. A command-based undo (the design this chapter recommends above) makes that cost visible
+      and attributable to one keystroke; a snapshot-based undo would hide it inside the same expensive restore
+      that already made Matt Duck's numbers look the way they did.</p>
+    </div>
+    <p data-anchor="afc-p-edge-2">Line numbers and search interact too, in a smaller but still real way: Chapter
+    13's match-repositioning code sets <code class="inl">E.cx</code> and <code class="inl">E.coloff</code>
+    directly rather than through <code class="inl">editorMoveCursor</code> (Chapter 9). Any of those direct
+    writes that assume "column 0 is the left edge of the text" needs the same gutter-width offset the rest of the
+    drawing code would need &mdash; a second call site to update, easy to miss precisely because it doesn't look
+    like a drawing function.</p>
+
+    <div class="reflect" data-anchor="afc-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>Not five features bolted on at once &mdash; a costed list. Line numbers and syntax-highlighting
+      extension are cheap, for two different reasons: one touches many call sites but nothing structural, the
+      other has a seam built for it since Chapter 16. Undo/redo and richer search are exactly as expensive as
+      you choose to make them &mdash; a snapshot or highlight-everything implementation is a few hours of typing
+      and a real, measured memory or responsiveness cost; the disciplined version costs more code and less at
+      runtime. Clipboard support is cheap and safe in one direction (write) and a genuinely different, more
+      sensitive feature in the other (read). Kent Beck's engineering aphorism &mdash; make the change easy, then
+      make the easy change &mdash; is exactly Chapter 19's own method applied here: the small, verified refactor
+      (threading state as a parameter, extracting a dispatch table) comes first, so that each of these features,
+      when it's actually written, is a small, reviewable diff on top of it rather than a change that's hard to
+      untangle from everything else it touched. Chapter 21 is what makes "verified" mean something more than
+      "I tried it once" for any of this.</p>
+    </div>
+
+    <div class="challenges" data-anchor="afc-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Using this chapter's four design questions, rank the five features from cheapest to most expensive
+        to add to kilo.c, and justify the two endpoints of your ranking using specific claims from this
+        chapter (not general intuition).</li>
+        <li>Sketch the struct you'd need for one command-based undo entry that can reverse a call to
+        <code class="inl">editorDelChar</code> &mdash; what does it need to store to know how to put the deleted
+        character back, and where?</li>
+        <li>The "richer search" section shows one cost of highlighting every match. Using the same
+        FIND_RESTORE_HL mechanism described in Chapter 13, describe what data structure would replace
+        <code class="inl">saved_hl</code>/<code class="inl">saved_hl_line</code>, and what has to happen to it
+        on every keystroke of the query, not just on cancel.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="afc-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/README.md" target="_blank" rel="noopener">[1] antirez/kilo — README.md</a> &middot;
+      <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[2] kilo.c — raw source</a> &middot;
+      <a href="https://www.mattduck.com/undo-redo-in-kilo" target="_blank" rel="noopener">[3] Adding undo/redo to kilo (and debugging memory usage) — Matt Duck</a> &middot;
+      <a href="https://www.mattduck.com/undo-redo-text-editors" target="_blank" rel="noopener">[4] Undo/redo implementations in text editors — Matt Duck</a> &middot;
+      <a href="https://sunaku.github.io/tmux-yank-osc52.html" target="_blank" rel="noopener">[5] Copying to clipboard via OSC 52 — The Terminal Programmer</a> &middot;
+      <a href="https://github.com/tmux/tmux/wiki/Clipboard" target="_blank" rel="noopener">[6] tmux/tmux Wiki — Clipboard</a> &middot;
+      <a href="https://github.com/vim/vim/commit/2e51d9a0972080b087d566608472928d5b7b35d7" target="_blank" rel="noopener">[7] vim patch 8.0.1238 — highlight all matches</a> &middot;
+      <a href="https://www.gnu.org/software/emacs/manual/html_node/emacs/Search-Customizations.html" target="_blank" rel="noopener">[8] Search Customizations — GNU Emacs Manual</a> &middot;
+      <a href="https://phoenixnap.com/kb/vim-show-line-numbers" target="_blank" rel="noopener">[9] How to Show or Hide Line Numbers in Vim — phoenixNAP KB</a> &middot;
+      <a href="https://github.com/neovim/neovim/issues/17229" target="_blank" rel="noopener">[10] Query gutter width — neovim/neovim#17229</a> &middot;
+      <a href="https://martinfowler.com/articles/preparatory-refactoring-example.html" target="_blank" rel="noopener">[11] An example of preparatory refactoring — Martin Fowler</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="19-refactoring-kilo.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="21-testing-a-terminal-app.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

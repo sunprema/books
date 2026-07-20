@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File Types and Highlight Rules — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="ftr-eyebrow">Chapter 16 &middot; Part V — Search &amp; Highlighting</p>
+    <h1 data-anchor="ftr-h1">File Types and Highlight Rules</h1>
+
+    <p class="lead" data-anchor="ftr-lead">Chapter 15 read the entire C/C++ scan body and closed on a promise: that
+    scan is generic over <em>which</em> keywords and delimiters it's given, so a second language shouldn't need a
+    single line of it touched. This chapter is where we cash that promise in. Nothing new gets colored here &mdash;
+    instead we go one level up, to the two questions every one of the last two chapters quietly assumed had already
+    been answered: how does Kilo decide <em>which</em> table of keywords and delimiters applies to the file you just
+    opened, and what would it actually take to add a second entry to that table? Both answers turn out to live in
+    about twenty lines of code and one comment block antirez left for exactly this purpose.</p>
+
+    <h2 data-anchor="ftr-h2-motivation">Motivation: E.syntax didn't set itself</h2>
+    <p data-anchor="ftr-p-motivation-1">Go back to the opening line of Chapter 14's <code class="inl">editorUpdateSyntax</code>:
+    <code class="inl">if (E.syntax == NULL) return;</code>. Every claim in the last two chapters about keywords
+    turning yellow, types turning green, strings surviving an escaped quote &mdash; all of it was conditioned on
+    <code class="inl">E.syntax</code> already pointing at the right table by the time a single row got scanned. We
+    never asked how it got there. It turns out the answer is deliberately boring: one function, called once, before
+    the file is even read.</p>
+    <p data-anchor="ftr-p-motivation-2">The struct that <code class="inl">E.syntax</code> points at is one we've
+    been reading through piecemeal since Chapter 15. Here it is whole:</p>
+    <pre class="tab"><span class="kw">struct</span> editorSyntax {
+    <span class="ty">char</span> **filematch;
+    <span class="ty">char</span> **keywords;
+    <span class="ty">char</span> singleline_comment_start[2];
+    <span class="ty">char</span> multiline_comment_start[3];
+    <span class="ty">char</span> multiline_comment_end[3];
+    <span class="ty">int</span> flags;
+};</pre>
+    <p data-anchor="ftr-p-motivation-3">Five of these six fields you've already used, through <code
+    class="inl">E.syntax</code>, without ever seeing the struct declaration itself: <code
+    class="inl">keywords</code> drove Chapter 15's whole scan, the three comment-delimiter buffers gated the
+    single- and multi-line comment branches, and <code class="inl">flags</code> is where <code
+    class="inl">HL_HIGHLIGHT_STRINGS</code> and <code class="inl">HL_HIGHLIGHT_NUMBERS</code> live. The one field
+    this chapter is actually about is the first one: <code class="inl">char **filematch</code>. It's the only part
+    of the struct that has nothing to do with <em>coloring</em> a row, and everything to do with <em>choosing</em>
+    which struct instance gets used at all.</p>
+
+    <h2 data-anchor="ftr-h2-hldb">Design: one array, one instance, one counted by the compiler</h2>
+    <p data-anchor="ftr-p-hldb-1">Kilo's language table isn't a linked list you register entries into at runtime,
+    and it isn't read from a config file. It's a plain, statically-initialized C array:</p>
+    <pre class="tab"><span class="kw">struct</span> editorSyntax HLDB[] = {
+    {
+        <span class="cm">/* C / C++ */</span>
+        C_HL_extensions,
+        C_HL_keywords,
+        <span class="str">"//"</span>,<span class="str">"/*"</span>,<span class="str">"*/"</span>,
+        HL_HIGHLIGHT_STRINGS | HL_HIGHLIGHT_NUMBERS
+    }
+};
+
+<span class="mac">#define</span> HLDB_ENTRIES (<span class="kw">sizeof</span>(HLDB)/<span class="kw">sizeof</span>(HLDB[0]))</pre>
+    <p data-anchor="ftr-p-hldb-2">One stanza, one language. But look at how <code class="inl">HLDB_ENTRIES</code>
+    is defined: not as a hand-written constant like <code class="inl">#define HLDB_ENTRIES 1</code>, but as
+    <code class="inl">sizeof(HLDB)/sizeof(HLDB[0])</code> &mdash; the array's total byte size divided by one
+    element's byte size, computed by the compiler at build time. That's the detail that makes the whole mechanism
+    additive. Every loop in the file that walks <code class="inl">HLDB</code> does so up to <code
+    class="inl">HLDB_ENTRIES</code>, so the moment you add a second <code class="inl">{ ... }</code> stanza inside
+    the braces above, every one of those loops sees two entries instead of one, with nothing else to update. There's
+    no separate "how many languages do we support" counter sitting somewhere else in the file, waiting to drift out
+    of sync with the array it's supposed to describe.</p>
+    <div class="callout key" data-anchor="ftr-callout-onelement">
+      <span class="tag">The array shape was always general; only the contents are C-specific</span>
+      <p>Chapter 15's callout already flagged this: nothing about <code class="inl">struct editorSyntax</code> or
+      <code class="inl">HLDB</code>'s declaration forces exactly one entry. The struct has a <code
+      class="inl">char **filematch</code> field, and <code class="inl">HLDB</code> is an array, precisely so a
+      second stanza &mdash; Python, JSON, Markdown, whatever you need next &mdash; can sit right next to the C/C++
+      one. This chapter is that door, opened.</p>
+    </div>
+
+    <h2 data-anchor="ftr-h2-select">Implementation: editorSelectSyntaxHighlight, read whole</h2>
+    <p data-anchor="ftr-p-select-1">Here's the function that turns a filename string into a decision about which
+    HLDB stanza &mdash; if any &mdash; <code class="inl">E.syntax</code> should point at:</p>
+    <pre class="tab"><span class="cm">/* Select the syntax highlight scheme depending on the filename,
+ * setting it in the global state E.syntax. */</span>
+<span class="ty">void</span> editorSelectSyntaxHighlight(<span class="ty">char</span> *filename) {
+    <span class="kw">for</span> (<span class="ty">unsigned int</span> j = 0; j &lt; HLDB_ENTRIES; j++) {
+        <span class="kw">struct</span> editorSyntax *s = HLDB+j;
+        <span class="ty">unsigned int</span> i = 0;
+        <span class="kw">while</span>(s-&gt;filematch[i]) {
+            <span class="ty">char</span> *p;
+            <span class="ty">int</span> patlen = strlen(s-&gt;filematch[i]);
+            <span class="kw">if</span> ((p = strstr(filename,s-&gt;filematch[i])) != NULL) {
+                <span class="kw">if</span> (s-&gt;filematch[i][0] != <span class="str">'.'</span> || p[patlen] == <span class="str">'\0'</span>) {
+                    E.syntax = s;
+                    <span class="kw">return</span>;
+                }
+            }
+            i++;
+        }
+    }
+}</pre>
+    <p data-anchor="ftr-p-select-2">Two nested loops, and neither one is doing anything exotic. The outer loop walks
+    the <code class="inl">HLDB</code> array itself, entry by entry, up to <code class="inl">HLDB_ENTRIES</code>.
+    The inner loop walks <em>that entry's</em> <code class="inl">filematch</code> array &mdash; the same
+    NULL-terminated-array idiom Chapters 3 and 15 already leaned on for <code class="inl">keywords</code> &mdash;
+    testing each pattern in turn. The instant a pattern matches, the function sets <code
+    class="inl">E.syntax = s</code> and returns immediately. There's no scoring, no "check every entry and pick the
+    best match" pass: the first pattern, in the first entry, that matches, wins. With <code
+    class="inl">HLDB_ENTRIES == 1</code> in the shipped source, the outer loop only ever gets one iteration to
+    prove itself &mdash; but nothing about how it's written assumes that.</p>
+
+    <h2 data-anchor="ftr-h2-filematch">Design: what a filematch pattern actually means</h2>
+    <p data-anchor="ftr-p-filematch-1">All of the real logic in that function is one <code class="inl">if</code>
+    buried in the middle: <code class="inl">if (s->filematch[i][0] != '.' || p[patlen] == '\0')</code>. To see why
+    it's there, start with what <code class="inl">strstr(filename, pattern)</code> does on its own: it finds the
+    pattern <em>anywhere</em> inside the filename, as a plain substring, and returns a pointer to where the match
+    starts (or NULL). That's exactly right for a pattern like <code class="inl">"Makefile"</code> &mdash; the one
+    example kilo.c's own doc comment gives for a non-extension match &mdash; because you want <code
+    class="inl">"Makefile"</code> to match whether the file is named exactly <code class="inl">Makefile</code> or
+    something like <code class="inl">GNUmakefile.Makefile</code>. But a bare substring match is far too loose for
+    an extension. <code class="inl">".c"</code> is a substring of <code class="inl">foo.c</code> &mdash; and also
+    of <code class="inl">foo.copy</code>, which is not a C file at all.</p>
+    <p data-anchor="ftr-p-filematch-2">The dot check is what closes that gap. If the pattern's first character is
+    <code class="inl">'.'</code>, the match is only accepted when <code class="inl">p[patlen] == '\0'</code>
+    &mdash; that is, when nothing follows the matched substring inside the filename, which is only true when the
+    match lands at the very end of the string. <code class="inl">.c</code> matches <code class="inl">main.c</code>
+    (the match starts at index 4, and index 6 &mdash; right past it &mdash; is the string's terminating <code
+    class="inl">'\0'</code>). <code class="inl">.c</code> does <em>not</em> match <code class="inl">foo.copy</code>,
+    because the match starts at index 3 and index 5 holds <code class="inl">'o'</code>, not <code
+    class="inl">'\0'</code>. A pattern with no leading dot skips this extra check entirely and keeps strstr's plain
+    "matches anywhere" behavior.</p>
+    <div class="callout warn" data-anchor="ftr-callout-onecheck">
+      <span class="tag">One if, two matching rules</span>
+      <p>It's easy to read <code class="inl">editorSelectSyntaxHighlight</code> as "it checks extensions" and stop
+      there. It actually implements two different matching rules selected by one leading character: a
+      dot-prefixed pattern means "must match at the end of the filename" (an extension), and every other pattern
+      means "match anywhere in the filename" (a full or partial name, like <code class="inl">Makefile</code>).
+      Both rules are expressed by the same <code class="inl">strstr</code> call &mdash; the dot check only adds a
+      constraint, it never changes what gets searched for.</p>
+    </div>
+
+    <h2 data-anchor="ftr-h2-when">When selection happens, and what "no match" means</h2>
+    <p data-anchor="ftr-p-when-1"><code class="inl">editorSelectSyntaxHighlight</code> is called exactly once per
+    run of the program, from <code class="inl">main()</code>, and the order matters:</p>
+    <pre class="tab">initEditor();
+editorSelectSyntaxHighlight(argv[1]);
+editorOpen(argv[1]);
+enableRawMode(STDIN_FILENO);</pre>
+    <p data-anchor="ftr-p-when-2">Selection happens <em>before</em> <code class="inl">editorOpen</code> reads a
+    single line. That ordering is what makes Chapter 14's claim true &mdash; that every row is highlighted
+    correctly from the very first paint, with no second pass that goes back and colors an already-loaded file.
+    <code class="inl">editorOpen</code> calls <code class="inl">editorInsertRow</code> once per line, and <code
+    class="inl">editorInsertRow</code> already ends in <code class="inl">editorUpdateRow</code> /
+    <code class="inl">editorUpdateSyntax</code>. By the time the first of those calls happens, <code
+    class="inl">E.syntax</code> is already whatever <code class="inl">editorSelectSyntaxHighlight</code> decided
+    it should be &mdash; a real HLDB entry, or still NULL.</p>
+    <p data-anchor="ftr-p-when-3">NULL is not an error case here; it's the ordinary outcome for any filename that
+    matches nothing in <code class="inl">HLDB</code>. <code class="inl">E.syntax</code> starts life NULL (set in
+    <code class="inl">initEditor</code>), and if the inner <code class="inl">while</code> loop runs off the end of
+    every entry's <code class="inl">filematch</code> array without a match, <code class="inl">E.syntax</code>
+    simply never gets reassigned. That's the exact NULL Chapter 14 built its very first branch around: <code
+    class="inl">if (E.syntax == NULL) return;</code>, everything <code class="inl">HL_NORMAL</code>. Open a
+    <code class="inl">.txt</code> file, or a file with no name at all, and you get a perfectly working editor with
+    plain text &mdash; the "no highlighting" path was never a separate feature to build, just this function
+    declining to set a pointer.</p>
+
+    <h2 data-anchor="ftr-h2-extend">Implementation: what adding a second language actually costs</h2>
+    <p data-anchor="ftr-p-extend-1">kilo.c documents its own extension recipe in a comment block sitting directly
+    above the C/C++ definitions &mdash; addressed to whoever reads this code next, typos and all:</p>
+    <pre class="tab"><span class="cm">/* =========================== Syntax highlights DB =========================
+ *
+ * In order to add a new syntax, define two arrays with a list of file name
+ * matches and keywords. The file name matches are used in order to match
+ * a given syntax with a given file name: if a match pattern starts with a
+ * dot, it is matched as the last past of the filename, for example ".c".
+ * Otherwise the pattern is just searched inside the filenme, like "Makefile").
+ *
+ * The list of keywords to highlight is just a list of words, however if they
+ * a trailing '|' character is added at the end, they are highlighted in
+ * a different color, so that you can have two different sets of keywords.
+ *
+ * Finally add a stanza in the HLDB global variable with two two arrays
+ * of strings, and a set of flags in order to enable highlighting of
+ * comments and numbers.
+ *
+ * The characters for single and multi line comments must be exactly two
+ * and must be provided as well (see the C language example).
+ *
+ * There is no support to highlight patterns currently. */</span></pre>
+    <p data-anchor="ftr-p-extend-2">Strip that down to the three steps it's actually describing, and it matches
+    everything this chapter has walked through, in order: define a <code class="inl">filematch</code> array (the
+    patterns <code class="inl">editorSelectSyntaxHighlight</code> will test), define a <code
+    class="inl">keywords</code> array (Chapter 15's trailing-pipe convention still applies &mdash; <code
+    class="inl">"if"</code> for a keyword, <code class="inl">"int|"</code> for a type), and add one more stanza to
+    <code class="inl">HLDB</code> combining both arrays with the four comment/flag fields. Nothing else in the file
+    changes. <code class="inl">editorSelectSyntaxHighlight</code>'s two loops already walk <code
+    class="inl">HLDB_ENTRIES</code> entries, whatever that turns out to be; <code class="inl">editorUpdateSyntax</code>'s
+    scan already reads <code class="inl">E.syntax->keywords</code> and the delimiter fields generically, never a
+    C-specific literal. A second language is additive by construction, not by careful editing.</p>
+    <div class="callout key" data-anchor="ftr-callout-constraint">
+      <span class="tag">Two real constraints on what you can add</span>
+      <p>"Additive" doesn't mean "unconstrained." The doc comment names one limit outright &mdash; comment
+      delimiters "must be exactly two" characters &mdash; and the struct enforces it structurally: <code
+      class="inl">singleline_comment_start[2]</code>, <code class="inl">multiline_comment_start[3]</code>, and
+      <code class="inl">multiline_comment_end[3]</code> are fixed-size buffers (2 content bytes plus a null
+      terminator), read by Chapter 15's scan as a rigid pair &mdash; <code class="inl">scs[0]</code>/<code
+      class="inl">scs[1]</code>, never a <code class="inl">strlen()</code> call. A language whose comment marker is
+      one character (<code class="inl">#</code>, for Python or shell) doesn't fit this struct as shipped without
+      changing both it and the scan that reads it. And <code class="inl">filematch</code> patterns are plain
+      substring/suffix checks, not globs &mdash; the doc comment's own last line says so: "There is no support to
+      highlight patterns currently." One pattern per extension, exactly as <code
+      class="inl">C_HL_extensions</code> lists <code class="inl">.c</code>, <code class="inl">.h</code>, <code
+      class="inl">.cpp</code>, <code class="inl">.hpp</code>, and <code class="inl">.cc</code> as five separate
+      strings rather than one clever pattern.</p>
+    </div>
+
+    <h2 data-anchor="ftr-h2-worked">Worked example: sketching a second stanza</h2>
+    <p data-anchor="ftr-p-worked-1">None of this needs to stay abstract. Here's what a (hypothetical, not-shipped)
+    Python entry would look like, built from exactly the three pieces the doc comment names:</p>
+    <pre class="tab"><span class="ty">char</span> *PY_HL_extensions[] = {<span class="str">".py"</span>,NULL};
+<span class="ty">char</span> *PY_HL_keywords[] = {
+    <span class="str">"def"</span>,<span class="str">"return"</span>,<span class="str">"if"</span>,<span class="str">"else"</span>,<span class="str">"elif"</span>,<span class="str">"for"</span>,<span class="str">"while"</span>,
+    <span class="str">"import"</span>,<span class="str">"class"</span>,<span class="str">"try"</span>,<span class="str">"except"</span>,NULL,
+    <span class="cm">/* types, trailing-pipe convention from Chapter 15 */</span>
+    <span class="str">"int|"</span>,<span class="str">"str|"</span>,<span class="str">"float|"</span>,<span class="str">"bool|"</span>,<span class="str">"list|"</span>,<span class="str">"dict|"</span>,NULL
+};
+
+<span class="kw">struct</span> editorSyntax HLDB[] = {
+    { C_HL_extensions, C_HL_keywords, <span class="str">"//"</span>,<span class="str">"/*"</span>,<span class="str">"*/"</span>,
+      HL_HIGHLIGHT_STRINGS | HL_HIGHLIGHT_NUMBERS },
+    <span class="cm">/* Python -- hypothetical second entry */</span>
+    { PY_HL_extensions, PY_HL_keywords, <span class="str">"#"</span>,<span class="str">""</span>,<span class="str">""</span>,
+      HL_HIGHLIGHT_STRINGS | HL_HIGHLIGHT_NUMBERS }
+};</pre>
+    <p data-anchor="ftr-p-worked-2">Follow it through <code class="inl">editorSelectSyntaxHighlight</code> for a
+    file named <code class="inl">tool.py</code>: <code class="inl">HLDB_ENTRIES</code> is now 2. <code
+    class="inl">j=0</code> checks the C/C++ entry's <code class="inl">filematch</code> list &mdash; <code
+    class="inl">.c</code>, <code class="inl">.h</code>, and so on &mdash; none of which land at the end of
+    <code class="inl">tool.py</code>, so the inner loop exhausts without matching. <code class="inl">j=1</code>
+    checks the Python entry: <code class="inl">.py</code> matches, and it's the last two characters of the
+    filename, so <code class="inl">p[patlen] == '\0'</code> holds. <code class="inl">E.syntax</code> is set to
+    the Python stanza, the function returns, and every row of that file now gets highlighted against Python's
+    keyword list instead of C's &mdash; without <code class="inl">editorUpdateSyntax</code> or the drawing loop
+    knowing or caring that a second language exists at all.</p>
+    <p data-anchor="ftr-p-worked-3">Notice, too, the one real snag this sketch runs straight into: Python's
+    natural single-line comment marker is <code class="inl">#</code>, one character &mdash; and the constraint
+    from the callout above bites immediately. Writing <code class="inl">"#"</code> into a <code
+    class="inl">char[2]</code> is legal C (it's just a shorter string in a same-or-larger buffer), but Chapter 15's
+    scan always reads <code class="inl">scs[0]</code> <em>and</em> <code class="inl">scs[1]</code> as a pair
+    when it tests for a comment start &mdash; so <code class="inl">scs[1]</code> would end up reading whatever
+    byte happens to sit after the string's terminator, not a second comment character that doesn't exist. Getting
+    a one-character marker working correctly is exactly the kind of small, honest change &mdash; to the scan, not
+    just the table &mdash; the "additive, no other changes" story above glosses over. Naming it here beats
+    discovering it by surprise later.</p>
+
+    <div class="reflect" data-anchor="ftr-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A second look at something we'd been taking on faith since Chapter 14: <code class="inl">E.syntax</code>
+      doesn't appear from nowhere, it's set by one function, called once, before the file is even opened, based on
+      a filename test with exactly one piece of real logic in it &mdash; a dot at the front of a pattern means
+      "must match at the end," anything else means "match anywhere." <code class="inl">HLDB</code>'s size is
+      never hand-counted, so growing the table from one language to two is genuinely additive: a new <code
+      class="inl">filematch</code> array, a new <code class="inl">keywords</code> array, one new stanza, and every
+      function downstream &mdash; selection, scanning, drawing &mdash; picks it up with zero edits, because all
+      three were already written generically against "whatever <code class="inl">E.syntax</code> points at."
+      That's the payoff of Chapter 15's plain, unglamorous design: a scanner with no notion of "C" baked into its
+      control flow is a scanner that's already ready for a second language, the moment someone writes the table
+      for it. The two real limits worth carrying forward &mdash; comment delimiters fixed at two characters, and
+      filename matching with no glob support &mdash; aren't oversights to route around quietly; they're the
+      honest edges of a table built to hold exactly the one language Kilo shipped with.</p>
+    </div>
+
+    <div class="challenges" data-anchor="ftr-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Sketch the smallest change to <code class="inl">struct editorSyntax</code> and the scan in Chapter 15
+        that would let a language declare a one-character single-line comment marker (like Python's <code
+        class="inl">#</code>) without reading past the end of a too-short buffer.</li>
+        <li>Suppose you added a filematch entry <code class="inl">"README"</code> (no leading dot) to some
+        hypothetical Markdown stanza. Would it match a file named <code class="inl">MY_README.txt</code>? Walk the
+        exact <code class="inl">strstr</code> + dot-check logic to justify your answer.</li>
+        <li><code class="inl">editorSelectSyntaxHighlight</code> returns on the very first match and never checks
+        whether a later entry might also match, or match "better." Construct two filematch patterns, in two
+        different HLDB stanzas, that could both match the same real filename &mdash; and explain which one wins,
+        and why the code doesn't warn you about the collision.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="ftr-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — struct editorSyntax, the syntax-highlights-DB doc comment, HLDB, HLDB_ENTRIES, editorSelectSyntaxHighlight, main()</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="15-highlighting-c-code.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="17-error-handling-and-cleanup.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>

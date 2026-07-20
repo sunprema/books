@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raw Mode and Key Input — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="raw-eyebrow">Chapter 04 &middot; Part II — The Terminal &amp; The Loop</p>
+    <h1 data-anchor="raw-h1">Raw Mode and Key Input</h1>
+
+    <p class="lead" data-anchor="raw-lead">Chapter 03 told you the terminal starts in <em>canonical</em>
+    mode — the kernel buffers your keystrokes, applies backspace for you, and only hands a program a
+    complete line once you hit <span class="kbd">Enter</span>. That's exactly wrong for an editor. This
+    chapter is where we actually turn it off, byte by byte, and then read what the keyboard sends one
+    keystroke at a time — including the arrow keys, which don't arrive as one byte at all.</p>
+
+    <h2 data-anchor="raw-h2-motivation">Motivation: an editor needs every keystroke, the instant it happens</h2>
+    <p data-anchor="raw-p-motivation-1">Try this thought experiment: you're holding down the
+    <span class="kbd">&uarr;</span> key to scroll up. In canonical mode, nothing happens — not one thing —
+    until you press Enter, and by then the kernel has already handed your program a whole line of
+    escape-sequence bytes to sort out after the fact, with backspace edits baked in if you fixed a typo along
+    the way. An editor can't work like that. It needs to react to the arrow key <em>the moment it's
+    pressed</em>, and it needs to draw its own cursor rather than let the terminal echo raw bytes wherever it
+    pleases. Both of those requirements point at the same fix: leave canonical mode entirely, and take over
+    reading input one byte at a time.</p>
+    <p data-anchor="raw-p-motivation-2">That fix is called <strong>raw mode</strong>, and it isn't a single
+    switch — it's roughly a dozen individual bits in a <code class="inl">struct termios</code>, each one
+    disabling a specific piece of kernel behavior you'd otherwise take for granted. Kilo turns every one of
+    them off, on purpose, in one function: <code class="inl">enableRawMode()</code>.</p>
+
+    <h2 data-anchor="raw-h2-design">Design: a snapshot, a mutated copy, and a promise to put it back</h2>
+    <p data-anchor="raw-p-design-1">Before Kilo changes anything, it saves what was there. Right at file
+    scope, separate from the big <code class="inl">struct editorConfig E</code> we'll meet properly in
+    Chapter 07, sits one more global:</p>
+    <pre class="tab"><span class="kw">static</span> <span class="kw">struct</span> termios orig_termios; <span class="cm">/* In order to restore at exit.*/</span></pre>
+    <p data-anchor="raw-p-design-2">That's deliberate placement, not an oversight: <code class="inl">orig_termios</code>
+    isn't <em>editor</em> state, it's <em>terminal-restoration</em> bookkeeping — the one snapshot needed to
+    put the user's shell back exactly the way it found it, whether the editor exits cleanly, quits on an
+    error, or the user hits <span class="kbd">Ctrl-Q</span>. The whole design of this chapter is really one
+    promise: <em>whatever we do to the terminal, we will undo it before we hand control back.</em> Everything
+    below exists to keep that promise even when the program doesn't exit through its normal path.</p>
+
+    <div class="callout key" data-anchor="raw-callout-guards">
+      <span class="tag">Three guards, before a single flag is touched</span>
+      <p><code class="inl">enableRawMode(fd)</code> doesn't rush to <code class="inl">tcsetattr()</code>. It
+      checks, in order: (1) is raw mode already on (<code class="inl">E.rawmode</code>) — if so, return
+      immediately, the function is idempotent; (2) is <code class="inl">stdin</code> even a terminal
+      (<code class="inl">isatty()</code>) — if input is piped from a file instead of typed, there's no
+      terminal to put in raw mode, and Kilo bails out cleanly instead of calling <code class="inl">tcgetattr()</code>
+      on something that isn't a tty; only then does it (3) register a cleanup handler with
+      <code class="inl">atexit()</code> and take the snapshot with <code class="inl">tcgetattr()</code>. Order
+      matters here — you register the safety net <em>before</em> you touch anything.</p>
+    </div>
+
+    <h2 data-anchor="raw-h2-impl">Implementation: enableRawMode, flag by flag</h2>
+    <p data-anchor="raw-p-impl-1">Here is the whole function, unabridged:</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">enableRawMode</span>(<span class="ty">int</span> fd) {
+    <span class="kw">struct</span> termios raw;
+
+    <span class="kw">if</span> (E.rawmode) <span class="kw">return</span> 0; <span class="cm">/* Already enabled. */</span>
+    <span class="kw">if</span> (!<span class="fn">isatty</span>(STDIN_FILENO)) <span class="kw">goto</span> fatal;
+    <span class="fn">atexit</span>(editorAtExit);
+    <span class="kw">if</span> (<span class="fn">tcgetattr</span>(fd,&amp;orig_termios) == -1) <span class="kw">goto</span> fatal;
+
+    raw = orig_termios;  <span class="cm">/* modify the original mode */</span>
+    raw.c_iflag &amp;= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &amp;= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &amp;= ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 0;   <span class="cm">/* Return each byte, or zero for timeout. */</span>
+    raw.c_cc[VTIME] = 1;  <span class="cm">/* 100 ms timeout (unit is tens of second). */</span>
+
+    <span class="kw">if</span> (<span class="fn">tcsetattr</span>(fd,TCSAFLUSH,&amp;raw) &lt; 0) <span class="kw">goto</span> fatal;
+    E.rawmode = 1;
+    <span class="kw">return</span> 0;
+
+fatal:
+    errno = ENOTTY;
+    <span class="kw">return</span> -1;
+}</pre>
+    <p data-anchor="raw-p-impl-2">Notice the very first line inside the flag section: <code class="inl">raw
+    = orig_termios;</code> copies the snapshot into a local variable, and every flag change below mutates
+    <code class="inl">raw</code>, never <code class="inl">orig_termios</code>. The original stays untouched in
+    memory for exactly as long as the program runs, ready to be handed straight back to
+    <code class="inl">tcsetattr()</code> at exit.</p>
+    <p data-anchor="raw-p-impl-3">Then come four groups of flags, and the direction of the operator is the
+    entire meaning of each line — <code class="inl">&amp;= ~(...)</code> clears bits (turns features
+    <em>off</em>), <code class="inl">|= (...)</code> sets bits (turns features <em>on</em>):</p>
+    <table class="grid" data-anchor="raw-table-flags">
+      <thead><tr><th>Field</th><th>Flags cleared / set</th><th>What it disables (or enables)</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">c_iflag</td><td class="mono">&amp;= ~(BRKINT|ICRNL|INPCK|ISTRIP|IXON)</td>
+          <td>No break-condition signal, no CR&rarr;NL translation, no parity checking, no 8th-bit
+          stripping, no software flow control (<span class="kbd">Ctrl-S</span>/<span class="kbd">Ctrl-Q</span>
+          pausing/resuming output) — Kilo wants those two keys for itself.</td></tr>
+        <tr><td class="mono">c_oflag</td><td class="mono">&amp;= ~(OPOST)</td>
+          <td>Disables output post-processing — no automatic <code class="inl">\n</code>&rarr;<code class="inl">\r\n</code>
+          translation on write(). Kilo writes its own <code class="inl">\r\n</code> where it wants one.</td></tr>
+        <tr><td class="mono">c_cflag</td><td class="mono">|= (CS8)</td>
+          <td>Sets the character size to 8 bits per byte (a positive <em>set</em>, the one flag here that
+          turns something <em>on</em>).</td></tr>
+        <tr><td class="mono">c_lflag</td><td class="mono">&amp;= ~(ECHO|ICANON|IEXTEN|ISIG)</td>
+          <td>No echoing typed characters back automatically (Kilo draws its own screen), no canonical
+          line-buffering (this is the big one — see below), no extended input processing, no
+          <span class="kbd">Ctrl-C</span>/<span class="kbd">Ctrl-Z</span> turned into signals before Kilo
+          ever sees the byte.</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="raw-p-impl-4">That last cleared flag, <code class="inl">ISIG</code>, is easy to skim past
+    and important not to: without it, pressing <span class="kbd">Ctrl-C</span> would send
+    <code class="inl">SIGINT</code> and kill the process before a single line of Kilo's own code ran. With
+    <code class="inl">ISIG</code> off, <span class="kbd">Ctrl-C</span> arrives as an ordinary byte —
+    <code class="inl">CTRL_C = 3</code> in the <code class="inl">enum KEY_ACTION</code> from Chapter 03 — and
+    it's Kilo's own <code class="inl">editorProcessKeypress()</code>, not the kernel, that decides what it
+    means. Turning ISIG off is what lets an editor claim Ctrl-C as a keybinding at all.</p>
+
+    <div class="callout" data-anchor="raw-callout-vmin-vtime">
+      <span class="tag">c_cc[VMIN] and c_cc[VTIME]: how long read() is willing to wait</span>
+      <p>Two more fields, not flags this time but small integers, control <code class="inl">read()</code>'s
+      patience once <code class="inl">ICANON</code> is off. Kilo sets <code class="inl">VMIN = 0</code> and
+      <code class="inl">VTIME = 1</code>, which together mean: return as soon as a byte is available, or
+      after <strong>100&nbsp;milliseconds</strong> (VTIME's unit is tenths of a second) with zero bytes if
+      nothing arrived. <code class="inl">read()</code> in this mode never blocks forever, and it never
+      returns an error just because nothing was typed yet — a timeout comes back as
+      <code class="inl">nread == 0</code>, which is not an error and not end-of-file. Kilo's own comment on
+      the VMIN line says it plainly: <em>&ldquo;Return each byte, or zero for timeout.&rdquo;</em></p>
+    </div>
+
+    <p data-anchor="raw-p-tcsetattr">The whole modified <code class="inl">raw</code> struct is applied with
+    <code class="inl">tcsetattr(fd, TCSAFLUSH, &amp;raw)</code>. <code class="inl">TCSAFLUSH</code> is the
+    detail worth naming: it applies the new settings only <em>after</em> discarding any input that's already
+    been typed but not yet read. Without it, keystrokes buffered in canonical mode right before the switch
+    could leak through afterward and get misread as something else entirely — the flush makes the transition
+    clean.</p>
+
+    <h3 data-anchor="raw-h3-restore">Putting it back: disableRawMode and atexit</h3>
+    <p data-anchor="raw-p-restore-1">A promise to restore the terminal is only as good as the mechanism that
+    keeps it even when the program doesn't exit the way you expect. Kilo's answer is two small functions and
+    one standard-library call:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">disableRawMode</span>(<span class="ty">int</span> fd) {
+    <span class="cm">/* Don't even check the return value as it's too late. */</span>
+    <span class="kw">if</span> (E.rawmode) {
+        <span class="fn">tcsetattr</span>(fd,TCSAFLUSH,&amp;orig_termios);
+        E.rawmode = 0;
+    }
+}
+
+<span class="cm">/* Called at exit to avoid remaining in raw mode. */</span>
+<span class="ty">void</span> <span class="fn">editorAtExit</span>(<span class="ty">void</span>) {
+    <span class="fn">disableRawMode</span>(STDIN_FILENO);
+}</pre>
+    <p data-anchor="raw-p-restore-2"><code class="inl">editorAtExit()</code> is registered inside
+    <code class="inl">enableRawMode()</code> itself, with <code class="inl">atexit(editorAtExit)</code> —
+    step 3 of the guard sequence above. The C standard library guarantees an <code class="inl">atexit()</code>-registered
+    function runs whenever the process reaches <code class="inl">exit()</code>, from anywhere: a normal fall-through
+    out of <code class="inl">main()</code>'s loop, or an <code class="inl">exit(1)</code> called from deep
+    inside some unrelated error path. You don't have to remember to call
+    <code class="inl">disableRawMode()</code> at every place the program might stop — you register it once,
+    and the runtime calls it for you.<sup>[1]</sup></p>
+    <p data-anchor="raw-p-restore-3">Notice the comment above <code class="inl">disableRawMode()</code>:
+    <em>&ldquo;Don't even check the return value as it's too late.&rdquo;</em> That's not carelessness, it's
+    an honest read of the situation — by the time this function runs, the process is already on its way out.
+    If <code class="inl">tcsetattr()</code> itself somehow fails here, there is no meaningful recovery action
+    left to take. It's a small, deliberate acknowledgment that error handling has limits, and this is past
+    them.</p>
+
+    <div class="callout warn" data-anchor="raw-callout-scope">
+      <span class="tag">A limit worth naming honestly</span>
+      <p><code class="inl">atexit()</code> only covers exit paths the C runtime controls. It does
+      <strong>not</strong> run on an unhandled signal that terminates the process abnormally (a segfault, an
+      unhandled <code class="inl">SIGKILL</code>) or on a hard kill from outside the process. That gap is a
+      real, known limitation of this approach — Chapter 17 (<em>Error Handling and Cleanup</em>) comes back to
+      it directly, once you've seen the whole shape of Kilo's error handling to compare it against.</p>
+    </div>
+
+    <h2 data-anchor="raw-h2-readkey">Reading one keystroke — and un-mangling the ones that aren't one byte</h2>
+    <p data-anchor="raw-p-readkey-1">Raw mode alone gets you individual bytes, on demand. It does not get you
+    individual <em>keys</em> — because not every key a user presses corresponds to one byte. The arrow keys,
+    Home, End, Delete, Page Up, and Page Down all arrive as multi-byte <strong>escape sequences</strong>: the
+    terminal, watching what you type, sends a short burst of bytes starting with <code class="inl">ESC</code>
+    (<code class="inl">0x1B</code>) that <em>encodes</em> which key you pressed. Turning that burst back into
+    one logical keypress is <code class="inl">editorReadKey()</code>'s entire job.</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">editorReadKey</span>(<span class="ty">int</span> fd) {
+    <span class="ty">int</span> nread;
+    <span class="ty">char</span> c, seq[3];
+    <span class="kw">while</span> ((nread = <span class="fn">read</span>(fd,&amp;c,1)) == 0);
+    <span class="kw">if</span> (nread == -1) <span class="fn">exit</span>(1);
+
+    <span class="kw">while</span>(1) {
+        <span class="kw">switch</span>(c) {
+        <span class="kw">case</span> ESC:
+            <span class="kw">if</span> (<span class="fn">read</span>(fd,seq,1) == 0) <span class="kw">return</span> ESC;
+            <span class="kw">if</span> (<span class="fn">read</span>(fd,seq+1,1) == 0) <span class="kw">return</span> ESC;
+
+            <span class="kw">if</span> (seq[0] == <span class="str">'['</span>) {
+                <span class="kw">if</span> (seq[1] &gt;= <span class="str">'0'</span> &amp;&amp; seq[1] &lt;= <span class="str">'9'</span>) {
+                    <span class="kw">if</span> (<span class="fn">read</span>(fd,seq+2,1) == 0) <span class="kw">return</span> ESC;
+                    <span class="kw">if</span> (seq[2] == <span class="str">'~'</span>) {
+                        <span class="kw">switch</span>(seq[1]) {
+                        <span class="kw">case</span> <span class="str">'3'</span>: <span class="kw">return</span> DEL_KEY;
+                        <span class="kw">case</span> <span class="str">'5'</span>: <span class="kw">return</span> PAGE_UP;
+                        <span class="kw">case</span> <span class="str">'6'</span>: <span class="kw">return</span> PAGE_DOWN;
+                        }
+                    }
+                } <span class="kw">else</span> {
+                    <span class="kw">switch</span>(seq[1]) {
+                    <span class="kw">case</span> <span class="str">'A'</span>: <span class="kw">return</span> ARROW_UP;
+                    <span class="kw">case</span> <span class="str">'B'</span>: <span class="kw">return</span> ARROW_DOWN;
+                    <span class="kw">case</span> <span class="str">'C'</span>: <span class="kw">return</span> ARROW_RIGHT;
+                    <span class="kw">case</span> <span class="str">'D'</span>: <span class="kw">return</span> ARROW_LEFT;
+                    <span class="kw">case</span> <span class="str">'H'</span>: <span class="kw">return</span> HOME_KEY;
+                    <span class="kw">case</span> <span class="str">'F'</span>: <span class="kw">return</span> END_KEY;
+                    }
+                }
+            }
+            <span class="kw">else if</span> (seq[0] == <span class="str">'O'</span>) {
+                <span class="kw">switch</span>(seq[1]) {
+                <span class="kw">case</span> <span class="str">'H'</span>: <span class="kw">return</span> HOME_KEY;
+                <span class="kw">case</span> <span class="str">'F'</span>: <span class="kw">return</span> END_KEY;
+                }
+            }
+            <span class="kw">break</span>;
+        <span class="kw">default</span>:
+            <span class="kw">return</span> c;
+        }
+    }
+}</pre>
+    <p data-anchor="raw-p-readkey-2">Read it in three movements.</p>
+    <p data-anchor="raw-p-readkey-3"><strong>First, get one real byte.</strong>
+    <code class="inl">while ((nread = read(fd,&amp;c,1)) == 0);</code> is a loop with an empty body — it
+    keeps calling <code class="inl">read()</code> for exactly one byte, and keeps discarding
+    <code class="inl">nread == 0</code> results (that's the VMIN/VTIME timeout from a moment ago, not an
+    error) until either a byte actually arrives or something goes genuinely wrong
+    (<code class="inl">nread == -1</code>, which exits the whole program). From the caller's point of view,
+    this loop is what turns Kilo's technically-non-blocking, 100ms-polling <code class="inl">read()</code>
+    back into an ordinary blocking &ldquo;wait for the next keystroke&rdquo; call. The polling is invisible
+    from outside <code class="inl">editorReadKey()</code>.</p>
+    <p data-anchor="raw-p-readkey-4"><strong>Second, the plain case.</strong> Once <code class="inl">c</code>
+    holds a real byte, the outer <code class="inl">switch(c)</code> has exactly two paths: everything that
+    isn't <code class="inl">ESC</code> falls to <code class="inl">default</code> and is returned immediately,
+    unmodified. A letter, a digit, a Ctrl-key byte from Chapter 03's enum — all of them are already one
+    complete key, so there's nothing to decode.</p>
+    <p data-anchor="raw-p-readkey-5"><strong>Third, the interesting case.</strong> If <code class="inl">c
+    == ESC</code>, the function doesn't yet know whether the user pressed a lone
+    <span class="kbd">Esc</span> key or the terminal is mid-way through sending a multi-byte sequence for
+    something like <span class="kbd">&uarr;</span>. It reads up to two more bytes to find out — and if either
+    of those reads times out (<code class="inl">== 0</code>), that <em>is</em> the answer: nothing else was
+    coming, so it really was just <span class="kbd">Esc</span>, and the function returns
+    <code class="inl">ESC</code> plain. This is worth sitting with, because it's a genuinely clever piece of
+    design: <strong>Kilo tells a bare Esc apart from the start of an arrow-key sequence purely by
+    timing</strong> — by whether the rest of the sequence's bytes show up within the same 100&nbsp;ms window
+    VTIME already set up, not by looking for some special terminating byte. The two mechanisms — raw mode's
+    read timeout, and escape-sequence disambiguation — are the same trick, reused.</p>
+
+    <div class="callout key" data-anchor="raw-callout-csi">
+      <span class="tag">Reading the sequence table like the terminal writes it</span>
+      <p>An arrow key sends three bytes: <code class="inl">ESC</code>, then <code class="inl">'['</code>
+      (the <em>CSI</em>, or Control Sequence Introducer), then a single letter — <code class="inl">'A'</code>
+      for up, <code class="inl">'B'</code> down, <code class="inl">'C'</code> right, <code class="inl">'D'</code>
+      left. Home and End use the same introducer with <code class="inl">'H'</code>/<code class="inl">'F'</code>
+      — <em>or</em>, on some terminal emulators, an older <code class="inl">ESC O</code> introducer (SS3)
+      instead of <code class="inl">ESC [</code>, which is exactly why <code class="inl">editorReadKey()</code>
+      checks <code class="inl">seq[0] == 'O'</code> as a separate case: without it, Home/End would silently
+      break on whichever terminal family doesn't use CSI for those two keys. Delete, Page Up, and Page Down
+      are one byte longer still — <code class="inl">ESC [ 3 ~</code>, <code class="inl">ESC [ 5 ~</code>,
+      <code class="inl">ESC [ 6 ~</code> — because CSI has room for a numeric parameter before its final
+      byte, and these three keys are distinguished by that number rather than by a unique letter.</p>
+    </div>
+
+    <p data-anchor="raw-p-softcodes">Every path through the escape-sequence decoding returns one of the
+    &ldquo;soft codes&rdquo; from Chapter 03's <code class="inl">enum KEY_ACTION</code> —
+    <code class="inl">ARROW_UP</code>, <code class="inl">DEL_KEY</code>, <code class="inl">PAGE_UP</code>, and
+    the rest, all numbered <code class="inl">1000</code> and above precisely so they can never collide with a
+    real byte value (which tops out at 255). Those codes were never sent by any terminal as a single byte —
+    they're synthesized right here, inside <code class="inl">editorReadKey()</code> — but once synthesized,
+    they're indistinguishable from an ordinary keypress to every function downstream.
+    <code class="inl">editorProcessKeypress()</code>'s big dispatch switch, which we'll meet properly in
+    Chapter 06, never has to know or care whether the <code class="inl">int</code> it received was one byte
+    typed directly or three bytes decoded on its behalf. That uniformity is the entire payoff of doing this
+    decoding here, in one place, instead of scattering &ldquo;is this an escape sequence?&rdquo; checks
+    throughout the rest of the program.</p>
+
+    <h2 data-anchor="raw-h2-edge">Edge cases: what this design deliberately doesn't handle</h2>
+    <ul data-anchor="raw-ul-edge">
+      <li data-anchor="raw-li-edge-1"><strong>Piped input.</strong> If <code class="inl">stdin</code> isn't a
+      terminal at all — input redirected from a file — <code class="inl">isatty()</code> catches it in
+      <code class="inl">enableRawMode()</code>'s second guard, and the function fails cleanly with
+      <code class="inl">errno = ENOTTY</code> rather than calling <code class="inl">tcgetattr()</code> on
+      something it can't query.</li>
+      <li data-anchor="raw-li-edge-2"><strong>A slow or laggy connection.</strong> The Esc-vs-sequence
+      disambiguation depends on the remaining bytes of a sequence arriving within the 100ms VTIME window. On
+      an unusually slow terminal connection (a long-haul SSH session over a bad link, for instance) it's
+      theoretically possible for an arrow-key sequence's bytes to arrive spread further apart than that and
+      get misread as a lone Esc followed by stray characters. It's a known, named trade-off of this exact
+      technique, not a bug specific to Kilo — every terminal program that disambiguates Esc this way inherits
+      it.</li>
+      <li data-anchor="raw-li-edge-3"><strong>An unhandled signal or a hard kill.</strong> As the callout
+      above says plainly: <code class="inl">atexit()</code> only fires on paths the C runtime controls. A
+      crash that bypasses normal exit, or a <span class="kbd">kill -9</span> from another terminal, leaves
+      raw mode set and the user's shell looking broken until they run <code class="inl">reset</code> or
+      <code class="inl">stty sane</code>. Chapter 17 returns to this gap once you've seen the rest of Kilo's
+      error handling to weigh it against.</li>
+      <li data-anchor="raw-li-edge-4"><strong>Calling enableRawMode twice.</strong> The very first guard,
+      <code class="inl">if (E.rawmode) return 0;</code>, makes the function idempotent on purpose — safe to
+      call again without re-snapshotting a terminal that's already in raw mode (which would otherwise
+      overwrite <code class="inl">orig_termios</code> with the <em>raw</em> settings instead of the original
+      ones, corrupting the very thing you're trying to restore).</li>
+    </ul>
+
+    <div class="reflect" data-anchor="raw-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>One function, <code class="inl">enableRawMode()</code>, that trades a dozen small pieces of kernel
+      convenience — line buffering, auto-echo, signal generation, newline translation — for total control
+      over every byte the keyboard sends, the instant it's sent. One promise, kept by
+      <code class="inl">atexit(editorAtExit)</code>, that whatever raw mode changes gets undone no matter how
+      the program ends (within the honest limits we named). And one function,
+      <code class="inl">editorReadKey()</code>, that hides the ugliest part of that trade — multi-byte escape
+      sequences for arrow keys and friends — behind a single, uniform return value: one
+      <code class="inl">int</code> per logical keypress, real byte or synthesized soft code alike. Everything
+      from Chapter 06 onward gets to assume that uniformity and never think about raw termios flags again.</p>
+    </div>
+
+    <div class="challenges" data-anchor="raw-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Trace what happens if you comment out just <code class="inl">ISIG</code> from the
+        <code class="inl">c_lflag</code> clear (leave everything else in raw mode). What single keystroke
+        would now behave differently than the rest of the editor, and why?</li>
+        <li>Kilo's escape-sequence table doesn't handle every possible VT100 sequence — only the ones its own
+        keymap needs (arrows, Home/End, Delete, Page Up/Down). What would <code class="inl">editorReadKey()</code>
+        return today if a terminal sent a sequence it doesn't recognize, say <code class="inl">ESC [ 1 5 ~</code>
+        (F5 on some terminals)? Walk the function's branches by hand to find out.</li>
+        <li>Why does <code class="inl">disableRawMode()</code> check <code class="inl">E.rawmode</code> before
+        calling <code class="inl">tcsetattr()</code>, given that <code class="inl">editorAtExit()</code> only
+        ever calls it once, at exit? (Hint: what else in the program is allowed to call
+        <code class="inl">disableRawMode()</code> directly?)</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="raw-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — enableRawMode, disableRawMode, editorAtExit, editorReadKey</a> &middot;
+      <a href="https://man7.org/linux/man-pages/man3/termios.3.html" target="_blank" rel="noopener">[2] termios(3) — Linux manual page (VMIN/VTIME, ICANON, ISIG)</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[3] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-c-and-terminal-prerequisites.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-escape-sequences-and-screen-drawing.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
