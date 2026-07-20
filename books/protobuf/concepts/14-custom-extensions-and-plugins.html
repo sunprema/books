@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custom Extensions and Plugins — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="ext-kicker">Chapter 14 &middot; Production &amp; Beyond</span>
+    <h1 data-anchor="ext-h1">Custom Extensions and Plugins</h1>
+
+    <p class="lede" data-anchor="ext-lede">
+      For thirteen chapters we've treated <code>protoc</code> as a closed appliance: you feed it a
+      <code>.proto</code>, it hands you generated code, and the only knobs are the ones Google gave you
+      &mdash; <code>java_package</code>, <code>deprecated</code>, <code>optimize_for</code>. But here's a
+      question that should have been nagging at you: where do those knobs <em>come from</em>? What makes
+      <code>option java_package = "..."</code> legal, and could <em>you</em> add a knob of your own? The
+      answer turns out to be one of the most elegant ideas in the whole system &mdash; protobuf is built
+      out of protobuf, its compiler is designed to be extended by strangers, and once you see how, you can
+      teach your schema to carry any metadata you like and teach the compiler to do anything you want with
+      it. This chapter is about opening the appliance. We'll add our own options, read them back through
+      reflection, and then write a <code>protoc</code> plugin from scratch &mdash; and discover that a
+      plugin is a far smaller, humbler thing than its name suggests.
+    </p>
+
+    <h2 data-anchor="ext-h2-options">Options were extensions all along</h2>
+    <p data-anchor="ext-p-options-1">
+      Let's start by demystifying the <code>option</code> keyword, because the trick hides in plain sight.
+      When you write <code>option java_package = "com.example";</code> at the top of a file, it looks like
+      special compiler syntax. It isn't. Every <code>.proto</code> element &mdash; a file, a message, a
+      field, an enum, a service, a method &mdash; has an <em>options message</em> hanging off it, and those
+      messages are ordinary protobuf messages defined in a file that ships with the compiler:
+      <code>google/protobuf/descriptor.proto</code>. There's a <code>FileOptions</code>, a
+      <code>MessageOptions</code>, a <code>FieldOptions</code>, an <code>EnumOptions</code>, and so on.
+      <code>java_package</code> is just field number 1 of <code>FileOptions</code>. Setting an option is
+      <em>setting a field on a message</em>. It was protobuf all the way down the entire time.
+    </p>
+    <p data-anchor="ext-p-options-2">
+      That reframing is the key that unlocks everything else. Recall from Chapter&nbsp;8 that protobuf has a
+      feature called <em>extensions</em>: a way to declare "some other file may add fields to this message
+      at these numbers." The options messages in <code>descriptor.proto</code> are deliberately declared
+      with wide <code>extensions</code> ranges &mdash; Google left the door open on purpose. So a
+      <strong>custom option is nothing more exotic than an extension of one of those options messages.</strong>
+      You extend <code>FieldOptions</code>, and suddenly there's a new option you can write on any field,
+      as native-feeling as the built-ins.
+    </p>
+    <pre data-anchor="ext-code-declare"><code><span class="kw">syntax</span> = <span class="str">"proto3"</span>;
+<span class="kw">package</span> myco;
+<span class="kw">import</span> <span class="str">"google/protobuf/descriptor.proto"</span>;   <span class="cm">// the option messages live here</span>
+
+<span class="cm">// Declare custom options by EXTENDING descriptor.proto's option messages.</span>
+<span class="kw">extend</span> <span class="ty">google.protobuf.FieldOptions</span> {
+  <span class="ty">string</span> sensitivity = <span class="num">50001</span>;   <span class="cm">// a new knob for any field</span>
+}
+<span class="kw">extend</span> <span class="ty">google.protobuf.MessageOptions</span> {
+  <span class="ty">bool</span> audited = <span class="num">50002</span>;         <span class="cm">// a new knob for any message</span>
+}</code></pre>
+    <div class="callout key-idea" data-anchor="ext-callout-frame">
+      <span class="callout-label">The whole idea in one sentence</span>
+      An option is a field on a descriptor message; a <em>custom</em> option is an extension field you add
+      to that message. Nothing about the mechanism is new &mdash; it's the extensions you already learned,
+      pointed at the compiler's own data structures.
+    </div>
+
+    <h2 data-anchor="ext-h2-apply">Applying them &mdash; and the number that matters</h2>
+    <p data-anchor="ext-p-apply-1">
+      Once declared, a custom option is applied with the exact same syntax as a built-in one, with a single
+      cosmetic difference: because it's an extension, its name goes in parentheses. At the message or file
+      level you write <code>option (myco.audited) = true;</code>; inside a field's inline square brackets you
+      write <code>[(myco.sensitivity) = "pii"]</code>. The parentheses are how the parser knows "look this
+      name up as an extension, not as a built-in field."
+    </p>
+    <pre data-anchor="ext-code-apply"><code><span class="kw">message</span> <span class="ty">User</span> {
+  <span class="kw">option</span> (myco.audited) = <span class="kw">true</span>;                     <span class="cm">// message-level custom option</span>
+
+  <span class="ty">string</span> id    = <span class="num">1</span>;
+  <span class="ty">string</span> email = <span class="num">2</span> [(myco.sensitivity) = <span class="str">"pii"</span>];    <span class="cm">// field-level</span>
+  <span class="ty">string</span> ssn   = <span class="num">3</span> [(myco.sensitivity) = <span class="str">"secret"</span>];
+}</code></pre>
+    <p data-anchor="ext-p-apply-2">
+      Now, that number &mdash; <code>50001</code> &mdash; is not arbitrary, and getting it wrong is the one
+      way to really hurt yourself here. Extension field numbers share the same flat space as regular field
+      numbers, which means two different custom options claiming the same number on the same options message
+      is a genuine collision. The protobuf project carved out a safe range for exactly this: the numbers
+      <strong>50000&ndash;99999 are reserved for internal, in-house use.</strong> Inside a single
+      organization, where one team can eyeball who's using what, you may grab any number in that band freely.
+    </p>
+    <div class="callout warning" data-anchor="ext-callout-numbers">
+      <span class="callout-label">In-house numbers are a private agreement, not a global guarantee</span>
+      The 50000&ndash;99999 range is safe only because everyone in <em>your</em> org agrees to stay in it and
+      not step on each other. The moment a custom option travels in a <code>.proto</code> that other
+      organizations will compile &mdash; a public schema, an open-source annotation library &mdash; that
+      informal agreement evaporates. Public options need a <strong>globally unique</strong> number, and the
+      protobuf project maintains a global extension registry you should reserve one in. Two libraries that
+      both grabbed <code>50001</code> can never be imported into the same build.
+    </div>
+
+    <h2 data-anchor="ext-h2-read">Reading options back: annotations are inert until someone looks</h2>
+    <p data-anchor="ext-p-read-1">
+      Here's the part that trips up everyone the first time. You've declared <code>sensitivity</code>,
+      you've tagged <code>email</code> as <code>"pii"</code>, you recompile&hellip; and nothing happens. No
+      redaction, no warning, no behavior at all. That's not a bug &mdash; it's the whole design.
+      <strong>A custom option is pure metadata.</strong> All <code>protoc</code> does is record the value
+      into the compiled descriptor and move on. The option does nothing until some <em>other</em> piece of
+      code &mdash; a plugin at generation time, or your own program at runtime &mdash; goes and reads it
+      back off the descriptor. Options are notes you leave on the schema; someone still has to read the notes.
+    </p>
+    <p data-anchor="ext-p-read-2">
+      Reading them back is a reflection operation, and it follows the same shape in every language: reach the
+      <em>descriptor</em> of the element you care about (the message descriptor, the field descriptor), then
+      pull the extension off its <code>.Options()</code>. In Go that's <code>proto.GetExtension</code>; in
+      Python it's the <code>Extensions[]</code> map on the options; in Java it's <code>getExtension</code>;
+      in C++ it's <code>GetExtension</code>. Same move, different spelling.
+    </p>
+    <pre data-anchor="ext-code-read"><code><span class="cm">// Go: read our custom field option back off a field descriptor.</span>
+fd := msgDesc.<span class="fn">Fields</span>().<span class="fn">ByName</span>(<span class="str">"email"</span>)
+opts := fd.<span class="fn">Options</span>().(*<span class="ty">descriptorpb</span>.<span class="ty">FieldOptions</span>)
+
+<span class="kw">if</span> proto.<span class="fn">HasExtension</span>(opts, mycopb.<span class="ty">E_Sensitivity</span>) {
+    level := proto.<span class="fn">GetExtension</span>(opts, mycopb.<span class="ty">E_Sensitivity</span>).(<span class="ty">string</span>)
+    <span class="cm">// level == "pii" — now YOU decide what that means:</span>
+    <span class="cm">// redact it in logs, encrypt it at rest, flag it in an audit report…</span>
+}</code></pre>
+    <div class="callout note" data-anchor="ext-callout-runtime-read">
+      <span class="callout-label">The same descriptors you met in Chapter 13</span>
+      This is the reflection API from the storage chapter wearing a different hat. There we walked a
+      <code>DynamicMessage</code> to decode unknown bytes; here we walk a <em>field descriptor</em> to read
+      the annotations a schema author left behind. Custom options and runtime reflection are the same toolkit:
+      the schema, examined as data, at runtime.
+    </div>
+
+    <h2 data-anchor="ext-h2-loop">The annotate-then-process loop</h2>
+    <p data-anchor="ext-p-loop-1">
+      Step back and you'll see the shape of the whole extension story. It's a two-beat rhythm: someone
+      <strong>annotates</strong> the schema with custom options, and someone else <strong>processes</strong>
+      those annotations &mdash; either at build time, generating code, or at runtime, changing behavior.
+      Every extension use case in this chapter, from validation to documentation, is just a different
+      answer to "who processes the annotations, and when?"
+    </p>
+
+    <figure class="figbox" data-anchor="ext-fig-loop">
+      <svg viewBox="0 0 720 200" role="img" aria-labelledby="ext-fig-loop-title">
+        <title id="ext-fig-loop-title">A .proto is annotated with custom options; protoc compiles it into a descriptor that carries those options; a plugin or a runtime reads the options back via reflection and acts on them</title>
+        <text x="360" y="22" text-anchor="middle" font-family="var(--font-display)" font-size="15" fill="var(--ink)">Annotate, then process</text>
+
+        <!-- proto -->
+        <rect x="20" y="52" width="150" height="72" rx="8" fill="none" stroke="var(--ty)" stroke-width="1.4"/>
+        <text x="95" y="76" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ty)">.proto</text>
+        <text x="95" y="95" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">option (sensitivity)</text>
+        <text x="95" y="108" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--accent)">= "pii"</text>
+
+        <!-- protoc -->
+        <rect x="230" y="52" width="120" height="72" rx="8" fill="none" stroke="var(--rule)" stroke-width="1.4"/>
+        <text x="290" y="82" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ink)">protoc</text>
+        <text x="290" y="100" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">records into</text>
+
+        <!-- descriptor -->
+        <rect x="410" y="52" width="140" height="72" rx="8" fill="var(--code-bg)" stroke="var(--en)" stroke-width="1.3"/>
+        <text x="480" y="76" text-anchor="middle" font-family="var(--font-display)" font-size="12" fill="var(--en)">descriptor</text>
+        <text x="480" y="95" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">schema as data,</text>
+        <text x="480" y="107" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">options and all</text>
+
+        <!-- consumer -->
+        <rect x="600" y="40" width="104" height="44" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.4"/>
+        <text x="652" y="60" text-anchor="middle" font-family="var(--font-display)" font-size="12" fill="var(--fn)">plugin</text>
+        <text x="652" y="74" text-anchor="middle" font-family="var(--font-mono)" font-size="7.5" fill="var(--ink-soft)">build time</text>
+        <rect x="600" y="94" width="104" height="44" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.4"/>
+        <text x="652" y="114" text-anchor="middle" font-family="var(--font-display)" font-size="12" fill="var(--fn)">runtime</text>
+        <text x="652" y="128" text-anchor="middle" font-family="var(--font-mono)" font-size="7.5" fill="var(--ink-soft)">reflection</text>
+
+        <g stroke="var(--rule)" stroke-width="1.3" fill="none">
+          <path d="M170 88 L228 88" marker-end="url(#ext-arrow)"/>
+          <path d="M350 88 L408 88" marker-end="url(#ext-arrow)"/>
+          <path d="M550 78 L598 64" marker-end="url(#ext-arrow)"/>
+          <path d="M550 98 L598 112" marker-end="url(#ext-arrow)"/>
+        </g>
+        <text x="360" y="160" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">read the option back via reflection &rarr; generate code, or change behavior</text>
+        <defs>
+          <marker id="ext-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0 0 L6 3 L0 6 z" fill="var(--rule)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        The option is inert on its own; the value only matters when a build-time plugin or a runtime
+        reflection reader picks it up. Everything in the rest of the chapter is a variation on this loop.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ext-h2-plugin">Writing a protoc plugin: a program that reads stdin</h2>
+    <p data-anchor="ext-p-plugin-1">
+      So who is this build-time "plugin" that reads the descriptors? The word sounds heavyweight &mdash; you
+      picture a shared library, an SDK, a registration API. The reality is almost anticlimactic, and it's my
+      favorite thing about protobuf's design. <strong>A <code>protoc</code> plugin is just an executable that
+      reads a protobuf from stdin and writes a protobuf to stdout.</strong> That's the entire contract. No
+      linking against <code>protoc</code>, no callbacks, no framework. If your language can read standard
+      input, parse a message, and print to standard output, it can host a plugin.
+    </p>
+    <p data-anchor="ext-p-plugin-2">
+      The two messages it speaks are defined in <code>google/protobuf/compiler/plugin.proto</code>. When you
+      run <code>protoc</code>, it parses your <code>.proto</code> files and resolves all their descriptors
+      &mdash; the same descriptors we've been discussing &mdash; packs them into a
+      <strong><code>CodeGeneratorRequest</code></strong>, and pipes the serialized bytes into the plugin's
+      stdin. The plugin does its work and writes back a serialized
+      <strong><code>CodeGeneratorResponse</code></strong> listing the files it wants created. <code>protoc</code>
+      reads that response and writes the files to disk. The compiler handles all the hard parts &mdash;
+      parsing, importing, type resolution &mdash; and hands your plugin a fully-chewed schema as data.
+    </p>
+
+    <figure class="figbox" data-anchor="ext-fig-plugin">
+      <svg viewBox="0 0 720 210" role="img" aria-labelledby="ext-fig-plugin-title">
+        <title id="ext-fig-plugin-title">protoc parses proto files, serializes a CodeGeneratorRequest to the plugin's stdin, the plugin writes a CodeGeneratorResponse to stdout, and protoc writes the resulting files to disk</title>
+        <text x="360" y="22" text-anchor="middle" font-family="var(--font-display)" font-size="15" fill="var(--ink)">The plugin protocol is just stdin &rarr; stdout</text>
+
+        <!-- protoc -->
+        <rect x="24" y="70" width="130" height="70" rx="8" fill="none" stroke="var(--ty)" stroke-width="1.5"/>
+        <text x="89" y="98" text-anchor="middle" font-family="var(--font-display)" font-size="14" fill="var(--ty)">protoc</text>
+        <text x="89" y="116" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">parses .proto,</text>
+        <text x="89" y="128" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">resolves imports</text>
+
+        <!-- plugin -->
+        <rect x="430" y="70" width="150" height="70" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.5"/>
+        <text x="505" y="98" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--fn)">protoc-gen-NAME</text>
+        <text x="505" y="116" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">your executable,</text>
+        <text x="505" y="128" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">any language</text>
+
+        <!-- request arrow -->
+        <g stroke="var(--accent)" stroke-width="1.5" fill="none">
+          <path d="M154 92 L428 92" marker-end="url(#ext-arrow2)"/>
+        </g>
+        <text x="291" y="84" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--accent)">CodeGeneratorRequest</text>
+        <text x="291" y="106" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">(serialized) &rarr; stdin</text>
+
+        <!-- response arrow -->
+        <g stroke="var(--en)" stroke-width="1.5" fill="none">
+          <path d="M428 122 L156 122" marker-end="url(#ext-arrow3)"/>
+        </g>
+        <text x="291" y="140" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--en)">CodeGeneratorResponse</text>
+        <text x="291" y="152" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">stdout &rarr; (serialized)</text>
+
+        <!-- disk -->
+        <rect x="24" y="164" width="130" height="34" rx="6" fill="var(--code-bg)" stroke="var(--rule)" stroke-width="1.2"/>
+        <text x="89" y="185" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">writes files to disk</text>
+        <g stroke="var(--rule)" stroke-width="1.2" fill="none">
+          <path d="M89 140 L89 163" marker-end="url(#ext-arrow)"/>
+        </g>
+
+        <defs>
+          <marker id="ext-arrow2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="var(--accent)"/></marker>
+          <marker id="ext-arrow3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="var(--en)"/></marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <code>protoc</code> does the parsing and hands the plugin a complete schema-as-data over a pipe. The
+        plugin never touches a <code>.proto</code> file directly &mdash; it reads descriptors and emits file
+        contents. Two messages, one pipe, done.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="ext-p-plugin-3">
+      The wiring is a naming convention, and it's beautifully low-tech. If you pass
+      <code>--NAME_out=./gen</code> to <code>protoc</code>, it looks on your <code>PATH</code> for a binary
+      literally called <code>protoc-gen-NAME</code> and runs it. That's why the Go plugin is
+      <code>protoc-gen-go</code> and you invoke it with <code>--go_out</code>; the docs plugin is
+      <code>protoc-gen-doc</code>, invoked with <code>--doc_out</code>. Convention <em>is</em> the
+      configuration. Any options you want to pass your plugin ride along in <code>--NAME_opt=key=value</code>,
+      which shows up as the <code>parameter</code> string inside the request.
+    </p>
+    <pre data-anchor="ext-code-invoke"><code><span class="cm"># protoc runs protoc-gen-myext (found on PATH) because of --myext_out.</span>
+<span class="fn">protoc</span> -I. --myext_out=./gen --myext_opt=paths=source_relative user.proto
+<span class="cm">#          |            |               |</span>
+<span class="cm">#    import path   runs protoc-gen-myext   arrives as request.parameter</span>
+
+<span class="cm"># Or wire an arbitrary binary to a name explicitly:</span>
+<span class="fn">protoc</span> --plugin=protoc-gen-myext=./bin/myext --myext_out=./gen user.proto</code></pre>
+
+    <h2 data-anchor="ext-h2-request">Inside the request and response</h2>
+    <p data-anchor="ext-p-req-1">
+      Let's look at what's actually in those two messages, because two of their fields hide gotchas worth
+      knowing before you write a line of plugin code. The <strong><code>CodeGeneratorRequest</code></strong>
+      carries three things you care about:
+    </p>
+    <table class="cmp" data-anchor="ext-table-request">
+      <thead><tr><th>Field</th><th>What it holds</th><th>The subtlety</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>file_to_generate</code></td>
+          <td>The <code>.proto</code> files the user actually named on the command line.</td>
+          <td>Just the <em>roots</em> &mdash; not their imports. Generate output for <em>these</em>.</td>
+        </tr>
+        <tr>
+          <td><code>proto_file</code></td>
+          <td>Full <code>FileDescriptorProto</code>s for the roots <em>and</em> every transitive import, topologically sorted.</td>
+          <td>Read descriptors from <em>here</em> &mdash; it's the complete schema, deps included.</td>
+        </tr>
+        <tr>
+          <td><code>parameter</code></td>
+          <td>The string from <code>--NAME_opt</code> (or the <code>key=value:dir</code> form of <code>--NAME_out</code>).</td>
+          <td>Your plugin parses it however it likes &mdash; there's no schema for it.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p data-anchor="ext-p-req-2">
+      The <strong><code>CodeGeneratorResponse</code></strong> is what you send back. Its <code>file</code>
+      list is the meat &mdash; each entry is a <code>File</code> with a <code>name</code> and its
+      <code>content</code> as a string, and <code>protoc</code> writes exactly those. There's an
+      <code>error</code> field for reporting trouble, and a <code>supported_features</code> bitmask where you
+      advertise capabilities like <code>FEATURE_PROTO3_OPTIONAL</code> or <code>FEATURE_SUPPORTS_EDITIONS</code>
+      so <code>protoc</code> knows your plugin can handle those schemas.
+    </p>
+    <pre data-anchor="ext-code-skeleton"><code><span class="cm">// The ENTIRE contract of a plugin, by hand (real plugins use a helper).</span>
+<span class="kw">func</span> <span class="fn">main</span>() {
+    in, _ := io.<span class="fn">ReadAll</span>(os.<span class="ty">Stdin</span>)               <span class="cm">// 1. read request bytes</span>
+    <span class="kw">var</span> req pluginpb.<span class="ty">CodeGeneratorRequest</span>
+    proto.<span class="fn">Unmarshal</span>(in, &amp;req)                     <span class="cm">// 2. parse it</span>
+
+    <span class="kw">var</span> resp pluginpb.<span class="ty">CodeGeneratorResponse</span>
+    <span class="kw">for</span> _, f := <span class="kw">range</span> req.<span class="fn">GetProtoFile</span>() {          <span class="cm">// 3. walk descriptors,</span>
+        <span class="cm">//    read custom options off each element, build output…</span>
+        resp.<span class="ty">File</span> = <span class="fn">append</span>(resp.<span class="ty">File</span>, &amp;pluginpb.<span class="ty">CodeGeneratorResponse_File</span>{
+            <span class="ty">Name</span>:    proto.<span class="fn">String</span>(f.<span class="fn">GetName</span>() + <span class="str">".myext.go"</span>),
+            <span class="ty">Content</span>: proto.<span class="fn">String</span>(generated),
+        })
+    }
+    resp.<span class="ty">SupportedFeatures</span> = proto.<span class="fn">Uint64</span>(
+        <span class="ty">uint64</span>(pluginpb.<span class="ty">CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL</span>))
+    out, _ := proto.<span class="fn">Marshal</span>(&amp;resp)                <span class="cm">// 4. write response bytes</span>
+    os.<span class="ty">Stdout</span>.<span class="fn">Write</span>(out)
+}</code></pre>
+    <div class="callout warning" data-anchor="ext-callout-exit">
+      <span class="callout-label">Report errors in the response, then exit zero</span>
+      This one surprises everyone. If your plugin hits a <em>generation</em> error &mdash; a schema it can't
+      handle, a bad option &mdash; you set <code>CodeGeneratorResponse.error</code> to a message and
+      <strong>still exit with status 0</strong>. <code>protoc</code> reads the error out of the response and
+      fails the build gracefully. A non-zero exit code is reserved for your plugin actually <em>crashing</em>
+      (write those to stderr). Exit non-zero on a normal generation error and you'll get a confusing "plugin
+      failed" instead of your nice message.
+    </div>
+    <p data-anchor="ext-p-req-3">
+      In practice you almost never write that skeleton by hand. Every mature ecosystem ships a helper that
+      does the stdio dance and hands you resolved, walkable descriptors: Go has
+      <code>google.golang.org/protobuf/compiler/protogen</code>, Scala has ScalaPB's
+      <code>protocgen</code>, and there are equivalents for Python, Java, and more. You write the interesting
+      part &mdash; walk the types, read the custom options, emit strings &mdash; and let the helper own the
+      pipe. There's one more trick worth naming: the <strong><code>insertion_point</code></strong>. A plugin
+      can emit content containing a marker comment like
+      <code>// @@protoc_insertion_point(NAME)</code>, and a <em>later</em> plugin can target that marker to
+      splice its own code into the first plugin's file instead of overwriting it. That's how a gRPC generator
+      can weave service methods into another generator's output.
+    </p>
+
+    <h2 data-anchor="ext-h2-uses">What people actually build with this</h2>
+    <p data-anchor="ext-p-uses-1">
+      This machinery is not academic &mdash; a large slice of the protobuf ecosystem is exactly "custom
+      options plus a plugin (or a runtime reader)." Once you can annotate a schema and process the
+      annotations, your <code>.proto</code> becomes a single source of truth that spins off validators,
+      documentation, gateways, and bespoke code. Here are the load-bearing examples.
+    </p>
+    <table class="cmp" data-anchor="ext-table-uses">
+      <thead><tr><th>Tool</th><th>Annotation</th><th>What processes it, and when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>protovalidate</strong> (Buf)</td>
+          <td><code>(buf.validate.field)</code> rules + CEL</td>
+          <td>A <em>runtime</em> library reads the options and checks the message. No generated code.</td>
+        </tr>
+        <tr>
+          <td><strong>protoc-gen-validate</strong> (legacy)</td>
+          <td><code>(validate.rules)</code> field options</td>
+          <td>A <em>build-time</em> plugin emits <code>Validate()</code> methods. Superseded by protovalidate.</td>
+        </tr>
+        <tr>
+          <td><strong>protoc-gen-doc</strong></td>
+          <td>Leading <code>//</code> comments on messages/fields</td>
+          <td>A plugin turns the schema + comments into HTML / Markdown / JSON API docs.</td>
+        </tr>
+        <tr>
+          <td><strong>grpc-gateway</strong></td>
+          <td><code>google.api.http</code> method options</td>
+          <td>A plugin generates a REST/JSON reverse proxy in front of a gRPC service.</td>
+        </tr>
+        <tr>
+          <td><strong>your codegen</strong></td>
+          <td>whatever options you invent</td>
+          <td>SQL schemas, TS clients, config loaders, mock servers &mdash; anything.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p data-anchor="ext-p-uses-2">
+      The validation story is worth dwelling on, because it captures a real shift in taste. The original
+      <strong>protoc-gen-validate</strong> was a classic plugin: you annotated fields with
+      <code>(validate.rules)</code>, and it generated a <code>Validate()</code> method in each language you
+      targeted. It worked, but it meant a code-generation step per language and a pile of generated
+      validation code to compile in. Buf's successor, <strong>protovalidate</strong>, keeps the annotations
+      but throws away the codegen: the constraints live as <code>buf.validate</code> custom options in the
+      descriptor, and a tiny runtime library reads them and validates on the fly &mdash; using Google's
+      Common Expression Language (CEL) for anything beyond the built-in rules, including cross-field checks.
+      Same annotate-then-process loop, but the "process" moved from build time to runtime.
+    </p>
+    <pre data-anchor="ext-code-validate"><code><span class="cm">// protovalidate: the rules live in the schema; a runtime reads them.</span>
+<span class="kw">message</span> <span class="ty">Signup</span> {
+  <span class="ty">string</span> email = <span class="num">1</span> [(buf.validate.field).string.email = <span class="kw">true</span>];
+  <span class="ty">uint32</span> age   = <span class="num">2</span> [(buf.validate.field).uint32.gte = <span class="num">13</span>,
+                    (buf.validate.field).uint32.lte = <span class="num">150</span>];
+  <span class="ty">string</span> id    = <span class="num">3</span> [(buf.validate.field).string.uuid = <span class="kw">true</span>];
+}
+<span class="cm">// No Validate() is generated. At runtime: protovalidate.Validate(msg)</span>
+<span class="cm">// reads these options off the descriptor and returns the violations.</span></code></pre>
+    <div class="callout note" data-anchor="ext-callout-buf">
+      <span class="callout-label">Running plugins without the flag soup</span>
+      In Chapter&nbsp;5 you assembled <code>protoc --NAME_out --NAME_opt</code> flags by hand. Once you're
+      running several plugins, that gets unwieldy, which is why <code>buf generate</code> exists: a
+      <code>buf.gen.yaml</code> lists your plugins &mdash; local binaries, or <em>remote</em> plugins hosted
+      on the Buf Schema Registry and pinned by version &mdash; with their <code>out</code>/<code>opt</code>,
+      and runs them reproducibly on every laptop and CI machine. Underneath, it's still exactly the
+      <code>CodeGeneratorRequest</code>/<code>Response</code> protocol we just dissected. The protocol is the
+      bedrock; <code>buf generate</code> is a nicer way to drive it.
+    </div>
+
+    <div class="callout key-idea" data-anchor="ext-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      We opened the appliance and found it was never sealed. The <code>option</code> keyword turned out to be
+      fields on descriptor messages, and because those messages allow extensions, <em>we</em> can add options
+      of our own &mdash; safe in the 50000&ndash;99999 range, registered globally if they ever leave home. But
+      an option is only a note; the value came alive only when something read it back through reflection. That
+      "something" is a plugin &mdash; and a plugin, stripped of its intimidating name, is just a program that
+      reads a <code>CodeGeneratorRequest</code> from stdin and writes a <code>CodeGeneratorResponse</code> to
+      stdout, wired up by nothing more than a <code>protoc-gen-NAME</code> filename. Put the two halves
+      together &mdash; annotate the schema, process the annotations &mdash; and you have the engine behind
+      validation, documentation, REST gateways, and every bespoke generator a team ever wished for. Your
+      <code>.proto</code> stops being merely a message definition and becomes the single source of truth an
+      entire toolchain reads from. That's the real prize: not a new feature, but a door you can walk through
+      to build features nobody at Google ever anticipated.
+    </div>
+
+    <div class="callout note" data-anchor="ext-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>You add <code>option (myco.audited) = true;</code> to a message, recompile, and nothing changes
+        in your program's behavior. A teammate says the option is broken. Explain precisely why nothing
+        happened, and what would have to exist for the annotation to actually do something.</li>
+        <li>Two open-source annotation libraries both chose extension number <code>50123</code> on
+        <code>FieldOptions</code>. What concretely goes wrong when a project tries to import both, and what
+        rule were the libraries supposed to follow to prevent it?</li>
+        <li>Your plugin receives a <code>CodeGeneratorRequest</code> for <code>order.proto</code>, which
+        imports <code>user.proto</code>. Which of the two shows up in <code>file_to_generate</code>, which
+        in <code>proto_file</code>, and why would generating output for everything in <code>proto_file</code>
+        be a bug?</li>
+        <li>Your plugin encounters a field it can't handle and you want to fail the build with a clear
+        message. Describe exactly how to report it &mdash; which field you set and what exit code you use
+        &mdash; and what happens if you exit non-zero instead.</li>
+        <li>A colleague wants field-level validation and is about to adopt <code>protoc-gen-validate</code>.
+        Explain how <code>protovalidate</code> differs in <em>where</em> the validation logic runs, and why
+        that difference removes a per-language build step.</li>
+      </ol>
+    </div>
+
+    <p data-anchor="ext-sources" style="margin-top:2rem;font-size:.82em;color:var(--ink-soft);border-top:1px solid var(--rule);padding-top:.8rem;">
+      Sources: protobuf's
+      <a href="https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/compiler/plugin.proto">plugin.proto</a>
+      (fetched from the GitHub raw mirror) for the exact <code>CodeGeneratorRequest</code>/<code>CodeGeneratorResponse</code>
+      shape, the <code>file_to_generate</code>-vs-<code>proto_file</code> distinction, the
+      <code>supported_features</code>/<code>Feature</code> enum, and the <code>insertion_point</code> mechanism;
+      the canonical
+      <a href="https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/unittest_custom_options.proto">unittest_custom_options.proto</a>
+      for the <code>extend</code>-the-option-message pattern and the <code>option (name) = value</code> /
+      field <code>[(name) = value]</code> application syntax; the proto2 Language Guide's Custom Options
+      section (via WebSearch snippets, with ScalaPB's and Giorgio Azzinnaro's writeups) for the
+      50000&ndash;99999 in-house range and the global extension registry; Eric Chiang's
+      &ldquo;Protobuf generators for fun and profit&rdquo; and ScalaPB's plugin guide (via search snippet;
+      the direct fetch failed mid-session) for the <code>protoc-gen-NAME</code>/<code>--NAME_out</code>
+      convention and the report-error-then-exit-0 rule; Buf's
+      <a href="https://github.com/bufbuild/protovalidate">protovalidate</a> README (raw mirror) for the
+      runtime-validation model and the <code>buf.validate</code>/CEL annotations, and
+      <a href="https://github.com/bufbuild/protoc-gen-validate">protoc-gen-validate</a> for the superseded
+      code-generating predecessor; and the third-party plugin ecosystem (protoc-gen-doc, grpc-gateway) plus
+      Buf's <code>buf generate</code>/remote-plugin docs for the real-world uses.
+      (protobuf.dev and grpc.io were unreachable from this build's sandbox; their claims were corroborated via
+      the reachable GitHub raw mirrors and WebSearch snippets.)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="13-storage-and-event-systems.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="15-debugging-and-common-mistakes.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
