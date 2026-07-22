@@ -1,0 +1,335 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Control Protocol: Talking to the Fleet — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="cp-eyebrow">Chapter 10</p>
+    <h1 data-anchor="cp-title">The Control Protocol: Talking to the Fleet</h1>
+    <p class="lede" data-anchor="cp-lede">Everything so far has been about <em>one</em> process capturing <em>one</em> failure. But you don't run one process — you run a fleet, and a fleet has a problem a single agent can't solve alone. This chapter is about the second protocol in LinkLog, the one you never implement but should absolutely understand: the <strong>Control Protocol (LCP)</strong>. It's a persistent connection from inside your network to a vendor's server — so its <strong>safety shape</strong> is worth your full attention, and it turns out to be the most carefully constrained thing in the whole system.</p>
+
+    <figure class="img-slot" data-img-slot="control-plane-illustration" data-img-file="assets/img/control-plane-illustration.png" style="--img-aspect:16 / 9" data-anchor="cp-illustration">
+      <img class="img-real" src="../assets/img/control-plane-illustration.png" alt="An agent inside a customer boundary opening a single outbound connection to a control plane; a narrow capability envelope gates what the platform can ask" width="1280" height="720" onerror="this.closest('.img-slot').classList.add('img-missing')">
+      <div class="img-drop"><div class="img-drop-inner">
+        <strong>Illustration</strong>
+        <p class="img-prompt">A cyan-on-navy blueprint-style editorial illustration: inside a walled customer boundary, a single agent opens one thin outbound arrow up to a distant "control plane" node — no arrow ever points back in. Between them sits a narrow keyhole/valve labelled by shape only, letting only small "verdict" tokens pass downward while blocking larger "command" shapes. Thin technical schematic linework, drafting grid, one bright cyan accent on the outbound line, orange on the blocked commands. No readable text baked in. ~1280×720px, 16:9, centred with safe margins.</p>
+        <button type="button" class="img-copy">Copy prompt</button>
+        <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+      </div></div>
+      <figcaption>One outbound connection, a narrow envelope. The platform can make the agent do less — never more.</figcaption>
+    </figure>
+
+    <h2 data-anchor="cp-h-two">Two protocols, opposite jobs</h2>
+    <p data-anchor="cp-p-two1">You already met one protocol without me naming it. When your process commits a <code>.llog</code> artifact and the sidecar reads it (Chapter 9), that's the <strong>Logic Graph Protocol (LGP)</strong> — SDK to agent, one forensic artifact per failure, on a hot path with a sub-millisecond budget. <strong>LCP</strong> is its opposite in almost every dimension: agent to control plane, a handful of coordination messages per minute, never anywhere near your application. They version independently and share nothing but a company.</p>
+
+    <table data-anchor="cp-tbl-two">
+      <thead><tr><th></th><th>LGP · Chapter 9</th><th>LCP · this chapter</th></tr></thead>
+      <tbody>
+        <tr><td>Between</td><td>SDK → Agent</td><td>Agent ↔ Control Plane</td></tr>
+        <tr><td>Carries</td><td>Forensic execution graphs</td><td>Coordination only</td></tr>
+        <tr><td>Volume</td><td>One artifact per failure</td><td>A few messages / minute / agent</td></tr>
+        <tr><td>Budget</td><td>&lt;1ms on the app hot path</td><td>Not on any hot path</td></tr>
+        <tr><td>Direction</td><td>One way</td><td>Bidirectional</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout key" data-anchor="cp-key-why">
+      <span class="ct">Why it has to exist</span>
+      <p>Per-agent containment <strong>does not compose</strong>. Picture a real outage: ten thousand of your agents each correctly dedupe the same failure locally (Chapter 7) — and still each open one pull request for the <em>one</em> bug. Ten thousand PRs. Local caps can't see each other, so a fleet-wide cap needs a single coordination point. That point, and <em>only</em> that point, is what justifies a standing connection to the vendor.</p>
+    </div>
+
+    <h2 data-anchor="cp-h-envelope">The load-bearing rule: the envelope</h2>
+    <p data-anchor="cp-p-env1">A persistent outbound connection from inside your network to a vendor-controlled server is, by default, a dangerous shape. The thing that makes it safe is one rule the entire protocol is built to preserve:</p>
+
+    <div class="callout note" data-anchor="cp-note-envelope">
+      <span class="ct">The Envelope Principle</span>
+      <p>The agent's capability envelope is <strong>declared locally and enforced locally</strong>. The control plane may only request <em>within</em> it — it can never grant a capability your local configuration didn't already allow. It can only ever make the agent do <strong>less</strong>, never more.</p>
+    </div>
+
+    <p data-anchor="cp-p-env2">This is the difference between a capability system and a command-and-control channel, and it's enforced by the party with something to lose: your agent. The very first message on connect, <code>HELLO</code>, is the agent announcing what it is <em>and what it will refuse</em>:</p>
+
+    <pre data-anchor="cp-code-hello"><code><span class="cap">HELLO — the agent tells the platform what it may NOT ask</span><span class="pr">{</span>
+  <span class="str">"type"</span>: <span class="str">"HELLO"</span>,
+  <span class="str">"payload"</span>: <span class="pr">{</span>
+    <span class="str">"role"</span>: <span class="str">"production"</span>,
+    <span class="str">"envelope"</span>: <span class="pr">{</span>
+      <span class="str">"accepts_policy_tighten"</span>: <span class="kw">true</span>,
+      <span class="str">"accepts_stand_down"</span>: <span class="kw">true</span>,
+      <span class="str">"accepts_action_budget"</span>: <span class="kw">true</span>,
+      <span class="str">"accepts_correlation"</span>: <span class="kw">true</span>,
+      <span class="str">"executes_plugins"</span>: <span class="kw">false</span>,   <span class="cm"># statement of fact, not a preference</span>
+      <span class="str">"serves_context_requests"</span>: <span class="kw">false</span>
+    <span class="pr">}</span>
+  <span class="pr">}</span>
+<span class="pr">}</span></code></pre>
+
+    <p data-anchor="cp-p-env3">The envelope is not a negotiation — the platform cannot expand it. And <code>role</code> is a <em>closed set</em>: <span class="pill">production</span> or <span class="pill">ci</span>, nothing in between. A <code>production</code> agent <strong>always</strong> reports <code>executes_plugins: false</code>; one that claims otherwise is malformed, and the platform must reject the session. Staging and every other flavor declare <code>production</code>, because the restrictive envelope is the safe default and an in-between role is just a hole waiting for a rationale.</p>
+
+    <h2 data-anchor="cp-h-verdicts">Conclusions and constraints, never commands</h2>
+    <p data-anchor="cp-p-verd1">Here's the rule that makes the whole thing auditable. Every server-to-agent message carries a <strong>verdict or a limit</strong> — never an instruction and never a data request. The distinction is not stylistic; it's structural:</p>
+
+    <figure class="diagram" data-anchor="cp-fig-maymay">
+      <svg viewBox="0 0 720 250" role="img" aria-label="What the platform may say versus what it may not say">
+        <rect x="18" y="20" width="330" height="212" rx="10" fill="rgba(159,211,90,.06)" stroke="#9fd35a" stroke-width="1.3"></rect>
+        <rect x="372" y="20" width="330" height="212" rx="10" fill="rgba(239,106,106,.06)" stroke="#ef6a6a" stroke-width="1.3"></rect>
+        <text x="183" y="46" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">the platform MAY say</text>
+        <text x="537" y="46" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">the platform may NOT say</text>
+        <g font-family="ui-monospace,monospace" font-size="12" fill="#dbeaf4">
+          <text x="40" y="82">“that bug is handled”</text>
+          <text x="40" y="112">“you have 0 actions left”</text>
+          <text x="40" y="142">“also redact this pattern”</text>
+          <text x="40" y="172">“this is incident #42”</text>
+        </g>
+        <g font-family="ui-monospace,monospace" font-size="12" fill="#c4d7e4">
+          <text x="394" y="82">“run this”</text>
+          <text x="394" y="112">“fetch that file”</text>
+          <text x="394" y="142">“capture more”</text>
+          <text x="394" y="172">“send me your environment”</text>
+        </g>
+        <line x1="388" y1="70" x2="690" y2="70" stroke="#ef6a6a" stroke-width="1" opacity=".25"></line>
+        <text x="183" y="212" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">verdicts &amp; limits</text>
+        <text x="537" y="212" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">commands &amp; data requests</text>
+      </svg>
+      <figcaption>The left column is coordination; the right column is command-and-control. LCP is structurally incapable of the right column.</figcaption>
+    </figure>
+
+    <p data-anchor="cp-p-verd2">The enforcement is beautifully blunt: <strong>no LCP message may name a filesystem path, a query, or an executable.</strong> Messages reference fingerprints, artifact IDs, and lease IDs — nothing else. The rule of thumb the spec keeps repeating is the one to memorize:</p>
+
+    <div class="callout trap" data-anchor="cp-trap-file">
+      <span class="ct">The one-line test</span>
+      <p><em>If a message can name a file, it is the wrong message.</em> An agent that receives one refuses it, reports an <code>ENVELOPE_VIOLATION</code>, writes it to your local audit log, and keeps running. A platform asking for a forbidden capability is a security event <strong>for you</strong> — and you can see it without the vendor's cooperation.</p>
+    </div>
+
+    <h2 data-anchor="cp-h-storm">What the channel actually does: contain storms</h2>
+    <p data-anchor="cp-p-storm1">Strip away the safety scaffolding and LCP has exactly one job worth a standing connection: stop a correlated storm from becoming ten thousand outward actions. It does this with two mechanisms — one for <em>correctness</em>, one for <em>optimization</em> — and you need both.</p>
+
+    <h3 data-anchor="cp-h-lease">Correctness: ask before you act, and get a lease</h3>
+    <p data-anchor="cp-p-lease1">Before any expensive or outward-facing action — an AI diagnosis, a PR, a ticket — the agent asks. A broadcast budget can't do this job: tell 10,000 agents "1 remaining" and you get 10,000 actions. So a grant is a <strong>lease</strong>, issued to exactly one agent:</p>
+
+    <figure class="diagram" data-anchor="cp-fig-lease">
+      <svg viewBox="0 0 720 300" role="img" aria-label="Many agents request an action on one fingerprint; exactly one receives a lease, the rest are denied already_claimed">
+        <defs>
+          <marker id="cpa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+        </defs>
+        <!-- agents -->
+        <text x="72" y="26" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">10,000 agents,</text>
+        <text x="72" y="40" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">same fingerprint</text>
+        <g fill="#0a1b28" stroke="#244a63">
+          <rect x="24" y="58" width="96" height="26" rx="5"></rect>
+          <rect x="24" y="92" width="96" height="26" rx="5"></rect>
+          <rect x="24" y="126" width="96" height="26" rx="5"></rect>
+          <rect x="24" y="196" width="96" height="26" rx="5"></rect>
+        </g>
+        <g font-family="ui-monospace,monospace" font-size="10" fill="#dbeaf4" text-anchor="middle">
+          <text x="72" y="75">ACTION_REQUEST</text>
+          <text x="72" y="109">ACTION_REQUEST</text>
+          <text x="72" y="143">ACTION_REQUEST</text>
+          <text x="72" y="213">ACTION_REQUEST</text>
+        </g>
+        <text x="72" y="180" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="14" text-anchor="middle">⋮</text>
+        <!-- control plane -->
+        <line x1="122" y1="110" x2="270" y2="130" stroke="#46b1e0" stroke-width="1.3" marker-end="url(#cpa)"></line>
+        <rect x="272" y="104" width="150" height="64" rx="9" fill="rgba(18,48,73,.6)" stroke="#46b1e0" stroke-width="1.5"></rect>
+        <text x="347" y="132" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">control plane</text>
+        <text x="347" y="150" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">one lease per fingerprint</text>
+        <!-- grant to one -->
+        <line x1="422" y1="122" x2="540" y2="70" stroke="#9fd35a" stroke-width="1.6" marker-end="url(#cpa)"></line>
+        <rect x="540" y="48" width="158" height="46" rx="6" fill="#0a1b28" stroke="#9fd35a" stroke-width="1.5"></rect>
+        <text x="619" y="68" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">ACTION_GRANT</text>
+        <text x="619" y="84" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">lease_id · expires_at</text>
+        <!-- deny to rest -->
+        <line x1="422" y1="150" x2="540" y2="196" stroke="#f0a15a" stroke-width="1.6" marker-end="url(#cpa)"></line>
+        <rect x="540" y="176" width="158" height="46" rx="6" fill="#0a1b28" stroke="#f0a15a" stroke-width="1.5"></rect>
+        <text x="619" y="196" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">ACTION_DENY ✕ 9,999</text>
+        <text x="619" y="212" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">reason: already_claimed</text>
+        <text x="360" y="270" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">a 20ms round-trip against a multi-second LLM call is noise — and it only happens on the failure path</text>
+      </svg>
+      <figcaption>One fingerprint, one lease, one outward action. The other 9,999 agents are denied <code>already_claimed</code> and simply don't act.</figcaption>
+    </figure>
+
+    <p data-anchor="cp-p-lease2">The lease has three properties worth remembering, because they're all consequences of "safe to lose":</p>
+    <ul data-anchor="cp-ul-lease">
+      <li><strong>Expiry is the only backstop.</strong> The server picks <code>expires_at</code> generously above the action's worst case. A granted agent that dies is handled by the lease simply expiring — there is no liveness protocol on this channel.</li>
+      <li><strong>No renewal.</strong> An action that outlives a generous lease is an action that <em>should</em> fail.</li>
+      <li><strong>Leases survive disconnects.</strong> A lease is time-scoped, not session-scoped — the agent holds <code>lease_id</code> and <code>expires_at</code> locally, so a network blip mid-action doesn't strand the fleet's one permitted action.</li>
+    </ul>
+
+    <p data-anchor="cp-p-deny">The four <code>ACTION_DENY</code> reasons are a closed set, and one of them is the fail-open rule in miniature:</p>
+    <table data-anchor="cp-tbl-deny">
+      <thead><tr><th>Reason</th><th>Agent behavior</th></tr></thead>
+      <tbody>
+        <tr><td><code>already_claimed</code></td><td>Do not act — another agent (or an earlier lease of this one) holds it.</td></tr>
+        <tr><td><code>budget_exhausted</code></td><td>Do not act — the fleet budget for this window is spent.</td></tr>
+        <tr><td><code>stand_down_active</code></td><td>Do not act — equivalent to holding a stand-down for this fingerprint.</td></tr>
+        <tr><td><code>unknown_action</code></td><td><strong>Act per local caps.</strong> The channel doesn't govern this action, so it gets no veto — suppression by ignorance is forbidden.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 data-anchor="cp-h-standdown">Optimization: STAND_DOWN, with a lock you hold</h3>
+    <p data-anchor="cp-p-sd1">Once a fingerprint is claimed, it's wasteful to keep fielding 9,999 requests for it. So the platform proactively silences the fleet with a <code>STAND_DOWN</code>. This is the <em>optimization</em> layered on top of the correctness mechanism — lose it, and you degrade to ask-and-be-denied. More round-trips, zero wrong behavior.</p>
+    <p data-anchor="cp-p-sd2">But a "be quiet" message from a vendor is exactly the kind of power the envelope exists to bound. So the agent clamps it:</p>
+
+    <pre data-anchor="cp-code-standdown"><code><span class="cap">STAND_DOWN — and the local clamp the platform can't see or exceed</span><span class="cm"># the message:</span>
+<span class="pr">{</span> <span class="str">"type"</span>: <span class="str">"STAND_DOWN"</span>,
+  <span class="str">"payload"</span>: <span class="pr">{</span> <span class="str">"fingerprint"</span>: <span class="str">"a83f92bc"</span>,
+    <span class="str">"until"</span>: <span class="num">1752541200000</span>, <span class="str">"reason"</span>: <span class="str">"incident_open"</span>,
+    <span class="str">"incident_id"</span>: <span class="str">"INC-42"</span> <span class="pr">}</span> <span class="pr">}</span>
+
+<span class="cm"># the agent's enforcement (from the reference client):</span>
+max     <span class="pr">:=</span> now <span class="pr">+</span> max_stand_down_s <span class="pr">*</span> <span class="num">1000</span>   <span class="cm"># default 3600s, local config</span>
+clamped <span class="pr">:=</span> until <span class="pr">></span> max
+until    <span class="pr">=</span> <span class="fn">min</span>(until, max)                <span class="cm"># the platform cannot exceed your ceiling</span></code></pre>
+
+    <p data-anchor="cp-p-sd3">The default ceiling is <span class="pill default">3600s</span> — one hour, locally configurable, and the platform can't see, set, or exceed it. One hour silences a storm wave; a hostile or buggy platform can silence your fleet for <em>at most</em> an hour per message. And because re-issuing before expiry is explicitly allowed (it's how a long incident is meant to work), sustained suppression becomes a <strong>repeating, audited act</strong> — every re-issue lands in the log you own — never a one-shot silent state. Hold that thought; it's the seam of the entire threat model.</p>
+
+    <h2 data-anchor="cp-h-floor">The policy floor: more redaction, never less</h2>
+    <p data-anchor="cp-p-floor1">There's one thing the platform <em>can</em> push that sounds dangerous: sanitization rules. A channel that can push redaction rules could push <em>worse</em> ones — quietly turning "raw data never leaves your host" into "…unless the vendor says otherwise." The resolution is an asymmetry: <strong>more redaction is safe; less is a trust inversion.</strong> So the rule set has two layers, and they combine by union:</p>
+
+    <figure class="diagram" data-anchor="cp-fig-floor">
+      <svg viewBox="0 0 720 210" role="img" aria-label="Effective rules equal local rules union the platform layer; the local floor is never touched">
+        <rect x="40" y="60" width="250" height="110" rx="10" fill="rgba(159,211,90,.08)" stroke="#9fd35a" stroke-width="1.5"></rect>
+        <text x="165" y="50" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">LOCAL floor (yours)</text>
+        <text x="165" y="112" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">never touched, extended,</text>
+        <text x="165" y="130" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">shadowed, or referenced</text>
+        <text x="320" y="120" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="26" text-anchor="middle">∪</text>
+        <rect x="350" y="60" width="250" height="110" rx="10" fill="rgba(70,177,224,.08)" stroke="#46b1e0" stroke-width="1.5" stroke-dasharray="5 4"></rect>
+        <text x="475" y="50" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">PLATFORM layer (vendor)</text>
+        <text x="475" y="112" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">additive overlay, replaced</text>
+        <text x="475" y="130" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">wholesale each POLICY_TIGHTEN</text>
+        <text x="628" y="120" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="22" text-anchor="middle">→</text>
+        <text x="360" y="196" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">effective = local ∪ platform   ·   only POLICY_TIGHTEN exists; POLICY_REPLACE is forbidden</text>
+      </svg>
+      <figcaption>Your local ruleset is the floor and is never expressible in a pushed message. The vendor can only add to it.</figcaption>
+    </figure>
+
+    <p data-anchor="cp-p-floor2">Before applying any <code>POLICY_TIGHTEN</code>, the agent enforces five checks and rejects the update if <em>any</em> fails — reporting which one via <code>POLICY_ACK</code>:</p>
+    <ol data-anchor="cp-ol-floor">
+      <li><strong>Local rules untouched.</strong> No pushed rule may reuse a local rule's <code>id</code> — a push that names a local id is a refusal.</li>
+      <li><strong>No capture config.</strong> The update can't touch capture, sampling, or allowlist mode. "Capture more" is a loosening and is out of scope entirely.</li>
+      <li><strong>Signed.</strong> Ed25519 over the decoded blob bytes — verified <em>before</em> parsing — against a key you pinned at deploy.</li>
+      <li><strong>Monotonic.</strong> The signed inner <code>version</code> must exceed the stored one; replays are rejected.</li>
+      <li><strong>Audit-logged.</strong> Every update, applied or rejected, is written to a log you own.</li>
+    </ol>
+
+    <div class="callout note" data-anchor="cp-note-key">
+      <span class="ct">The trust root never travels the wire</span>
+      <p>The verifying public key is <strong>local configuration, full stop</strong> — placed by your deploy, rotated by a redeploy. LCP can never carry a key, because a channel that could rotate its own trust root would be granting itself capability — the exact inversion the envelope exists to prevent. Under these rules, policy push flips from a risk into a <em>feature</em>: a new secret format appears in the wild, the pattern is pushed, and your whole fleet hardens in seconds instead of a redeploy cycle.</p>
+    </div>
+
+    <h2 data-anchor="cp-h-forbidden">The messages that will never exist</h2>
+    <p data-anchor="cp-p-forbid1">Most protocols list what they support. LCP also, unusually, names what it <strong>permanently forbids</strong> — so the boundary is auditable and nobody can re-propose one of these as a reasonable-sounding feature later. All are rejected on sight; the reference client won't even parse them:</p>
+    <table data-anchor="cp-tbl-forbidden">
+      <thead><tr><th>Forbidden type</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>EXECUTE_PLUGIN</code></td><td>Remote code execution beside production — a command-and-control shape. Validation belongs in your CI.</td></tr>
+        <tr><td><code>FETCH_CONTEXT</code></td><td>A data-exfiltration primitive. Reading host env/config/logs on demand is exactly what this product sells against.</td></tr>
+        <tr><td><code>CAPTURE_MORE</code></td><td>Remotely loosening capture inverts the trust boundary.</td></tr>
+        <tr><td><code>POLICY_REPLACE</code></td><td>Would permit <em>removing</em> redaction. Only <code>POLICY_TIGHTEN</code> exists.</td></tr>
+        <tr><td>any path / query</td><td>A message that can name a file is the wrong message.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="cp-h-threat">If the control plane went fully hostile</h2>
+    <p data-anchor="cp-p-threat1">Put the pieces together and you can answer the question that actually matters: assume the vendor's control plane is completely compromised — what can it do to you?</p>
+    <table data-anchor="cp-tbl-threat">
+      <thead><tr><th>Attempt</th><th>Outcome</th></tr></thead>
+      <tbody>
+        <tr><td>Execute code on your agents</td><td>Rejected — type forbidden, not implemented agent-side</td></tr>
+        <tr><td>Exfiltrate host data</td><td>Rejected — type forbidden</td></tr>
+        <tr><td>Weaken sanitization</td><td>Rejected — floor rule + signature</td></tr>
+        <tr><td>Rotate the policy trust root</td><td>Impossible — keys never travel this channel</td></tr>
+        <tr><td>Broaden capture</td><td>Rejected — out of protocol scope</td></tr>
+        <tr><td>Suppress all reporting</td><td><strong>Possible — but bounded &amp; audited</strong></td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="cp-p-threat2">One row is not "rejected," and the spec is honest about it. The residual risk is <strong>suppression</strong>: a hostile platform can issue blanket stand-downs and silence your fleet's outward actions. This is accepted and bounded — the <code>max_stand_down_s</code> clamp means sustained silence requires continuous, audit-logged re-issuing, and it can only withhold <em>actions</em>, never leak <em>data</em>. Silencing is strictly less severe than execution or exfiltration, and it degrades toward the offline behavior you already trust.</p>
+
+    <h2 data-anchor="cp-h-you">What this means for you</h2>
+    <p data-anchor="cp-p-you1">You will never write an LCP message. But four of its properties are yours to rely on, and one knob is yours to turn:</p>
+    <div class="callout key" data-anchor="cp-key-takeaway">
+      <span class="ct">Your takeaways</span>
+      <p><strong>It's default-off.</strong> The open-source agent ships the LCP client disabled — it does nothing until you turn it on. <strong>It's safe to lose.</strong> With the channel down the agent still captures, sanitizes, fingerprints, diagnoses, and dispatches; it fails open to the local caps from Chapter 7, which are your always-on floor. Air-gapped is a first-class deployment, not a degraded one. <strong>You own the audit log</strong> — every grant, denial, stand-down (with clamping), policy change, and envelope violation, readable without the vendor. <strong>You pin the policy key</strong> at deploy. And the one setting worth tuning is <code>max_stand_down_s</code>: your ceiling on how long anything upstream can quiet a given signature.</p>
+    </div>
+
+    <p class="soft" data-anchor="cp-p-next">That completes the fleet picture: the SDK captures (Chapters 1–8), the sidecar processes and replays (Chapter 9), and the control plane coordinates the fleet without ever gaining a command over it (this chapter). Two final chapters return to the SDK itself — how it stays correct when hundreds of requests fail at once, and how to <em>prove</em> your integration actually fires.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-downstream.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="11-concurrency.html">Next: Concurrency ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->

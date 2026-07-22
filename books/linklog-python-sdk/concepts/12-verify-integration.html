@@ -1,0 +1,186 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verifying Your Integration — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="vi-eyebrow">Chapter 12</p>
+    <h1 data-anchor="vi-title">Verifying Your Integration</h1>
+    <p class="lede" data-anchor="vi-lede">You've wired the whole thing: middleware, intents, buffer mode, allowlist. It compiles, your test throws and gets caught, everything looks green. Here's the uncomfortable truth this chapter exists for — with LinkLog, <strong>"looks like it works" is exactly the failure mode.</strong> Every common integration mistake is invisible when you <em>read</em> the code and obvious only when you <em>run</em> it. So LinkLog ships a way to force the running and read the verdict off disk.</p>
+
+    <h2 data-anchor="vi-h-lie">Three ways an integration lies to you</h2>
+    <p data-anchor="vi-p-lie1">These aren't hypotheticals — they're the specific mistakes a person (or, increasingly, a coding agent) makes wiring LinkLog in, each of which produces a false green:</p>
+
+    <div class="callout trap" data-anchor="vi-trap-three">
+      <span class="ct">The false greens</span>
+      <p><strong>1. The pre-empted hook.</strong> Reaching for a global <code>sys.excepthook</code> that your web framework's exception handling silently pre-empts (invariant #9) — it rarely fires, but nothing errors. <strong>2. The Mac false green.</strong> "Verifying" on a macOS laptop, where the core capture path doesn't even exist, so a test passes having exercised nothing (Chapter 5). <strong>3. The wrong mode.</strong> Picking <code>ANONYMOUS</code> mode and never capturing the OOM-kills that are the whole point in Kubernetes (invariant #10). All three read as working. Only execution on the real platform tells the truth.</p>
+    </div>
+
+    <p data-anchor="vi-p-lie2">And there's a fourth, subtler one that undoes naive testing entirely: because LinkLog is <strong>zero-panic</strong> (Chapter 8), its internal errors are swallowed. So a caught exception in your handler is <em>not</em> proof anything was captured. The exception firing and the checkpoint landing are two independent events — and only one of them is the thing you care about.</p>
+
+    <div class="callout key" data-anchor="vi-key-rule">
+      <span class="ct">The rule that redefines "done"</span>
+      <p><strong>Assert the artifact, not the return value.</strong> Integration is complete not when the code compiles or the exception is caught, but when a forced, real failure produces a <code>.llog</code> on disk — <em>on Linux</em>. LinkLog gives you two commands that make exactly that the definition of done.</p>
+    </div>
+
+    <h2 data-anchor="vi-h-rules">Step one: <code>llog rules sync</code> — teach the integrator the non-obvious path</h2>
+    <p data-anchor="vi-p-rules1">Most people won't hand-integrate an SDK anymore — their coding agent will. Left unaided, an agent reading the SDK source gets the LinkLog-specific parts wrong in precisely the invisible ways above. So the SDK ships its own integration rules and writes them where the agent will read them:</p>
+
+    <pre data-anchor="vi-code-sync"><code><span class="cap">terminal</span><span class="sh">$</span> llog rules sync
+  <span class="cm"># reads the rules bundled *inside* the installed SDK (offline, no network)</span>
+  <span class="cm"># merges them into ./AGENTS.md between version-stamped markers:</span>
+  wrote <span class="pr">&lt;!--</span> BEGIN llog-python v1 <span class="pr">--&gt;</span> … <span class="pr">&lt;!--</span> END llog-python <span class="pr">--&gt;</span>
+
+<span class="sh">$</span> llog rules sync <span class="cm"># idempotent: run it again → byte-identical, no duplicate block</span>
+<span class="sh">$</span> llog rules sync --also CLAUDE.md   <span class="cm"># optional second target</span></code></pre>
+
+    <p data-anchor="vi-p-rules2">The block is <strong>marker-scoped</strong>, so a polyglot repo gets one clean block per SDK and syncing one never disturbs another's. It carries the SDK version and warns if your installed SDK is newer than the block on disk. And what it writes into <code>AGENTS.md</code> is the non-obvious correct path, stated as rules:</p>
+    <ul data-anchor="vi-ul-rules">
+      <li>Framework <strong>middleware is primary</strong>; <code>sys.excepthook</code> is only a fallback (frameworks swallow exceptions — Chapter 4).</li>
+      <li>The <code>ANONYMOUS</code>-vs-<code>STAGING</code> choice, tied to its consequence: anonymous can't see an OOM-kill (Chapter 5).</li>
+      <li><strong>Allowlist capture</strong> as the default for regulated data (Chapter 6).</li>
+      <li>The write-only boundary, and: zero-panic means a caught exception is <em>not</em> proof of capture — <em>assert the artifact</em>.</li>
+      <li>And it redefines done: integration is complete when <code>llog verify-integration</code> forces a failure and sees a <code>.llog</code> land on Linux.</li>
+    </ul>
+
+    <div class="callout note" data-anchor="vi-note-dr018">
+      <span class="ct">Why the rules can be trusted (DR-018)</span>
+      <p>These rules are prose that makes falsifiable claims about how to wire capture — exactly the kind of thing this whole product exists because prose drifts from truth. So they're not hand-maintained per SDK. They're <strong>composed from one canonical source</strong> (a language-neutral <code>core.md</code> plus a per-language overlay) into a committed bundle, and <strong>CI holds the bundle to reality</strong>: it regenerates the bundle and fails on any diff, and it <em>executes</em> the integration snippet embedded in the rules on the Linux harness, asserting a checkpoint lands. Rotted rules go red. The rules can't document a path that doesn't run.</p>
+    </div>
+
+    <h2 data-anchor="vi-h-verify">Step two: <code>llog verify-integration</code> — force a failure, assert the artifact</h2>
+    <p data-anchor="vi-p-verify1">This is the executable done-gate. It's a self-contained smoke test of the <em>mechanism</em>: it instruments a tiny function, forces a raise, and then asserts a <code>.llog</code> actually appears in <code>/dev/shm/llog/events/</code>. If a sidecar happens to be watching, it confirms pickup too — but "no sidecar" is still a normal <strong>PASS</strong>, because it's asserting the SDK-side commit, which needs no watcher.</p>
+
+    <pre data-anchor="vi-code-verify"><code><span class="cap">terminal — the same command, three honest outcomes</span><span class="cm"># On Linux, correctly wired:</span>
+<span class="sh">$</span> llog verify-integration
+  forcing a failure through your instrumentation…
+  <span class="fn">PASS</span>  artifact observed: /dev/shm/llog/events/3f9c.llog     <span class="cm"># exit 0</span>
+
+<span class="cm"># On Linux, capture is broken (e.g. a parent dir the agent can't write):</span>
+<span class="sh">$</span> llog verify-integration
+  forcing a failure through your instrumentation…
+  <span class="num">FAIL</span>  no artifact appeared — capture is not working              <span class="cm"># exit 1</span>
+
+<span class="cm"># On macOS:</span>
+<span class="sh">$</span> llog verify-integration
+  <span class="num">REFUSED</span>  no O_TMPFILE / no /dev/shm here — a green would be false  <span class="cm"># exit 3</span></code></pre>
+
+    <p data-anchor="vi-p-verify2">Three distinct exit codes, so a caller — a CI job, a Makefile, your agent — can tell "broken" apart from "not applicable here":</p>
+
+    <figure class="diagram" data-anchor="vi-fig-codes">
+      <svg viewBox="0 0 720 210" role="img" aria-label="The three exit codes of verify-integration: 0 verified, 1 ran but no artifact, 3 refused on the wrong platform">
+        <rect x="24" y="40" width="210" height="120" rx="10" fill="rgba(159,211,90,.07)" stroke="#9fd35a" stroke-width="1.4"></rect>
+        <rect x="255" y="40" width="210" height="120" rx="10" fill="rgba(239,106,106,.07)" stroke="#ef6a6a" stroke-width="1.4"></rect>
+        <rect x="486" y="40" width="210" height="120" rx="10" fill="rgba(240,161,90,.07)" stroke="#f0a15a" stroke-width="1.4"></rect>
+        <g font-family="ui-monospace,monospace" text-anchor="middle">
+          <text x="129" y="78" fill="#9fd35a" font-size="30">0</text>
+          <text x="129" y="106" fill="#dbeaf4" font-size="12">verified</text>
+          <text x="129" y="130" fill="#8fb0c4" font-size="10">a .llog landed</text>
+          <text x="129" y="146" fill="#8fb0c4" font-size="10">on disk</text>
+          <text x="360" y="78" fill="#ef6a6a" font-size="30">1</text>
+          <text x="360" y="106" fill="#dbeaf4" font-size="12">ran, no artifact</text>
+          <text x="360" y="130" fill="#8fb0c4" font-size="10">capture is broken —</text>
+          <text x="360" y="146" fill="#8fb0c4" font-size="10">fix the wiring</text>
+          <text x="591" y="78" fill="#f0a15a" font-size="30">3</text>
+          <text x="591" y="106" fill="#dbeaf4" font-size="12">refused</text>
+          <text x="591" y="130" fill="#8fb0c4" font-size="10">wrong platform —</text>
+          <text x="591" y="146" fill="#8fb0c4" font-size="10">a green would be false</text>
+        </g>
+        <text x="360" y="188" fill="#5b7d92" font-size="10" font-family="ui-monospace,monospace" text-anchor="middle">"broken" and "not applicable here" are different answers — the exit code tells them apart</text>
+      </svg>
+      <figcaption>Not a boolean. Three outcomes, because a refusal on macOS is a <em>correct</em> result, not a failure.</figcaption>
+    </figure>
+
+    <p data-anchor="vi-p-refuse">That macOS <strong>REFUSED</strong> is the most important design choice in the command. It does not report success on a platform where the capture mechanism doesn't exist — it explains, in plain language, why a green there would be a lie, and exits non-zero. The refusal is load-bearing, not decorative: it's mutation-tested by stubbing the platform guard to "allow" and confirming it <em>would</em> false-green on the fallback. A tool that told you "yes, it works" on your laptop would be teaching you the exact trap the product exists to eliminate.</p>
+
+    <div class="callout note" data-anchor="vi-note-local">
+      <span class="ct">It is not a phone-home</span>
+      <p><code>verify-integration</code> produces a <strong>local</strong> artifact and inspects it <strong>locally</strong> — it sends nothing off-host. And it reads the checkpoint it just wrote through the <em>reader</em> path, as a diagnostic tool, never back through the SDK: the write-only wall from Chapter 6 stays intact even in the tool that verifies capture.</p>
+    </div>
+
+    <h2 data-anchor="vi-h-ci">Wire it into CI as your done-gate</h2>
+    <p data-anchor="vi-p-ci1">The payoff is a one-line gate that fails the build when capture silently breaks — a dependency bump, a middleware reorder, a mode flipped in a refactor. Run it where the mechanism is real:</p>
+    <pre data-anchor="vi-code-ci"><code><span class="cap">.github/workflows/ci.yml — runs on a Linux runner</span><span class="at">- name</span>: Verify LinkLog capture still fires
+  <span class="at">run</span>: llog verify-integration      <span class="cm"># exit 0 required; 1 fails the build, 3 shouldn't occur on Linux CI</span></code></pre>
+    <p data-anchor="vi-p-ci2">On a non-root container — and production is never root — it still must pass; a root-only green would hide a <code>CAP_DAC_READ_SEARCH</code> gap. That's the whole discipline of this book made mechanical: don't trust that capture works because the code looks right; force a failure and watch the checkpoint land.</p>
+
+    <p class="soft" data-anchor="vi-p-next">That closes the loop. You've built capture (Chapters 1–8), watched it survive load (Chapter 11), followed the checkpoint downstream and out to the fleet (Chapters 9–10), and now you can <em>prove</em> the whole chain fires on every commit. Flip to the Cheatsheet for the whole API, every config knob, and the traps — on one page you can keep open while you wire it in.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="11-concurrency.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Next: Cheatsheet ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->

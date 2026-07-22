@@ -1,0 +1,208 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concurrency: Hundreds of Requests at Once — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="cc-eyebrow">Chapter 11</p>
+    <h1 data-anchor="cc-title">Concurrency: Hundreds of Requests at Once</h1>
+    <p class="lede" data-anchor="cc-lede">Every chapter so far followed a single request through capture. But your service doesn't serve one request — it serves hundreds, interleaved, and the obvious question is <em>"if hundreds fail at once, how does <code>llog</code> keep them straight?"</em> The one-line answer is reassuring; the consequences are worth spelling out, because one of them is the difference between a correct artifact and a <strong>privacy leak that only ever appears under load</strong>.</p>
+
+    <div class="callout key" data-anchor="cc-key-oneline">
+      <span class="ct">The one line</span>
+      <p>Every in-flight request gets its <strong>own</strong> <code>Session</code> → its own <code>Buffer</code> → its own file descriptor → its own causality graph. There is no process-wide buffer that requests write into together, so "hundreds at once" is just hundreds of independent objects. The <em>only</em> shared state is read-mostly config plus two deliberately-locked coordination points: the storm limiter and one-time directory setup.</p>
+    </div>
+
+    <p data-anchor="cc-p-intro">What keeps each request's state separate depends on your execution model, and the two cases differ enough to matter. Get the second one wrong and you don't get a crash — you get two users' data in one file.</p>
+
+    <h2 data-anchor="cc-h-threads">Case one: thread-per-request (WSGI, sync workers)</h2>
+    <p data-anchor="cc-p-thr1">Picture 300 requests on 300 threads. When <code>@llog.intent</code> fires it calls <code>_begin()</code>, which builds a fresh <code>Session</code> and stashes it in a <code>ContextVar</code> — not a plain global. Each thread reads its own value, so there's no cross-talk:</p>
+
+    <pre data-anchor="cc-code-cvars"><code><span class="cap">llog/tracker.py — per-request isolation lives in two ContextVars</span><span class="kw">from</span> contextvars <span class="kw">import</span> ContextVar
+
+_session: ContextVar[Session | <span class="kw">None</span>] = <span class="fn">ContextVar</span>(<span class="str">"llog_session"</span>, default=<span class="kw">None</span>)
+_parent:  ContextVar[<span class="ty">str</span> | <span class="kw">None</span>]     = <span class="fn">ContextVar</span>(<span class="str">"llog_parent"</span>,  default=<span class="kw">None</span>)
+
+<span class="kw">def</span> <span class="fn">_begin</span>(intent_name):
+    s = <span class="fn">Session</span>(intent_name)     <span class="cm"># fresh Session → fresh Buffer → fresh fd</span>
+    _session.<span class="fn">set</span>(s)              <span class="cm"># each thread reads *its own* copy</span>
+    <span class="kw">return</span> s</code></pre>
+
+    <p data-anchor="cc-p-thr2">A second <code>ContextVar</code>, <code>_parent</code>, holds the current parent event id, so nested <code>with llog.scope(...)</code> blocks build the correct parent→child graph <em>per thread</em>. And each <code>Buffer</code> holds one <code>O_TMPFILE</code> fd whose writes go straight to the kernel via <code>os.write</code> — no application-memory buffering (that's invariant #2 from Chapter 8) — so two concurrent threads never touch the same descriptor. Threads are the easy case: the OS already keeps them apart, and a <code>ContextVar</code> rides along.</p>
+
+    <h2 data-anchor="cc-h-async">Case two: async / FastAPI — the case the design is built around</h2>
+    <p data-anchor="cc-p-async1">Async is where a naive design quietly breaks. FastAPI <strong>interleaves many requests on a single event-loop thread</strong> — they take turns, hopping in and out at every <code>await</code>. Now ask what would happen if the tracker had stored its session in a <code>threading.local</code> or a module global:</p>
+
+    <div class="callout trap" data-anchor="cc-trap-splice">
+      <span class="ct">The bug that only exists under concurrency</span>
+      <p>A <code>threading.local</code> is shared across coroutines that interleave on the <em>same</em> thread. A module global is shared across <em>everything</em>. Either one would splice two concurrently-interleaved requests' execution graphs into <strong>one</strong> artifact — a correctness bug <em>and</em> a privacy leak (invariant #5, Chapter 6). Request A's snapshot lands in Request B's checkpoint. It passes every single-request test and only surfaces when two requests overlap in time.</p>
+    </div>
+
+    <figure class="diagram" data-anchor="cc-fig-async">
+      <svg viewBox="0 0 720 320" role="img" aria-label="Two requests interleaved on one event-loop thread; with contextvars each resolves to its own artifact, with a global they splice into one">
+        <defs>
+          <marker id="cca" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+        </defs>
+        <text x="360" y="22" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">one event-loop thread · requests A and B interleave at every await</text>
+        <!-- timeline -->
+        <line x1="40" y1="60" x2="680" y2="60" stroke="#244a63" stroke-width="1.2"></line>
+        <g font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">
+          <rect x="48" y="46" width="70" height="28" rx="5" fill="#0a1b28" stroke="#46b1e0"></rect><text x="83" y="64" fill="#46b1e0">A.begin</text>
+          <rect x="140" y="46" width="70" height="28" rx="5" fill="#0a1b28" stroke="#9fd35a"></rect><text x="175" y="64" fill="#9fd35a">B.begin</text>
+          <rect x="232" y="46" width="86" height="28" rx="5" fill="#0a1b28" stroke="#46b1e0"></rect><text x="275" y="64" fill="#46b1e0">A.snapshot</text>
+          <rect x="340" y="46" width="86" height="28" rx="5" fill="#0a1b28" stroke="#9fd35a"></rect><text x="383" y="64" fill="#9fd35a">B.snapshot</text>
+          <rect x="448" y="46" width="70" height="28" rx="5" fill="#0a1b28" stroke="#ef6a6a"></rect><text x="483" y="64" fill="#ef6a6a">A.raise</text>
+          <rect x="540" y="46" width="70" height="28" rx="5" fill="#0a1b28" stroke="#9fd35a"></rect><text x="575" y="64" fill="#9fd35a">B.done</text>
+        </g>
+        <!-- good path -->
+        <text x="180" y="120" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">contextvars: each task, own copy</text>
+        <rect x="70" y="132" width="200" height="52" rx="8" fill="rgba(159,211,90,.08)" stroke="#9fd35a" stroke-width="1.4"></rect>
+        <text x="170" y="154" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">A.llog</text>
+        <text x="170" y="172" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">only A's begin/snapshot/raise</text>
+        <line x1="83" y1="74" x2="140" y2="132" stroke="#9fd35a" stroke-width="1.1" opacity=".6"></line>
+        <line x1="275" y1="74" x2="200" y2="132" stroke="#9fd35a" stroke-width="1.1" opacity=".6"></line>
+        <line x1="483" y1="74" x2="230" y2="132" stroke="#9fd35a" stroke-width="1.1" opacity=".6"></line>
+        <text x="170" y="206" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">✓ correct &amp; private</text>
+        <!-- bad path -->
+        <text x="540" y="120" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">global / thread-local: one slot</text>
+        <rect x="440" y="132" width="220" height="52" rx="8" fill="rgba(239,106,106,.08)" stroke="#ef6a6a" stroke-width="1.4"></rect>
+        <text x="550" y="154" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">spliced.llog</text>
+        <text x="550" y="172" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="9" text-anchor="middle">A's snapshot inside B's graph</text>
+        <line x1="275" y1="74" x2="470" y2="132" stroke="#ef6a6a" stroke-width="1.1" opacity=".7"></line>
+        <line x1="383" y1="74" x2="540" y2="132" stroke="#ef6a6a" stroke-width="1.1" opacity=".7"></line>
+        <text x="550" y="206" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">✕ correctness bug + privacy leak</text>
+        <text x="360" y="250" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">contextvars give each async task its own copy of _session and _parent —</text>
+        <text x="360" y="266" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">a load-bearing choice, not a style preference</text>
+      </svg>
+      <figcaption>The same interleaving, two storage choices. <code>contextvars</code> keep A and B in separate artifacts; a global folds them into one.</figcaption>
+    </figure>
+
+    <p data-anchor="cc-p-async2">That is exactly why the tracker uses <code>contextvars</code> and not a thread-local. <code>contextvars</code> give each async task its own copy of <code>_session</code> and <code>_parent</code>, so the graph stays correct with hundreds of coroutines interleaved on one thread. You don't configure this and you can't get it wrong — but it's worth knowing it's load-bearing, because it's the reason you install the <strong>ASGI middleware</strong> (Chapter 4) rather than reaching for a global hook:</p>
+
+    <pre data-anchor="cc-code-mw"><code><span class="cap">main.py — middleware is the primary path, and it's concurrency-correct by construction</span><span class="kw">from</span> fastapi <span class="kw">import</span> FastAPI
+<span class="kw">import</span> llog
+
+app = <span class="fn">FastAPI</span>()
+app.<span class="fn">add_middleware</span>(llog.<span class="ty">ASGIMiddleware</span>)   <span class="cm"># each request → its own contextvar-scoped Session</span></code></pre>
+
+    <h2 data-anchor="cc-h-lock">The one place two threads share a buffer</h2>
+    <p data-anchor="cc-p-lock1">There is exactly one write path where two threads legitimately touch the <em>same</em> buffer: the request thread, and the watchdog thread (Chapter 4) that commits a deadlocked request which never returns (invariant #9). Two threads appending into one MessagePack stream would interleave two objects and corrupt the artifact — so every <code>Buffer</code> carries its <strong>own</strong> <code>threading.Lock</code>, taken by <code>write</code> / <code>discard</code> / <code>commit</code>, plus a closed-state flag that turns post-commit writes into no-ops.</p>
+
+    <div class="callout note" data-anchor="cc-note-lock">
+      <span class="ct">Why this lock never shows up in a flame graph</span>
+      <p>Because the lock is <strong>per buffer</strong>, it's never a contention point <em>between</em> requests — a request only ever contends with its own watchdog, and only if it's hung. Uncontended acquisition is ~20–25ns and lands on the success path, so it's benchmarked with the watchdog live, not assumed (DR-001; still unverified until the deadline registry is wired). One request's lock has nothing to say to another's.</p>
+    </div>
+
+    <h2 data-anchor="cc-h-storm">The real stress case isn't concurrency — it's <em>correlated</em> failure</h2>
+    <p data-anchor="cc-p-storm1">Here's the reframe that matters. Hundreds of requests running at once is <em>not</em> the scary scenario — they're independent objects and the machinery above keeps them apart. The scary scenario is <strong>correlated failure</strong> (invariant #8, and the whole of Chapter 7): a shared dependency dies, all N requests fail together, and all N buffers try to commit at the same instant — filling <code>/dev/shm</code> and handing the sidecar N identical artifacts for one bug. The tool would invert under exactly the load it exists to survive.</p>
+    <p data-anchor="cc-p-storm2">This is the one point where every failing thread converges on a <em>single</em> shared object — the per-signature storm limiter — and correctness under that contention is its entire job:</p>
+
+    <table data-anchor="cc-tbl-limiter">
+      <thead><tr><th>Aspect</th><th>Behavior under a storm</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Key</strong></td><td>a cheap local signature — <code>exc_type | innermost_frame | intent</code> — not the sidecar's authoritative fingerprint (DR-011)</td></tr>
+        <tr><td><strong>Limit</strong></td><td>per-signature token bucket, default 10 commits/min (<code>max_commits_per_min</code>)</td></tr>
+        <tr><td><strong>Contention</strong></td><td>one shared object hit by every failing thread at once → globally locked; being correct here is the point</td></tr>
+        <tr><td><strong>Suppressed</strong></td><td><strong>counted, not lost</strong> — the next allowed commit stamps <code>V_SUPPRESSED_COUNT</code>, so "9,997 of 10,000 suppressed" is still recorded</td></tr>
+        <tr><td><strong>Failure mode</strong></td><td>fails <strong>open</strong> — a limiter bug allows the commit rather than silencing all reporting mid-storm (invariant #13)</td></tr>
+        <tr><td><strong>Memory</strong></td><td>bucket map bounded by LRU eviction at 4,096, so a storm of <em>distinct</em> signatures can't OOM the app either</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="cc-p-storm3">That's the same containment you met in Chapter 7, now seen from the concurrency angle: it's the deliberate exception to "every request is independent," and it's globally locked precisely because its correctness under a thundering herd is the property you're relying on.</p>
+
+    <h2 data-anchor="cc-h-ceilings">Resource ceilings that bound "hundreds → thousands"</h2>
+    <p data-anchor="cc-p-ceil1">Concurrency turns small per-request costs into budgets. Three are managed explicitly so LinkLog can never become the reason your app fell over:</p>
+    <ul data-anchor="cc-ul-ceilings">
+      <li><strong>One fd per in-flight buffer.</strong> File-descriptor count is a real budget at high concurrency (HLD §9). So the root fd for <code>linkat</code> and the directory setup are opened <strong>once per process</strong> (<code>_get_root_fd</code>, <code>_ensure_dirs</code>), never per request — precisely to not double the fd cost on the hot path.</li>
+      <li><strong>tmpfs pages count against your cgroup.</strong> Every buffer lives in <code>/dev/shm</code>, whose pages count against the container's memory limit — so each buffer is capped (<code>MAX_BUFFER_BYTES</code>, <code>MAX_EVENTS</code>). An unbounded buffer could OOM-kill the very app it observes (invariant #7).</li>
+      <li><strong>Zero panic throughout.</strong> A full <code>/dev/shm</code>, an fd closed underneath it, a limiter bug — every path degrades to "stop recording" or "allow the commit," never a raise into your application code (Chapter 8).</li>
+    </ul>
+
+    <div class="callout warn" data-anchor="cc-warn-linux">
+      <span class="ct">Verify concurrency on Linux, or you've verified nothing</span>
+      <p><code>O_TMPFILE</code>, <code>/dev/shm</code>, and the <code>linkat</code> commit exist only on Linux; macOS and Windows silently use the named-file fallback, and the test suite <em>refuses to collect there</em>. So every claim on this page is verified on real Linux via the <code>linux-test</code> harness — not on a developer laptop. A concurrency stress test that "passes" on your Mac proved nothing about the mechanism the product is built on. The next chapter makes that discipline a command you can run.</p>
+    </div>
+
+    <p class="soft" data-anchor="cc-p-next">So: hundreds of requests are hundreds of independent objects, async correctness rides on <code>contextvars</code>, one per-buffer lock guards the watchdog seam, and the storm limiter is the single deliberate convergence point. All of which raises a fair question — <em>how do you know your integration actually did all this?</em> That's the final chapter.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="10-control-protocol.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="12-verify-integration.html">Next: Verifying Your Integration ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->

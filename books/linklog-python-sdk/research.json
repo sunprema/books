@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "researched": "2026-07-21",
+  "note": "Legacy book — research.json backfilled only for the concepts this pass touched (control-protocol, concurrency, verify-integration). Earlier concepts (01-09) predate the research artifact and are intentionally not backfilled.",
+  "sources": [
+    {
+      "id": "src-lcp-spec-v1",
+      "url": "/Volumes/x/projects/linklog/docs/link_log_control_protocol_v1.md",
+      "title": "LinkLog Control Protocol (LCP) v1.0 — FROZEN",
+      "kind": "internal-spec",
+      "accessed": "2026-07-21"
+    },
+    {
+      "id": "src-lcp-impl",
+      "url": "/Volumes/x/projects/linklog/lcp",
+      "title": "LinkLog Control Protocol reference implementation (Go, agent-side client)",
+      "kind": "reference-impl",
+      "accessed": "2026-07-21"
+    },
+    {
+      "id": "src-python-hld-concurrency",
+      "url": "/Volumes/x/projects/linklog/docs/sdks/python.md",
+      "title": "Python SDK High-Level Design — §4 Concurrency: How the SDK Handles Simultaneous Requests",
+      "kind": "internal-spec",
+      "accessed": "2026-07-21"
+    },
+    {
+      "id": "src-p08b-rules",
+      "url": "/Volumes/x/projects/linklog/phases/P08b-agent-integration-rules.md",
+      "title": "P08b: Agent Integration Rules (llog rules sync + llog verify-integration)",
+      "kind": "internal-spec",
+      "accessed": "2026-07-21"
+    },
+    {
+      "id": "src-dr-018",
+      "url": "/Volumes/x/projects/linklog/docs/decisions/018-agent-rules-composed-and-drift-gated.md",
+      "title": "DR-018: Agent Rules Are Composed From One Source and Gated Against Drift",
+      "kind": "decision-record",
+      "accessed": "2026-07-21"
+    }
+  ],
+  "structure": {
+    "rationale": "LCP is the fleet-coordination protocol between the Go sidecar (agent) and the commercial control plane — the counterpart to LGP (SDK->agent) covered in ch.9. A Python-SDK integrator never implements LCP, but must understand it for two reasons: it is a persistent outbound connection from inside their network to a vendor server, so its safety shape matters; and it is what decides whether a fleet of their services survives a correlated storm rather than opening 10,000 PRs. The chapter is therefore framed around the three load-bearing rules (envelope, conclusions-not-commands, safe-to-lose), the storm-containment mechanism the whole protocol exists for, the policy floor, and what all of it concretely means for the reader (default-off, local audit log, locally-pinned key, local caps as the always-on floor).",
+    "audience": "Working Python developers integrating LinkLog who already wired up capture (ch.1-9) and now want to understand and safely enable the control channel."
+  },
+  "concepts": {
+    "control-protocol": {
+      "researched": "2026-07-21",
+      "claims": [
+        { "text": "LinkLog has two protocols: LGP (SDK->Agent, forensic execution graphs, <1ms hot-path budget, one artifact per failure) and LCP (Agent<->Control Plane, coordination, a few low-volume messages per minute, never on a hot path). They version independently.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "LCP exists for one reason request/response cannot serve: per-agent failure containment does not compose across a fleet. Ten thousand agents each correctly deduping the same fingerprint locally still produce ten thousand pull requests for one bug; fleet-wide caps need a coordination point.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "The Envelope Principle (the load-bearing rule): the agent's capability envelope is declared locally and enforced locally; the control plane may only request within it. The control plane can never grant a capability the local config did not already allow — it may only make the agent do less, never more.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "Server->agent messages carry verdicts and limits (conclusions and constraints), never commands or data requests. Structurally enforced: no LCP message may name a filesystem path, a query, or an executable; messages reference fingerprints, artifact IDs, and lease IDs only. 'If a message can name a file, it is the wrong message.'", "sources": ["src-lcp-spec-v1"] },
+        { "text": "Every platform->agent message must be safe to lose. The channel may drop or reset; the agent must degrade to a known-good state (ask again, or fall back to local caps), never a wrong one. Delivery is at-most-once: no acknowledgment protocol, no redelivery, no receiver dedup obligation.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "Transport is agent-initiated outbound only — the agent never listens, the customer opens no inbound ports. v1 normative binding is WebSocket over wss:// with subprotocol 'lcp.v1', mTLS mutually authenticated, JSON encoding, one JSON message per text frame, max message size 256 KiB.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "role is a closed set: production | ci. A production agent always has executes_plugins=false and serves_context_requests=false; ci may have executes_plugins=true but never serves_context_requests. A production agent advertising executes_plugins=true is malformed and the platform must reject the session.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "Fleet storm containment has two mechanisms. Correctness: ACTION_REQUEST/ACTION_GRANT/ACTION_DENY/ACTION_COMPLETE — the agent asks before any expensive/outward action (LLM call, PR, ticket); a grant is a time-bounded lease issued to exactly one agent. Broadcast budgets alone cannot do this (telling 10,000 agents '1 remaining' yields 10,000 actions).", "sources": ["src-lcp-spec-v1", "src-lcp-impl"] },
+        { "text": "A grant is a lease: expiry is the only backstop (server sets expires_at generously above the action's worst case), no renewal, leases survive disconnects (time-scoped, not session-scoped, held locally with lease_id + expires_at). Only expiry or ACTION_COMPLETE ends a lease.", "sources": ["src-lcp-spec-v1", "src-lcp-impl"] },
+        { "text": "ACTION_DENY reasons are a closed normative set: already_claimed (do not act), budget_exhausted (do not act), stand_down_active (do not act), unknown_action (act per local caps — fail open; the channel must never gain a veto over actions it does not understand).", "sources": ["src-lcp-spec-v1"] },
+        { "text": "STAND_DOWN is the storm optimization layered on the ACTION_REQUEST correctness mechanism: once a fingerprint is claimed the platform proactively silences the fleet instead of fielding 10,000 requests. The agent clamps 'until' to now + max_stand_down_s (default 3600, locally configurable; the platform cannot see, set, or exceed it). Sustained suppression requires continuous re-issuing, each occurrence landing in the customer-owned audit log.", "sources": ["src-lcp-spec-v1", "src-lcp-impl"] },
+        { "text": "The Floor Rule: effective rules = local rules union platform layer. The customer's local ruleset is the floor and is never touched, extended, shadowed, or referenced by a push. Each POLICY_TIGHTEN carries the complete platform layer (not a delta), wholesale-replacing the prior platform layer. More redaction is safe; less is a trust inversion — only POLICY_TIGHTEN exists, POLICY_REPLACE is forbidden.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "POLICY_TIGHTEN is protected by an Ed25519 signature over the decoded blob bytes exactly as decoded (no JSON canonicalization anywhere in LCP); the receiver verifies bytes first, parses second. The authoritative version lives inside the signed blob. The verifying public key is local configuration placed by the customer's deploy — LCP can never carry a key, since a channel that rotates its own trust root grants itself capability.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "Agents must enforce five floor rules on POLICY_TIGHTEN or reject: (1) no pushed rule id may collide with a local rule id, (2) the update must not touch capture config/sampling/allowlist mode, (3) signature must verify against the locally pinned key, (4) inner version must exceed the stored version (monotonic; replay rejected), (5) every applied or rejected update is written to a customer-owned local audit log. POLICY_ACK reports applied or rejected with a closed reason set.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "Forbidden types are permanently reserved and must be rejected: EXECUTE_PLUGIN (RCE / command-and-control shape), FETCH_CONTEXT (data-exfiltration primitive), CAPTURE_MORE (remotely loosening capture inverts the trust boundary), POLICY_REPLACE (would permit removing redaction), and any message naming a path/query. Receivers must reject unknown message types and log the rejection — unknown types are not forward-compatible extension points.", "sources": ["src-lcp-spec-v1", "src-lcp-impl"] },
+        { "text": "Against a fully hostile control plane: code execution and host-data exfiltration are rejected (forbidden types, not implemented agent-side); weakening sanitization is rejected (floor rule + signature); rotating the trust root is impossible (keys never travel the channel); broadening capture is out of scope. The one residual risk is suppression — possible but bounded by the max_stand_down_s clamp, visible in the audit log, and it can only withhold actions, never leak data.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "The LCP client ships default-off in the open-source agent — it is disabled unless the operator turns it on. When the channel is down the agent must still capture, parse, sanitize, fingerprint, diagnose and dispatch; it fails open to local per-agent caps (the SDK storm caps from ch.7). Air-gapped is a first-class deployment, not a degraded one.", "sources": ["src-lcp-spec-v1"] },
+        { "text": "The v1 frozen message set (17 types): HELLO, HELLO_ACK, HELLO_REJECT, HEARTBEAT, GOODBYE, FAILURE_REPORT, ACTION_REQUEST, ACTION_GRANT, ACTION_DENY, ACTION_COMPLETE, STAND_DOWN, ACTION_BUDGET, POLICY_TIGHTEN, POLICY_ACK, CORRELATION, ENVELOPE_VIOLATION. Additive fields and additive 'action' enum values do not bump the version; new message types do.", "sources": ["src-lcp-spec-v1", "src-lcp-impl"] }
+      ],
+      "snippets": [
+        { "lang": "json",
+          "code": "{\n  \"type\": \"HELLO\",\n  \"payload\": {\n    \"role\": \"production\",\n    \"envelope\": {\n      \"accepts_policy_tighten\": true,\n      \"accepts_stand_down\": true,\n      \"accepts_action_budget\": true,\n      \"accepts_correlation\": true,\n      \"executes_plugins\": false,\n      \"serves_context_requests\": false\n    }\n  }\n}",
+          "note": "The envelope block is the agent telling the platform what it may not ask; the platform cannot expand it. Verified against spec §4.1.", "sources": ["src-lcp-spec-v1"] },
+        { "lang": "json",
+          "code": "{ \"type\": \"STAND_DOWN\",\n  \"payload\": { \"fingerprint\": \"a83f92bc\", \"until\": 1752541200000,\n    \"reason\": \"incident_open\", \"incident_id\": \"INC-42\" } }",
+          "note": "Agent clamps until to now + max_stand_down_s (default 3600). Verified against spec §5.3 and containment.go handleStandDown.", "sources": ["src-lcp-spec-v1", "src-lcp-impl"] },
+        { "lang": "go",
+          "code": "max := c.Now().UnixMilli() + c.MaxStandDownSeconds*1000\nclamped := p.Until > max\nuntil := min(p.Until, max)\nc.standDowns[p.Fingerprint] = until",
+          "note": "lcp/containment.go — the local-maximum clamp is unconditional; the platform cannot see or exceed it.", "sources": ["src-lcp-impl"] }
+      ],
+      "pitfalls": [
+        "Reading LCP as a command channel. It carries verdicts and limits only; a message that could name a file, query, or executable is by construction the wrong message.",
+        "Assuming the channel must be up for LinkLog to work. It is default-off and safe-to-lose; the SDK's local caps are the always-on floor and the channel is pure enhancement.",
+        "Confusing LCP with LGP. LGP is SDK->agent forensic capture on the hot path (ch.9); LCP is agent<->control-plane coordination and never touches the application."
+      ],
+      "furtherReading": ["src-lcp-spec-v1", "src-lcp-impl"]
+    },
+    "concurrency": {
+      "researched": "2026-07-21",
+      "claims": [
+        { "text": "Every in-flight request gets its own Session -> its own Buffer -> its own file descriptor and its own causality graph. There is no process-wide buffer requests write into together, so 'hundreds at once' is just hundreds of independent objects. The only shared state is read-mostly config plus two deliberately-locked coordination points (the storm limiter and one-time directory setup).", "sources": ["src-python-hld-concurrency"] },
+        { "text": "Thread-per-request (WSGI/sync): @llog.intent calls _begin() (tracker.py) which builds a fresh Session and stores it with _session.set(s), where _session is a ContextVar so each thread reads its own value. The current parent eid is a second ContextVar (_parent), so nested with llog.scope(...) blocks build the correct parent->child graph per thread with no cross-talk. Each Buffer holds one O_TMPFILE fd and writes go straight to the kernel via os.write (no application-memory buffering, invariant #2), so concurrent threads never touch the same fd.", "sources": ["src-python-hld-concurrency"] },
+        { "text": "Async/FastAPI is the case the design is built around: FastAPI interleaves many requests on a single event-loop thread. The tracker uses contextvars rather than a thread-local or module global because a threading.local is shared across coroutines that interleave on the same thread and a module global is shared across everything — either would splice two concurrently-interleaved requests' execution graphs into one artifact, a correctness bug AND a privacy leak (invariant #5), one that only appears under concurrency. contextvars gives each async task its own copy of _session and _parent.", "sources": ["src-python-hld-concurrency"] },
+        { "text": "The one shared write path is a per-buffer lock. Within a single buffer there can be two writers — the request thread and the (M4) watchdog thread that commits deadlocked requests that never return (invariant #9). Two threads appending into one MessagePack stream would corrupt the artifact, so every Buffer carries its own threading.Lock (taken by write/discard/commit) plus a closed-state flag making post-commit writes no-ops. Because the lock is per buffer it is never a contention point between requests — a request contends only with its own watchdog; uncontended acquisition is ~20-25ns and must be benchmarked with the watchdog live (DR-001, unverified until M4).", "sources": ["src-python-hld-concurrency"] },
+        { "text": "Simultaneous concurrency is not the scary scenario — correlated failure is (invariant #8). When a shared dependency dies, all N requests fail together and all N buffers try to commit, filling /dev/shm and handing the sidecar N identical artifacts for one bug; the architecture would invert under exactly the load it exists to survive. The per-signature storm limiter (ratelimit.py) contains this: key is the cheap local signature exc_type|innermost_frame|intent (not the sidecar's authoritative fingerprint, DR-011), per-signature token bucket default 10 commits/min (max_commits_per_min), one shared globally-locked object, suppressed counts stamped as V_SUPPRESSED_COUNT (counted not lost), fails open (invariant #13), bucket map LRU-evicted at 4,096 so a storm of distinct signatures can't OOM the app.", "sources": ["src-python-hld-concurrency"] },
+        { "text": "Resource ceilings bound hundreds->thousands: one fd per in-flight buffer (fd count is a real budget at high concurrency, HLD §9), and the root fd for linkat plus directory setup are opened once per process (_get_root_fd, _ensure_dirs), never per request, to not double it on the hot path. tmpfs pages count against the container's cgroup limit so each buffer is capped (MAX_BUFFER_BYTES, MAX_EVENTS) — an unbounded buffer could OOM-kill the very app it observes (invariant #7). Zero panic throughout: a full /dev/shm, an fd closed underneath, a limiter bug — every path degrades to 'stop recording' or 'allow the commit', never a raise into application code.", "sources": ["src-python-hld-concurrency"] },
+        { "text": "The concurrency mechanism runs as described only on Linux: O_TMPFILE, /dev/shm, and the linkat commit exist only on Linux; macOS/Windows silently use the named-file fallback and the suite refuses to collect there. The concurrent-request behavior is verified on real Linux via the linux-test harness, not on a developer laptop — a concurrency stress test that 'passes' on macOS proved nothing about the mechanism the product is built on.", "sources": ["src-python-hld-concurrency"] }
+      ],
+      "snippets": [
+        { "lang": "python",
+          "code": "# tracker.py — per-request isolation via contextvars, NOT thread-locals\n_session: ContextVar[Session | None] = ContextVar(\"llog_session\", default=None)\n_parent:  ContextVar[str | None]     = ContextVar(\"llog_parent\",  default=None)\n\ndef _begin(intent_name):\n    s = Session(intent_name)        # fresh Session -> fresh Buffer -> fresh fd\n    _session.set(s)                 # each thread AND each async task: own copy\n    return s",
+          "note": "Conceptual, faithful to python.md §4.1-4.2: contextvars give both threads and interleaved coroutines their own _session/_parent.", "sources": ["src-python-hld-concurrency"] },
+        { "lang": "python",
+          "code": "app.add_middleware(LlogASGIMiddleware)   # FastAPI: middleware is the primary detection path\n# hundreds of coroutines interleave on ONE event-loop thread;\n# each still resolves _session to its own artifact.",
+          "note": "FastAPI/ASGI is the concurrency case the design targets. Verified against python.md §4.2.", "sources": ["src-python-hld-concurrency"] }
+      ],
+      "pitfalls": [
+        "Assuming a thread-local (or a module global) would work. Under async both splice two interleaved requests into one artifact — a correctness bug and a privacy leak that only appears under concurrency.",
+        "Thinking mere simultaneity is the stress case. It isn't — correlated failure is; N buffers committing at once is what the per-signature limiter exists to contain.",
+        "Trusting a concurrency stress test that passes on macOS. The mechanism (O_TMPFILE/linkat/dev-shm) doesn't exist there; only the Linux harness proves it."
+      ],
+      "furtherReading": ["src-python-hld-concurrency"]
+    },
+    "verify-integration": {
+      "researched": "2026-07-21",
+      "claims": [
+        { "text": "A coding agent can integrate a LinkLog SDK wrongly in ways that look like they work: it reaches for a global sys.excepthook that a web framework's exception handling silently pre-empts (invariant #9), it verifies on a Mac laptop and gets a false green because the core capture path doesn't exist there, and it picks ANONYMOUS mode and never captures the OOM-kills that are the whole point in Kubernetes (invariant #10). Every one is invisible to an agent reading the SDK and obvious only on execution.", "sources": ["src-p08b-rules"] },
+        { "text": "llog rules sync reads the bundled composed rules file (offline, no network) and merges it into the project-root AGENTS.md inside <!-- BEGIN llog-python vX -->...<!-- END llog-python --> markers. It is idempotent and marker-scoped, so running it twice is byte-identical and a polyglot repo gets one clean block per SDK; --also CLAUDE.md is optional. It carries the SDK version and warns if the installed SDK is newer than an existing block.", "sources": ["src-p08b-rules"] },
+        { "text": "The rules block redefines 'done': integration is complete not when the code compiles but when llog verify-integration forces a real failure and observes a .llog land on disk on Linux. The rules steer the agent to framework middleware as the primary path (not excepthook), the explicit ANONYMOUS-vs-STAGING buffer-mode choice tied to its OOM consequence, allowlist capture mode as the default for regulated environments, the write-only boundary, and 'zero-panic means internal errors are swallowed, so a caught exception is not proof of capture — assert the artifact, not the return value.'", "sources": ["src-p08b-rules"] },
+        { "text": "llog verify-integration is a self-contained mechanism smoke test: it instruments a tiny function, forces a raise, and asserts a .llog appears in /dev/shm/llog/events/ (and, if a sidecar is watching, that it is picked up — but 'no sidecar' is still a normal PASS since it asserts only the SDK-side commit). It is not a phone-home: it produces a local artifact and inspects it locally via the reader path, never reading state back through the SDK (write-only preserved, invariant #6).", "sources": ["src-p08b-rules"] },
+        { "text": "On macOS verify-integration refuses with a plain-language explanation of why a green there would be false (no O_TMPFILE, no /dev/shm — only the named-file fallback), exiting non-zero rather than reporting success. The refusal is the correct outcome and is load-bearing: a mutation check stubs the platform guard to 'allow' and confirms it would false-green on the fallback. Exit codes are three distinct values: 0 = verified/synced, 1 = ran but no artifact (capture broken), 3 = refused (wrong platform), so a caller can tell 'broken' from 'not applicable here'.", "sources": ["src-p08b-rules"] },
+        { "text": "DR-018: agent rules are composed from one canonical source (usage-rules/core.md, language-neutral integrator voice, plus a per-language overlay such as overlays/python.md) into a committed bundle shipped inside the SDK package (sdk/python/llog/_rules/rules.md), and CI holds the bundle to its source and to reality — it regenerates the bundle via tools/compose_rules.py and fails on any diff, and the Linux harness executes the integration snippet embedded in the composed rules plus verify-integration, asserting a checkpoint lands. For a product whose thesis is 'prose drifts from truth', shipping unmanaged integration prose would be dogfooding the failure; the executable done-gate is what makes the rules more than assertion.", "sources": ["src-dr-018", "src-p08b-rules"] },
+        { "text": "The audience distinction is the load-bearing design call: CLAUDE.md is for the project's own contributors' agent, while usage-rules/core.md is for the user's integrator agent — same facts, different cut, keeping only what bites someone adding LinkLog. The Java overlay (2026-07-19) proved the compose machinery generalizes and surfaced a new requirement: an overlay must be honest about feature parity (Java lacks allowlist/storm-limiting/watchdog that the shared core states as facts), pinned by a test so silence can't invite the agent to invent missing APIs.", "sources": ["src-p08b-rules", "src-dr-018"] }
+      ],
+      "snippets": [
+        { "lang": "text",
+          "code": "$ llog rules sync\n  wrote <!-- BEGIN llog-python v1 --> block into ./AGENTS.md\n  (idempotent: re-running is byte-identical; --also CLAUDE.md optional)\n\n$ llog verify-integration        # on Linux\n  forcing a failure through your instrumentation...\n  PASS  artifact observed: /dev/shm/llog/events/3f9c.llog   (exit 0)\n\n$ llog verify-integration        # on macOS\n  REFUSED  no O_TMPFILE / no /dev/shm here — a green would be false.  (exit 3)",
+          "note": "Faithful to P08b §6 exit criterion + §9 exit-code contract (0 verified / 1 capture broken / 3 refused).", "sources": ["src-p08b-rules"] }
+      ],
+      "pitfalls": [
+        "Treating 'the code compiles / the exception was caught' as done. Zero-panic swallows internal errors, so a caught exception is not proof of capture — assert the artifact on disk.",
+        "Trusting a green verify on macOS. There is no green on macOS by design: it refuses (exit 3) because the capture mechanism doesn't exist there.",
+        "Hand-editing the rules block or the bundled rules.md. The bundle is composed from usage-rules/core.md + the overlay and CI fails on drift; edit the source, regenerate."
+      ],
+      "furtherReading": ["src-p08b-rules", "src-dr-018"]
+    }
+  },
+  "volatile": [
+    "max_commits_per_min default (currently 10) and the LRU bucket cap (currently 4,096)",
+    "per-buffer lock uncontended cost (~20-25ns, unverified until M4 per DR-001)",
+    "verify-integration exit codes (0 / 1 / 3) and the AGENTS.md marker version (currently v1)",
+    "LCP protocol version (currently v1, FROZEN 2026-07-19)",
+    "max_stand_down_s default (currently 3600)",
+    "the closed 'action' enum values (ai_diagnose | create_issue | create_pr | create_ticket | notify)",
+    "WebSocket max message size (currently 256 KiB)"
+  ]
+}
