@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syntax Highlighting Basics — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="syn-eyebrow">Chapter 14 &middot; Part V — Search &amp; Highlighting</p>
+    <h1 data-anchor="syn-h1">Syntax Highlighting Basics</h1>
+
+    <p class="lead" data-anchor="syn-lead">Every row already carries two versions of itself: <code
+    class="inl">chars</code>, what you typed, and <code class="inl">render</code>, what tabs turn it into for the
+    screen. Syntax highlighting adds a third: <code class="inl">hl</code>, one byte per character of
+    <code class="inl">render</code> saying what <em>kind</em> of thing that character is. Not a parse tree. Not a
+    token list you could hand to a compiler. One byte, one character, chosen by a single left-to-right scan that
+    forgets everything the instant it reaches the end of the row &mdash; except for one bit of state, an open
+    comment, that it hands to the next row on its way out. This chapter is the machine that fills
+    <code class="inl">hl</code> and the smaller machine that turns it into color on screen. What counts as a
+    keyword, a string, or a number is next chapter's problem; this one is about the architecture those rules will
+    plug into.</p>
+
+    <h2 data-anchor="syn-h2-motivation">Motivation: color is a per-character fact, not a per-line one</h2>
+    <p data-anchor="syn-p-motivation-1">Think about what a real syntax highlighter has to answer, for every
+    single character on screen: what color is <em>this</em> one? Not "is this line a comment" &mdash; a line can
+    open with code, run into a string halfway through, and end inside a comment that continues onto the next
+    line. The honest unit of "what color" is the character, not the line, not even the token. Kilo's answer is
+    almost embarrassingly literal: give every row a second array, the same length as its rendered text, and put
+    one small integer in it per character &mdash; a <em>highlight type</em>. Nine possible values, defined as
+    plain <code class="inl">#define</code> constants:</p>
+    <pre class="tab"><span class="mac">#define</span> HL_NORMAL 0
+<span class="mac">#define</span> HL_NONPRINT 1
+<span class="mac">#define</span> HL_COMMENT 2   <span class="cm">/* Single line comment. */</span>
+<span class="mac">#define</span> HL_MLCOMMENT 3 <span class="cm">/* Multi-line comment. */</span>
+<span class="mac">#define</span> HL_KEYWORD1 4
+<span class="mac">#define</span> HL_KEYWORD2 5
+<span class="mac">#define</span> HL_STRING 6
+<span class="mac">#define</span> HL_NUMBER 7
+<span class="mac">#define</span> HL_MATCH 8      <span class="cm">/* Search match. */</span>
+
+<span class="mac">#define</span> HL_HIGHLIGHT_STRINGS (1&lt;&lt;0)
+<span class="mac">#define</span> HL_HIGHLIGHT_NUMBERS (1&lt;&lt;1)</pre>
+    <p data-anchor="syn-p-motivation-2">You've already met the last one. Chapter 13's <code
+    class="inl">editorFind</code> reached into a row's highlight array and stamped <code
+    class="inl">HL_MATCH</code> across a search hit, using machinery this chapter is about to build. That's worth
+    sitting with for a second: search didn't need a highlighting <em>feature</em> to borrow the highlighting
+    <em>storage</em>. One array, one byte-per-character convention, and two completely different producers &mdash;
+    a parser and a search function &mdash; both write into it, and one consumer, the screen-drawing loop, doesn't
+    care which wrote what.</p>
+    <div class="callout key" data-anchor="syn-callout-thirdbuffer">
+      <span class="tag">A third parallel buffer</span>
+      <p>Chapter 08 gave each row two buffers of text: <code class="inl">chars</code> (what you typed) and
+      <code class="inl">render</code> (what tabs turn it into). <code class="inl">hl</code> is the third leg of
+      that stool &mdash; not text at all, but a same-length array of small integers riding alongside
+      <code class="inl">render</code>, one classification per rendered character. The struct's own comment says
+      it plainly: <code class="inl">unsigned char *hl; /* Syntax highlight type for each character in render.*/</code>.
+      Note which buffer it's parallel to &mdash; not <code class="inl">chars</code>.</p>
+    </div>
+
+    <h2 data-anchor="syn-h2-design">Design: a scan with three bits of memory, plus one that survives the row</h2>
+    <p data-anchor="syn-p-design-1">If <code class="inl">hl</code> is going to hold a classification per
+    character, something has to walk the row and decide, character by character, what each one is. Call it a
+    parser if you like, but it's a small one: a single forward pass over <code class="inl">render</code>, carrying
+    exactly three pieces of state as it goes.</p>
+    <ul data-anchor="syn-ul-state">
+      <li data-anchor="syn-li-state-1"><code class="inl">prev_sep</code> &mdash; was the character just before
+      this one a token boundary? Needed to tell "the start of a new word" from "the middle of one you're already
+      inside."</li>
+      <li data-anchor="syn-li-state-2"><code class="inl">in_string</code> &mdash; either <code
+      class="inl">0</code>, or the exact quote character (<code class="inl">"</code> or <code class="inl">'</code>)
+      currently open, so the scan knows which quote closes it.</li>
+      <li data-anchor="syn-li-state-3"><code class="inl">in_comment</code> &mdash; inside an unterminated
+      <code class="inl">/* */</code> span, whether it opened on this line or was still open when the line
+      began.</li>
+    </ul>
+    <p data-anchor="syn-p-design-2">That's the entire "parser state." No stack, no lookahead beyond one or two
+    characters, no backtracking. What decides "is this a token boundary" in the first place is one small helper
+    used everywhere the scan needs to answer that question:</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">is_separator</span>(<span class="ty">int</span> c) {
+    <span class="kw">return</span> c == <span class="str">'\0'</span> || isspace(c) || strchr(<span class="str">",.()+-/*=~%[];"</span>,c) != NULL;
+}</pre>
+    <p data-anchor="syn-p-design-3">Whitespace, the end of the row, or one of a fixed set of punctuation
+    characters &mdash; that's what "a token just ended" means to Kilo. Chapter 15's keyword and number rules lean
+    on this same function; it isn't reinvented per rule, it's the one shared notion of "boundary" the whole
+    scanner agrees on.</p>
+    <p data-anchor="syn-p-design-4">The fourth piece of state is the interesting one, because it doesn't live in
+    a local variable &mdash; it has to outlive the function call. A <code class="inl">/* */</code> comment can
+    span many lines, so when the scan reaches the end of a row still inside one, that fact has to be remembered
+    somewhere the <em>next</em> row's scan can find it. That's <code class="inl">erow.hl_oc</code>, "row had open
+    comment at end in last syntax highlight check" &mdash; state that belongs to the row, not to any one call of
+    the function that fills it in.</p>
+    <div class="callout warn" data-anchor="syn-callout-notlast">
+      <span class="tag">Not quite "does the last character say MLCOMMENT"</span>
+      <p>Computing "is this row still open" isn't just checking whether the row's last <code
+      class="inl">hl</code> byte is <code class="inl">HL_MLCOMMENT</code>. A comment can close exactly at
+      end-of-line &mdash; and its closing <code class="inl">*/</code> is itself colored as part of the comment, so
+      the last byte would still say <code class="inl">HL_MLCOMMENT</code> even though nothing is open anymore.
+      <code class="inl">editorRowHasOpenComment</code> checks both things: the last <code class="inl">hl</code>
+      byte <em>and</em> that the row's actual last two rendered characters aren't the literal closer.</p>
+      <pre class="tab"><span class="ty">int</span> <span class="fn">editorRowHasOpenComment</span>(erow *row) {
+    <span class="kw">if</span> (row-&gt;hl &amp;&amp; row-&gt;rsize &amp;&amp; row-&gt;hl[row-&gt;rsize-1] == HL_MLCOMMENT &amp;&amp;
+        (row-&gt;rsize &lt; 2 || (row-&gt;render[row-&gt;rsize-2] != <span class="str">'*'</span> ||
+                            row-&gt;render[row-&gt;rsize-1] != <span class="str">'/'</span>))) <span class="kw">return</span> 1;
+    <span class="kw">return</span> 0;
+}</pre>
+    </div>
+
+    <h2 data-anchor="syn-h2-impl">Implementation: editorUpdateSyntax, one row at a time</h2>
+    <p data-anchor="syn-p-impl-1"><code class="inl">editorUpdateSyntax(erow *row)</code> is the whole classifier.
+    It doesn't run on its own schedule or in response to its own event &mdash; it's the last line of <code
+    class="inl">editorUpdateRow()</code>, the same function Chapter 08 introduced to rebuild <code
+    class="inl">render</code> from <code class="inl">chars</code> after every edit. Every function that changes a
+    row's text already calls <code class="inl">editorUpdateRow()</code>; that means every one of them already
+    triggers a full rehighlight of that row as a side effect, with no separate call site to remember.</p>
+    <div class="callout key" data-anchor="syn-callout-noincremental">
+      <span class="tag">There is no incremental highlighting</span>
+      <p>Type one character, and Kilo does not patch one entry of <code class="inl">hl</code>. <code
+      class="inl">editorUpdateRow()</code> rebuilds the whole of <code class="inl">render</code>, then <code
+      class="inl">editorUpdateSyntax()</code> throws away the whole of <code class="inl">hl</code> and recomputes
+      it, left to right, from the first character of the row. For a single line, that's cheap enough not to
+      matter. What it buys in return is simplicity: no logic anywhere for "which part of the highlighting is now
+      stale" &mdash; the answer is always "all of it, recompute."</p>
+    </div>
+    <p data-anchor="syn-p-impl-2">Here is the function, with the character-by-character comment/string/number/
+    keyword body &mdash; Chapter 15's subject &mdash; folded down to a comment so the shape around it is easy to
+    see:</p>
+    <pre class="tab"><span class="cm">/* Set every byte of row-&gt;hl (that corresponds to every character in the line)
+ * to the right syntax highlight type (HL_* defines). */</span>
+<span class="ty">void</span> <span class="fn">editorUpdateSyntax</span>(erow *row) {
+    row-&gt;hl = realloc(row-&gt;hl,row-&gt;rsize);
+    memset(row-&gt;hl,HL_NORMAL,row-&gt;rsize);
+
+    <span class="kw">if</span> (E.syntax == NULL) <span class="kw">return</span>; <span class="cm">/* No syntax, everything is HL_NORMAL. */</span>
+
+    <span class="ty">int</span> i, prev_sep, in_string, in_comment;
+    <span class="ty">char</span> *p;
+    <span class="ty">char</span> **keywords = E.syntax-&gt;keywords;
+    <span class="ty">char</span> *scs = E.syntax-&gt;singleline_comment_start;
+    <span class="ty">char</span> *mcs = E.syntax-&gt;multiline_comment_start;
+    <span class="ty">char</span> *mce = E.syntax-&gt;multiline_comment_end;
+
+    <span class="cm">/* Point to the first non-space char. */</span>
+    p = row-&gt;render;
+    i = 0; <span class="cm">/* Current char offset */</span>
+    <span class="kw">while</span>(*p &amp;&amp; isspace(*p)) { p++; i++; }
+    prev_sep = 1; <span class="cm">/* Tell the parser if 'i' points to start of word. */</span>
+    in_string = 0; <span class="cm">/* Are we inside "" or '' ? */</span>
+    in_comment = 0; <span class="cm">/* Are we inside multi-line comment? */</span>
+
+    <span class="cm">/* If the previous line has an open comment, this line starts
+     * with an open comment state. */</span>
+    <span class="kw">if</span> (row-&gt;idx &gt; 0 &amp;&amp; editorRowHasOpenComment(&amp;E.row[row-&gt;idx-1]))
+        in_comment = 1;
+
+    <span class="cm">/* ... per-character scan: single-line and multi-line comments, strings,
+     * non-printable bytes, numbers, keywords &mdash; Chapter 15 ... */</span>
+
+    <span class="cm">/* Propagate syntax change to the next row if the open comment
+     * state changed. This may recursively affect all the following rows
+     * in the file. */</span>
+    <span class="ty">int</span> oc = editorRowHasOpenComment(row);
+    <span class="kw">if</span> (row-&gt;hl_oc != oc &amp;&amp; row-&gt;idx+1 &lt; E.numrows)
+        editorUpdateSyntax(&amp;E.row[row-&gt;idx+1]);
+    row-&gt;hl_oc = oc;
+}</pre>
+    <p data-anchor="syn-p-impl-3">Read the shape, not the elided middle. The function resets the row to all-<code
+    class="inl">HL_NORMAL</code> and bails immediately if there's no active language (<code
+    class="inl">E.syntax == NULL</code>) &mdash; a file Kilo doesn't recognize is not a special case anywhere
+    else; it's just this one early return. Otherwise it sets up the three scan variables, seeds <code
+    class="inl">in_comment</code> from the previous row's carried-over state, walks the row (Chapter 15), and then
+    &mdash; every single time, whether or not anything about this row's own text looks unusual &mdash; recomputes
+    whether <em>this</em> row now ends inside an open comment and compares it to what <code
+    class="inl">hl_oc</code> said last time.</p>
+
+    <h3 data-anchor="syn-h3-cascade">The recursion: one edit, potentially many rows</h3>
+    <p data-anchor="syn-p-cascade-1">That comparison is where this "just rehighlight one row" function stops
+    being quite so local. If the open-comment state changed &mdash; a line that used to end inside a comment now
+    doesn't, or vice versa &mdash; the very next row's highlighting was computed against the <em>old</em>
+    assumption and is now wrong. So <code class="inl">editorUpdateSyntax</code> calls itself on that next row.
+    And if <em>that</em> row's open-comment state also changes as a result, it calls itself again, one row
+    further down. The function's own comment names this plainly: "This may recursively affect all the following
+    rows in the file."</p>
+    <div class="callout warn" data-anchor="syn-callout-cascade">
+      <span class="tag">A keystroke that rehighlights the rest of the file</span>
+      <p>Most edits touch <code class="inl">hl_oc</code> not at all &mdash; the recursion's base case, <code
+      class="inl">row->hl_oc != oc</code> being false, fires almost immediately and the cascade goes nowhere.
+      But type a stray <code class="inl">/*</code> near the top of a large C file, with no matching
+      <code class="inl">*/</code> below it, and every row underneath flips from "not open" to "open," which
+      means every one of them recurses into the next. One keystroke, one full rehighlight of the rest of the
+      file. It's a narrow, pathological case &mdash; not a bug, exactly, more a cost the design accepts in
+      exchange for never having to reason about partial or stale highlight state.</p>
+    </div>
+
+    <h2 data-anchor="syn-h2-color">From bytes to color: editorSyntaxToColor and the drawing loop</h2>
+    <p data-anchor="syn-p-color-1"><code class="inl">editorUpdateSyntax</code> never writes an escape sequence.
+    Classification and coloring are two different functions with two different jobs: one decides what a
+    character <em>is</em>, the other decides what that means on screen. The second one is almost insultingly
+    simple &mdash; a switch from highlight type to an ANSI foreground color number:</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">editorSyntaxToColor</span>(<span class="ty">int</span> hl) {
+    <span class="kw">switch</span>(hl) {
+    <span class="kw">case</span> HL_COMMENT:
+    <span class="kw">case</span> HL_MLCOMMENT: <span class="kw">return</span> 36;     <span class="cm">/* cyan */</span>
+    <span class="kw">case</span> HL_KEYWORD1: <span class="kw">return</span> 33;    <span class="cm">/* yellow */</span>
+    <span class="kw">case</span> HL_KEYWORD2: <span class="kw">return</span> 32;    <span class="cm">/* green */</span>
+    <span class="kw">case</span> HL_STRING: <span class="kw">return</span> 35;      <span class="cm">/* magenta */</span>
+    <span class="kw">case</span> HL_NUMBER: <span class="kw">return</span> 31;      <span class="cm">/* red */</span>
+    <span class="kw">case</span> HL_MATCH: <span class="kw">return</span> 34;      <span class="cm">/* blu */</span>
+    <span class="kw">default</span>: <span class="kw">return</span> 37;             <span class="cm">/* white */</span>
+    }
+}</pre>
+    <p data-anchor="syn-p-color-2">Seven cases feeding six colors (comment and multi-line comment share cyan),
+    plus a fallback. Those numbers &mdash; 31 through 37 &mdash; are the standard ANSI SGR foreground codes from
+    Chapter 05's escape-sequence vocabulary: <code class="inl">\x1b[&lt;n&gt;m</code> sets the foreground color
+    to <code class="inl">n</code>. Nothing new is invented here; highlighting reuses the exact same escape
+    mechanism that draws the status bar and the cursor.</p>
+    <p data-anchor="syn-p-color-3">The actual color only appears when the per-row loop inside <code
+    class="inl">editorRefreshScreen</code> draws the visible slice of a row. For each on-screen character it
+    checks the parallel <code class="inl">hl</code> byte and picks one of three branches:</p>
+    <pre class="tab"><span class="ty">int</span> current_color = -1;
+...
+unsigned <span class="ty">char</span> *hl = r-&gt;hl+E.coloff;
+<span class="kw">for</span> (j = 0; j &lt; len; j++) {
+    <span class="kw">if</span> (hl[j] == HL_NONPRINT) {
+        <span class="ty">char</span> sym;
+        abAppend(&amp;ab,<span class="str">"\x1b[7m"</span>,4);
+        <span class="kw">if</span> (c[j] &lt;= 26) sym = <span class="str">'@'</span>+c[j]; <span class="kw">else</span> sym = <span class="str">'?'</span>;
+        abAppend(&amp;ab,&amp;sym,1);
+        abAppend(&amp;ab,<span class="str">"\x1b[0m"</span>,4);
+    } <span class="kw">else if</span> (hl[j] == HL_NORMAL) {
+        <span class="kw">if</span> (current_color != -1) {
+            abAppend(&amp;ab,<span class="str">"\x1b[39m"</span>,5);
+            current_color = -1;
+        }
+        abAppend(&amp;ab,c+j,1);
+    } <span class="kw">else</span> {
+        <span class="ty">int</span> color = editorSyntaxToColor(hl[j]);
+        <span class="kw">if</span> (color != current_color) {
+            <span class="ty">char</span> buf[16];
+            <span class="ty">int</span> clen = snprintf(buf,<span class="kw">sizeof</span>(buf),<span class="str">"\x1b[%dm"</span>,color);
+            current_color = color;
+            abAppend(&amp;ab,buf,clen);
+        }
+        abAppend(&amp;ab,c+j,1);
+    }
+}
+abAppend(&amp;ab,<span class="str">"\x1b[39m"</span>,5);
+abAppend(&amp;ab,<span class="str">"\x1b[0K"</span>,4);
+abAppend(&amp;ab,<span class="str">"\r\n"</span>,2);</pre>
+    <p data-anchor="syn-p-color-4"><code class="inl">HL_NONPRINT</code> gets special treatment, not a color at
+    all &mdash; a substituted, readable stand-in character (a caret-style letter for low control bytes, <code
+    class="inl">?</code> otherwise) wrapped in reverse video, <code class="inl">\x1b[7m</code> ...
+    <code class="inl">\x1b[0m</code>, so an unprintable byte in the file is visible and unambiguous rather than
+    silently mangling the terminal. <code class="inl">HL_NORMAL</code> resets the foreground to the terminal's
+    own default, <code class="inl">\x1b[39m</code> &mdash; but only if a color was actually active, via
+    <code class="inl">current_color</code>. Everything else asks <code class="inl">editorSyntaxToColor</code> for
+    a number and, again, only emits the escape if that number differs from what's already active.</p>
+    <div class="callout key" data-anchor="syn-callout-coalesce">
+      <span class="tag">current_color is Chapter 05's batching instinct, reapplied</span>
+      <p>Without the <code class="inl">color != current_color</code> check, every single character of a
+      highlighted word would carry its own color escape &mdash; five bytes of overhead per character for no
+      visual difference, since consecutive characters of a keyword are already the same color. Tracking
+      <code class="inl">current_color</code> across the loop means one word, one string, one run of digits gets
+      exactly one leading escape. It's the same "accumulate, then act once" instinct the append buffer itself
+      embodies (Chapter 06) &mdash; applied here to the <em>content</em> written into that buffer, not just to
+      how it's flushed.</p>
+    </div>
+    <p data-anchor="syn-p-color-5">And notice what happens at the very end of every row, unconditionally:
+    <code class="inl">\x1b[39m</code> resets the foreground, <code class="inl">\x1b[0K</code> erases to end of
+    line, then the ordinary <code class="inl">\r\n</code>. Whatever color a row ended in, it never leaks into the
+    next one &mdash; the reset isn't left to chance or to whichever branch happened to fire last.</p>
+
+    <h2 data-anchor="syn-h2-select">One more thing that happens before any of this: choosing E.syntax</h2>
+    <p data-anchor="syn-p-select-1">Everything above reads <code class="inl">E.syntax</code> as if it's already
+    correctly set. It is, and by the time a single row has been loaded. <code class="inl">main()</code> calls
+    <code class="inl">editorSelectSyntaxHighlight(argv[1])</code> &mdash; matching the filename against a table
+    of known languages and setting the global <code class="inl">E.syntax</code> pointer, or leaving it
+    <code class="inl">NULL</code> &mdash; <em>before</em> <code class="inl">editorOpen()</code> reads a single
+    line of the file. Since <code class="inl">editorInsertRow()</code> (called once per line while opening)
+    already ends in <code class="inl">editorUpdateRow()</code>/<code class="inl">editorUpdateSyntax()</code>,
+    every row is highlighted correctly from the very first paint. There's no separate "now go color the file
+    I already loaded" pass to get wrong or forget to call.</p>
+    <p data-anchor="syn-p-select-2">What that table of languages actually contains &mdash; how a filename pattern
+    picks a language, how a keyword list is written, where the comment markers come from &mdash; is Chapter 16's
+    subject. For now, treat <code class="inl">E.syntax</code> as a switch this chapter doesn't build, only reads:
+    either it's set to something with a keyword list and comment markers, or it's <code class="inl">NULL</code>
+    and every row in the file is <code class="inl">HL_NORMAL</code>, full stop.</p>
+
+    <h2 data-anchor="syn-h2-edge">Edge cases: what this architecture quietly guarantees (and doesn't)</h2>
+    <ul data-anchor="syn-ul-edge">
+      <li data-anchor="syn-li-edge-1"><strong>No filetype match means no highlighting, not an error.</strong>
+      <code class="inl">E.syntax == NULL</code> is a normal, silent state &mdash; opening a <code
+      class="inl">.txt</code> file or one with no extension just means every row's <code class="inl">hl</code>
+      stays <code class="inl">HL_NORMAL</code> after the one early return.</li>
+      <li data-anchor="syn-li-edge-2"><strong>Highlighting is recomputed, never patched.</strong> There is no
+      code path that updates a single byte of <code class="inl">hl</code> in place in response to a keystroke
+      &mdash; every touched row is fully rebuilt, every time, by the same <code class="inl">editorUpdateRow</code>
+      call that already had to rebuild <code class="inl">render</code>.</li>
+      <li data-anchor="syn-li-edge-3"><strong>An edit's blast radius isn't bounded to one row.</strong> The
+      <code class="inl">hl_oc</code> propagation means a single keystroke can, in the worst case, trigger a
+      rehighlight cascade through every subsequent row in the file &mdash; bounded by file length, not by what
+      was actually typed.</li>
+      <li data-anchor="syn-li-edge-4"><strong>hl indexes render, not chars.</strong> The same split Chapter 08
+      drew between on-disk bytes and on-screen bytes applies here: a highlight byte at position <code
+      class="inl">i</code> describes <code class="inl">render[i]</code>. On a line with tabs before a highlighted
+      span, that index does not line up with the same position in <code class="inl">chars</code> &mdash; the
+      identical class of gap Chapter 13 found between a search match's offset and <code class="inl">E.cx</code>.</li>
+      <li data-anchor="syn-li-edge-5"><strong>The color escapes are coalesced, but the classification isn't
+      cached across the pass.</strong> <code class="inl">current_color</code> in the drawing loop only avoids
+      redundant escapes within a single frame's draw of a single row; it has no memory from one refresh to the
+      next, and no bearing on whether <code class="inl">editorUpdateSyntax</code> reruns.</li>
+      <li data-anchor="syn-li-edge-6"><strong>HL_MATCH is structurally identical to every other type, but
+      produced from outside.</strong> Nothing in <code class="inl">editorUpdateSyntax</code> or <code
+      class="inl">editorSyntaxToColor</code> treats it specially beyond mapping it to blue &mdash; the special
+      case, if there is one, is entirely in who's allowed to write it (Chapter 13's <code
+      class="inl">editorFind</code>, and no one else).</li>
+    </ul>
+
+    <div class="reflect" data-anchor="syn-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>Two shapes, both reused from chapters you've already read. First: highlighting is just a third parallel
+      buffer, the same pattern <code class="inl">chars</code>/<code class="inl">render</code> already
+      established in Chapter 08 &mdash; one more array, same length as its partner, filled by one more function,
+      hung off the same <code class="inl">editorUpdateRow</code> hook every edit already runs through. No new
+      event, no new call site to remember. Second: turning data into color is, again, the append-buffer discipline
+      from Chapters 05 and 06 &mdash; decide what to write, batch it, emit it once, reset cleanly at the boundary
+      &mdash; just aimed at escape sequences instead of screen content. The one genuinely new idea is the
+      <code class="inl">hl_oc</code> carry-over and its recursive propagation: proof that "per-row" and "row-local"
+      aren't the same thing the instant a token (a comment) is allowed to span more than one line. Chapter 15
+      spends its whole length on the scan this chapter elided &mdash; what actually makes something a keyword, a
+      string, or a number. The scaffolding it plugs into is everything you just read.</p>
+    </div>
+
+    <div class="challenges" data-anchor="syn-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Add a tenth highlight type, <code class="inl">HL_TODO</code>, for the word <code
+        class="inl">TODO</code> appearing inside a comment. Where in <code class="inl">editorUpdateSyntax</code>
+        would you have to check for it, and why does it matter that the check has to happen
+        <em>after</em> the comment-detection branches rather than before them?</li>
+        <li>Trace through what happens if you delete the closing <code class="inl">*/</code> of a multi-line
+        comment on line 5 of a 2,000-line file. Which function notices, and roughly how many rows end up
+        rehighlighted before the recursion in <code class="inl">editorUpdateSyntax</code> stops?</li>
+        <li>The drawing loop's <code class="inl">current_color</code> optimization only spans one row (it's a
+        local variable, reset to <code class="inl">-1</code> at the top of each row's draw). Would coalescing
+        color escapes <em>across</em> row boundaries be worth doing, given that every row already ends with an
+        unconditional <code class="inl">\x1b[39m</code> reset? What would you have to give up to make it work?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="syn-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — HL_* defines, erow.hl/hl_oc, is_separator, editorRowHasOpenComment, editorUpdateSyntax, editorSyntaxToColor, editorRefreshScreen's row-drawing loop, editorSelectSyntaxHighlight</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="13-search.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="15-highlighting-c-code.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

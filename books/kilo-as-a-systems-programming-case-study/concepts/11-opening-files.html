@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opening Files — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="open-eyebrow">Chapter 11 &middot; Part IV — Files</p>
+    <h1 data-anchor="open-h1">Opening Files</h1>
+
+    <p class="lead" data-anchor="open-lead">Chapter 10 closed by pointing straight at this chapter:
+    <code class="inl">editorInsertRow()</code> already knows how to build a file's rows one at a time, by hand,
+    from whatever bytes you hand it. Everything left to do here is get those bytes from disk instead of from
+    a keystroke. That turns out to be a short chapter &mdash; not because loading a file is trivial, but
+    because kilo.c already did the hard part, and opening a file is mostly wiring that existing machine up to
+    <code class="inl">fopen()</code> and a loop.</p>
+
+    <h2 data-anchor="open-h2-motivation">Motivation: a file is just rows you haven't built yet</h2>
+    <p data-anchor="open-p-motivation-1">Look at where <code class="inl">editorOpen()</code> sits in
+    <code class="inl">main()</code>, and it tells you something before you've read a line of its body:</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">main</span>(<span class="ty">int</span> argc, <span class="ty">char</span> **argv) {
+    <span class="kw">if</span> (argc != 2) {
+        fprintf(stderr,<span class="str">"Usage: kilo &lt;filename&gt;\n"</span>);
+        exit(1);
+    }
+
+    <span class="fn">initEditor</span>();
+    <span class="fn">editorSelectSyntaxHighlight</span>(argv[1]);
+    <span class="fn">editorOpen</span>(argv[1]);
+    <span class="fn">enableRawMode</span>(STDIN_FILENO);
+    <span class="fn">editorSetStatusMessage</span>(
+        <span class="str">"HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find"</span>);
+    <span class="kw">while</span>(1) {
+        <span class="fn">editorRefreshScreen</span>();
+        <span class="fn">editorProcessKeypress</span>(STDIN_FILENO);
+    }
+    <span class="kw">return</span> 0;
+}</pre>
+    <p data-anchor="open-p-motivation-2">Two things worth noticing before <code class="inl">editorOpen</code>
+    itself. First, <code class="inl">argc != 2</code> is checked before anything else runs &mdash; not even
+    <code class="inl">initEditor()</code>. Kilo has no &ldquo;start with an empty, unnamed buffer&rdquo; mode;
+    a filename, real or not, is mandatory from the very first line of the program. Second,
+    <code class="inl">editorOpen(argv[1])</code> runs <em>before</em> <code class="inl">enableRawMode(STDIN_FILENO)</code>.
+    That ordering isn't an accident, and it matters more than it looks &mdash; hold onto it, because the next
+    section explains exactly why it's there.</p>
+
+    <h2 data-anchor="open-h2-design">Design: load before you touch the terminal</h2>
+    <p data-anchor="open-p-design-1"><code class="inl">enableRawMode()</code> is the function that calls
+    <code class="inl">atexit(editorAtExit)</code>, registering the cleanup handler that will later restore the
+    user's terminal settings. In <code class="inl">main()</code>, <code class="inl">editorOpen()</code> runs
+    one line <em>before</em> that call. Which means: if loading the file fails badly enough that
+    <code class="inl">editorOpen()</code> calls <code class="inl">exit()</code>, no cleanup handler has been
+    registered yet, because the terminal was never put into raw mode in the first place. There is nothing to
+    restore, so a hard failure can just <code class="inl">exit(1)</code> and walk away. Chapter 17 will spend a
+    whole chapter on the general problem of cleaning up after yourself; this chapter gets to sidestep it
+    entirely, just by going first.</p>
+    <div class="callout key" data-anchor="open-callout-order">
+      <span class="tag">Sequencing is a design decision</span>
+      <p>Nothing in <code class="inl">editorOpen()</code>'s own code depends on raw mode being off. The safety
+      here comes entirely from <em>where</em> the call sits in <code class="inl">main()</code>. It's a small
+      reminder that in a program this size, the order you call things in is doing real work &mdash; it's not
+      just a list of setup steps that happen to be arranged top to bottom.</p>
+    </div>
+
+    <h2 data-anchor="open-h2-implementation">Implementation: editorOpen, in full</h2>
+    <p data-anchor="open-p-impl-1">Here is the entire function &mdash; thirty-one lines, and every one of them
+    earns its place:</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">editorOpen</span>(<span class="ty">char</span> *filename) {
+    FILE *fp;
+
+    E.dirty = 0;
+    free(E.filename);
+    <span class="ty">size_t</span> fnlen = strlen(filename)+1;
+    E.filename = malloc(fnlen);
+    memcpy(E.filename,filename,fnlen);
+
+    fp = fopen(filename,<span class="str">"r"</span>);
+    <span class="kw">if</span> (!fp) {
+        <span class="kw">if</span> (errno != ENOENT) {
+            perror(<span class="str">"Opening file"</span>);
+            exit(1);
+        }
+        <span class="kw">return</span> 1;
+    }
+
+    <span class="ty">char</span> *line = NULL;
+    <span class="ty">size_t</span> linecap = 0;
+    ssize_t linelen;
+    <span class="kw">while</span>((linelen = getline(&amp;line,&amp;linecap,fp)) != -1) {
+        <span class="kw">if</span> (linelen &amp;&amp; (line[linelen-1] == <span class="str">'\n'</span> || line[linelen-1] == <span class="str">'\r'</span>))
+            line[--linelen] = <span class="str">'\0'</span>;
+        <span class="fn">editorInsertRow</span>(E.numrows,line,linelen);
+    }
+    free(line);
+    fclose(fp);
+    E.dirty = 0;
+    <span class="kw">return</span> 0;
+}</pre>
+    <p data-anchor="open-p-impl-2">Four things happen in order, and each one deserves its own look.</p>
+
+    <h3 data-anchor="open-h3-filename">1. Kilo makes its own copy of the filename</h3>
+    <p data-anchor="open-p-filename-1">Before it opens anything, <code class="inl">editorOpen</code> frees
+    whatever <code class="inl">E.filename</code> already pointed to, then allocates
+    <code class="inl">strlen(filename)+1</code> bytes and <code class="inl">memcpy</code>s the argument in,
+    null terminator included. <code class="inl">E.filename</code> is never a pointer aliased into
+    <code class="inl">argv</code> &mdash; it's a heap buffer kilo owns outright, which is exactly what lets
+    <code class="inl">editorOpen</code> be called again later (say, &ldquo;Save As&rdquo; in Chapter 12) without
+    worrying about who owns the string it's replacing.</p>
+
+    <h3 data-anchor="open-h3-fopen">2. fopen, and the one error kilo forgives</h3>
+    <p data-anchor="open-p-fopen-1"><code class="inl">fopen(filename, "r")</code> either succeeds or sets
+    <code class="inl">errno</code> and returns <code class="inl">NULL</code>. Kilo's response is deliberately
+    asymmetric: if <code class="inl">errno == ENOENT</code> &mdash; the file simply doesn't exist yet &mdash;
+    the function just <code class="inl">return</code>s 1 with zero rows loaded, and the editor comes up with an
+    empty buffer under that name. That's the whole mechanism behind &ldquo;run <code class="inl">kilo
+    newfile.txt</code> to start a new file&rdquo;: there's no special &ldquo;new file&rdquo; branch anywhere in
+    the program, just a tolerated <code class="inl">errno</code> value. Any <em>other</em> reason
+    <code class="inl">fopen</code> could fail &mdash; permission denied, too many open files, whatever
+    <code class="inl">errno</code> the platform reports &mdash; is treated as fatal: <code class="inl">perror("Opening
+    file")</code> prints it to stderr and <code class="inl">exit(1)</code> ends the program on the spot. There
+    is no in-editor error message for this one; it never gets far enough to draw a screen.</p>
+
+    <h3 data-anchor="open-h3-getline">3. Reading lines with getline, and stripping exactly one byte</h3>
+    <p data-anchor="open-p-getline-1">The read loop leans on POSIX <code class="inl">getline(&amp;line,
+    &amp;linecap, fp)</code>: it grows <code class="inl">line</code>'s heap buffer itself as needed (tracked by
+    <code class="inl">linecap</code>), returns the byte length of whatever it just read, and returns
+    <code class="inl">-1</code> at end of file. This is also why the very top of kilo.c defines
+    <code class="inl">_POSIX_C_SOURCE 200809L</code> under <code class="inl">#ifdef __linux__</code> &mdash;
+    <code class="inl">getline</code> is a POSIX.1-2008 addition, not part of standard C, and glibc won't expose
+    it without being asked. Each line getline hands back still has its terminator attached, so the very next
+    line strips it:</p>
+    <p data-anchor="open-p-getline-2"><code class="inl">if (linelen &amp;&amp; (line[linelen-1] == '\n' ||
+    line[linelen-1] == '\r')) line[--linelen] = '\0';</code> &mdash; read that carefully: it's one
+    <code class="inl">if</code>, not a loop. It removes exactly one trailing byte, once.</p>
+    <div class="callout warn" data-anchor="open-callout-crlf">
+      <span class="tag">A single if, not a while &mdash; verify it yourself</span>
+      <p>On a Unix file, each line ends in a lone <code class="inl">'\n'</code>, and one strip removes it
+      cleanly. But a Windows-style CRLF file ends every line in <code class="inl">"\r\n"</code> &mdash; two
+      bytes. The <code class="inl">if</code> above fires once, sees <code class="inl">'\n'</code> as the last
+      byte, and removes only that. The <code class="inl">'\r'</code> right before it is never touched, and
+      becomes the new last character of <code class="inl">line</code> &mdash; which then gets copied straight
+      into <code class="inl">row->chars</code> by the very next call. Kilo does not normalize CRLF line endings
+      on load. Open a CRLF file in kilo and every single row quietly carries a trailing <code class="inl">'\r'</code>
+      you can't see on screen. Trace the condition yourself against a fresh clone of kilo.c before taking this
+      on faith &mdash; the same habit this book has asked of you at every callout like this one.</p>
+    </div>
+    <p data-anchor="open-p-getline-3">Whatever survives the strip is handed to
+    <code class="inl">editorInsertRow(E.numrows, line, linelen)</code> &mdash; always at
+    <code class="inl">E.numrows</code>, i.e. always appended to the end of the row array currently being built.
+    That's the same primitive Chapter 08 built for splitting a line and Chapter 10 reused for typing Enter.
+    <code class="inl">editorOpen</code> doesn't need a separate &ldquo;load a line from disk&rdquo; code path;
+    it's a loop around the one function that already knows how to add a row, called once per line
+    <code class="inl">getline</code> reads.</p>
+
+    <h3 data-anchor="open-h3-dirty">4. Cleanup, and a second E.dirty = 0 that isn't redundant</h3>
+    <p data-anchor="open-p-dirty-1">After the loop ends, <code class="inl">editorOpen</code> frees
+    <code class="inl">line</code> (the buffer <code class="inl">getline</code> was managing),
+    <code class="inl">fclose</code>s the file, and sets <code class="inl">E.dirty = 0</code> a second time
+    &mdash; the same assignment already made at the very top of the function. It's tempting to read that as a
+    leftover duplicate. It isn't. <code class="inl">editorInsertRow()</code> increments
+    <code class="inl">E.dirty</code> on <em>every</em> call &mdash; that's how it flags real edits elsewhere in
+    the program. During the load loop above, it gets called once per line read, so a freshly opened
+    hundred-line file would leave <code class="inl">E.dirty</code> at 100 if nothing reset it afterward. The
+    second <code class="inl">E.dirty = 0</code> is what makes &ldquo;just opened&rdquo; read as &ldquo;nothing
+    to save yet&rdquo; instead of &ldquo;a hundred unsaved changes,&rdquo; the instant the file finishes
+    loading and before the user has typed a single character.</p>
+
+    <h2 data-anchor="open-h2-consequences">What loading a file changes elsewhere on screen</h2>
+    <p data-anchor="open-p-consequences-1"><code class="inl">editorOpen</code> never draws anything itself
+    &mdash; but two things it sets, <code class="inl">E.filename</code> and <code class="inl">E.numrows</code>,
+    are read by code you've already met in earlier chapters, and both change what the very next
+    <code class="inl">editorRefreshScreen()</code> call puts on screen.</p>
+    <table class="grid" data-anchor="open-table-consequences">
+      <tr><th>What editorOpen set</th><th>Who reads it</th><th>Visible effect</th></tr>
+      <tr><td class="mono">E.filename</td><td class="mono">editorRefreshScreen()</td><td>Status bar formats it with <code class="inl">"%.20s - %d lines %s"</code> &mdash; the open path (truncated to 20 characters), live row count, and the dirty marker, redrawn every frame.</td></tr>
+      <tr><td class="mono">E.numrows == 0</td><td class="mono">editorRefreshScreen()</td><td>The welcome banner ("Kilo editor -- verison %s") is only drawn when <code class="inl">E.numrows == 0</code> &mdash; exactly the state editorOpen leaves behind for a not-yet-existing file, or a file that was genuinely empty.</td></tr>
+      <tr><td class="mono">argv[1] (filename text)</td><td class="mono">editorSelectSyntaxHighlight()</td><td>Runs <em>before</em> editorOpen, matching the raw filename against the HLDB table (Chapters 14&ndash;16) &mdash; syntax mode is chosen from the name alone, whether or not the file exists yet.</td></tr>
+    </table>
+    <p data-anchor="open-p-consequences-2">Notice the typo baked right into the welcome string &mdash;
+    <code class="inl">"verison"</code> for &ldquo;version.&rdquo; It's shipped, verbatim, in the real source. Small
+    reminder from a small program: even a codebase this deliberately minimal, this widely read, still has a
+    typo nobody's fixed. Worth remembering the next time a piece of code looks too authoritative to
+    double-check.</p>
+
+    <h2 data-anchor="open-h2-edge">Edge cases: what editorOpen quietly guarantees (and doesn't)</h2>
+    <ul data-anchor="open-ul-edge">
+      <li data-anchor="open-li-edge-1"><strong>A missing file is not an error the user ever sees.</strong>
+      <code class="inl">ENOENT</code> is the one <code class="inl">errno</code> value <code class="inl">editorOpen</code>
+      forgives, and it forgives it silently &mdash; no status message, no beep, just an empty buffer under the
+      name you gave it.</li>
+      <li data-anchor="open-li-edge-2"><strong>Every other open failure is fatal, immediately.</strong> Permission
+      denied and every other <code class="inl">errno</code> route through <code class="inl">perror</code> +
+      <code class="inl">exit(1)</code> before the editor has drawn a single frame &mdash; there's no recovering
+      into an empty buffer for those.</li>
+      <li data-anchor="open-li-edge-3"><strong>editorOpen's own return value goes nowhere.</strong> It's declared
+      to return 0 on success or 1 on a tolerated not-found, but <code class="inl">main()</code> calls
+      <code class="inl">editorOpen(argv[1]);</code> as a bare statement and never reads the result. The
+      <code class="inl">errno</code> branch inside the function is what actually decides behavior; the return
+      value is documentation that nothing downstream consults.</li>
+      <li data-anchor="open-li-edge-4"><strong>CRLF files keep a stray trailing <code class="inl">'\r'</code> per
+      line.</strong> The newline strip is a single <code class="inl">if</code>, and only ever removes one byte.</li>
+      <li data-anchor="open-li-edge-5"><strong>Loading reuses insertion, it doesn't duplicate it.</strong> Every
+      line read becomes one more call to the same <code class="inl">editorInsertRow()</code> Chapters 08 and 10
+      already built &mdash; there is no parallel, file-specific way to add a row to the buffer.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="open-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>Almost nothing new, and that's the point. <code class="inl">editorOpen</code> adds one system call
+      (<code class="inl">fopen</code>), one library loop (<code class="inl">getline</code>), and about a dozen
+      lines gluing them to <code class="inl">editorInsertRow()</code> &mdash; a function this book had already
+      fully built two chapters ago. The genuinely new ideas are small and specific: forgive exactly one
+      <code class="inl">errno</code>, run before the terminal is touched so failure stays cheap to handle, and
+      remember to zero the dirty counter a second time because the loading loop itself trips it. Everything else
+      is reuse. Chapter 12 is the mirror image of this chapter &mdash; instead of turning disk bytes into rows,
+      it turns rows back into disk bytes &mdash; and it will lean on that same <code class="inl">E.dirty</code>
+      counter this chapter was careful to reset.</p>
+    </div>
+
+    <div class="challenges" data-anchor="open-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Rewrite the trailing-newline strip so it correctly removes a full CRLF pair (<code class="inl">"\r\n"</code>),
+        not just its last byte, while still leaving a lone Unix <code class="inl">'\n'</code> handled correctly
+        too. What has to change about the condition, and does it still only need to look at the last one or two
+        bytes of <code class="inl">line</code>?</li>
+        <li>Trace what happens if you run kilo on a path that exists but is a directory, not a regular file.
+        Does <code class="inl">fopen</code> fail on your system, and with which <code class="inl">errno</code>?
+        Work out, before you test it, which branch of <code class="inl">editorOpen</code> that lands in.</li>
+        <li><code class="inl">editorOpen</code>'s int return value is never checked by its only caller. Sketch
+        the smallest change to <code class="inl">main()</code> that would let it tell the user, in the status
+        bar, &ldquo;New file&rdquo; versus an existing file was loaded &mdash; using information
+        <code class="inl">editorOpen</code> already computes but currently discards.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="open-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — editorOpen, main(), editorRefreshScreen's welcome banner and status bar, editorSelectSyntaxHighlight</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="10-editing-text.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="12-saving-files.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

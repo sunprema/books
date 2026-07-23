@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schema Evolution — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="se-kicker">Chapter 07 &middot; Evolution &amp; Interop</span>
+    <h1 data-anchor="se-h1">Schema Evolution</h1>
+
+    <p class="lede" data-anchor="se-lede">
+      Every chapter so far has been about writing a schema. This one is about
+      the day, six months or six years later, when you have to change it
+      &mdash; while an old mobile client, a half-updated backend fleet, and a
+      three-year-old message sitting in a queue all keep working without
+      anyone coordinating a synchronized rollout. That's not a hope. It's a
+      small, learnable set of rules, and protobuf's whole design &mdash; field
+      numbers instead of names, no schema on the wire, unknown fields kept
+      instead of dropped &mdash; exists to make those rules possible in the
+      first place. Break one of them and nothing crashes. Something just goes
+      quietly, plausibly wrong, which is the worse failure to ship.
+    </p>
+
+    <h2 data-anchor="se-h2-directions">Two directions, and why both matter</h2>
+    <p data-anchor="se-p-directions-1">
+      Get the vocabulary straight first, because the two terms get swapped
+      constantly and they mean different things. <strong>Backward
+      compatible</strong> means your <em>new</em> code can correctly read
+      data an <em>old</em> version wrote. <strong>Forward compatible</strong>
+      means your <em>old</em> code can correctly read data a <em>new</em>
+      version wrote. A change that's fully compatible holds in both
+      directions at once &mdash; and that's the property that actually
+      matters in production, because it's what lets one service deploy a
+      schema change on Tuesday while three other teams' services, holding
+      the old schema, keep running untouched until they get around to it.
+      Nobody has to deploy in lockstep. That's the whole payoff of this
+      chapter.
+    </p>
+    <table class="cmp" data-anchor="se-table-directions">
+      <thead><tr><th>Direction</th><th>Who's reading</th><th>Who wrote the data</th><th>What it buys you</th></tr></thead>
+      <tbody>
+        <tr><td>Backward compatible</td><td>new code</td><td>old code</td><td>roll forward without a data migration</td></tr>
+        <tr><td>Forward compatible</td><td>old code</td><td>new code</td><td>deploy consumers before producers, safely</td></tr>
+        <tr><td>Fully compatible</td><td>either</td><td>either</td><td>no deploy-order constraint at all</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="se-p-directions-2">
+      Everything below is really one question, asked twice: does an old
+      reader survive this change, and does a new reader survive it too?
+      Most of the rules in this chapter turn out to answer &ldquo;yes&rdquo;
+      to both at once &mdash; that's not a coincidence, it's the reason
+      protobuf's format was shaped the way it was.
+    </p>
+
+    <h2 data-anchor="se-h2-numbers">Names are free. Numbers are forever.</h2>
+    <p data-anchor="se-p-numbers-1">
+      Here's the single fact almost everything else in this chapter derives
+      from, and you already have half of it from Chapter 2: the wire format
+      carries a field's <em>number</em>, never its name. That asymmetry cuts
+      both ways, and both halves matter. Renaming <code>quantity</code> to
+      <code>stock_count</code> touches nothing on the wire &mdash; it's a
+      generated-code change, full stop, and every peer exchanging bytes with
+      you never notices. Changing a field's <em>number</em>, on the other
+      hand, is not a small edit. It is, on the wire, indistinguishable from
+      deleting that field and inventing an entirely new one that happens to
+      share a type. Every message already serialized under the old number,
+      and every peer still compiled against it, is now reading (or about to
+      write) the wrong identity. There is no safe way to change a field
+      number once it has shipped. Not &ldquo;risky&rdquo; &mdash; not
+      possible. This is the one rule in the whole chapter that never bends.
+    </p>
+    <div class="callout key-idea" data-anchor="se-callout-numbers">
+      <span class="callout-label">The rule underneath all the other rules</span>
+      If you remember nothing else from this chapter: a field's number is a
+      permanent identity, assigned once. Its name, type, and even its
+      existence can change around it &mdash; the number can't.
+    </div>
+
+    <h2 data-anchor="se-h2-add">Adding a field</h2>
+    <p data-anchor="se-p-add-1">
+      Adding a field is the easy, load-bearing case, and it's worth seeing
+      exactly <em>why</em> it's safe rather than just trusting that it is.
+      Pick a number that was never used before in this message and add the
+      field. An old reader, compiled before this field existed, encounters
+      bytes tagged with a number it has no schema entry for. It doesn't
+      error. It reads the wire type off the tag alone &mdash; no schema
+      needed for that part &mdash; skips exactly that many bytes, and, since
+      protobuf 3.5, holds onto them as an <em>unknown field</em> rather than
+      throwing them away. If that old reader turns around and re-serializes
+      the same parsed message (forwarding it, storing it, relaying it), those
+      bytes come back out unchanged, even though the code that did the
+      relaying still has no idea what they mean. That's forward
+      compatibility, mechanically: new data survives old code completely
+      intact.
+    </p>
+    <p data-anchor="se-p-add-2">
+      Run it the other direction and it's backward compatibility, just as
+      mechanically: a new reader parsing an <em>old</em> message that
+      predates the field simply finds the field absent, and reads back
+      whatever &ldquo;absent&rdquo; means for that field's presence rules
+      &mdash; the zero value for a plain scalar, <code>false</code> for
+      <code>has_x()</code> if it's <code>optional</code>, an empty list for
+      <code>repeated</code>. Nothing to reconcile, nothing to migrate. Adding
+      a field is compatible in both directions, for free, as long as the
+      number is genuinely unused.
+    </p>
+
+    <h2 data-anchor="se-h2-remove">Removing a field &mdash; and why <code>reserved</code> exists</h2>
+    <p data-anchor="se-p-remove-1">
+      Deleting a field is <em>also</em> wire-safe in both directions &mdash;
+      there's nothing left in the schema for a decoder to choke on. The part
+      that isn't automatically safe is what happens next, to a number nobody
+      is watching anymore. Nothing stops a teammate, six months from now,
+      from adding a brand-new field and letting the editor autocomplete hand
+      them the next integer &mdash; which might be the exact number you just
+      freed up. If any peer anywhere is still running the old schema, it now
+      decodes your teammate's new field as if it were the field you deleted.
+      No error. No warning. Just a plausible, wrong value, silently, forever,
+      until someone notices the data doesn't add up.
+    </p>
+    <p data-anchor="se-p-remove-2">
+      <code>reserved</code> exists to turn that landmine into a compile-time
+      error instead. Say it once for the number, once more for the name
+      &mdash; the two need separate statements, you can't mix them in one
+      &mdash; and protoc refuses to let anyone reintroduce either:
+    </p>
+    <pre data-anchor="se-code-reserved"><code><span class="kw">message</span> <span class="ty">Product</span> {
+  <span class="cm">// v1 shipped: name=1, quantity=2, sku_legacy=3</span>
+
+  <span class="ty">string</span> name = <span class="num">1</span>;
+  <span class="ty">int32</span> quantity = <span class="num">2</span>;
+
+  <span class="kw">reserved</span> <span class="num">3</span>;
+  <span class="kw">reserved</span> <span class="str">"sku_legacy"</span>;   <span class="cm">// number AND name, both off-limits forever</span>
+}</code></pre>
+    <p data-anchor="se-p-remove-3">
+      <code>reserved</code> also takes a comma-separated list or a range
+      (<code>reserved 2, 15, 9 to 11;</code>, or <code>9 to max;</code> to
+      retire everything from 9 up), and the identical mechanism protects enum
+      values &mdash; delete a value, reserve its number and its name the same
+      way, for the same reason: JSON and text-format encodings address fields
+      and enum values by name, so a reused <em>name</em> can corrupt those
+      formats even when the binary wire format wouldn't care. A documented
+      alternative, if you'd rather the retirement stay visible in the .proto
+      to a human skimming it, is to keep the field but rename it with an
+      <code>OBSOLETE_</code> prefix instead of deleting it outright &mdash;
+      readable, but it doesn't get the compiler's enforcement the way
+      <code>reserved</code> does.
+    </p>
+    <div class="callout warning" data-anchor="se-callout-never-reuse">
+      <span class="callout-label">Never, ever reuse a field number</span>
+      Not &ldquo;avoid it when you can.&rdquo; Never. A reused field number
+      is the one schema mistake in this entire book that produces no error
+      anywhere in the pipeline &mdash; just quietly wrong data, possibly for
+      a long time before anyone notices. <code>reserved</code> is cheap
+      insurance against a very expensive bug.
+    </div>
+
+    <h2 data-anchor="se-h2-deprecate">Deprecating, as a step before deleting</h2>
+    <p data-anchor="se-p-deprecate-1">
+      Between &ldquo;in active use&rdquo; and &ldquo;deleted and reserved,&rdquo;
+      there's a middle step worth using deliberately rather than skipping: the
+      <code>[deprecated = true]</code> field option.
+    </p>
+    <pre data-anchor="se-code-deprecated"><code><span class="ty">string</span> internal_note = <span class="num">5</span> [<span class="mac">deprecated</span> = <span class="kw">true</span>];</code></pre>
+    <p data-anchor="se-p-deprecate-2">
+      This changes nothing about the wire format and nothing about runtime
+      behavior &mdash; the field still works exactly as before. What it
+      changes is what a generated-code caller sees: most language codegens
+      surface it as a compiler or IDE warning on the accessor, a nudge to new
+      callers before you ever get to the actual deletion-plus-<code>reserved</code>
+      step. It's a signal, not an enforcement mechanism &mdash; nothing
+      stops someone from ignoring the warning and setting the field anyway
+      &mdash; but it's the honest, visible way to announce &ldquo;this is
+      going away&rdquo; before it actually does.
+    </p>
+
+    <h2 data-anchor="se-h2-types">Safe vs. unsafe: changing a field's type</h2>
+    <p data-anchor="se-p-types-1">
+      This is where the wire-type groundwork from Chapter 4 finally pays
+      off directly. A field's wire type &mdash; varint, 64-bit, length-delimited,
+      or 32-bit &mdash; is fixed by its declared protobuf type and travels on
+      every tag. Two types sharing a wire type is <em>necessary</em> for a
+      type change to be safe, but it is not <em>sufficient</em> &mdash; the
+      bytes can parse cleanly and still mean the wrong thing. Both failure
+      modes exist in this table: a hard parse-level break, and the quieter,
+      worse one, a clean parse that silently produces the wrong value.
+    </p>
+    <table class="cmp" data-anchor="se-table-types">
+      <thead><tr><th>Change</th><th>Wire type</th><th>Safe?</th><th>What actually happens</th></tr></thead>
+      <tbody>
+        <tr><td><code>int32</code> &harr; <code>uint32</code> &harr; <code>int64</code> &harr; <code>uint64</code> &harr; <code>bool</code></td><td>varint (all share it)</td><td>Yes</td><td>Parses cleanly; a value outside the narrower type's range silently truncates instead of erroring.</td></tr>
+        <tr><td><code>sint32</code> &harr; <code>sint64</code></td><td>varint</td><td>Yes</td><td>Both ZigZag-encoded the same way; values round-trip exactly.</td></tr>
+        <tr><td><code>int32</code>/<code>uint32</code>/<code>int64</code>/<code>uint64</code> &harr; <code>sint32</code>/<code>sint64</code></td><td>varint (same type, different meaning)</td><td><strong>No</strong></td><td>Parses without error &mdash; then silently decodes a different number, because ZigZag remaps the bits.</td></tr>
+        <tr><td><code>fixed32</code> &harr; <code>sfixed32</code> &harr; <code>float</code></td><td>32-bit</td><td>Yes</td><td>Same 4 bytes, reinterpreted per declared type.</td></tr>
+        <tr><td><code>fixed64</code> &harr; <code>sfixed64</code> &harr; <code>double</code></td><td>64-bit</td><td>Yes</td><td>Same 8 bytes, reinterpreted per declared type.</td></tr>
+        <tr><td>32-bit group &harr; 64-bit group &harr; varint group</td><td>different wire types</td><td><strong>No</strong></td><td>Hard parse-level break &mdash; the decoder can't even skip it correctly.</td></tr>
+        <tr><td><code>string</code> &harr; <code>bytes</code></td><td>length-delimited</td><td>Usually</td><td><code>bytes</code>&rarr;<code>string</code> only safe if every existing value is valid UTF-8; <code>string</code>&rarr;<code>bytes</code> is always safe.</td></tr>
+        <tr><td><code>enum</code> &harr; <code>int32</code></td><td>varint</td><td>Yes</td><td>An enum <em>is</em> an int32 on the wire &mdash; this is also why open enums accept out-of-range values.</td></tr>
+        <tr><td>singular &harr; <code>repeated</code> (message field)</td><td>length-delimited either way</td><td>Yes</td><td>A singular reader merges repeated occurrences, effectively keeping the last one.</td></tr>
+        <tr><td>singular &harr; <code>repeated</code> (scalar/bool/enum field)</td><td>varint/fixed vs. length-delimited (packed)</td><td><strong>Only if unpacked</strong></td><td>Default packed encoding is one concatenated blob &mdash; not the shape a singular reader expects.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warning" data-anchor="se-callout-sint">
+      <span class="callout-label">The gotcha that shares a wire type on purpose</span>
+      <code>int32</code> and <code>sint32</code> both use wire type 0 &mdash;
+      so a decoder never rejects the bytes. It just silently decodes the
+      wrong number. Watch what happens to the same logical value,
+      &minus;2, depending only on which of the two the field was declared as:
+    </div>
+    <pre data-anchor="se-code-zigzag"><code><span class="cm">// field declared int32, value -2:</span>
+<span class="cm">//   sign-extended to 64 bits -> costs the full 10-byte varint</span>
+<span class="cm">//   wire bytes: FE FF FF FF FF FF FF FF FF 01</span>
+
+<span class="cm">// SAME field redeclared sint32, SAME logical value -2:</span>
+<span class="cm">//   ZigZag(-2) = 3 -> fits in one byte</span>
+<span class="cm">//   wire bytes: 03</span>
+
+<span class="cm">// an old peer still expecting int32, decoding byte 0x03 as a plain varint:</span>
+<span class="cm">//   reads back the value 3 -- not -2, and no parse error anywhere</span></code></pre>
+    <p data-anchor="se-p-types-2">
+      That's the general shape of every unsafe-but-same-wire-type change in
+      the table above: nothing throws, nothing logs, a value just quietly
+      stops meaning what it used to mean. Treat &ldquo;does it parse&rdquo;
+      and &ldquo;does it mean the same thing&rdquo; as two separate
+      questions &mdash; this chapter's whole safe/unsafe table exists because
+      those two questions don't always have the same answer.
+    </p>
+
+    <h2 data-anchor="se-h2-repeated">Singular and repeated: the packed asterisk</h2>
+    <p data-anchor="se-p-repeated-1">
+      The singular-vs-repeated row above deserves its own beat, because the
+      answer genuinely depends on the field's underlying type in a way none
+      of the other rows do. A <code>repeated</code> <em>message</em> field is
+      simple: an embedded message is always length-delimited, singular or
+      repeated, so an old singular-field reader parsing what's now a
+      repeated stream of that message just keeps merging every occurrence it
+      sees &mdash; which lands it on the last one, the same &ldquo;last
+      write wins&rdquo; behavior a singular field always had. Safe, no
+      asterisk.
+    </p>
+    <p data-anchor="se-p-repeated-2">
+      A <code>repeated</code> <em>scalar</em>, <em>bool</em>, or
+      <em>enum</em> field is where the asterisk lives. Proto3 defaults a
+      repeated scalar field to <strong>packed</strong> encoding &mdash; every
+      element's varint or fixed bytes concatenated back-to-back inside one
+      length-delimited entry, with no per-element tag. That's a genuinely
+      different byte shape than a singular field of the same type expects to
+      find. A parser must accept a repeated field written either packed or
+      unpacked no matter which one the current .proto declares &mdash; that
+      bidirectional acceptance is exactly what makes toggling
+      <code>[packed=true]</code>/<code>[packed=false]</code> itself a safe
+      change. But it doesn't rescue the singular-vs-repeated case: for that
+      change to be safe, the repeated field has to be explicitly unpacked.
+    </p>
+    <div class="callout note" data-anchor="se-callout-packed">
+      <span class="callout-label">One asterisk, easy to remember</span>
+      Repeated <em>message</em> field &harr; singular: always fine. Repeated
+      <em>scalar/bool/enum</em> field &harr; singular: fine only with
+      <code>[packed=false]</code>. Same &ldquo;singular vs. repeated&rdquo;
+      question, two different answers, depending on what's inside the list.
+    </div>
+
+    <h2 data-anchor="se-h2-unknown">Why forwarding services don't need a rebuild</h2>
+    <p data-anchor="se-p-unknown-1">
+      Chapter 4 introduced unknown-field preservation as a wire-format fact;
+      here's why it's the specific mechanism that makes forward compatibility
+      actually usable in a real system, not just theoretically true. A proxy,
+      a message bus, an audit-log writer &mdash; any service that receives a
+      message, does something with the fields it recognizes, and then passes
+      the <em>same parsed object</em> along &mdash; carries every field it
+      doesn't understand along for the ride, byte-for-byte, without ever
+      being rebuilt to know that field exists. Since protobuf 3.5 restored
+      this behavior (proto3 briefly dropped it, then brought it back to match
+      proto2), that's not a special case you have to opt into. It's the
+      default.
+    </p>
+    <p data-anchor="se-p-unknown-2">
+      The guarantee is precisely scoped, though, and the scope is worth
+      being exact about: it covers <em>re-serializing the original parsed
+      object</em>. The moment you convert that message to JSON, or build a
+      brand-new message and copy fields into it one at a time, you've stepped
+      outside the guarantee &mdash; both operations only carry over the
+      fields the code explicitly names, and anything else is gone. A service
+      that forwards the object it received stays forward-compatible for
+      free. A service that reconstructs one field-by-field has quietly opted
+      back out.
+    </p>
+
+    <h2 data-anchor="se-h2-required">The cautionary tale: proto2's <code>required</code></h2>
+    <p data-anchor="se-p-required-1">
+      If you want the whole chapter's argument distilled into one historical
+      example, it's this. proto2 let a field be marked <code>required</code>,
+      and it seemed reasonable at the time &mdash; some fields really are
+      always present in a well-formed message, so why not have the parser
+      enforce it? The trap wasn't in adding the constraint. It was in ever
+      trying to <em>remove</em> it later. Once one deployed reader anywhere
+      rejects a message that omits a required field, and one deployed writer
+      anywhere might legitimately want to omit it, there is no safe order to
+      roll out that change &mdash; you need every reader and every writer
+      updated in the same instant, which is precisely the coordination
+      problem this whole chapter's rules exist to make unnecessary.
+    </p>
+    <p data-anchor="se-p-required-2">
+      Proto3 didn't patch <code>required</code>. It removed the concept
+      entirely, on the theory that a field that looks required today may
+      turn out not to be next year, and a schema language shouldn't offer a
+      constraint that can be added painlessly but never safely taken away.
+      Every rule in this chapter is a smaller version of the same lesson:
+      ask not just &ldquo;is this change safe now,&rdquo; but &ldquo;does
+      this change leave me a safe way out later.&rdquo;
+    </p>
+    <div class="callout key-idea" data-anchor="se-callout-required">
+      <span class="callout-label">The lesson underneath the lesson</span>
+      <code>required</code> wasn't removed because it was unsafe to add.
+      It was removed because there was no safe way to ever take it back off.
+      That asymmetry &mdash; easy to add, impossible to undo &mdash; is the
+      exact shape to watch for in your own schema decisions.
+    </div>
+
+    <h2 data-anchor="se-h2-ci">Let a tool hold the line</h2>
+    <p data-anchor="se-p-ci-1">
+      None of these rules are exotic once you've seen them, but a schema
+      shared across a dozen services and three languages doesn't stay safe
+      because every contributor memorized this chapter &mdash; it stays safe
+      because something checks. Tools like <code>buf breaking</code> diff a
+      proposed schema against a previous version (a git ref, a tag, a stored
+      snapshot) and fail the build the moment a change violates one of these
+      rules: a reused or renumbered field number, an unsafe type swap, a
+      field or enum value gone without a matching <code>reserved</code>.
+      Wired into CI as a required check on every pull request, that turns
+      &ldquo;remember not to reuse field 3&rdquo; from institutional
+      knowledge into something the build enforces whether or not anyone
+      remembers it. We'll wire exactly this up in the production chapters
+      ahead.
+    </p>
+    <p data-anchor="se-p-ci-2">
+      One honest caveat: a breaking-change tool's rules aren't always
+      identical to raw wire compatibility. Some are deliberately stricter
+      &mdash; flagging, say, a schema reorganization that wouldn't actually
+      corrupt a single byte on the wire, because it's still risky enough in
+      practice to want a human's sign-off. &ldquo;The tool didn't flag it&rdquo;
+      and &ldquo;this is wire-compatible&rdquo; are related claims, not
+      identical ones &mdash; the tool errs toward caution on your behalf.
+    </p>
+
+    <div class="callout note" data-anchor="se-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>A teammate deletes a field, forgets to write <code>reserved</code>,
+        and a month later a different teammate adds a new field that happens
+        to land on the freed-up number. Walk through exactly what an old,
+        undeployed peer does with the bytes &mdash; does it error, and if
+        not, what does it actually read?</li>
+        <li>Why is <code>sint32</code> &harr; <code>int32</code> unsafe even
+        though both use wire type 0, while <code>int32</code> &harr;
+        <code>uint32</code> is safe on that same wire type? Name the one
+        difference between them that matters.</li>
+        <li>You want to change <code>repeated int32 scores</code> to
+        singular, since it turns out only one score is ever set. What field
+        option, if any, do you need before that's actually safe &mdash; and
+        would the answer change if the field were <code>repeated
+        ScoreRecord</code> instead?</li>
+        <li>Explain, to someone who's never heard of proto2, why
+        <code>required</code> was removed in proto3 &mdash; not what it did,
+        but specifically why it was dangerous.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-modeling-real-data.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-advanced-schema-design.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

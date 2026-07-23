@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Escape Sequences and Screen Drawing — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="esc-eyebrow">Chapter 05 &middot; Part II — The Terminal &amp; The Loop</p>
+    <h1 data-anchor="esc-h1">Escape Sequences and Screen Drawing</h1>
+
+    <p class="lead" data-anchor="esc-lead">Chapter 04 got you a raw stream of keystrokes. This chapter is
+    about the other direction: how Kilo puts pixels — well, characters — on the screen with no curses, no
+    terminfo database, and no library standing between it and the terminal. The trick is that a terminal
+    emulator already understands a small vocabulary of special byte sequences. Kilo's whole visual output is
+    just <code class="inl">write()</code>, called with the right bytes.</p>
+
+    <h2 data-anchor="esc-h2-motivation">Motivation: the screen is not a canvas, it's a conversation</h2>
+    <p data-anchor="esc-p-motivation-1">Here's the thing that has to click before any of this makes sense: a
+    terminal program does not have a frame buffer it can poke pixels into. It has one file descriptor it can
+    <code class="inl">write()</code> bytes to, and a terminal emulator on the other end that decides what those
+    bytes mean. Ordinary bytes become ordinary characters. But a byte sequence starting with
+    <code class="inl">ESC</code> (<code class="inl">0x1B</code>) followed by <code class="inl">'['</code> — the
+    <strong>Control Sequence Introducer</strong>, or CSI — is a signal the terminal treats specially: move the
+    cursor, erase some text, change a color, hide the cursor entirely. Kilo never draws anything. It asks the
+    terminal, politely and in writing, to draw things for it.</p>
+    <p data-anchor="esc-p-motivation-2">That reframes the whole chapter. There's no new I/O mechanism to learn
+    — it's the same <code class="inl">write(STDOUT_FILENO, ...)</code> you'd use to print anything else. What's
+    new is the vocabulary: a compact set of escape sequences that, strung together in the right order, redraw
+    an entire terminal screen every time the user presses a key.</p>
+
+    <h2 data-anchor="esc-h2-design">Design: one buffer, one write, zero flicker</h2>
+    <p data-anchor="esc-p-design-1">The naive approach — call <code class="inl">write()</code> once per escape
+    sequence, once per character, as you figure out what to draw — would work, but it would also mean dozens or
+    hundreds of tiny system calls per frame, each one a chance for the terminal to repaint partially and for the
+    user to see a flicker mid-redraw. Kilo's answer is the same idea Chapter 03 previewed: an <strong>append
+    buffer</strong>, one heap-allocated string that every escape sequence and every character gets appended to,
+    flushed to the terminal with exactly one <code class="inl">write()</code> call per frame.</p>
+    <pre class="tab"><span class="cm">/* We define a very simple "append buffer" structure, that is an heap
+ * allocated string where we can append to. This is useful in order to
+ * write all the escape sequences in a buffer and flush them to the standard
+ * output in a single call, to avoid flickering effects. */</span>
+<span class="kw">struct</span> abuf {
+    <span class="ty">char</span> *b;
+    <span class="ty">int</span> len;
+};
+
+<span class="mac">#define</span> ABUF_INIT {NULL,0}
+
+<span class="ty">void</span> <span class="fn">abAppend</span>(<span class="kw">struct</span> abuf *ab, <span class="kw">const</span> <span class="ty">char</span> *s, <span class="ty">int</span> len) {
+    <span class="ty">char</span> *new = <span class="fn">realloc</span>(ab-&gt;b,ab-&gt;len+len);
+
+    <span class="kw">if</span> (new == NULL) <span class="kw">return</span>;
+    <span class="fn">memcpy</span>(new+ab-&gt;len,s,len);
+    ab-&gt;b = new;
+    ab-&gt;len += len;
+}
+
+<span class="ty">void</span> <span class="fn">abFree</span>(<span class="kw">struct</span> abuf *ab) {
+    <span class="fn">free</span>(ab-&gt;b);
+}</pre>
+    <p data-anchor="esc-p-design-2">Read <code class="inl">abAppend()</code> and you'll recognize the pattern
+    from <code class="inl">erow</code>'s dynamic array in Chapter 02: grow with <code class="inl">realloc()</code>,
+    reassign the pointer to whatever (possibly relocated) block comes back, then <code class="inl">memcpy()</code>
+    the new bytes in at the end. There's no string formatting here, no null terminators to worry about —
+    <code class="inl">len</code> is tracked explicitly the whole way, exactly the discipline Chapter 03 flagged as
+    a running theme in this codebase. By the time <code class="inl">editorRefreshScreen()</code> is done, every
+    escape sequence and every visible character for the entire frame lives in one contiguous block of memory,
+    and it hits the wire in a single <code class="inl">write()</code>.</p>
+
+    <div class="callout key" data-anchor="esc-callout-noclear">
+      <span class="tag">The clear-screen sequence you won't find</span>
+      <p>If you've seen the popular <em>Build Your Own Text Editor</em> tutorial that walks this same program,
+      you may be expecting <code class="inl">ESC[2J</code> — &ldquo;erase entire display&rdquo; — as the first
+      thing Kilo does each frame. It isn't there. A search of the real <code class="inl">kilo.c</code> for
+      <code class="inl">[2J</code> comes back empty. Kilo never clears the whole screen. Instead it goes home
+      (<code class="inl">ESC[H</code>) and redraws <em>every visible row, every frame</em>, erasing only to the
+      end of each line as it goes. Since nothing is left un-redrawn, there's nothing a full clear would need to
+      clean up — and skipping it means one less full-screen repaint for the terminal to do.</p>
+    </div>
+
+    <h2 data-anchor="esc-h2-impl">Implementation: reading editorRefreshScreen top to bottom</h2>
+    <p data-anchor="esc-p-impl-1">The whole function is worth walking in the order it actually executes,
+    because that order <em>is</em> the drawing order on screen: top row to bottom row, then the two status
+    rows, then the cursor.</p>
+
+    <h3 data-anchor="esc-h3-hide">Step 1 — hide the cursor, go home</h3>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorRefreshScreen</span>(<span class="ty">void</span>) {
+    <span class="ty">int</span> y;
+    erow *r;
+    <span class="ty">char</span> buf[32];
+    <span class="kw">struct</span> abuf ab = ABUF_INIT;
+
+    <span class="fn">abAppend</span>(&amp;ab,<span class="str">"\x1b[?25l"</span>,6); <span class="cm">/* Hide cursor. */</span>
+    <span class="fn">abAppend</span>(&amp;ab,<span class="str">"\x1b[H"</span>,3); <span class="cm">/* Go home. */</span></pre>
+    <p data-anchor="esc-p-impl-2">Two escapes, and the order matters. <code class="inl">ESC[?25l</code> is a
+    <strong>DEC private mode</strong> sequence (that leading <code class="inl">?</code> marks it as one) that
+    turns the text cursor invisible — the terminal keeps tracking where it &ldquo;is&rdquo; internally, it just
+    stops drawing the blinking block there. <code class="inl">ESC[H</code> is <strong>CUP</strong> (Cursor
+    Position) called with no parameters, which defaults to row 1, column 1 — home. Hiding the cursor
+    <em>first</em> means the user never watches it hop around mid-redraw; it reappears exactly once, at the very
+    end, already in its correct final spot.</p>
+
+    <h3 data-anchor="esc-h3-rows">Step 2 — redraw every row, tilde or text</h3>
+    <p data-anchor="esc-p-rows-1">Kilo then loops <code class="inl">E.screenrows</code> times (one iteration per
+    visible row) and, for each row past the end of the file, writes a bare <code class="inl">~</code> — the
+    vi-family convention for &ldquo;this line doesn't exist.&rdquo; If the file is completely empty, one row
+    near the top instead centers a welcome banner:</p>
+    <pre class="tab"><span class="kw">for</span> (y = 0; y &lt; E.screenrows; y++) {
+    <span class="ty">int</span> filerow = E.rowoff+y;
+
+    <span class="kw">if</span> (filerow &gt;= E.numrows) {
+        <span class="kw">if</span> (E.numrows == 0 &amp;&amp; y == E.screenrows/3) {
+            <span class="ty">char</span> welcome[80];
+            <span class="ty">int</span> welcomelen = <span class="fn">snprintf</span>(welcome,<span class="kw">sizeof</span>(welcome),
+                <span class="str">"Kilo editor -- verison %s\x1b[0K\r\n"</span>, KILO_VERSION);
+            <span class="ty">int</span> padding = (E.screencols-welcomelen)/2;
+            <span class="kw">if</span> (padding) {
+                <span class="fn">abAppend</span>(&amp;ab,<span class="str">"~"</span>,1);
+                padding--;
+            }
+            <span class="kw">while</span>(padding--) <span class="fn">abAppend</span>(&amp;ab,<span class="str">" "</span>,1);
+            <span class="fn">abAppend</span>(&amp;ab,welcome,welcomelen);
+        } <span class="kw">else</span> {
+            <span class="fn">abAppend</span>(&amp;ab,<span class="str">"~\x1b[0K\r\n"</span>,7);
+        }
+        <span class="kw">continue</span>;
+    }
+    <span class="cm">/* ...render the row's characters... */</span>
+}</pre>
+    <p data-anchor="esc-p-rows-2">Notice <code class="inl">ESC[0K</code> at the end of every one of these lines
+    — <strong>EL</strong>, Erase in Line, with parameter <code class="inl">0</code> meaning &ldquo;from the
+    cursor to the end of the line.&rdquo; That's the per-line stand-in for the full-screen clear Kilo doesn't do:
+    whatever character happened to be sitting at the end of this terminal row from some previous, longer frame
+    gets wiped before the carriage return. Erase locally, every row, every frame — never globally.</p>
+
+    <h3 data-anchor="esc-h3-color">Step 3 — text rows, colored lazily</h3>
+    <p data-anchor="esc-p-color-1">For a row that <em>does</em> hold file content, Kilo walks its
+    <code class="inl">render</code> buffer (the tab-expanded display version from Chapter 02, one byte at a
+    time) alongside its <code class="inl">hl</code> array (one highlight-type byte per rendered character, from
+    Chapter 14 onward). The color-changing logic is worth isolating, because it's a small, deliberate
+    optimization:</p>
+    <div class="callout" data-anchor="esc-callout-lazy-color">
+      <span class="tag">current_color: only speak up when something changes</span>
+      <p>A local <code class="inl">int current_color</code> tracks the SGR (Select Graphic Rendition) color
+      code most recently written. Kilo only appends a new <code class="inl">ESC[&lt;n&gt;m</code> sequence when
+      the character's color actually differs from <code class="inl">current_color</code> — a run of ten
+      same-colored characters costs <em>one</em> color escape, not ten. Falling back to
+      <code class="inl">HL_NORMAL</code> appends <code class="inl">ESC[39m</code> (reset foreground to the
+      terminal's default) exactly once, the moment color is no longer needed — not on every plain character.</p>
+    </div>
+    <p data-anchor="esc-p-color-2">The color numbers themselves come from a small, honest mapping —
+    <code class="inl">editorSyntaxToColor()</code> — that has nothing clever in it: comments and multi-line
+    comments are <code class="inl">36</code> (cyan), the first keyword class is <code class="inl">33</code>
+    (yellow), the second is <code class="inl">32</code> (green), strings are <code class="inl">35</code>
+    (magenta), numbers are <code class="inl">31</code> (red), a search match is <code class="inl">34</code>
+    (blue), and anything else defaults to <code class="inl">37</code> (white). These are the classic 8-color SGR
+    codes every VT100-descended terminal understands — no 256-color or truecolor codes, on purpose, for maximum
+    compatibility.</p>
+    <p data-anchor="esc-p-color-3">One more category gets special treatment: <code class="inl">HL_NONPRINT</code>
+    — raw control bytes that end up inside a line. Rather than write them out and risk the terminal
+    misinterpreting a stray control character as its own escape sequence, Kilo wraps a printable stand-in in
+    reverse video:</p>
+    <pre class="tab"><span class="kw">if</span> (hl[j] == HL_NONPRINT) {
+    <span class="ty">char</span> sym;
+    <span class="fn">abAppend</span>(&amp;ab,<span class="str">"\x1b[7m"</span>,4);
+    <span class="kw">if</span> (c[j] &lt;= 26)
+        sym = <span class="str">'@'</span>+c[j];
+    <span class="kw">else</span>
+        sym = <span class="str">'?'</span>;
+    <span class="fn">abAppend</span>(&amp;ab,&amp;sym,1);
+    <span class="fn">abAppend</span>(&amp;ab,<span class="str">"\x1b[0m"</span>,4);
+}</pre>
+    <p data-anchor="esc-p-color-4"><code class="inl">ESC[7m</code> is SGR 7, reverse video — it swaps foreground
+    and background so the glyph stands out as &ldquo;something unusual is here&rdquo; rather than blending in or
+    corrupting the display. Bytes 1&ndash;26 (the classic Ctrl-A through Ctrl-Z range) get mapped back to their
+    letter (<code class="inl">'@'+1 = 'A'</code>, and so on) so a reader can tell <em>which</em> control
+    character it was; anything else just shows a reversed <code class="inl">?</code>. <code class="inl">ESC[0m</code>
+    resets every SGR attribute back to plain before continuing. Every text row still ends with its own
+    <code class="inl">ESC[39m</code> (color reset) + <code class="inl">ESC[0K</code> (erase to end of line) +
+    <code class="inl">\r\n</code>, regardless of what happened inside it — belt-and-suspenders against a color
+    escape leaking into the next line.</p>
+
+    <h3 data-anchor="esc-h3-status">Step 4 — two status rows, reserved on purpose</h3>
+    <p data-anchor="esc-p-status-1">Below the text, Kilo appends exactly two more rows, both built the same
+    way as everything above — more escape sequences into the same buffer, no separate mechanism:</p>
+    <table class="grid" data-anchor="esc-table-status">
+      <thead><tr><th>Row</th><th>Sequence</th><th>Content</th></tr></thead>
+      <tbody>
+        <tr><td>Status bar</td><td class="mono">ESC[7m ... ESC[0m\r\n</td>
+          <td>Reverse video the whole row; left side shows <code class="inl">filename - N lines
+          (modified)</code>, right side shows <code class="inl">currentline/totallines</code>, space-padded to
+          fill exactly <code class="inl">E.screencols</code>.</td></tr>
+        <tr><td>Message bar</td><td class="mono">ESC[0K then plain text</td>
+          <td><code class="inl">E.statusmsg</code>, shown only if <code class="inl">time(NULL) -
+          E.statusmsg_time &lt; 5</code> — a message older than five seconds simply stops being written, no
+          explicit clear required.</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="esc-p-status-2">These two rows aren't drawn into leftover space by accident — they're
+    <em>reserved</em>. <code class="inl">updateWindowSize()</code>, which we'll get to in a moment, subtracts 2
+    from the queried terminal height before storing it in <code class="inl">E.screenrows</code>. The text-row
+    loop's <code class="inl">for (y = 0; y &lt; E.screenrows; y++)</code> physically cannot reach these last two
+    lines, because they were never counted as part of it.</p>
+
+    <h3 data-anchor="esc-h3-cursor">Step 5 — place the cursor, show it, flush once</h3>
+    <p data-anchor="esc-p-cursor-1">The very last work before flushing is figuring out where the terminal
+    cursor actually belongs:</p>
+    <pre class="tab"><span class="ty">int</span> j;
+<span class="ty">int</span> cx = 1;
+<span class="ty">int</span> filerow = E.rowoff+E.cy;
+erow *row = (filerow &gt;= E.numrows) ? NULL : &amp;E.row[filerow];
+<span class="kw">if</span> (row) {
+    <span class="kw">for</span> (j = E.coloff; j &lt; (E.cx+E.coloff); j++) {
+        <span class="kw">if</span> (j &lt; row-&gt;size &amp;&amp; row-&gt;chars[j] == TAB) cx += 7-((cx)%8);
+        cx++;
+    }
+}
+<span class="fn">snprintf</span>(buf,<span class="kw">sizeof</span>(buf),<span class="str">"\x1b[%d;%dH"</span>,E.cy+1,cx);
+<span class="fn">abAppend</span>(&amp;ab,buf,<span class="fn">strlen</span>(buf));
+<span class="fn">abAppend</span>(&amp;ab,<span class="str">"\x1b[?25h"</span>,6); <span class="cm">/* Show cursor. */</span>
+<span class="fn">write</span>(STDOUT_FILENO,ab.b,ab.len);
+<span class="fn">abFree</span>(&amp;ab);</pre>
+    <p data-anchor="esc-p-cursor-2"><code class="inl">cx</code> is deliberately <em>not</em>
+    <code class="inl">E.cx+1</code>. The loop re-walks the row from the horizontal scroll offset up to
+    <code class="inl">E.cx</code>, and every time it crosses a <code class="inl">TAB</code> byte it advances
+    <code class="inl">cx</code> to the next multiple of 8 first — the exact same expansion rule
+    <code class="inl">editorUpdateRow()</code> used to build the <code class="inl">render</code> buffer back in
+    Chapter 02. If it didn't, a cursor sitting after a tab would land on the wrong visual column: correct in
+    terms of bytes into <code class="inl">chars</code>, wrong in terms of columns on screen. The
+    <code class="inl">%d;%dH</code> escape is CUP again, this time with real parameters, 1-indexed because
+    terminals count from row/column 1 while <code class="inl">E.cy</code>/<code class="inl">cx</code> are
+    0/1-indexed respectively in the code.</p>
+    <p data-anchor="esc-p-cursor-3">Then: reveal the cursor (<code class="inl">ESC[?25h</code>), and only now —
+    after every escape sequence and every character for the entire frame has been appended — one
+    <code class="inl">write()</code>, one <code class="inl">abFree()</code>. Everything since
+    <code class="inl">ESC[?25l</code> at the top of the function happened entirely in memory.</p>
+
+    <h2 data-anchor="esc-h2-query">Escape sequences that ask questions, not just draw</h2>
+    <p data-anchor="esc-p-query-1">So far every sequence has been one-directional: Kilo tells the terminal what
+    to do. But one sequence works the other way — Kilo asks the terminal a question and reads back an answer,
+    over the very same file descriptor Chapter 04's <code class="inl">editorReadKey()</code> normally reads
+    keystrokes from.</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">getCursorPosition</span>(<span class="ty">int</span> ifd, <span class="ty">int</span> ofd, <span class="ty">int</span> *rows, <span class="ty">int</span> *cols) {
+    <span class="ty">char</span> buf[32];
+    <span class="ty">unsigned</span> <span class="ty">int</span> i = 0;
+
+    <span class="cm">/* Report cursor location */</span>
+    <span class="kw">if</span> (<span class="fn">write</span>(ofd, <span class="str">"\x1b[6n"</span>, 4) != 4) <span class="kw">return</span> -1;
+
+    <span class="cm">/* Read the response: ESC [ rows ; cols R */</span>
+    <span class="kw">while</span> (i &lt; <span class="kw">sizeof</span>(buf)-1) {
+        <span class="kw">if</span> (<span class="fn">read</span>(ifd,buf+i,1) != 1) <span class="kw">break</span>;
+        <span class="kw">if</span> (buf[i] == <span class="str">'R'</span>) <span class="kw">break</span>;
+        i++;
+    }
+    buf[i] = <span class="str">'\0'</span>;
+
+    <span class="cm">/* Parse it. */</span>
+    <span class="kw">if</span> (buf[0] != ESC || buf[1] != <span class="str">'['</span>) <span class="kw">return</span> -1;
+    <span class="kw">if</span> (<span class="fn">sscanf</span>(buf+2,<span class="str">"%d;%d"</span>,rows,cols) != 2) <span class="kw">return</span> -1;
+    <span class="kw">return</span> 0;
+}</pre>
+    <p data-anchor="esc-p-query-2"><code class="inl">ESC[6n</code> is <strong>DSR</strong>, Device Status
+    Report, with parameter 6 specifically requesting the cursor position. The terminal replies — as ordinary
+    bytes on the input side — with <code class="inl">ESC[&lt;row&gt;;&lt;col&gt;R</code>. Kilo reads that reply
+    one byte at a time until it sees the terminating <code class="inl">'R'</code>, then parses it with a plain
+    <code class="inl">sscanf()</code>. Nothing exotic: the &ldquo;response to a query&rdquo; is just more input,
+    read with the same <code class="inl">read()</code> syscall as everything else, arriving on a channel Kilo
+    otherwise treats as pure keystrokes.</p>
+
+    <h3 data-anchor="esc-h3-winsize">getWindowSize: ioctl first, escape sequences as a fallback</h3>
+    <p data-anchor="esc-p-winsize-1"><code class="inl">getCursorPosition()</code> exists mainly to serve a
+    second function, one this chapter's drawing code depends on entirely: knowing how big the terminal actually
+    is.</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">getWindowSize</span>(<span class="ty">int</span> ifd, <span class="ty">int</span> ofd, <span class="ty">int</span> *rows, <span class="ty">int</span> *cols) {
+    <span class="kw">struct</span> winsize ws;
+
+    <span class="kw">if</span> (<span class="fn">ioctl</span>(1, TIOCGWINSZ, &amp;ws) == -1 || ws.ws_col == 0) {
+        <span class="ty">int</span> orig_row, orig_col, retval;
+
+        retval = <span class="fn">getCursorPosition</span>(ifd,ofd,&amp;orig_row,&amp;orig_col);
+        <span class="kw">if</span> (retval == -1) <span class="kw">goto</span> failed;
+
+        <span class="cm">/* Go to right/bottom margin and get position. */</span>
+        <span class="kw">if</span> (<span class="fn">write</span>(ofd,<span class="str">"\x1b[999C\x1b[999B"</span>,12) != 12) <span class="kw">goto</span> failed;
+        retval = <span class="fn">getCursorPosition</span>(ifd,ofd,rows,cols);
+        <span class="kw">if</span> (retval == -1) <span class="kw">goto</span> failed;
+
+        <span class="ty">char</span> seq[32];
+        <span class="fn">snprintf</span>(seq,32,<span class="str">"\x1b[%d;%dH"</span>,orig_row,orig_col);
+        <span class="kw">if</span> (<span class="fn">write</span>(ofd,seq,<span class="fn">strlen</span>(seq)) == -1) { <span class="cm">/* Can't recover... */</span> }
+        <span class="kw">return</span> 0;
+    } <span class="kw">else</span> {
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;
+        <span class="kw">return</span> 0;
+    }
+failed:
+    <span class="kw">return</span> -1;
+}</pre>
+    <p data-anchor="esc-p-winsize-2">The preferred path costs no escape sequences at all:
+    <code class="inl">ioctl(1, TIOCGWINSZ, &amp;ws)</code> asks the kernel directly, which knows the terminal's
+    dimensions without needing to ask the terminal emulator anything. Only if that fails, or reports
+    <code class="inl">ws_col == 0</code> (which the code's own comment notes happens on some terminals or
+    terminal multiplexers), does Kilo fall back to the escape-sequence route. That fallback is a neat trick:
+    write <code class="inl">ESC[999C ESC[999B</code> — cursor forward 999, cursor down 999 — then read the
+    cursor's position back. 999 isn't a real column or row count; it's deliberately oversized, relying on the
+    fact that VT100-family terminals <em>clamp</em> cursor motion at the actual screen edge instead of scrolling
+    or erroring. Wherever the cursor lands after &ldquo;move by 999, twice&rdquo; <em>is</em> the bottom-right
+    corner, and reading its position back with <code class="inl">getCursorPosition()</code> tells you exactly
+    how many rows and columns the terminal has. The cursor is then walked back to wherever it started
+    (<code class="inl">ESC[%d;%dH</code> with the saved <code class="inl">orig_row</code>/<code class="inl">orig_col</code>)
+    so a size query the user never asked for doesn't visibly move anything.</p>
+
+    <div class="callout warn" data-anchor="esc-callout-reserve">
+      <span class="tag">Where the &ldquo;minus 2&rdquo; comes from</span>
+      <p><code class="inl">updateWindowSize()</code> calls <code class="inl">getWindowSize()</code> and then does
+      <code class="inl">E.screenrows -= 2</code> — the one line that reserves this chapter's two status rows.
+      It's also registered as the response to a live terminal resize: <code class="inl">signal(SIGWINCH,
+      handleSigWinCh)</code> means the kernel-delivered <code class="inl">SIGWINCH</code> signal re-runs
+      <code class="inl">updateWindowSize()</code> (and clamps <code class="inl">E.cy</code> back inside the new
+      bounds) whenever the user resizes their terminal window mid-session, so the next
+      <code class="inl">editorRefreshScreen()</code> draws against dimensions that are actually still
+      correct.</p>
+    </div>
+
+    <h2 data-anchor="esc-h2-edge">Edge cases: what this design deliberately doesn't do</h2>
+    <ul data-anchor="esc-ul-edge">
+      <li data-anchor="esc-li-edge-1"><strong>No full-screen clear, ever.</strong> As the callout above says,
+      <code class="inl">ESC[2J</code> doesn't appear anywhere in <code class="inl">kilo.c</code>. This is a
+      deliberate trade for less flicker, not an oversight — but it only works because every visible row is
+      genuinely redrawn every single frame, with its own per-line erase. Skip a row in that loop and stale
+      content from a previous, longer frame could survive on screen with no clear to remove it.</li>
+      <li data-anchor="esc-li-edge-2"><strong>Ctrl-L is a no-op, on purpose.</strong> The conventional
+      &ldquo;refresh the screen&rdquo; keystroke in many terminal programs does essentially nothing special in
+      Kilo's key dispatch:
+      <pre class="tab"><span class="kw">case</span> CTRL_L: <span class="cm">/* ctrl+l, clear screen */</span>
+    <span class="cm">/* Just refresht the line as side effect. */</span>
+    <span class="kw">break</span>;</pre>
+      (Yes, that comment has a typo in the real source.) It isn't ignored — the keystroke is consumed so it
+      doesn't fall through to text insertion — it's just that Chapter 06's read-react-repaint loop already calls
+      <code class="inl">editorRefreshScreen()</code> unconditionally on every trip through
+      <code class="inl">main()</code>, whether or not Ctrl-L was pressed. There's nothing left for the keystroke
+      itself to trigger.</li>
+      <li data-anchor="esc-li-edge-3"><strong>The size-query fallback assumes edge-clamping behavior.</strong>
+      <code class="inl">ESC[999C</code>/<code class="inl">ESC[999B</code> only work as a size probe because
+      real terminals clamp cursor motion at the screen boundary instead of, say, ignoring an out-of-range
+      request or scrolling the viewport. It's a documented VT100-family behavior, not an assumption unique to
+      Kilo, but it's still an assumption — a hypothetical terminal that didn't clamp would break this fallback
+      silently.</li>
+      <li data-anchor="esc-li-edge-4"><strong>Terminal-emulator quirks aren't Kilo's problem to solve.</strong>
+      Every sequence in this chapter — <code class="inl">ESC[H</code>, <code class="inl">ESC[0K</code>,
+      <code class="inl">ESC[?25l</code>/<code class="inl">h</code>, SGR colors, <code class="inl">ESC[6n</code> —
+      is old, widely-supported VT100/ANSI vocabulary, chosen precisely because virtually every terminal emulator
+      in real use honors it. Kilo doesn't detect terminal capabilities or fall back to a lesser drawing mode;
+      it simply assumes a reasonably compliant VT100-compatible terminal on the other end, the same assumption
+      Chapter 03 flagged when it first introduced escape sequences as &ldquo;ordinary bytes the terminal has
+      agreed to treat specially.&rdquo;</li>
+    </ul>
+
+    <div class="reflect" data-anchor="esc-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A complete answer to &ldquo;how does a program with no GUI toolkit draw a screen?&rdquo; — and it turns
+      out to be smaller than it sounds. One append buffer that turns dozens of small drawing decisions into one
+      <code class="inl">write()</code>. A handful of escape sequences — hide/show cursor, home, erase-to-end-of-
+      line, set/reset color, position the cursor — reused for every row, every frame, with no special-casing.
+      And one sequence, <code class="inl">ESC[6n</code>, that runs the whole conversation in reverse: the program
+      asks, the terminal answers, over the same channel keystrokes arrive on. Chapter 06 picks this up
+      immediately — <code class="inl">editorRefreshScreen()</code> is one of exactly two calls in Kilo's entire
+      main loop, and now you know everything that one call actually does.</p>
+    </div>
+
+    <div class="challenges" data-anchor="esc-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Trace what would visibly go wrong if <code class="inl">ESC[?25h</code> (show cursor) were appended
+        <em>before</em> the row-drawing loop instead of after it, at the very end. What would the user see
+        during a redraw that they don't see today?</li>
+        <li>The <code class="inl">current_color</code> optimization only tracks syntax-highlight color, not the
+        reverse-video escapes used for <code class="inl">HL_NONPRINT</code> or the status bar. Why might it be
+        safe to skip that optimization for those two cases specifically? (Hint: how often does each one actually
+        occur in a typical frame?)</li>
+        <li>Suppose <code class="inl">ioctl(1, TIOCGWINSZ, &amp;ws)</code> succeeded but returned
+        <code class="inl">ws_row</code> as 1 more than the terminal's real height — an off-by-one in the
+        kernel's report. Walk through what would happen on the next <code class="inl">editorRefreshScreen()</code>
+        call, and explain why this class of bug would be easy to miss during quick manual testing.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="esc-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — abuf/abAppend/abFree, editorRefreshScreen, getCursorPosition, getWindowSize, updateWindowSize, handleSigWinCh</a> &middot;
+      <a href="https://vt100.net/docs/vt100-ug/chapter3.html" target="_blank" rel="noopener">[2] Digital VT100 User Guide, ch. 3 — escape/control sequences</a> &middot;
+      <a href="https://en.wikipedia.org/wiki/ANSI_escape_code" target="_blank" rel="noopener">[3] ANSI escape code — CSI/SGR/DEC private mode reference</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[4] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-raw-mode-and-key-input.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-the-refresh-cycle.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

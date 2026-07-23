@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code Generation and Tooling — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="cgt-kicker">Chapter 05 &middot; Encoding &amp; Tooling</span>
+    <h1 data-anchor="cgt-h1">Code Generation and Tooling</h1>
+
+    <p class="lede" data-anchor="cgt-lede">
+      We closed the last chapter with a promise: you'll never hand-write a
+      single byte of the wire format yourself &mdash; that's <code>protoc</code>'s
+      job. Fair enough, but that just moves the question one level up. What
+      does <code>protoc</code> actually <em>do</em> when you point it at a
+      <code>.proto</code> file? How does it know how to talk to a program
+      it's never heard of, written in a language it doesn't even ship a
+      compiler for? And once a team has fifteen services and four target
+      languages, is anyone really typing <code>--python_out</code> flags by
+      hand every day? This chapter answers all three, in that order.
+    </p>
+
+    <h2 data-anchor="cgt-h2-protoc">protoc: one compiler, many exits</h2>
+    <p data-anchor="cgt-p-protoc-1">
+      Strip away everything else and <code>protoc</code> does one thing:
+      it parses <code>.proto</code> files into an in-memory schema (the
+      <code>FileDescriptorProto</code> graph you've already met in passing),
+      resolves every <code>import</code> against the paths you gave it with
+      <code>-I</code>/<code>--proto_path</code>, and then hands that resolved
+      schema to a <em>generator</em> &mdash; once per <code>--&lt;lang&gt;_out</code>
+      flag on the command line. Everything downstream of parsing is a
+      generator's problem, not the compiler's.
+    </p>
+    <pre data-anchor="cgt-code-protoc-shape"><code>protoc -I=&lt;import-path&gt; --&lt;lang&gt;_out=&lt;output-dir&gt; &lt;path/to/file.proto&gt;</code></pre>
+    <p data-anchor="cgt-p-protoc-2">
+      A handful of generators live inside <code>protoc</code> itself &mdash;
+      C++, Java, Python, C#, Objective-C, PHP, Ruby, and now Kotlin and Rust
+      &mdash; so <code>--java_out</code> or <code>--python_out</code> just
+      works. Ask for anything else and <code>protoc</code> doesn't know how
+      to refuse gracefully: it goes looking on your <code>PATH</code> for an
+      executable named <strong><code>protoc-gen-&lt;name&gt;</code></strong>
+      and shells out to it. <code>--go_out</code> works because you installed
+      <code>protoc-gen-go</code>; <code>--go-grpc_out</code> works because you
+      also installed <code>protoc-gen-go-grpc</code>. Forget one, and
+      <code>protoc</code> fails with something like &ldquo;program not
+      found&rdquo; &mdash; not a friendly message, but at least a diagnosable
+      one once you know the naming convention.
+    </p>
+    <div class="callout note" data-anchor="cgt-callout-multiplugin">
+      <span class="callout-label">One invocation, several outputs</span>
+      Nothing stops you from combining flags: <code>protoc --go_out=. --go-grpc_out=. --java_out=./java file.proto</code>
+      runs three generators in a single pass over the same parsed schema.
+      Each one only cares about its own <code>--&lt;name&gt;_out</code> (and
+      optional <code>--&lt;name&gt;_opt</code>) flags; they don't know or care
+      that siblings are running too.
+    </div>
+
+    <h2 data-anchor="cgt-h2-shapes">The same schema, five different shapes</h2>
+    <p data-anchor="cgt-p-shapes-1">
+      Here's something worth sitting with: every one of these generators
+      starts from <em>exactly</em> the same input &mdash; the identical
+      resolved <code>FileDescriptorProto</code> for your <code>Product</code>
+      message &mdash; and yet what comes out the other end looks nothing alike
+      from language to language. The wire format is universal; the generated
+      code is not, and was never meant to be. Each generator's job is to make
+      the schema feel native to its own language.
+    </p>
+    <table class="cmp" data-anchor="cgt-table-shapes">
+      <thead><tr><th>Language</th><th>Generator</th><th>What you get</th></tr></thead>
+      <tbody>
+        <tr><td>Go</td><td><code>protoc-gen-go</code></td><td>a struct per message, exported fields, nil-safe <code>Get&lt;Field&gt;()</code> accessors</td></tr>
+        <tr><td>Java</td><td>built into <code>protoc</code></td><td>an immutable class built through <code>Message.newBuilder()....build()</code></td></tr>
+        <tr><td>Python</td><td>built into <code>protoc</code></td><td>a thin descriptor literal, handed to a metaclass that builds the real class at import time</td></tr>
+        <tr><td>C++</td><td>built into <code>protoc</code></td><td>a class with direct getters/setters, backing the reference runtime itself</td></tr>
+        <tr><td>TypeScript</td><td><code>ts-proto</code> or <code>protoc-gen-es</code></td><td>plain interfaces + functions, or a full-conformance class &mdash; your choice, no default</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="cgt-p-shapes-2">
+      Go is the most literal translation: one struct field per protobuf
+      field, each carrying a struct tag that encodes the wire-format details
+      the runtime needs (<code>protobuf:"varint,2,opt,name=quantity,proto3"</code>),
+      plus a plain <code>json</code> tag for good measure. What you don't get
+      automatically is nil-safety on direct field access &mdash; that's what
+      the generated getter is for.
+    </p>
+    <pre data-anchor="cgt-code-go-struct"><code><span class="kw">type</span> Product <span class="kw">struct</span> {
+  Name     <span class="ty">string</span> `<span class="mac">protobuf:"bytes,1,opt,name=name,proto3"</span> <span class="mac">json:"name,omitempty"</span>`
+  Quantity <span class="ty">int32</span>  `<span class="mac">protobuf:"varint,2,opt,name=quantity,proto3"</span> <span class="mac">json:"quantity,omitempty"</span>`
+}
+
+<span class="kw">func</span> (x *Product) <span class="fn">GetQuantity</span>() <span class="ty">int32</span> {
+  <span class="kw">if</span> x != <span class="kw">nil</span> {
+    <span class="kw">return</span> x.Quantity
+  }
+  <span class="kw">return</span> <span class="num">0</span>
+}</code></pre>
+    <p data-anchor="cgt-p-shapes-3">
+      Python goes the opposite direction: about as little generated code as
+      it can get away with. The <code>_pb2.py</code> file mostly serializes a
+      <code>FileDescriptorProto</code> literal, then hands it to a metaclass
+      (<code>GeneratedProtocolMessageType</code>, if you go looking) that
+      builds the actual message class when the module is imported &mdash; the
+      per-field behavior lives in shared runtime code, not in code generated
+      fresh for every message. That runtime, in turn, picks between a few
+      backends at load time: a pure-Python implementation, an older C++
+      extension, or <strong>upb</strong>, a small C library that's been the
+      default since protobuf 4.21 for its speed. Same generated Python file,
+      three possible engines underneath, chosen automatically.
+    </p>
+    <div class="callout key-idea" data-anchor="cgt-callout-no-ts-default">
+      <span class="callout-label">Not every language has &ldquo;the&rdquo; generator</span>
+      TypeScript is the odd one out on that table for a reason: it isn't
+      bundled in <code>protoc</code> at all, and unlike Go or Java there's no
+      single official plugin to reach for. <code>ts-proto</code> produces
+      idiomatic plain interfaces and functions with zero native dependencies;
+      <code>protoc-gen-es</code> (the Protobuf-ES project) generates a
+      fully spec-conformant runtime and pairs naturally with Connect-ES for
+      RPC. Picking between them is a real decision your team makes, not a
+      default protoc hands you.
+    </div>
+
+    <h2 data-anchor="cgt-h2-plugin-protocol">Plugins: how protoc talks to a program it's never heard of</h2>
+    <p data-anchor="cgt-p-plugin-1">
+      This is the part worth slowing down for, because the mechanism is
+      smaller and stranger than it sounds. <code>protoc</code> doesn't know
+      anything about Go, Rust, or whatever language your plugin happens to be
+      written in. It doesn't need to. A protoc plugin's <em>entire</em>
+      contract is two steps:
+    </p>
+    <ol data-anchor="cgt-list-plugin-contract">
+      <li>read one serialized <code>CodeGeneratorRequest</code> protobuf message from stdin;</li>
+      <li>write one serialized <code>CodeGeneratorResponse</code> protobuf message to stdout.</li>
+    </ol>
+    <p data-anchor="cgt-p-plugin-2">
+      That's it. The plugin is <em>itself</em> just another protobuf
+      consumer &mdash; it decodes a message using whatever protobuf library its
+      own language has, does some work, encodes a response message, and
+      exits. There's a pleasing bit of eating-your-own-dog-food here: the
+      tool that generates code from schemas is, at the transport level,
+      exercising the exact same encode/decode machinery Chapter 4 walked
+      through byte by byte.
+    </p>
+    <figure data-anchor="cgt-fig-plugin-flow">
+      <svg viewBox="0 0 700 210" role="img" aria-labelledby="cgt-fig-plugin-flow-title">
+        <title id="cgt-fig-plugin-flow-title">protoc forks protoc-gen-go, writes a CodeGeneratorRequest to its stdin, and reads a CodeGeneratorResponse back from its stdout</title>
+        <rect x="20" y="65" width="170" height="80" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.5"/>
+        <text x="105" y="95" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--fn)">protoc</text>
+        <text x="105" y="114" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">parses + resolves</text>
+        <text x="105" y="128" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">the schema graph</text>
+
+        <path d="M190 95 L268 95" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#cgt-arrow)"/>
+        <text x="229" y="83" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent)">CodeGeneratorRequest</text>
+        <text x="229" y="107" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">(serialized, on stdin)</text>
+
+        <rect x="268" y="55" width="180" height="100" rx="8" fill="none" stroke="var(--kw)" stroke-dasharray="3 4" stroke-width="1.5"/>
+        <text x="358" y="85" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--kw)">protoc-gen-go</text>
+        <text x="358" y="104" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">forked child process</text>
+        <text x="358" y="120" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">any language, any runtime</text>
+        <text x="358" y="136" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">&mdash; only the contract matters</text>
+
+        <path d="M448 95 L526 95" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#cgt-arrow)"/>
+        <text x="487" y="83" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent)">CodeGeneratorResponse</text>
+        <text x="487" y="107" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">(serialized, on stdout)</text>
+
+        <rect x="526" y="65" width="150" height="80" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.5"/>
+        <text x="601" y="95" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--fn)">protoc</text>
+        <text x="601" y="114" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">writes each</text>
+        <text x="601" y="128" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">File to disk</text>
+
+        <defs>
+          <marker id="cgt-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        The plugin is a black box to protoc &mdash; only the request/response
+        message shapes are the contract. This is why a plugin can be written
+        in literally any language with a protobuf library.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="cgt-p-plugin-3">
+      What's actually inside that request is worth naming, because it
+      explains a lot of what plugins can do that might otherwise feel like
+      magic. <code>CodeGeneratorRequest</code> carries:
+    </p>
+    <table class="cmp" data-anchor="cgt-table-request-fields">
+      <thead><tr><th>Field</th><th>What it holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>file_to_generate</code></td><td>only the files named explicitly on the command line &mdash; generate code for these, not their dependencies</td></tr>
+        <tr><td><code>parameter</code></td><td>the raw string passed via <code>--&lt;name&gt;_opt</code>, e.g. <code>paths=source_relative</code></td></tr>
+        <tr><td><code>proto_file</code></td><td>the <em>full</em> resolved schema: every file needed to generate the targets, including every transitive import, topologically ordered</td></tr>
+        <tr><td><code>compiler_version</code></td><td>the protoc version that invoked the plugin</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="cgt-p-plugin-4">
+      Notice the gap between <code>file_to_generate</code> and
+      <code>proto_file</code>. A plugin isn't handed a lonely single file to
+      generate code for in isolation &mdash; it's handed the <em>entire</em>
+      compiled graph the target file depends on, descriptors and all. That's
+      exactly why a plugin can do things that sound like they'd require
+      re-parsing your whole schema from scratch: it never has to, because
+      protoc already did that part and handed over the result.
+    </p>
+    <div class="callout warning" data-anchor="cgt-callout-graph-cost">
+      <span class="callout-label">The cost hiding in that convenience</span>
+      A plugin scales with your <em>whole</em> import graph, not just the
+      file you're generating. A schema with a deep or wide import tree makes
+      every plugin invocation proportionally slower, even for a change that
+      only touched one small leaf file &mdash; because <code>proto_file</code>
+      still carries the transitive closure every time.
+    </div>
+
+    <p data-anchor="cgt-p-plugin-5">
+      The response side has its own small trick worth knowing.
+      <code>CodeGeneratorResponse.File</code> has a <code>name</code> (the
+      output path) and <code>content</code> (the generated text) &mdash; the
+      obvious pair &mdash; plus an optional <code>insertion_point</code>. Set
+      that, and instead of writing a new file, protoc splices your content
+      into another generator's <em>already-written</em> output, at a matching
+      <code>@@protoc_insertion_point(NAME)</code> marker comment left behind
+      in that file. It's how two independent plugins can cooperate on one
+      generated file without either knowing the other exists &mdash; one
+      leaves markers, the other fills them in.
+    </p>
+
+    <h2 data-anchor="cgt-h2-grpc-and-more">The plugin ecosystem: gRPC is just the start</h2>
+    <p data-anchor="cgt-p-eco-1">
+      Once you see plugins as ordinary programs speaking a fixed request/
+      response contract, the rest of the ecosystem stops looking like a pile
+      of unrelated tools and starts looking like the same trick, reused. gRPC
+      service code, for instance, isn't folded into the message generator at
+      all &mdash; it's a <em>second</em>, separate plugin, layered on top. The
+      current Go workflow runs <code>protoc-gen-go</code> (messages) and
+      <code>protoc-gen-go-grpc</code> (service interfaces and clients) as two
+      distinct invocations, producing two distinct files:
+    </p>
+    <pre data-anchor="cgt-code-grpc-invocation"><code>protoc -I=. \
+  --go_out=. --go_opt=paths=source_relative \
+  --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+  catalog/v1/product.proto
+<span class="cm"># -&gt; catalog/v1/product.pb.go       (messages)</span>
+<span class="cm"># -&gt; catalog/v1/product_grpc.pb.go  (service)</span></code></pre>
+    <div class="callout note" data-anchor="cgt-callout-legacy-combined">
+      <span class="callout-label">A form you'll still see in older code</span>
+      An older, combined form &mdash; <code>--go_out=plugins=grpc:.</code> &mdash;
+      wrote both messages and service code into one file with a single
+      plugin. It still works in many setups, but it isn't the path current
+      tooling and docs are written against, and it produces a different file
+      layout than the split invocation above. If you're starting fresh, use
+      the split form.
+    </div>
+    <p data-anchor="cgt-p-eco-2">
+      The same request/response contract also powers plugins that have
+      nothing to do with generating a target-language runtime at all:
+      <code>protoc-gen-doc</code> walks the descriptor graph and renders
+      HTML, Markdown, or JSON documentation straight from your schema's own
+      comments; <code>grpc-gateway</code>'s <code>protoc-gen-grpc-gateway</code>
+      reads <code>google.api.http</code> annotations on a service definition
+      and generates a reverse-proxy server that exposes the same RPCs as a
+      RESTful JSON API. Neither one emits code you'd run your business logic
+      through &mdash; and neither needs to be special-cased by protoc to work.
+      They're plugins in exactly the sense <code>protoc-gen-go</code> is.
+    </p>
+    <div class="callout warning" data-anchor="cgt-callout-validate-superseded">
+      <span class="callout-label">Ecosystem churn, illustrated</span>
+      <code>protoc-gen-validate</code> was, for years, the standard way to
+      generate per-language <code>Validate()</code> methods from constraint
+      annotations on your fields. Its own repository now points newcomers to
+      <strong>protovalidate</strong> as the maintained successor for the same
+      job. The core protoc/plugin contract from the previous section is
+      stable; the plugins built on top of it &mdash; especially anything
+      validation- or gateway-adjacent &mdash; move faster and get superseded
+      more often. Check what a given plugin's own README currently
+      recommends before you commit to it.
+    </div>
+
+    <h2 data-anchor="cgt-h2-buf">Stop hand-assembling flags: buf</h2>
+    <p data-anchor="cgt-p-buf-1">
+      Picture a repo with a dozen services, four target languages, and a
+      grpc-gateway pass on top. That's a lot of <code>-I</code> paths and
+      <code>--&lt;lang&gt;_out</code> flags to keep in sync by hand across
+      Makefiles, and it's exactly the itch <strong>buf</strong> scratches.
+      Buf isn't a replacement for the wire format or for protoc's underlying
+      job &mdash; it's a CLI that wraps day-to-day protoc use in two
+      declarative config files instead of a shell script:
+    </p>
+    <table class="cmp" data-anchor="cgt-table-buf-files">
+      <thead><tr><th>File</th><th>Replaces</th><th>Declares</th></tr></thead>
+      <tbody>
+        <tr><td><code>buf.yaml</code></td><td>ad hoc <code>-I</code> juggling across a workspace</td><td>a module's lint rules, breaking-change rules, and dependencies</td></tr>
+        <tr><td><code>buf.gen.yaml</code></td><td>a hand-assembled string of <code>--&lt;lang&gt;_out</code>/<code>_opt</code> flags</td><td>which plugins to run, and where each one's output goes</td></tr>
+      </tbody>
+    </table>
+    <pre data-anchor="cgt-code-buf-gen-yaml"><code><span class="cm"># buf.gen.yaml -- replaces the hand-assembled protoc flags above</span>
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: gen/go
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: gen/go
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false</code></pre>
+    <p data-anchor="cgt-p-buf-2">
+      Run <code>buf generate</code> and it reads both files and runs every
+      configured plugin in one command &mdash; the same plugins, the same
+      request/response contract from the last section, just with the
+      bookkeeping centralized instead of copy-pasted into every service's
+      build script.
+    </p>
+    <p data-anchor="cgt-p-buf-3">
+      Codegen is the part that touches this chapter most directly, but it's
+      not the point of buf on its own. <code>buf lint</code> checks a schema
+      against style/API-shape rules; <code>buf format</code> canonicalizes
+      <code>.proto</code> formatting the way <code>gofmt</code> does for Go;
+      and <code>buf breaking</code> diffs your current schema against a prior
+      version &mdash; a git ref, a tag, a snapshot in the Buf Schema Registry
+      &mdash; and fails if it finds an incompatible change, like a reused or
+      retyped field number from Chapter 2's rules. That last one is the piece
+      worth remembering going into Chapter 7: it's the tool that turns
+      &ldquo;don't break the wire format&rdquo; from a rule you hope everyone
+      remembers into a check that fails a pull request automatically.
+    </p>
+    <div class="callout key-idea" data-anchor="cgt-callout-buf-ci">
+      <span class="callout-label">Wiring it into CI</span>
+      Buf's official GitHub Action (<code>bufbuild/buf-action</code>) runs
+      build, lint, format, and breaking checks in one workflow step and posts
+      the result as a pull-request comment. That's the concrete shape of the
+      &ldquo;CI breaking-change detector&rdquo; this book keeps promising:
+      a schema change that would silently corrupt an old reader's
+      understanding of the wire never merges in the first place.
+    </div>
+
+    <h2 data-anchor="cgt-h2-bazel">Build systems: Bazel's language-neutral proto_library</h2>
+    <p data-anchor="cgt-p-bazel-1">
+      Bazel takes a slightly different cut at the same problem, and it's
+      worth seeing because the shape generalizes: separate <em>declaring</em>
+      a schema from <em>compiling</em> it into any particular language. A
+      <code>proto_library</code> target names a <code>.proto</code> file's
+      sources and its dependencies on other <code>proto_library</code>
+      targets, mirroring that file's own <code>import</code> statements
+      &mdash; and nothing else. It doesn't pick Go or Java or generate a
+      single line of code by itself.
+    </p>
+    <pre data-anchor="cgt-code-bazel-build"><code><span class="cm"># BUILD.bazel</span>
+proto_library(
+    name = <span class="str">"product_proto"</span>,
+    srcs = [<span class="str">"product.proto"</span>],
+)
+
+go_proto_library(
+    name = <span class="str">"product_go_proto"</span>,
+    importpath = <span class="str">"example.com/catalog/v1"</span>,
+    proto = <span class="str">":product_proto"</span>,
+)
+
+py_proto_library(
+    name = <span class="str">"product_py_proto"</span>,
+    deps = [<span class="str">":product_proto"</span>],
+)</code></pre>
+    <p data-anchor="cgt-p-bazel-2">
+      Each language then layers its own rule on top of that bare
+      <code>proto_library</code> &mdash; <code>cc_proto_library</code>,
+      <code>java_proto_library</code>, <code>py_proto_library</code>, or a
+      community rule like <code>go_proto_library</code> from
+      <code>rules_proto_grpc</code>. Those wrapper rules are what actually
+      invoke <code>protoc</code>: each one implicitly depends on the protoc
+      binary and on a <code>proto_lang_toolchain</code> target describing
+      exactly how to call it for that language. The payoff is the same
+      one-schema-many-languages story as before, but with Bazel's caching:
+      generate Go and Python from the same <code>proto_library</code>, and
+      Bazel treats each as its own cacheable output, rebuilt only when the
+      schema or the toolchain actually changes.
+    </p>
+    <div class="callout note" data-anchor="cgt-callout-rules-proto-deprecated">
+      <span class="callout-label">If you're setting this up today</span>
+      Don't reach for the standalone <code>bazelbuild/rules_proto</code>
+      repository &mdash; as of a 2024 community decision, <code>proto_library</code>
+      and the core per-language rules moved directly into the
+      <code>protocolbuffers/protobuf</code> repository itself, and
+      <code>rules_proto</code> is kept around only as a migration pointer,
+      not an actively developed rule set.
+    </div>
+
+    <h2 data-anchor="cgt-h2-editors">Editors caught up too</h2>
+    <p data-anchor="cgt-p-editors-1">
+      One last, smaller piece, but worth a mention because it changes how
+      writing a <code>.proto</code> file actually feels day to day.
+      <code>.proto</code> editor support has converged on the same Language
+      Server Protocol that powers modern editor tooling for most other
+      languages, rather than a pile of one-off syntax-highlighting plugins.
+      Buf ships its own production-grade Protobuf language server, bundled
+      automatically into its VS Code extension, giving you go-to-definition,
+      completion, and inline lint diagnostics right as you type &mdash; the
+      same <code>buf lint</code> rules from two sections ago, surfaced live
+      instead of only at CI time. Independent community language servers
+      (<code>protobuf-language-server</code>, <code>protols</code>) cover
+      other editors, and formatting can run through that LSP, through
+      <code>clang-format</code>, or by shelling out to <code>buf format</code>
+      directly.
+    </p>
+
+    <h2 data-anchor="cgt-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="cgt-p-reflect-1">
+      Start to finish, this chapter has really been one idea wearing several
+      outfits: <code>protoc</code> parses a schema once and hands the
+      <em>result</em>, not the source text, to whatever generates code next.
+      When that generator is built in, you don't notice the handoff at all.
+      When it's an external plugin, the handoff becomes an honest-to-goodness
+      protobuf message crossing a pipe &mdash; which is also why a plugin can
+      be written in any language, why it can see your entire import graph
+      instead of just one file, and why two plugins can cooperate on one file
+      through insertion points without ever importing each other's code. buf
+      and Bazel are both, underneath, organizing that same handoff at a
+      larger scale: one config file or one build graph standing in for a
+      hundred hand-typed <code>--&lt;lang&gt;_out</code> invocations.
+    </p>
+    <p data-anchor="cgt-p-reflect-2">
+      None of this has said anything yet about what to actually <em>put</em>
+      in a schema once you're modeling something more real-world than a
+      product with a name and a quantity &mdash; nested types, cross-file
+      references, well-known types for time and dynamic data, and the
+      judgment calls that separate a schema that ages well from one that
+      doesn't. That's next.
+    </p>
+
+    <div class="callout note" data-anchor="cgt-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>You run <code>protoc --rust_out=. widget.proto</code> and get a
+        &ldquo;program not found&rdquo; failure. Name the exact binary
+        <code>protoc</code> went looking for on your <code>PATH</code>, and
+        why the flag name determines that.</li>
+        <li>A plugin author complains their generator is slow on a schema
+        with one small file that changed. Given what <code>proto_file</code>
+        actually contains in a <code>CodeGeneratorRequest</code>, explain why
+        the size of the change isn't what determines the plugin's runtime.</li>
+        <li>Your team currently keeps a shared shell script with everyone's
+        <code>protoc</code> flags for four languages across ten services.
+        Name the two buf config files that would replace it, and which one
+        of the two <code>buf breaking</code> reads from.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-how-serialization-works.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-modeling-real-data.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

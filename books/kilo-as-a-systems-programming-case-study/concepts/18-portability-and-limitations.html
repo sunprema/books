@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portability and Limitations — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="pl-eyebrow">Chapter 18 &middot; Part VI — Robustness</p>
+    <h1 data-anchor="pl-h1">Portability and Limitations</h1>
+
+    <p class="lead" data-anchor="pl-lead">Chapter 17 closed on a promise: that judging whether a design
+    choice is "fine" always depends on where the program runs and what happens if it's wrong. This chapter
+    is where that judgment gets made explicit, all at once. "Portable" turns out to be two different
+    questions wearing one word &mdash; will this program even <em>compile and run</em> on a given operating
+    system, and, separately, will it <em>render correctly</em> on a given terminal once it's running &mdash;
+    and kilo.c answers those two questions very differently. Then there's the list of things it simply
+    doesn't do at all. Neither the assumptions nor the omissions are accidents. Read the source looking for
+    them, and they turn out to be about a dozen small, deliberate lines.</p>
+
+    <h2 data-anchor="pl-h2-motivation">Motivation: portable to where, exactly?</h2>
+    <p data-anchor="pl-p-motivation-1">kilo.c's own README states the tradeoff it's making in three
+    sentences, and it's worth reading literally rather than skimming past:</p>
+    <div class="callout key" data-anchor="pl-callout-readme">
+      <span class="tag">From the README, verbatim</span>
+      <p>"Kilo does not depend on any library (not even curses). It uses fairly standard VT100 (and similar
+      terminals) escape sequences. The project is in alpha stage and was written in just a few hours."</p>
+    </div>
+    <p data-anchor="pl-p-motivation-2">Every clause there is a portability claim. "Does not depend on any
+    library" means no <code class="inl">ncurses</code> to install, link, or version-match &mdash; drop
+    kilo.c on almost any Unix-like box with a C compiler and it builds. "Fairly standard VT100 escape
+    sequences" is the other half of the same coin, and it cuts the opposite way: those sequences are written
+    straight into the source, not looked up from a database of what <em>this particular</em> terminal
+    supports. And "alpha stage" is antirez naming the scope honestly &mdash; this was never meant to be a
+    program that handles every environment it might be run in.</p>
+
+    <h2 data-anchor="pl-h2-design">Design: a POSIX program, not a plain C program</h2>
+    <p data-anchor="pl-p-design-1">Everything kilo.c does to the terminal &mdash; entering raw mode
+    (Chapter 4), reading the window size, reacting to a resize &mdash; goes through POSIX, not through the C
+    standard library. The <code class="inl">#include</code> list at the top of the file is the tell:</p>
+    <pre class="tab"><span class="mac">#define</span> KILO_VERSION <span class="str">"0.0.1"</span>
+
+<span class="mac">#ifdef</span> __linux__
+<span class="mac">#define</span> _POSIX_C_SOURCE 200809L
+<span class="mac">#endif</span>
+
+<span class="mac">#include</span> <span class="lif">&lt;termios.h&gt;</span>
+<span class="cm">/* ...stdlib.h, stdio.h, string.h, ctype.h, time.h... */</span>
+<span class="mac">#include</span> <span class="lif">&lt;sys/ioctl.h&gt;</span>
+<span class="mac">#include</span> <span class="lif">&lt;sys/time.h&gt;</span>
+<span class="mac">#include</span> <span class="lif">&lt;unistd.h&gt;</span>
+<span class="mac">#include</span> <span class="lif">&lt;fcntl.h&gt;</span>
+<span class="mac">#include</span> <span class="lif">&lt;signal.h&gt;</span></pre>
+    <p data-anchor="pl-p-design-2"><code class="inl">termios.h</code> is what raw mode is built on. <code
+    class="inl">sys/ioctl.h</code> is what <code class="inl">getWindowSize</code> queries the terminal
+    with. <code class="inl">signal.h</code> is what lets Chapter 17's <code
+    class="inl">handleSigWinCh</code> hear about a resize at all. None of these three exist on Windows, and
+    there is no conditional compilation anywhere in kilo.c that reaches for a different API when they're
+    missing.</p>
+    <div class="callout warn" data-anchor="pl-callout-windows">
+      <span class="tag">Not a missing shim &mdash; a missing terminal layer</span>
+      <p>Porting kilo.c to Windows isn't a matter of adding an <code class="inl">#ifdef _WIN32</code> branch
+      next to the POSIX calls. There is no Windows equivalent of <code class="inl">termios</code> and <code
+      class="inl">tcsetattr</code> to drop in &mdash; the closest analog is the Win32 Console API (or, on
+      modern Windows, ConPTY), a different model entirely for the same underlying idea of "control this
+      terminal directly." <code class="inl">ioctl(fd, TIOCGWINSZ, ...)</code> becomes <code
+      class="inl">GetConsoleScreenBufferInfo</code>. <code class="inl">signal(SIGWINCH, ...)</code> has no
+      direct counterpart at all &mdash; console resize notifications work completely differently. A real
+      port means writing a second implementation of the whole terminal-handling layer this book has spent
+      four chapters on, not patching the existing one.</p>
+    </div>
+    <p data-anchor="pl-p-design-3">Look again at that first conditional, though, because it's not actually
+    about Windows &mdash; it's a portability wrinkle <em>within</em> the POSIX world kilo.c already targets.
+    <code class="inl">_POSIX_C_SOURCE 200809L</code> is defined only <code class="inl">#ifdef
+    __linux__</code>, never on macOS or the BSDs. The reason is <code class="inl">editorOpen</code>'s use of
+    <code class="inl">getline()</code> (Chapter 11) &mdash; a POSIX.1-2008 function that glibc, Linux's C
+    library, only declares when a program explicitly opts into that POSIX revision via a feature-test macro
+    like this one. macOS's libc doesn't gate the same function behind that macro, so the guard would be a
+    no-op there, and kilo.c simply skips it. One three-line conditional, and it exists purely because
+    "POSIX-compliant" doesn't mean two libc implementations expose identical symbols under identical
+    default settings.</p>
+
+    <h2 data-anchor="pl-h2-winsize">Implementation: two ways to ask how big the terminal is</h2>
+    <p data-anchor="pl-p-winsize-1"><code class="inl">getWindowSize</code>, first introduced in Chapter 17
+    for its exit path, is also kilo.c's clearest piece of defensive portability &mdash; it doesn't trust a
+    single API to always answer the question:</p>
+    <pre class="tab"><span class="ty">int</span> getWindowSize(<span class="ty">int</span> ifd, <span class="ty">int</span> ofd, <span class="ty">int</span> *rows, <span class="ty">int</span> *cols) {
+    <span class="kw">struct</span> winsize ws;
+
+    <span class="kw">if</span> (ioctl(1, TIOCGWINSZ, &amp;ws) == -1 || ws.ws_col == 0) {
+        <span class="cm">/* ioctl() failed. Try to query the terminal itself. */</span>
+        <span class="ty">int</span> orig_row, orig_col, retval;
+
+        retval = getCursorPosition(ifd,ofd,&amp;orig_row,&amp;orig_col);
+        <span class="kw">if</span> (retval == -1) <span class="kw">goto</span> failed;
+
+        <span class="cm">/* Go to right/bottom margin, then read the cursor position back. */</span>
+        <span class="kw">if</span> (write(ofd,<span class="str">"\x1b[999C\x1b[999B"</span>,12) != 12) <span class="kw">goto</span> failed;
+        retval = getCursorPosition(ifd,ofd,rows,cols);
+        <span class="kw">if</span> (retval == -1) <span class="kw">goto</span> failed;
+        <span class="cm">/* ...restore the cursor to orig_row/orig_col, return 0... */</span>
+    }
+    <span class="cm">/* ...set *rows/*cols from ws, return 0... */</span>
+}</pre>
+    <p data-anchor="pl-p-winsize-2">The primary path, <code class="inl">ioctl(1, TIOCGWINSZ, &amp;ws)</code>,
+    asks the kernel directly and is the fast, normal answer on a real terminal device. The fallback doesn't
+    touch the kernel at all: it writes <code class="inl">\x1b[999C\x1b[999B</code>, an escape sequence that
+    shoves the cursor to column 999 and row 999 &mdash; clamped to the actual bottom-right corner by any
+    VT100-compatible terminal &mdash; then asks <em>where the cursor ended up</em> with the <code
+    class="inl">\x1b[6n</code> device-status-report sequence from Chapter 5. Whatever position comes back
+    <em>is</em> the terminal's size. It's a clever piece of portability precisely because it doesn't depend
+    on <code class="inl">ioctl</code> or <code class="inl">TIOCGWINSZ</code> at all &mdash; only on the same
+    minimal VT100 escape vocabulary the rest of the editor already assumes.</p>
+    <div class="callout warn" data-anchor="pl-callout-fd1">
+      <span class="tag">A parameter the function doesn't actually use</span>
+      <p>Look at the signature again: <code class="inl">getWindowSize(int ifd, int ofd, ...)</code> takes an
+      output file descriptor &mdash; but the <code class="inl">ioctl</code> call hardcodes the literal
+      <code class="inl">1</code> instead of <code class="inl">ofd</code>. It works only because of a POSIX
+      convention, not because the code enforces it: file descriptor 1 is standard output for any process
+      that hasn't had it explicitly reassigned. <code class="inl">ofd</code> happens to always be
+      <code class="inl">STDOUT_FILENO</code> (which <em>is</em> 1) at kilo.c's one call site, so the bug
+      never bites &mdash; but it's a real gap between what the function signature promises and what the
+      function body actually does.</p>
+    </div>
+
+    <h2 data-anchor="pl-h2-vt100">Design: no ncurses, no terminfo, no fallback</h2>
+    <p data-anchor="pl-p-vt100-1">Chapter 5 already showed <em>how</em> kilo.c draws the screen &mdash;
+    literal escape sequences written straight to <code class="inl">STDOUT_FILENO</code>. This chapter is
+    about what that choice costs. A library like <code class="inl">ncurses</code> ships a
+    <em>terminfo</em> database describing hundreds of terminal types and negotiates, at startup, which
+    specific byte sequences <em>this</em> terminal actually understands. kilo.c has none of that. It picks
+    one dialect &mdash; the VT100-family sequences that xterm and virtually every modern terminal emulator
+    happen to support &mdash; and emits exactly those, unconditionally, to whatever's on the other end of
+    stdout.</p>
+    <p data-anchor="pl-p-vt100-2">That's a genuinely good trade for a ~1000-line teaching program run on a
+    modern development machine: it works everywhere that matters, with zero setup, in a program small
+    enough to read start to finish. But it means kilo.c has no graceful-degradation path. A terminal that
+    doesn't understand a sequence it emits &mdash; a bare serial VT52, <code class="inl">TERM=dumb</code>,
+    some minimal embedded console &mdash; doesn't get a simplified rendering. It gets garbage on screen,
+    because there's no terminfo lookup standing between "here's what I want to draw" and "here's the exact
+    byte sequence for the terminal in front of me" to catch the mismatch.</p>
+
+    <h2 data-anchor="pl-h2-bytes">Limitations: bytes, not characters</h2>
+    <p data-anchor="pl-p-bytes-1">Chapter 15 showed <code class="inl">isprint()</code> flagging
+    non-printable bytes for the <code class="inl">HL_NONPRINT</code> highlight. Zoom out from that one check
+    and a wider pattern shows up: kilo.c treats a file as a stream of bytes, full stop. There is no concept
+    of a multi-byte character anywhere in the source. <code class="inl">isprint()</code> itself is
+    C-locale-dependent and answers one byte at a time. Every place that measures how much horizontal space
+    a character takes &mdash; the tab expansion in <code class="inl">editorUpdateRow</code>, the cursor's
+    on-screen column, the length checks against <code class="inl">E.screencols</code> &mdash; assumes one
+    byte is one column.</p>
+    <p data-anchor="pl-p-bytes-2">That assumption is invisible on an ASCII source file and wrong the moment
+    it isn't one. A single accented letter or emoji encoded as UTF-8 is two to four bytes, each of which
+    kilo.c will count and render as its own column. The result isn't a crash &mdash; it's a cursor that
+    silently drifts out of sync with what's visually under it, one multi-byte character at a time, with
+    nothing in the source flagging that anything went wrong.</p>
+
+    <h2 data-anchor="pl-h2-left-out">Limitations: what Kilo leaves out on purpose</h2>
+    <p data-anchor="pl-p-left-out-1">Beyond the terminal and character-set assumptions, a short, honest list
+    of features simply isn't there. None of these are bugs &mdash; they're the visible edge of a program
+    that stayed small on purpose:</p>
+    <div class="term" data-anchor="pl-term-left-out">
+      <div class="term-bar">
+        <span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span>
+        <span class="term-title">kilo.c — features that don't exist</span>
+      </div>
+      <pre>Line wrap          none — long lines scroll via E.coloff instead (Ch. 9, 13)
+Undo / redo         none — every edit is immediate and final
+Clipboard           none — no code path touches an OS clipboard at all
+Multiple buffers    none — one file per process, set once from argv[1]
+Split windows       none — a single full-screen view, always
+Mouse                none — editorProcessKeypress is keyboard-only
+Config file          none — tab width, buffer sizes, quit-confirm count are
+                     all compile-time #define constants <span class="cur">(edit + recompile to change)</span>
+Language support     one — HLDB ships a single C/C++ entry (Ch. 16)</pre>
+    </div>
+    <p data-anchor="pl-p-left-out-2">That "compile-time constants" row is worth naming precisely, since it's
+    a limitation in its own right: the tab stop is hardcoded to 8 columns inside <code
+    class="inl">editorUpdateRow</code>, the incremental-search query buffer is <code
+    class="inl">KILO_QUERY_LEN</code> (256 bytes, Chapter 13), the status-message buffer is a fixed 80
+    bytes (Chapter 7), and the unsaved-changes quit confirmation is <code
+    class="inl">KILO_QUIT_TIMES</code> (3 presses, Chapter 17). Every one of them is a number baked into the
+    binary at compile time, not something a user or a config file can adjust at runtime.</p>
+    <div class="callout key" data-anchor="pl-callout-compiler">
+      <span class="tag">Even the compiler isn't fully portable</span>
+      <p><code class="inl">handleSigWinCh</code>'s unused signal-number parameter is marked with <code
+      class="inl">__attribute__((unused))</code> &mdash; a GCC/Clang extension, not standard C, with no
+      fallback for a compiler that doesn't recognize it. It's a small thing next to "no Windows support,"
+      but it's the same story at a different scale: kilo.c targets a specific, common toolchain rather than
+      the broadest possible one, and does it without hiding the choice behind a portability macro.</p>
+    </div>
+
+    <div class="reflect" data-anchor="pl-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A precise answer to "what does Kilo run on?" that splits cleanly into two halves. On the operating
+      system axis, it's narrow and absolute: POSIX or nothing, no Windows path, one Linux-only feature-test
+      macro papering over the one place even POSIX systems disagree with each other. On the terminal axis,
+      it's wide but brittle: any VT100-family terminal works with zero setup, because there's no library to
+      install &mdash; and any terminal that isn't VT100-family gets no fallback at all, because there's no
+      terminfo database standing between the code and the screen. Layer on top of that a file model that
+      only understands single bytes, not characters, and a feature list that stops well short of undo,
+      clipboard, multiple buffers, or a config file. None of this is Kilo failing at portability. It's Kilo
+      being honest about which portability it paid for &mdash; "compiles and runs anywhere POSIX-y with a
+      common terminal, does the twelve things it does and nothing else" &mdash; and which it simply
+      didn't, the same kind of scope discipline that kept it under 1,000 lines in the first place. The next
+      three chapters pick that discipline apart on purpose: Chapter 19 asks what changes if you refactor
+      this code for maintainability, and Chapter 20 asks what it costs to add back some of what's missing
+      here.</p>
+    </div>
+
+    <div class="challenges" data-anchor="pl-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Sketch, in plain language, what would have to change to get raw-mode terminal control working on
+        Windows. Name the specific POSIX call in kilo.c &mdash; <code class="inl">tcgetattr</code>, <code
+        class="inl">tcsetattr</code>, <code class="inl">ioctl</code> with <code class="inl">TIOCGWINSZ</code>,
+        <code class="inl">signal</code> with <code class="inl">SIGWINCH</code> &mdash; that each Windows
+        replacement would need to stand in for, and say whether you think it's a drop-in swap or a
+        genuinely different design.</li>
+        <li>Trace through what happens if a line in the open file contains a single UTF-8 character encoded
+        as three bytes (a common case for, say, a curly quote or a currency symbol). Walk through <code
+        class="inl">editorUpdateRow</code>'s size math and <code class="inl">isprint()</code> check for
+        those three bytes, and describe exactly what the user would see happen to the cursor as they move
+        past that character.</li>
+        <li>Fix <code class="inl">getWindowSize</code>'s hardcoded <code class="inl">ioctl(1, ...)</code> to
+        use its own <code class="inl">ofd</code> parameter instead. Then describe a hypothetical caller
+        (not the one in kilo.c today) for which the hardcoded version would silently query the wrong
+        descriptor.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="pl-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — getWindowSize, getCursorPosition, enableRawMode, editorOpen, handleSigWinCh, HLDB</a> &middot;
+      <a href="https://github.com/antirez/kilo" target="_blank" rel="noopener">[2] antirez/kilo — GitHub repository &amp; README</a> &middot;
+      <a href="https://antirez.com/news/108" target="_blank" rel="noopener">[3] antirez — "Writing an editor in less than 1000 lines of code, just for fun"</a> &middot;
+      <a href="https://man7.org/linux/man-pages/man3/termios.3.html" target="_blank" rel="noopener">[4] termios(3) — Linux manual page</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="17-error-handling-and-cleanup.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="19-refactoring-kilo.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

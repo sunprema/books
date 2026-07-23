@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editor State — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="est-eyebrow">Chapter 07 &middot; Part III — Data &amp; Navigation</p>
+    <h1 data-anchor="est-h1">Editor State</h1>
+
+    <p class="lead" data-anchor="est-lead">Chapter 06 named the loop &mdash; paint, then react &mdash; and promised
+    that everything else in this book is just more work slotted into one of its two calls. But a switch statement
+    and a paint routine can't do anything on their own; they need something to read and something to write. This
+    chapter is about that something: one C struct, one global instance of it, and the surprisingly small set of
+    facts an entire text editor needs to remember between keystrokes.</p>
+
+    <h2 data-anchor="est-h2-motivation">Motivation: a loop needs somewhere to keep its memory</h2>
+    <p data-anchor="est-p-motivation-1">Every iteration of <code class="inl">while(1)</code> is, from C's point of
+    view, a fresh function call. <code class="inl">editorRefreshScreen()</code> runs, returns, and every local
+    variable it declared is gone. <code class="inl">editorProcessKeypress()</code> runs next, and it has no idea
+    what the previous call to either function did &mdash; unless something outlives both calls. A text editor is
+    inherently stateful: it has to remember where the cursor was, what's actually in the file, whether you've
+    saved, and what the terminal looks like, across thousands of these short-lived function calls. That memory has
+    to live somewhere that isn't a local variable.</p>
+    <p data-anchor="est-p-motivation-2">Kilo's answer is about as direct as C allows: one struct, holding every
+    field the editor needs to remember, declared once at file scope so it outlives every function call for the
+    life of the process. No context object gets allocated and threaded through calls, no handle gets passed
+    around &mdash; there's a single answer to &ldquo;where does the cursor's row live?&rdquo; and it's the same
+    answer everywhere in the file: <code class="inl">E.cy</code>.</p>
+
+    <h2 data-anchor="est-h2-design">Design: one struct, one static instance</h2>
+    <p data-anchor="est-p-design-1">Here's the whole thing, field for field, exactly as it appears in
+    <code class="inl">kilo.c</code>:</p>
+    <pre class="tab"><span class="kw">struct</span> editorConfig {
+    <span class="ty">int</span> cx,cy;  <span class="cm">/* Cursor x and y position in characters */</span>
+    <span class="ty">int</span> rowoff;     <span class="cm">/* Offset of row displayed. */</span>
+    <span class="ty">int</span> coloff;     <span class="cm">/* Offset of column displayed. */</span>
+    <span class="ty">int</span> screenrows; <span class="cm">/* Number of rows that we can show */</span>
+    <span class="ty">int</span> screencols; <span class="cm">/* Number of cols that we can show */</span>
+    <span class="ty">int</span> numrows;    <span class="cm">/* Number of rows */</span>
+    <span class="ty">int</span> rawmode;    <span class="cm">/* Is terminal raw mode enabled? */</span>
+    erow *row;      <span class="cm">/* Rows */</span>
+    <span class="ty">int</span> dirty;      <span class="cm">/* File modified but not saved. */</span>
+    <span class="ty">char</span> *filename; <span class="cm">/* Currently open filename */</span>
+    <span class="ty">char</span> statusmsg[80];
+    time_t statusmsg_time;
+    <span class="kw">struct</span> editorSyntax *syntax;    <span class="cm">/* Current syntax highlight, or NULL. */</span>
+};
+
+<span class="kw">static</span> <span class="kw">struct</span> editorConfig E;</pre>
+    <p data-anchor="est-p-design-2">Thirteen fields. That's the entire memory of a working text editor &mdash;
+    cursor, scroll position, screen size, the document itself, a dirty flag, a filename, a status line, and a
+    pointer to whichever syntax rules are active. Everything you'll build in the rest of this book &mdash; moving
+    around the file, editing, opening and saving, searching, highlighting &mdash; is implemented as code that reads
+    and updates some subset of these thirteen fields. If you can name where a feature's data lives in
+    <code class="inl">E</code>, you already understand most of how that feature works.</p>
+    <div class="callout key" data-anchor="est-callout-static">
+      <span class="tag">Why <code class="inl">static</code>, not just global</span>
+      <p><code class="inl">static</code> on a file-scope declaration in C isn't about storage duration here &mdash;
+      <code class="inl">E</code> would live for the whole process either way. It's about <em>linkage</em>: a
+      plain global would be visible to any other <code class="inl">.c</code> file that declared
+      <code class="inl">extern struct editorConfig E;</code>, while <code class="inl">static</code> restricts it
+      to this translation unit alone. Since Kilo is one file, the practical effect is the same either way &mdash;
+      but the keyword documents the intent: <code class="inl">E</code> is this file's own business, not an
+      exported API.</p>
+    </div>
+
+    <h2 data-anchor="est-h2-fields">What each field actually tracks</h2>
+    <p data-anchor="est-p-fields-1">Grouping the thirteen fields by the question they answer makes the struct
+    easier to hold in your head than reading it top to bottom:</p>
+    <table class="grid" data-anchor="est-table-fields">
+      <tr><th>Question</th><th>Field(s)</th><th>What it holds</th></tr>
+      <tr><td>Where's the cursor?</td><td class="mono">cx, cy</td><td>Cursor column and row, in characters into the file &mdash; not screen pixels, not terminal columns after tab expansion.</td></tr>
+      <tr><td>What part of the file is visible?</td><td class="mono">rowoff, coloff</td><td>How far the viewport has scrolled down and right past row/column zero. (Chapter 09 builds the scrolling logic that keeps these in sync with the cursor.)</td></tr>
+      <tr><td>How big is the terminal?</td><td class="mono">screenrows, screencols</td><td>The usable drawing area, queried once at startup and refreshed on <code class="inl">SIGWINCH</code>.</td></tr>
+      <tr><td>What's actually in the file?</td><td class="mono">numrows, row</td><td>How many lines exist, and a pointer to the heap-allocated array of <code class="inl">erow</code> that holds them. (Chapter 08 is entirely about this pair.)</td></tr>
+      <tr><td>Is the terminal in raw mode right now?</td><td class="mono">rawmode</td><td>Not document state at all &mdash; a safety flag so cleanup code never restores terminal settings it never actually changed.</td></tr>
+      <tr><td>Have edits been saved?</td><td class="mono">dirty</td><td>A counter incremented by every mutation, zeroed only by a successful save; drives the Ctrl-Q confirmation you saw in Chapter 06.</td></tr>
+      <tr><td>Which file, and what's the user being told?</td><td class="mono">filename, statusmsg, statusmsg_time</td><td>The open path, and the one-line status message shown under the file, plus when it was set (so it can expire).</td></tr>
+      <tr><td>How should this file's syntax be colored?</td><td class="mono">syntax</td><td>A pointer into a compile-time table of highlight rules, or <code class="inl">NULL</code> for an unrecognized file type. (Chapters 14&ndash;16 build on this.)</td></tr>
+    </table>
+    <p data-anchor="est-p-fields-2">Two of those groupings are worth pulling out on their own, because it's easy to
+    mentally fold them into &ldquo;the state struct&rdquo; when they're really neighbors of it, not members.</p>
+    <p data-anchor="est-p-fields-3"><strong><code class="inl">erow</code> is declared right above
+    <code class="inl">editorConfig</code>, but it isn't part of it.</strong> <code class="inl">E.row</code> is a
+    pointer to an array of this separate struct &mdash; one <code class="inl">erow</code> per line of the file,
+    each owning its own <code class="inl">chars</code>/<code class="inl">render</code> buffers:</p>
+    <pre class="tab"><span class="kw">typedef</span> <span class="kw">struct</span> erow {
+    <span class="ty">int</span> idx;            <span class="cm">/* Row index in the file, zero-based. */</span>
+    <span class="ty">int</span> size;           <span class="cm">/* Size of the row, excluding the null term. */</span>
+    <span class="ty">int</span> rsize;          <span class="cm">/* Size of the rendered row. */</span>
+    <span class="ty">char</span> *chars;        <span class="cm">/* Row content. */</span>
+    <span class="ty">char</span> *render;       <span class="cm">/* Row content "rendered" for screen (for TABs). */</span>
+    <span class="ty">unsigned</span> <span class="ty">char</span> *hl;  <span class="cm">/* Syntax highlight type for each character in render.*/</span>
+    <span class="ty">int</span> hl_oc;          <span class="cm">/* Row had open comment at end in last syntax highlight
+                       check. */</span>
+} erow;</pre>
+    <p data-anchor="est-p-fields-4">Chapter 08 is dedicated entirely to this struct and the array it lives in;
+    for now, the point is just that <code class="inl">editorConfig</code> doesn't <em>contain</em> the document, it
+    points at it &mdash; <code class="inl">E.row</code> is a handle, not storage.</p>
+    <p data-anchor="est-p-fields-5"><strong><code class="inl">E.syntax</code> works the same way, but it never
+    needs freeing.</strong> It's a pointer into <code class="inl">HLDB</code>, a static, compile-time table of
+    <code class="inl">struct editorSyntax</code> entries (file-match patterns, keyword lists, comment delimiters)
+    that <code class="inl">editorSelectSyntaxHighlight()</code> sets by taking the address of a matching table
+    entry. <code class="inl">editorConfig</code> never owns that memory, so there's no corresponding free anywhere
+    &mdash; unlike <code class="inl">E.row</code> and <code class="inl">E.filename</code>, which the editor does
+    allocate and must eventually clean up.</p>
+
+    <h2 data-anchor="est-h2-lifecycle">Implementation: how <code class="inl">E</code> comes to life</h2>
+    <p data-anchor="est-p-lifecycle-1">Because <code class="inl">E</code> is a plain file-scope struct (not a
+    pointer), the C runtime zero-initializes it before <code class="inl">main()</code> ever runs &mdash; there is
+    no <code class="inl">malloc()</code> call for <code class="inl">E</code> itself. But Kilo doesn't rely on that
+    implicit zeroing; <code class="inl">initEditor()</code>, called first thing in <code class="inl">main()</code>,
+    sets every field explicitly:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">initEditor</span>(<span class="ty">void</span>) {
+    E.cx = 0;
+    E.cy = 0;
+    E.rowoff = 0;
+    E.coloff = 0;
+    E.numrows = 0;
+    E.row = NULL;
+    E.dirty = 0;
+    E.filename = NULL;
+    E.syntax = NULL;
+    <span class="fn">updateWindowSize</span>();
+    <span class="fn">signal</span>(SIGWINCH, handleSigWinCh);
+}</pre>
+    <p data-anchor="est-p-lifecycle-2">Notice what's <em>not</em> in that list: <code class="inl">E.rawmode</code>.
+    That's not an oversight &mdash; it's a sign that <code class="inl">rawmode</code> belongs to a different part
+    of the program than the rest of the struct, and its own two functions manage it end to end:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">disableRawMode</span>(<span class="ty">int</span> fd) {
+    <span class="cm">/* Don't even check the return value as it's too late. */</span>
+    <span class="kw">if</span> (E.rawmode) {
+        <span class="fn">tcsetattr</span>(fd,TCSAFLUSH,&amp;orig_termios);
+        E.rawmode = 0;
+    }
+}
+
+<span class="ty">int</span> <span class="fn">enableRawMode</span>(<span class="ty">int</span> fd) {
+    <span class="kw">if</span> (E.rawmode) <span class="kw">return</span> 0; <span class="cm">/* Already enabled. */</span>
+    <span class="cm">/* &hellip; open the terminal, save orig_termios, set raw flags &hellip; */</span>
+    <span class="kw">if</span> (<span class="fn">tcsetattr</span>(fd,TCSAFLUSH,&amp;raw) &lt; 0) <span class="kw">goto</span> fatal;
+    E.rawmode = 1;
+    <span class="kw">return</span> 0;
+    <span class="cm">/* &hellip; */</span>
+}</pre>
+    <p data-anchor="est-p-lifecycle-3"><code class="inl">enableRawMode()</code> only sets
+    <code class="inl">E.rawmode = 1</code> after <code class="inl">tcsetattr()</code> has actually succeeded, and
+    <code class="inl">disableRawMode()</code> checks the flag before touching the terminal at all. That check is
+    what makes cleanup safe to call unconditionally: <code class="inl">editorAtExit()</code> (registered once via
+    <code class="inl">atexit()</code>, and the subject of Chapter 17) calls
+    <code class="inl">disableRawMode()</code> on every exit path, including ones that fire before raw mode was
+    ever successfully entered. Without the flag, that call could try to restore terminal settings that were never
+    saved in the first place.</p>
+    <div class="callout warn" data-anchor="est-callout-rawmode-not-document">
+      <span class="tag">One field, a different job than its twelve neighbors</span>
+      <p><code class="inl">rawmode</code> sits in the same struct as <code class="inl">cx</code> and
+      <code class="inl">dirty</code>, and it's easy to read the struct top to bottom and assume everything in it is
+      document/UI state. It isn't. <code class="inl">rawmode</code> tracks the <em>terminal's</em> state, not the
+      file's, has exactly one writer pair (<code class="inl">enableRawMode</code> /
+      <code class="inl">disableRawMode</code>), and exists purely so exit-time cleanup can't misfire. Kilo puts it
+      in <code class="inl">E</code> anyway, for the same reason almost everything else is there too: one place to
+      look, no second global to remember.</p>
+    </div>
+    <p data-anchor="est-p-lifecycle-4"><code class="inl">updateWindowSize()</code>, called at the end of
+    <code class="inl">initEditor()</code>, fills in the screen-dimension fields and reserves room for the status
+    bar in the same breath:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">updateWindowSize</span>(<span class="ty">void</span>) {
+    <span class="kw">if</span> (<span class="fn">getWindowSize</span>(STDIN_FILENO,STDOUT_FILENO,
+                      &amp;E.screenrows,&amp;E.screencols) == -1) {
+        <span class="fn">perror</span>(<span class="str">"Unable to query the screen for size (columns / rows)"</span>);
+        <span class="fn">exit</span>(1);
+    }
+    E.screenrows -= 2; <span class="cm">/* Get room for status bar. */</span>
+}
+
+<span class="ty">void</span> <span class="fn">handleSigWinCh</span>(<span class="ty">int</span> unused __attribute__((unused))) {
+    <span class="fn">updateWindowSize</span>();
+    <span class="kw">if</span> (E.cy &gt; E.screenrows) E.cy = E.screenrows - 1;
+    <span class="kw">if</span> (E.cx &gt; E.screencols) E.cx = E.screencols - 1;
+    <span class="fn">editorRefreshScreen</span>();
+}</pre>
+    <p data-anchor="est-p-lifecycle-5">That <code class="inl">-= 2</code> is a small but important detail:
+    <code class="inl">E.screenrows</code> is deliberately not the terminal's true row count &mdash; it's the true
+    count minus two, so the rest of the editor can treat <code class="inl">screenrows</code> as &ldquo;rows
+    available for file content&rdquo; without re-subtracting the status bar's height at every call site. And
+    because <code class="inl">handleSigWinCh()</code> is a <code class="inl">SIGWINCH</code> handler (registered
+    back in <code class="inl">initEditor()</code>), it re-runs this same sizing logic &mdash; and clamps
+    <code class="inl">E.cx</code>/<code class="inl">E.cy</code> back in bounds &mdash; the moment the terminal
+    window is resized, asynchronously, outside the loop's own scheduled call. It's the one place in Kilo where
+    <code class="inl">E</code> is mutated from signal-handler context rather than from inside
+    <code class="inl">while(1)</code>.</p>
+
+    <h2 data-anchor="est-h2-usage">How the rest of the file leans on <code class="inl">E</code></h2>
+    <p data-anchor="est-p-usage-1">Two more fields are worth tracing end to end, because they show the pattern
+    every later chapter repeats: one narrow write path, read from wherever the value is needed.
+    <code class="inl">E.dirty</code> starts at zero and is incremented by every mutating call &mdash;
+    <code class="inl">editorInsertChar()</code>, <code class="inl">editorDelChar()</code>,
+    <code class="inl">editorInsertNewline()</code>, <code class="inl">editorInsertRow()</code>,
+    <code class="inl">editorDelRow()</code> each do their own <code class="inl">E.dirty++</code> &mdash; and is only
+    ever reset to zero inside <code class="inl">editorSave()</code>, after a write actually succeeds. Chapter 06
+    already showed you the read side: the Ctrl-Q handler checks <code class="inl">E.dirty</code> before deciding
+    whether to demand extra confirmation presses.</p>
+    <p data-anchor="est-p-usage-2">The status line follows the same shape, funneled through one function:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorSetStatusMessage</span>(<span class="kw">const</span> <span class="ty">char</span> *fmt, ...) {
+    va_list ap;
+    <span class="fn">va_start</span>(ap,fmt);
+    <span class="fn">vsnprintf</span>(E.statusmsg,<span class="kw">sizeof</span>(E.statusmsg),fmt,ap);
+    <span class="fn">va_end</span>(ap);
+    E.statusmsg_time = <span class="fn">time</span>(NULL);
+}</pre>
+    <p data-anchor="est-p-usage-3">Every status message in Kilo &mdash; the startup help line, the Ctrl-Q warning,
+    a save confirmation, a search prompt &mdash; goes through this one <code class="inl">printf</code>-style
+    function, which writes into a fixed 80-byte buffer and stamps the current time alongside it.
+    <code class="inl">statusmsg_time</code> is state in its own right, not an afterthought:
+    <code class="inl">editorRefreshScreen()</code> (Chapter 06) reads it to decide whether the message is still
+    recent enough to keep showing, or old enough to let the status line go quiet. Trace either
+    <code class="inl">dirty</code> or <code class="inl">statusmsg</code> through the file and you've seen the whole
+    pattern this book will keep repeating: a field in <code class="inl">E</code>, a small number of writers, and
+    readers scattered wherever the value matters.</p>
+
+    <h2 data-anchor="est-h2-edge">Edge cases: where the &ldquo;one struct&rdquo; design shows its seams</h2>
+    <ul data-anchor="est-ul-edge">
+      <li data-anchor="est-li-edge-1"><strong>Not everything stateful lives in <code class="inl">E</code>.</strong>
+      Chapter 06 already flagged <code class="inl">quit_times</code> &mdash; the Ctrl-Q countdown &mdash; as a
+      <code class="inl">static</code> local inside <code class="inl">editorProcessKeypress()</code>, not a field
+      on <code class="inl">E</code>. The same is true of <code class="inl">orig_termios</code>, the saved
+      terminal settings <code class="inl">enableRawMode()</code> needs to restore: it's its own
+      <code class="inl">static struct termios orig_termios;</code>, declared separately, because it's needed by
+      exactly the raw-mode functions and nothing else. <code class="inl">E</code> holds what's genuinely shared
+      across many parts of the program &mdash; not literally every piece of state that outlives one function
+      call.</li>
+      <li data-anchor="est-li-edge-2"><strong>One process, one document, one terminal &mdash; no exceptions.</strong>
+      Because <code class="inl">E</code> is a single instance, not something you construct per document, Kilo can
+      only ever edit one file in one terminal per running process. There's no equivalent of a multi-buffer or
+      multi-window editor's &ldquo;list of open documents&rdquo; here; opening a second file means running a
+      second <code class="inl">kilo</code> process with its own, entirely separate <code class="inl">E</code>.</li>
+      <li data-anchor="est-li-edge-3"><strong>No getters, no setters, no protection.</strong> Nothing stops any
+      function in the file from writing any field of <code class="inl">E</code> directly &mdash; there's no
+      accessor layer, no validation on assignment. That's a fair trade for a single-file, ~1000-line program
+      where every writer is a few screens away from every other, but it's exactly the kind of shortcut a larger
+      codebase can't take for long. Chapter 19 (Refactoring Kilo) comes back to this struct specifically when it
+      asks what would have to change to make Kilo safely maintainable at ten times the size.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="est-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A map. Thirteen fields, one instance, zero indirection: <code class="inl">E</code> is the complete answer
+      to &ldquo;what does this editor remember?&rdquo; From here on, every chapter is really about one or two of
+      these fields &mdash; Chapter 08 is <code class="inl">E.row</code> and <code class="inl">E.numrows</code> in
+      depth, Chapter 09 is <code class="inl">E.cx</code>/<code class="inl">E.cy</code>/<code class="inl">E.rowoff</code>/<code class="inl">E.coloff</code>
+      working together, Chapter 12 is <code class="inl">E.dirty</code> and <code class="inl">E.filename</code> at
+      save time. You don't need to hold the whole editor in your head anymore &mdash; you need to know which
+      handful of fields a given feature touches, and this struct is the index.</p>
+    </div>
+
+    <div class="challenges" data-anchor="est-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Suppose Kilo needed to support editing two files at once in the same process (a simple split view). List
+        every field of <code class="inl">editorConfig</code> that would need to become <em>per-buffer</em> rather
+        than global, and every field (like <code class="inl">rawmode</code>) that could safely stay a single
+        process-wide value. What does that split tell you about which fields represent the document versus the
+        terminal session?</li>
+        <li><code class="inl">initEditor()</code> explicitly zeroes nine of the struct's thirteen fields, even
+        though a file-scope <code class="inl">static struct editorConfig E;</code> is already zero-initialized by
+        the C runtime before <code class="inl">main()</code> runs. Is that explicit zeroing redundant, or is there
+        a reason to write it anyway? Would removing <code class="inl">initEditor()</code>'s body change the
+        program's behavior?</li>
+        <li><code class="inl">E.rawmode</code> is read and written only by <code class="inl">enableRawMode()</code>
+        and <code class="inl">disableRawMode()</code>, yet it lives in the same struct as
+        <code class="inl">cx</code>, <code class="inl">dirty</code>, and <code class="inl">filename</code>. Argue
+        both sides: what's gained by keeping it in <code class="inl">E</code> alongside document state, and what
+        would be gained by pulling it out into its own file-scope <code class="inl">static int</code> next to
+        <code class="inl">orig_termios</code> instead?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="est-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — struct editorConfig, erow, editorSyntax, initEditor, enableRawMode/disableRawMode, updateWindowSize, handleSigWinCh, editorSetStatusMessage</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-the-refresh-cycle.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-text-storage.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

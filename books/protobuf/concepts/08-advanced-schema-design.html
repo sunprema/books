@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Advanced Schema Design — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="asd-kicker">Chapter 08 &middot; Evolution &amp; Interop</span>
+    <h1 data-anchor="asd-h1">Advanced Schema Design</h1>
+
+    <p class="lede" data-anchor="asd-lede">
+      By now you can write a schema that's correct and one that survives change.
+      This chapter is about the schema that's a pleasure to <em>use</em> &mdash;
+      the one where a reader can tell &ldquo;unset&rdquo; from &ldquo;zero,&rdquo;
+      where a field means exactly one thing, where a service can grow for five
+      years without a single breaking release. None of this is exotic. It's a
+      handful of design moves &mdash; <code>oneof</code>, explicit presence, how
+      you carve messages into files and packages, how you shape an RPC's inputs
+      and outputs &mdash; each of which trades a little verbosity now for a lot of
+      room to move later. We'll take them one at a time, and every one of them
+      comes back to the same instinct you built in the last chapter: leave
+      yourself a way out.
+    </p>
+
+    <h2 data-anchor="asd-h2-oneof">Oneof: exactly one of these, and the compiler knows it</h2>
+    <p data-anchor="asd-p-oneof-1">
+      Start with the case where a value is genuinely a choice. A payment is
+      funded by a card <em>or</em> a bank transfer <em>or</em> a stored wallet
+      &mdash; never two at once, and the &ldquo;which one&rdquo; is as much a
+      part of the data as the values themselves. You <em>could</em> model that as
+      three optional fields and a comment begging everyone to only set one. Don't.
+      That's what <code>oneof</code> is for: it groups a set of fields so that at
+      most one is set at any moment, and it makes that constraint the schema's
+      job instead of a convention nobody enforces.
+    </p>
+    <pre data-anchor="asd-code-oneof"><code><span class="kw">message</span> <span class="ty">Payment</span> {
+  <span class="cm">// exactly one funding source is ever set</span>
+  <span class="kw">oneof</span> source {
+    <span class="ty">CardDetails</span>  card      = <span class="num">1</span>;
+    <span class="ty">BankTransfer</span> bank      = <span class="num">2</span>;
+    <span class="ty">string</span>       wallet_id = <span class="num">3</span>;
+  }
+  <span class="ty">int64</span> amount_cents = <span class="num">10</span>;   <span class="cm">// NOT in the oneof — always present</span>
+}</code></pre>
+    <p data-anchor="asd-p-oneof-2">
+      Two things happen once you write that. First, the members <em>share
+      memory</em>: setting <code>card</code> automatically clears whatever was
+      set before &mdash; there is no state in which both <code>card</code> and
+      <code>bank</code> hold a value. Second, the generated code carries a single
+      discriminator &mdash; a <code>case</code> enum, or a <code>WhichOneof</code>
+      call, depending on the language &mdash; that tells you which member is set,
+      or that none of them is. That discriminator is the payoff. Instead of
+      checking three fields and hoping the invariant held, you switch on one
+      value the schema guarantees is consistent.
+    </p>
+    <div class="callout warning" data-anchor="asd-callout-oneof-clear">
+      <span class="callout-label">Clear-on-set has teeth</span>
+      Because members share storage, setting one member frees the previously-set
+      one. In C++ especially, holding a pointer to the old member across a
+      <code>set_other(...)</code> call is a use-after-free &mdash; the object it
+      pointed at is already gone. And an accessor for a member that isn't the
+      current case returns that member's <em>default</em>, not some value it once
+      held. Read the discriminator first; trust a member's value only when it's
+      the set one.
+    </div>
+    <p data-anchor="asd-p-oneof-3">
+      A <code>oneof</code> also has hard structural limits, and they trip
+      everyone once. A <code>oneof</code> field <strong>cannot be
+      repeated</strong>; its members <strong>cannot be maps</strong>; and no
+      member may carry the <code>optional</code>, <code>required</code>, or
+      <code>repeated</code> label. The workaround is always the same and always
+      clean: if you need a repeated or map value as one of the choices, wrap it
+      in a little message and make <em>that</em> a member.
+    </p>
+    <pre data-anchor="asd-code-oneof-wrap"><code><span class="kw">message</span> <span class="ty">Filter</span> {
+  <span class="kw">oneof</span> match {
+    <span class="ty">string</span> exact = <span class="num">1</span>;
+    <span class="ty">TagList</span> any_of = <span class="num">2</span>;   <span class="cm">// repeated lives INSIDE a wrapper message</span>
+  }
+}
+<span class="kw">message</span> <span class="ty">TagList</span> { <span class="kw">repeated</span> <span class="ty">string</span> tags = <span class="num">1</span>; }</code></pre>
+    <p data-anchor="asd-p-oneof-4">
+      One evolution note before we move on, because it connects straight to the
+      last chapter. Adding a brand-new field &mdash; fresh, never-used number
+      &mdash; <em>into</em> an existing <code>oneof</code> is wire-safe. But
+      moving a field that already shipped as a standalone field <em>into</em> a
+      <code>oneof</code>, or pulling one <em>out</em>, or shuffling it between two
+      <code>oneof</code>s, is a breaking change, even though the field's number,
+      name, and type never move. Old and new readers disagree about whether
+      setting it should clear its neighbors, and that disagreement is exactly the
+      kind of silent divergence <code>buf breaking</code> is built to catch. Decide
+      whether a field belongs in a <code>oneof</code> when you first add it.
+    </p>
+
+    <h2 data-anchor="asd-h2-presence">Presence: telling &ldquo;unset&rdquo; apart from &ldquo;zero&rdquo;</h2>
+    <p data-anchor="asd-p-presence-1">
+      Here's a bug that has cost more engineer-hours than it has any right to.
+      You have a proto3 field <code>int32 retry_limit = 4;</code>. A client sends
+      a message where <code>retry_limit</code> is <code>0</code>. Did they ask
+      for zero retries, or did they just not set the field and you're seeing the
+      default? In plain proto3, <em>you cannot tell.</em> A singular scalar with
+      no <code>optional</code> keyword has no presence: a value equal to the
+      default &mdash; <code>0</code>, <code>""</code>, <code>false</code> &mdash;
+      is indistinguishable from unset, gets no <code>has_</code> accessor, and
+      isn't even written to the wire. The two states are the same state.
+    </p>
+    <p data-anchor="asd-p-presence-2">
+      <strong>Field presence</strong> is precisely the ability to distinguish
+      &ldquo;this was explicitly set&rdquo; from &ldquo;this holds its default.&rdquo;
+      You opt into it, per field, with the <code>optional</code> keyword. That one
+      word buys you a <code>has_retry_limit()</code> accessor, and it changes the
+      wire behavior too: an <code>optional</code> field that's explicitly set
+      &mdash; <em>even to the default value</em> &mdash; is serialized, so the
+      other side can see you meant it.
+    </p>
+    <pre data-anchor="asd-code-presence"><code><span class="kw">message</span> <span class="ty">FeatureFlag</span> {
+  <span class="ty">int32</span>    count   = <span class="num">1</span>;  <span class="cm">// no presence: 0 == unset, indistinguishable</span>
+  <span class="kw">optional</span> <span class="ty">bool</span> enabled = <span class="num">2</span>;  <span class="cm">// presence: has_enabled() separates unset from false</span>
+}</code></pre>
+    <div class="callout key-idea" data-anchor="asd-callout-threestate">
+      <span class="callout-label">The three-state test</span>
+      A plain proto3 <code>bool</code> can only ever say <em>true</em> or
+      <em>false</em> &mdash; <code>false</code> is the default, so it's invisible.
+      The moment &ldquo;unset&rdquo; is a meaningful third answer (&ldquo;user
+      hasn't chosen yet&rdquo; vs. &ldquo;user chose off&rdquo;), you need
+      presence: reach for <code>optional bool</code>, or the boxed
+      <code>google.protobuf.BoolValue</code> wrapper, whose message-ness gives it
+      presence for free.
+    </div>
+    <p data-anchor="asd-p-presence-3">
+      Two field kinds already have presence in proto3 without you asking, and
+      it's worth knowing why. A singular <em>message</em> field distinguishes
+      &ldquo;unset&rdquo; from &ldquo;set to an empty message&rdquo; inherently
+      &mdash; a null sub-message is a different thing from a present-but-empty one
+      &mdash; so it never needs <code>optional</code>. <em>Repeated</em> fields go
+      the other way: they have <strong>no</strong> per-element presence at all. An
+      absent list and an explicitly-empty list are the same bytes on the wire.
+      If &ldquo;the client sent an empty list on purpose&rdquo; has to be
+      distinguishable from &ldquo;the client said nothing,&rdquo; a bare
+      <code>repeated</code> field can't carry that &mdash; you'll need a wrapper
+      message around it.
+    </p>
+
+    <h2 data-anchor="asd-h2-synthetic">The trick behind <code>optional</code>: synthetic oneofs</h2>
+    <p data-anchor="asd-p-synthetic-1">
+      This is a lovely little piece of compiler engineering, and knowing it
+      demystifies a name you'll eventually see in generated code or a descriptor
+      dump. proto3 didn't grow a whole new presence-tracking machine for
+      <code>optional</code>. It already <em>had</em> one &mdash; the machinery
+      behind <code>oneof</code>, which by definition tracks &ldquo;is a member
+      set, and which.&rdquo; So the compiler reuses it. When you write an
+      <code>optional</code> scalar, <code>protoc</code> quietly rewrites it into a
+      <strong>one-field oneof</strong> whose name is an underscore followed by the
+      field's name:
+    </p>
+    <pre data-anchor="asd-code-synthetic"><code><span class="cm">// You wrote:</span>
+<span class="kw">optional</span> <span class="ty">int32</span> retry_limit = <span class="num">4</span>;
+
+<span class="cm">// protoc rewrites it internally as a one-field synthetic oneof:</span>
+<span class="kw">oneof</span> _retry_limit {
+  <span class="ty">int32</span> retry_limit = <span class="num">4</span> [<span class="mac">proto3_optional</span> = <span class="kw">true</span>];
+}</code></pre>
+    <p data-anchor="asd-p-synthetic-2">
+      That's the whole trick: <em>every</em> proto3 optional field becomes its own
+      one-member oneof, and the oneof's &ldquo;is a member set&rdquo; bit becomes
+      the field's presence bit. But you never want that plumbing leaking into the
+      public API &mdash; nobody should call <code>WhichOneof("_retry_limit")</code>
+      to ask whether one field is set. So these are marked as <strong>synthetic</strong>
+      oneofs. Presence is tracked with an ordinary hasbit and surfaced as the
+      plain <code>has_retry_limit()</code> you expected. Reflection exposes
+      <code>OneofDescriptor::is_synthetic()</code>, and code generators call
+      <code>real_containing_oneof()</code> (null for synthetic ones) and
+      <code>real_oneof_decl_count()</code> to filter the synthetic oneofs out of
+      any user-facing case/WhichOneof API. To you, it's just <code>optional</code>.
+      Under the hood, it's a oneof of one.
+    </p>
+    <div class="callout note" data-anchor="asd-callout-editions">
+      <span class="callout-label">Editions says the same thing, differently</span>
+      In Protobuf Editions &mdash; the successor to the proto2/proto3 split
+      we'll meet later &mdash; you don't write <code>optional</code>; you request
+      the same behavior with the feature
+      <code>features.field_presence = EXPLICIT</code>. Different spelling, same
+      hasbit underneath.
+    </div>
+
+    <h2 data-anchor="asd-h2-nesting">Nested or top-level? A namespacing choice, not a wire choice</h2>
+    <p data-anchor="asd-p-nesting-1">
+      You can declare a message or an enum <em>inside</em> another message, and
+      it reads like ownership: <code>Order.LineItem</code> looks like a line item
+      that belongs to an order. Here's the fact that keeps this decision from
+      mattering more than it should: <strong>nesting has zero effect on the wire
+      format.</strong> A field's number and encoding are identical whether its
+      type is nested or top-level. Nesting only scopes the <em>name</em> &mdash;
+      it's an organizational choice, pure and simple, so make it on
+      organizational grounds.
+    </p>
+    <p data-anchor="asd-p-nesting-2">
+      And the organizational advice leans toward <em>not</em> nesting. The moment
+      you nest <code>LineItem</code> inside <code>Order</code>, referencing it
+      from anywhere else means dragging <code>Order.LineItem</code> around, and if
+      a second message ever needs line items you're stuck between an awkward name
+      and a painful move. The guidance: don't nest a type you might later want to
+      reference elsewhere &mdash; and <em>strongly</em> avoid nested
+      <strong>enums</strong>. Some target languages can't declare an enum inside a
+      struct-like type at all, and enum value names leak into the enclosing scope,
+      so a nested enum is both a portability risk and a naming hazard. Prefer a
+      top-level enum with prefixed values (<code>ORDER_STATUS_PENDING</code>)
+      &mdash; it's the option that comes out consistent across every language you
+      generate.
+    </p>
+
+    <h2 data-anchor="asd-h2-organize">Organizing a schema that outgrew one file</h2>
+    <p data-anchor="asd-p-organize-1">
+      A three-message <code>.proto</code> is fine as one file. A schema with two
+      hundred messages across a dozen teams is a different animal, and the way
+      you carve it up is itself a design decision. The protobuf project's rule of
+      thumb is called <strong>1-1-1</strong>: one top-level entity &mdash; one
+      message, one enum, or one service &mdash; per file, named after that entity.
+      It feels almost too granular at first. The payoff shows up later: a file
+      that holds exactly one thing can be moved, split off, or depended upon on
+      its own, and a change to one message touches the smallest possible surface,
+      which is exactly what you want when a breaking-change tool is diffing your
+      pull request.
+    </p>
+    <p data-anchor="asd-p-organize-2">
+      That's the file axis. The other axis is the <strong>package</strong>, and
+      it's the one people skip and regret. Every <code>.proto</code> should
+      declare a package: a dot-delimited, <code>lower_snake_case</code> namespace
+      that keeps type names from colliding when files from unrelated projects get
+      compiled into the same binary &mdash; and they will. That package maps
+      straight onto each language's namespace: a C++ <code>namespace</code>, a
+      Java package (unless <code>java_package</code> overrides it), a Go import
+      path via <code>go_package</code>.
+    </p>
+    <pre data-anchor="asd-code-package"><code><span class="kw">syntax</span> = <span class="str">"proto3"</span>;
+<span class="kw">package</span> mycorp.billing.v1;   <span class="cm">// versioned namespace so v2 can live beside it</span>
+
+<span class="kw">option</span> go_package   = <span class="str">"mycorp/billing/v1;billingv1"</span>;
+<span class="kw">option</span> java_package = <span class="str">"com.mycorp.billing.v1"</span>;</code></pre>
+    <div class="callout key-idea" data-anchor="asd-callout-version">
+      <span class="callout-label">Put the version in the package</span>
+      Name packages short and project-based, and end them with a version
+      component &mdash; <code>mycorp.billing.<strong>v1</strong></code>. When the
+      day comes that you need an incompatible redesign, <code>...v2</code> is a
+      brand-new namespace that coexists peacefully with <code>...v1</code> while
+      callers migrate. The alternative &mdash; mutating <code>v1</code> in place
+      &mdash; is the breaking-change trap the whole last chapter warned you off.
+    </div>
+
+    <h2 data-anchor="asd-h2-api">Designing the API surface: wrap everything</h2>
+    <p data-anchor="asd-p-api-1">
+      When your schema starts describing <em>RPCs</em> &mdash; requests and
+      responses for a service &mdash; a few patterns separate an API that ages
+      gracefully from one that calcifies. We'll do gRPC properly in the next
+      chapter; this is the schema-shaped half of it, and it's worth internalizing
+      before you write a single <code>rpc</code> line.
+    </p>
+    <p data-anchor="asd-p-api-2">
+      The first rule is almost mechanical: <strong>give every RPC its own
+      dedicated request and response message</strong>, even when the request is
+      empty or the response wraps a single value, and <em>never</em> use a bare
+      scalar (or a raw well-known type) as an RPC's parameter or return. It feels
+      like pointless ceremony to wrap one string in a whole message. It isn't. The
+      wrapper is the <em>only</em> place you can add a field later without changing
+      the method's signature &mdash; and changing a method signature breaks every
+      client. A <code>GetUser</code> that returns <code>User</code> can never
+      also return, say, a cache-freshness timestamp; a <code>GetUser</code> that
+      returns <code>GetUserResponse</code> can grow forever.
+    </p>
+    <p data-anchor="asd-p-api-3">
+      The second rule catches almost everyone eventually: <strong>build
+      pagination in from the very first version</strong> of any RPC that returns
+      a collection. Not when the list gets long &mdash; on day one. Adding
+      pagination later silently changes the method's behavior for every existing
+      caller (they used to get everything; now they get a page), which is a
+      breaking change dressed up as a feature. The shape is a small, standard
+      one, codified in Google's AIP-158: the request carries a
+      <code>page_size</code> and an opaque <code>page_token</code>; the response
+      returns the page plus a <code>next_page_token</code> that's empty when
+      there's nothing left.
+    </p>
+    <pre data-anchor="asd-code-api"><code><span class="cm">// Every RPC gets its own wrapper — even the "simple" ones.</span>
+<span class="kw">rpc</span> <span class="fn">ListInvoices</span>(<span class="ty">ListInvoicesRequest</span>) <span class="kw">returns</span> (<span class="ty">ListInvoicesResponse</span>);
+
+<span class="kw">message</span> <span class="ty">ListInvoicesRequest</span> {
+  <span class="ty">string</span> customer_id = <span class="num">1</span>;
+  <span class="ty">int32</span>  page_size   = <span class="num">2</span>;   <span class="cm">// designed in up front</span>
+  <span class="ty">string</span> page_token  = <span class="num">3</span>;   <span class="cm">// opaque cursor from a previous response</span>
+}
+<span class="kw">message</span> <span class="ty">ListInvoicesResponse</span> {
+  <span class="kw">repeated</span> <span class="ty">Invoice</span> invoices = <span class="num">1</span>;
+  <span class="ty">string</span> next_page_token = <span class="num">2</span>;   <span class="cm">// empty when iteration is done</span>
+}</code></pre>
+    <table class="cmp" data-anchor="asd-table-api">
+      <thead><tr><th>Temptation</th><th>Why it bites</th><th>Do this instead</th></tr></thead>
+      <tbody>
+        <tr><td><code>rpc Ping() returns (bool)</code></td><td>Can't add a field to a scalar; signature is frozen.</td><td>Wrap: <code>PingResponse { ... }</code>, empty today.</td></tr>
+        <tr><td>Return <code>repeated Item</code> directly</td><td>No room for a token, totals, or paging later.</td><td>Return a response message with the list inside.</td></tr>
+        <tr><td>Ship a list RPC with no token</td><td>Adding paging later changes behavior for everyone.</td><td><code>page_size</code> + <code>page_token</code> from v1.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="asd-h2-any">Escape hatches: <code>Any</code> and extensions, and their price</h2>
+    <p data-anchor="asd-p-any-1">
+      Sometimes a field genuinely has to hold &ldquo;a message, but we don't know
+      which type yet&rdquo; &mdash; an audit log that records events of every
+      kind, a plugin payload defined by code you've never seen.
+      <code>google.protobuf.Any</code> is the tool for that. It embeds an
+      arbitrary serialized message alongside a <code>type_url</code> string
+      (by default <code>type.googleapis.com/&lt;fully.qualified.Name&gt;</code>);
+      pack/unpack helpers write and read it, unpacking by matching on the type
+      name after the last <code>/</code>. In JSON it renders as the embedded
+      message's normal JSON with an extra <code>@type</code> member.
+    </p>
+    <p data-anchor="asd-p-any-2">
+      But be clear-eyed about what <code>Any</code> costs, because it's easy to
+      reach for and hard to walk back. It trades <em>static typing for dynamic
+      dispatch.</em> The compiler can't check that the embedded message is one the
+      reader expects; both peers must already share the concrete <code>.proto</code>
+      to unpack it; and every schema tool &mdash; including the breaking-change
+      checker you now rely on &mdash; is blind to what's inside. So the rule is
+      simple: when the set of variants is <em>known and bounded</em>, use a closed
+      <code>oneof</code> and keep your static typing. Reach for <code>Any</code>
+      only when the set is genuinely open, unbounded, or plugin-defined.
+    </p>
+    <pre data-anchor="asd-code-any"><code><span class="kw">import</span> <span class="str">"google/protobuf/any.proto"</span>;
+
+<span class="cm">// Open-ended — the variant set is unknown, so Any earns its keep:</span>
+<span class="kw">message</span> <span class="ty">AuditEvent</span> {
+  <span class="ty">string</span> actor = <span class="num">1</span>;
+  <span class="ty">google.protobuf.Any</span> payload = <span class="num">2</span>;   <span class="cm">// type_url + serialized bytes</span>
+}
+
+<span class="cm">// Bounded — the variants are KNOWN, so a oneof keeps static typing:</span>
+<span class="kw">message</span> <span class="ty">AuditEventClosed</span> {
+  <span class="ty">string</span> actor = <span class="num">1</span>;
+  <span class="kw">oneof</span> payload {
+    <span class="ty">LoginEvent</span>    login    = <span class="num">2</span>;
+    <span class="ty">LogoutEvent</span>   logout   = <span class="num">3</span>;
+    <span class="ty">PurchaseEvent</span> purchase = <span class="num">4</span>;
+  }
+}</code></pre>
+    <p data-anchor="asd-p-any-3">
+      The older cousin of <code>Any</code> is the proto2 <strong>extension</strong>.
+      A message reserves a range of field numbers &mdash;
+      <code>extensions 100 to 199;</code> &mdash; and other files fill that range
+      with typed fields <em>later</em>, attaching data to a shared type from the
+      outside without editing it. Extensions keep static typing (each extension is
+      a real, typed field), which is a genuine advantage over <code>Any</code>,
+      but they add real complexity, and proto3 dropped them for everything except
+      declaring custom options. Protobuf Editions brings back extension
+      <em>declarations</em>, mostly as a way to reserve and announce extension
+      numbers. For the vast majority of schemas the honest advice is: prefer a
+      plain field or a bounded <code>oneof</code>. <code>Any</code>, extensions,
+      and the free-form <code>google.protobuf.Struct</code> are all escape hatches
+      &mdash; useful, occasionally necessary, and each one a small surrender of
+      the static guarantees that made you choose protobuf in the first place.
+    </p>
+    <div class="callout warning" data-anchor="asd-callout-struct">
+      <span class="callout-label">Don't use an escape hatch to dodge schema work</span>
+      <code>google.protobuf.Struct</code> / <code>Value</code> &mdash; a
+      JSON-shaped tree &mdash; is the documented home for genuinely arbitrary,
+      schema-less data. It's also the fastest way to throw away every reason you
+      adopted protobuf: no static types, nothing for tooling to check, no
+      compatibility guarantees. Fine as a deliberate last resort. Never as a
+      shortcut around modeling the data you actually have.
+    </div>
+
+    <div class="callout key-idea" data-anchor="asd-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      Every move in this chapter buys the same currency: <em>room to change your
+      mind later.</em> A <code>oneof</code> makes an invariant the compiler's job.
+      <code>optional</code> lets a reader tell zero from unset. A wrapper message
+      lets an RPC grow a field without a breaking release. A versioned package
+      lets a redesign coexist with the thing it replaces. You're not decorating
+      the schema &mdash; you're paying a little now so that Future You, six months
+      and three teams from here, has somewhere to stand.
+    </div>
+
+    <div class="callout note" data-anchor="asd-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>A field is <code>int32 timeout_ms = 3;</code> and a client sends
+        <code>0</code>. Your service needs to distinguish &ldquo;use zero
+        timeout&rdquo; from &ldquo;client didn't specify.&rdquo; What one change
+        makes that possible, and what does it do to the wire bytes when the value
+        <em>is</em> zero?</li>
+        <li>You wrote <code>optional string nickname = 5;</code>. Describe, in the
+        compiler's terms, what <code>protoc</code> actually generates &mdash; and
+        why <code>WhichOneof</code> never shows <code>_nickname</code> as a
+        choice.</li>
+        <li>You need a <code>oneof</code> where one of the choices is a list of
+        tags. Why won't <code>repeated string tags</code> work as a direct member,
+        and what's the fix?</li>
+        <li>A teammate proposes <code>rpc GetBalance() returns
+        (google.protobuf.Int64Value)</code> because &ldquo;it's just a number.&rdquo;
+        Give the one-sentence reason this will hurt in a year, and the one-line
+        change that fixes it.</li>
+        <li>When is <code>google.protobuf.Any</code> the right call over a
+        <code>oneof</code>, and what exactly does your breaking-change tool lose
+        the ability to check the moment you use it?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-schema-evolution.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-grpc-and-service-definitions.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

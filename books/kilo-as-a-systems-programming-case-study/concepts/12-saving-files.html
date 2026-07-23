@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Saving Files — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="save-eyebrow">Chapter 12 &middot; Part IV — Files</p>
+    <h1 data-anchor="save-h1">Saving Files</h1>
+
+    <p class="lead" data-anchor="save-lead">Chapter 11 ended with a promise: this chapter is the mirror image
+    of that one. Opening turns disk bytes into an array of <code class="inl">erow</code> structs, one
+    <code class="inl">editorInsertRow()</code> call per line. Saving turns that array back into disk bytes,
+    one flatten-and-write. Same data, opposite direction &mdash; and, true to Kilo's style so far, almost no new
+    machinery. The interesting part isn't how the bytes get written. It's the handful of small, deliberate
+    decisions around <em>when</em> they get written, and what the editor remembers about whether they need to
+    be.</p>
+
+    <h2 data-anchor="save-h2-motivation">Motivation: a save is a flatten, then a write</h2>
+    <p data-anchor="save-p-motivation-1">Everything Kilo knows about your file lives as an array of rows, each
+    one holding its own raw bytes in <code class="inl">erow.chars</code>. A file on disk, though, is just one
+    contiguous stream of bytes with newlines in it. Saving has to bridge that gap before a single byte reaches
+    the filesystem, and Kilo does it as two separate, small functions: one that flattens the rows into a single
+    heap buffer, and one that writes that buffer to disk. Keeping them separate is itself a small design choice
+    worth noticing &mdash; the flattening logic doesn't know or care about file descriptors, and the writing
+    logic doesn't know or care about rows.</p>
+
+    <h2 data-anchor="save-h2-design">Design: flatten first, ask questions never</h2>
+    <p data-anchor="save-p-design-1"><code class="inl">editorRowsToString()</code> does the flattening. It
+    walks <code class="inl">E.row[]</code> twice: once to add up every row's <code class="inl">size</code>
+    (plus one byte per row, for a newline) into a total length, and once to actually copy each row's raw bytes
+    into a freshly <code class="inl">malloc</code>'d buffer, writing a literal <code class="inl">'\n'</code>
+    after every row as it goes &mdash; including the last one.</p>
+    <pre class="tab"><span class="cm">/* Turn the editor rows into a single heap-allocated string.
+ * Returns the pointer to the heap-allocated string and populate the
+ * integer pointed by 'buflen' with the size of the string, escluding
+ * the final nulterm. */</span>
+<span class="ty">char</span> *<span class="fn">editorRowsToString</span>(<span class="ty">int</span> *buflen) {
+    <span class="ty">char</span> *buf = NULL, *p;
+    <span class="ty">int</span> totlen = 0;
+    <span class="ty">int</span> j;
+
+    <span class="cm">/* Compute count of bytes */</span>
+    <span class="kw">for</span> (j = 0; j &lt; E.numrows; j++)
+        totlen += E.row[j].size+1; <span class="cm">/* +1 is for "\n" at end of every row */</span>
+    *buflen = totlen;
+    totlen++; <span class="cm">/* Also make space for nulterm */</span>
+
+    p = buf = malloc(totlen);
+    <span class="kw">for</span> (j = 0; j &lt; E.numrows; j++) {
+        memcpy(p,E.row[j].chars,E.row[j].size);
+        p += E.row[j].size;
+        *p = <span class="str">'\n'</span>;
+        p++;
+    }
+    *p = <span class="str">'\0'</span>;
+    <span class="kw">return</span> buf;
+}</pre>
+    <p data-anchor="save-p-design-2">Two things worth locking in before moving on to the write itself. First,
+    it copies <code class="inl">row.chars</code> &mdash; the raw bytes, exactly as typed or loaded &mdash;
+    never <code class="inl">row.render</code>, the tab-expanded copy Chapter 08 built purely so tabs line up on
+    screen. A tab character you typed is a tab character on disk; the expansion to spaces you see in the
+    terminal never touches what gets saved. Second, that <code class="inl">'\n'</code> goes after
+    <em>every</em> row, unconditionally, including the last one in the file. A file that had no trailing
+    newline when you opened it will have one the moment you save it. Kilo's save is faithful to your edits, not
+    to the exact original bytes on disk.</p>
+    <div class="callout key" data-anchor="save-callout-crlf">
+      <span class="tag">Callback to Chapter 11: the stray \r round-trips by accident</span>
+      <p>Opening a CRLF file leaves a stray <code class="inl">'\r'</code> baked onto the end of
+      <code class="inl">row.chars</code>, because the load-time strip only ever removes the final
+      <code class="inl">'\n'</code>. Now look at what happens on save:
+      <code class="inl">editorRowsToString</code> copies that <code class="inl">'\r'</code>-terminated
+      <code class="inl">chars</code> buffer verbatim, then appends its own <code class="inl">'\n'</code> right
+      after it &mdash; reconstructing <code class="inl">"...\r\n"</code>. The CRLF line ending survives the
+      round trip. But don't credit either function with CRLF support: neither one was written with CRLF in mind,
+      and nothing else in the program &mdash; cursor movement, column math, syntax highlighting &mdash; treats
+      that trailing <code class="inl">'\r'</code> as anything but an ordinary character. It's two narrow,
+      unrelated pieces of code happening to compose correctly, not a feature.</p>
+    </div>
+
+    <h2 data-anchor="save-h2-implementation">Implementation: editorSave, in full</h2>
+    <p data-anchor="save-p-impl-1">With a flat buffer in hand, <code class="inl">editorSave()</code> does the
+    actual disk write &mdash; nineteen lines, one <code class="inl">goto</code>, and a comment that tells you
+    exactly what trade-off it's making:</p>
+    <pre class="tab"><span class="cm">/* Save the current file on disk. Return 0 on success, 1 on error. */</span>
+<span class="ty">int</span> <span class="fn">editorSave</span>(<span class="ty">void</span>) {
+    <span class="ty">int</span> len;
+    <span class="ty">char</span> *buf = <span class="fn">editorRowsToString</span>(&amp;len);
+    <span class="ty">int</span> fd = open(E.filename,O_RDWR|O_CREAT,0644);
+    <span class="kw">if</span> (fd == -1) <span class="kw">goto</span> writeerr;
+
+    <span class="cm">/* Use truncate + a single write(2) call in order to make saving
+     * a bit safer, under the limits of what we can do in a small editor. */</span>
+    <span class="kw">if</span> (ftruncate(fd,len) == -1) <span class="kw">goto</span> writeerr;
+    <span class="kw">if</span> (write(fd,buf,len) != len) <span class="kw">goto</span> writeerr;
+
+    close(fd);
+    free(buf);
+    E.dirty = 0;
+    <span class="fn">editorSetStatusMessage</span>(<span class="str">"%d bytes written on disk"</span>, len);
+    <span class="kw">return</span> 0;
+
+writeerr:
+    free(buf);
+    <span class="kw">if</span> (fd != -1) close(fd);
+    <span class="fn">editorSetStatusMessage</span>(<span class="str">"Can't save! I/O error: %s"</span>,strerror(errno));
+    <span class="kw">return</span> 1;
+}</pre>
+    <p data-anchor="save-p-impl-2">Walk it in the order it actually runs.</p>
+
+    <h3 data-anchor="save-h3-open">1. Open for read-write, create if missing &mdash; but don't truncate yet</h3>
+    <p data-anchor="save-p-open-1"><code class="inl">open(E.filename, O_RDWR|O_CREAT, 0644)</code> either finds
+    the existing file or creates a new one at that path with permissions <code class="inl">0644</code>
+    (<code class="inl">rw-r--r--</code>, filtered through the process's umask like any newly created file
+    &mdash; a requested ceiling, not a guarantee). Look closely at the flags: there is no
+    <code class="inl">O_TRUNC</code>. That's not an omission; it sets up the next line to matter.</p>
+
+    <h3 data-anchor="save-h3-truncate">2. ftruncate does the job O_TRUNC would have done &mdash; explicitly</h3>
+    <p data-anchor="save-p-truncate-1">Because the file wasn't opened with <code class="inl">O_TRUNC</code>,
+    it still has whatever length it had before &mdash; possibly longer than the new content, if you deleted
+    text since you last saved. <code class="inl">ftruncate(fd, len)</code> resizes it to <em>exactly</em>
+    <code class="inl">len</code> bytes, the length <code class="inl">editorRowsToString</code> just computed.
+    Skip this call and a shorter save over a longer old file would leave stale bytes from the previous version
+    sitting past the end of your new content &mdash; <code class="inl">ftruncate</code> here isn't a safety
+    margin, it's load-bearing.</p>
+
+    <h3 data-anchor="save-h3-write">3. One write() call, and the comment that explains why</h3>
+    <p data-anchor="save-p-write-1">The whole buffer goes out in a single <code class="inl">write(fd, buf,
+    len)</code>, checked against <code class="inl">len</code> to catch a short write. Kilo's own comment,
+    sitting right above these two calls, says exactly what this buys you: <em>&ldquo;Use truncate + a single
+    write(2) call in order to make saving a bit safer, under the limits of what we can do in a small
+    editor.&rdquo;</em> Read that carefully &mdash; it says <em>a bit safer</em>, not <em>safe</em>.</p>
+    <div class="callout warn" data-anchor="save-callout-atomicity">
+      <span class="tag">Not crash-atomic &mdash; a named, deliberate limit</span>
+      <p>One <code class="inl">write()</code> call narrows the window in which a crash, power loss, or killed
+      process mid-save can corrupt your file, compared to writing lots of small chunks. It does not close that
+      window. If the process dies between <code class="inl">ftruncate</code> and the completion of
+      <code class="inl">write</code>, the file on disk can be left truncated or half-written &mdash; worse off
+      than before you saved. The genuinely crash-safe pattern is different: write the new content to a
+      <em>temporary</em> file, then <code class="inl">rename()</code> it over the original. A rename that
+      replaces an existing file is atomic at the filesystem level on POSIX &mdash; the old file is either fully
+      there or fully replaced, never half of either. Kilo doesn't do that. It's a real limitation, named in the
+      source itself, in keeping with the size budget this whole book keeps coming back to &mdash; and it's
+      exactly the kind of trade-off Chapter 18 (Portability and Limitations) will revisit.</p>
+    </div>
+
+    <h3 data-anchor="save-h3-errpath">4. One failure path, reached three different ways</h3>
+    <p data-anchor="save-p-errpath-1">Three separate checks &mdash; <code class="inl">fd == -1</code> (open
+    failed), <code class="inl">ftruncate(...) == -1</code>, and <code class="inl">write(...) != len</code>
+    &mdash; all <code class="inl">goto</code> the same <code class="inl">writeerr</code> label. That's one
+    cleanup path instead of three copies of it: free the buffer, close the fd <em>if it's actually open</em>
+    (<code class="inl">if (fd != -1)</code> &mdash; needed precisely because the open-failed branch lands here
+    too, and closing <code class="inl">-1</code> would itself be an error), report
+    <code class="inl">strerror(errno)</code> in the status bar, and return <code class="inl">1</code>. Notice
+    what <em>doesn't</em> happen on this path: <code class="inl">E.dirty</code> is untouched. A failed save
+    correctly leaves the buffer marked modified, because it still is.</p>
+
+    <h2 data-anchor="save-h2-wiring">How a keystroke becomes a save</h2>
+    <p data-anchor="save-p-wiring-1">All of the above is reached through exactly one line in
+    <code class="inl">editorProcessKeypress()</code>:</p>
+    <pre class="tab">    <span class="kw">case</span> CTRL_S:        <span class="cm">/* Ctrl-s */</span>
+        <span class="fn">editorSave</span>();
+        <span class="kw">break</span>;</pre>
+    <p data-anchor="save-p-wiring-2">No confirmation dialog, no filename prompt, no branch for saving under a
+    different name. Kilo has no &ldquo;Save As&rdquo; &mdash; <code class="inl">editorSave()</code> always
+    writes to <code class="inl">E.filename</code>, the exact path <code class="inl">editorOpen()</code>
+    recorded back in Chapter 11. And just like <code class="inl">editorOpen</code>'s own return value in that
+    chapter, <code class="inl">editorSave()</code>'s <code class="inl">int</code> result is computed carefully
+    (0 success, 1 error) and then thrown away here, its only caller. Every bit of feedback you actually get
+    about whether a save worked &mdash; <code class="inl">"%d bytes written on disk"</code> or
+    <code class="inl">"Can't save! I/O error: %s"</code> &mdash; comes from the status message
+    <code class="inl">editorSave</code> sets on its own way out, not from anything
+    <code class="inl">editorProcessKeypress</code> does with the number it gets back.</p>
+
+    <h2 data-anchor="save-h2-dirty">Dirty-state tracking: one flag, read in three places</h2>
+    <p data-anchor="save-p-dirty-1"><code class="inl">E.dirty</code> is the whole mechanism. It starts at
+    0, climbs by one on every mutating row operation (typing, deleting, splitting a line &mdash; the editing
+    chapter's territory), and this chapter adds its one and only reset: <code class="inl">E.dirty = 0</code>,
+    reached exactly once, on <code class="inl">editorSave()</code>'s success path. Three places downstream
+    read that single flag, and each does something different with it:</p>
+    <table class="grid" data-anchor="save-table-dirty">
+      <tr><th>Reader</th><th>What it does with E.dirty</th></tr>
+      <tr><td class="mono">editorRefreshScreen()</td><td>Status bar formats <code class="inl">E.dirty ? "(modified)" : ""</code> next to the filename, every single frame &mdash; the visible, always-current indicator.</td></tr>
+      <tr><td class="mono">editorProcessKeypress() &mdash; CTRL_Q</td><td>Checks truthiness only: <code class="inl">if (E.dirty &amp;&amp; quit_times)</code> gates the &ldquo;unsaved changes&rdquo; warning below.</td></tr>
+      <tr><td class="mono">editorFileWasModified()</td><td><code class="inl">return E.dirty;</code> &mdash; a tiny wrapper defined near the bottom of kilo.c that is never actually called anywhere else in the file. Declared, never consulted &mdash; the same shape as editorOpen's unread return value.</td></tr>
+    </table>
+
+    <h2 data-anchor="save-h2-quit">Quitting dirty: a throttle, not a guard</h2>
+    <p data-anchor="save-p-quit-1">Kilo does not stop you from quitting with unsaved changes. It makes you
+    press Ctrl-Q a few extra times:</p>
+    <pre class="tab"><span class="mac">#define</span> KILO_QUIT_TIMES 3
+<span class="ty">void</span> <span class="fn">editorProcessKeypress</span>(<span class="ty">int</span> fd) {
+    <span class="kw">static</span> <span class="ty">int</span> quit_times = KILO_QUIT_TIMES;
+    ...
+    <span class="kw">case</span> CTRL_Q:        <span class="cm">/* Ctrl-q */</span>
+        <span class="cm">/* Quit if the file was already saved. */</span>
+        <span class="kw">if</span> (E.dirty &amp;&amp; quit_times) {
+            <span class="fn">editorSetStatusMessage</span>(<span class="str">"WARNING!!! File has unsaved changes. "</span>
+                <span class="str">"Press Ctrl-Q %d more times to quit."</span>, quit_times);
+            quit_times--;
+            <span class="kw">return</span>;
+        }
+        exit(0);
+        <span class="kw">break</span>;
+    ...
+    }
+    quit_times = KILO_QUIT_TIMES; <span class="cm">/* Reset it to the original value. */</span>
+}</pre>
+    <p data-anchor="save-p-quit-2">Trace it slowly, because the mechanism is smaller than the warning message
+    makes it feel. <code class="inl">quit_times</code> is a <code class="inl">static</code> local &mdash; it
+    survives between calls to <code class="inl">editorProcessKeypress</code>, but there's exactly one of it in
+    the whole program, seeded to <code class="inl">KILO_QUIT_TIMES</code> (3). While the buffer is dirty and
+    <code class="inl">quit_times</code> is still positive, Ctrl-Q just warns and counts down, then
+    <code class="inl">return</code>s &mdash; the editor keeps running. Once <code class="inl">quit_times</code>
+    reaches 0 (three consecutive Ctrl-Q presses), or the buffer isn't dirty at all, the very next Ctrl-Q falls
+    straight through to <code class="inl">exit(0)</code>. No save happens on the way out &mdash; if you never
+    pressed Ctrl-S, three Ctrl-Q presses later your edits are simply gone.</p>
+    <div class="callout warn" data-anchor="save-callout-reset">
+      <span class="tag">The countdown only tracks consecutive presses</span>
+      <p>The line at the very bottom of <code class="inl">editorProcessKeypress</code> &mdash;
+      <code class="inl">quit_times = KILO_QUIT_TIMES;</code> &mdash; runs after <em>every</em> keypress that
+      falls through the switch without returning early. Type one character between two Ctrl-Q presses and the
+      counter resets to 3. The &ldquo;three more times&rdquo; warning is a countdown of consecutive Ctrl-Q's,
+      not a running total across your whole editing session.</p>
+    </div>
+
+    <h2 data-anchor="save-h2-edge">Edge cases: what editorSave quietly guarantees (and doesn't)</h2>
+    <ul data-anchor="save-ul-edge">
+      <li data-anchor="save-li-edge-1"><strong>A failed save leaves E.dirty untouched.</strong> Every
+      <code class="inl">writeerr</code> exit skips the reset, so the &ldquo;(modified)&rdquo; marker keeps
+      showing after a failed save &mdash; correctly, since the disk copy still doesn't match memory.</li>
+      <li data-anchor="save-li-edge-2"><strong>No Save As, ever.</strong> There is no code path in kilo.c for
+      writing to any path other than <code class="inl">E.filename</code>. Renaming a file means renaming it
+      outside the editor.</li>
+      <li data-anchor="save-li-edge-3"><strong>Tabs save as tabs.</strong> The saved bytes come from
+      <code class="inl">row.chars</code>, never the space-expanded <code class="inl">row.render</code> &mdash;
+      what you see on screen after tab expansion is not what lands on disk.</li>
+      <li data-anchor="save-li-edge-4"><strong>A missing trailing newline gets added.</strong>
+      <code class="inl">editorRowsToString</code> appends <code class="inl">'\n'</code> after every row,
+      including the last, unconditionally &mdash; save is not a byte-for-byte echo of what was on disk before.</li>
+      <li data-anchor="save-li-edge-5"><strong>Quitting dirty is throttled, not blocked.</strong> Three
+      consecutive Ctrl-Q presses (or one, if the buffer isn't dirty) always exits, unsaved changes and all.
+      There is no save-before-quit prompt anywhere in the program.</li>
+      <li data-anchor="save-li-edge-6"><strong>editorSave's own return value goes nowhere.</strong> Exactly
+      like editorOpen's in the previous chapter &mdash; computed, documented, and discarded at its only call
+      site. The status-bar message is the only channel that actually reaches the user.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="save-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>One new idea, really: <code class="inl">chars</code>-array-in, single-<code class="inl">write()</code>-out,
+      with truncate doing the resizing job the missing <code class="inl">O_TRUNC</code> flag doesn't. Everything
+      else is bookkeeping this book had already built &mdash; <code class="inl">E.dirty</code> was defined back
+      in Chapter 07, incremented throughout Chapter 10, and this chapter only adds the one place it gets reset.
+      The genuinely load-bearing design decisions are small and specific: truncate explicitly because
+      <code class="inl">O_TRUNC</code> was left out, batch the write into one call because that's &ldquo;a bit
+      safer&rdquo; under this program's size budget (explicitly not full crash-atomicity), and never touch
+      <code class="inl">E.dirty</code> on any failure path. Persistence, start to finish across these two
+      chapters, is symmetrical and small: read lines in with <code class="inl">getline</code>, flatten rows out
+      with <code class="inl">memcpy</code>, and one flag that remembers whether the two sides still agree.</p>
+    </div>
+
+    <div class="challenges" data-anchor="save-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Sketch the change to <code class="inl">editorSave()</code> that would make it crash-safe: write to
+        a temporary file in the same directory, then <code class="inl">rename()</code> it over
+        <code class="inl">E.filename</code> on success. What has to happen to the temp file on the
+        <code class="inl">writeerr</code> path that doesn't currently need to happen at all?</li>
+        <li>Add a real &ldquo;Save As&rdquo;: a new keybinding that prompts for a filename and calls a version
+        of <code class="inl">editorSave</code> that writes there instead of <code class="inl">E.filename</code>.
+        Should a successful Save As update <code class="inl">E.filename</code> itself? What does the status bar
+        show either way?</li>
+        <li><code class="inl">editorFileWasModified()</code> is dead code today. Find a real place in
+        <code class="inl">main()</code> or <code class="inl">editorAtExit()</code> where calling it would let
+        Kilo warn about unsaved changes on an abnormal exit path, not just on Ctrl-Q.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="save-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — editorRowsToString, editorSave, editorProcessKeypress (CTRL_S, CTRL_Q, quit_times), editorFileWasModified</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="11-opening-files.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="13-search.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gRPC and Service Definitions — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="grpc-kicker">Chapter 09 &middot; Evolution &amp; Interop</span>
+    <h1 data-anchor="grpc-h1">gRPC and Service Definitions</h1>
+
+    <p class="lede" data-anchor="grpc-lede">
+      For eight chapters protobuf has been a way to turn a message into bytes and
+      back. But look again at the <code>.proto</code> grammar and you'll notice two
+      keywords we've been stepping around &mdash; <code>service</code> and
+      <code>rpc</code> &mdash; that don't describe data at all. They describe
+      <em>verbs</em>: things a server can do. That's the seam where protobuf hands
+      off to <strong>gRPC</strong>. In this chapter we'll define a service, meet the
+      four shapes an RPC can take, watch <code>protoc</code> spin your schema into a
+      client stub and a server skeleton, and follow a single call all the way down
+      to the HTTP/2 bytes and back up through a status code. Most of all we'll draw
+      one line clearly: exactly where protobuf ends and gRPC begins &mdash; because
+      confusing the two is the single most common misunderstanding in this whole
+      corner of the field.
+    </p>
+
+    <h2 data-anchor="grpc-h2-line">First, the line between them</h2>
+    <p data-anchor="grpc-p-line-1">
+      Let's settle the big confusion up front, because everything else is easier
+      once it's fixed in your head. <strong>Protobuf</strong> is a serialization
+      format: a schema language, a binary wire encoding, and the compiler that turns
+      one into the other. You can use it with a file on disk, a Kafka topic, a Redis
+      value &mdash; no network required. <strong>gRPC</strong> is a
+      <em>Remote Procedure Call framework</em>: a runtime for calling a method on
+      another machine as if it were local. Google built it from an internal system
+      called Stubby and open-sourced it in 2015; it's now a CNCF project. gRPC
+      <em>uses</em> protobuf as its default interface definition language (IDL) and
+      its default message format &mdash; but the two are genuinely separable layers.
+    </p>
+    <div class="callout key-idea" data-anchor="grpc-callout-line">
+      <span class="callout-label">The one-sentence version</span>
+      Protobuf owns the <em>nouns and the bytes</em> &mdash; message schemas, the
+      wire encoding, and the <em>syntax</em> of <code>service</code>/<code>rpc</code>/<code>stream</code>.
+      gRPC owns the <em>verbs and the runtime</em> &mdash; how a call travels
+      (HTTP/2), what streaming actually does, deadlines, metadata, the status/error
+      model, and the generated stubs. The keywords parse under plain proto3, but they
+      only <em>mean</em> something when a gRPC-aware plugin generates code against
+      them.
+    </div>
+    <p data-anchor="grpc-p-line-2">
+      That last sentence has teeth, so let's make it concrete now and pay it off
+      later: if you run <code>protoc</code> with only a message plugin over a
+      <code>.proto</code> full of <code>service</code> blocks, it compiles happily
+      and generates <em>nothing at all</em> for the services. No stub, no skeleton,
+      no error. The service definitions are inert until something that understands
+      them &mdash; gRPC's code generator, or another RPC system's &mdash; is asked
+      to look. Protobuf will describe your API; it won't wire it up.
+    </p>
+
+    <h2 data-anchor="grpc-h2-define">Defining a service</h2>
+    <p data-anchor="grpc-p-define-1">
+      A service is a named bundle of methods. You declare it with the
+      <code>service</code> keyword, and inside it each method is an <code>rpc</code>
+      line: a name, one request message in parentheses, and one response message
+      after <code>returns</code>. Notice the shape of that contract &mdash;
+      <em>exactly one</em> message in, <em>exactly one</em> message out. There's no
+      such thing as an RPC that takes two arguments or returns a bare integer; the
+      parameter and the return are always message types.
+    </p>
+    <pre data-anchor="grpc-code-define"><code><span class="kw">syntax</span> = <span class="str">"proto3"</span>;
+<span class="kw">package</span> routeguide.v1;
+
+<span class="kw">service</span> <span class="ty">RouteGuide</span> {
+  <span class="cm">// A method is a verb the server offers. One message in, one out.</span>
+  <span class="kw">rpc</span> <span class="fn">GetFeature</span>(<span class="ty">Point</span>) <span class="kw">returns</span> (<span class="ty">Feature</span>);
+}
+
+<span class="kw">message</span> <span class="ty">Point</span>   { <span class="ty">int32</span> lat = <span class="num">1</span>; <span class="ty">int32</span> lng = <span class="num">2</span>; }
+<span class="kw">message</span> <span class="ty">Feature</span> { <span class="ty">string</span> name = <span class="num">1</span>; <span class="ty">Point</span> location = <span class="num">2</span>; }</code></pre>
+    <p data-anchor="grpc-p-define-2">
+      This is where the schema discipline from the last two chapters comes home to
+      roost. Because a request and response must be messages, you get, for free, the
+      one thing that lets an API age well: room to grow. That
+      <code>GetFeature(Point) returns (Feature)</code> can never <em>also</em> return
+      a freshness timestamp, because <code>Feature</code> is about a feature. The
+      fix &mdash; and the reason the best-practices chapter told you to wrap every
+      RPC in a dedicated <code>GetFeatureRequest</code>/<code>GetFeatureResponse</code>
+      even when it feels like ceremony &mdash; is that the wrapper is the only place
+      you can add a field later without changing the method signature, and changing
+      a signature breaks every client. gRPC is <em>why</em> that rule exists.
+    </p>
+
+    <h2 data-anchor="grpc-h2-four">The four kinds of RPC</h2>
+    <p data-anchor="grpc-p-four-1">
+      Here's the part that feels like magic the first time and obvious ever after.
+      An RPC doesn't have to be a single question and a single answer. gRPC gives
+      you <em>four</em> shapes, and &mdash; this is the lovely bit &mdash; you select
+      between them with a single keyword, <code>stream</code>, placed on the request
+      side, the response side, both, or neither.
+    </p>
+    <pre data-anchor="grpc-code-four"><code><span class="kw">service</span> <span class="ty">RouteGuide</span> {
+  <span class="cm">// 1. Unary — one request, one response. A normal function call.</span>
+  <span class="kw">rpc</span> <span class="fn">GetFeature</span>(<span class="ty">Point</span>) <span class="kw">returns</span> (<span class="ty">Feature</span>);
+
+  <span class="cm">// 2. Server streaming — one request, a sequence of responses.</span>
+  <span class="kw">rpc</span> <span class="fn">ListFeatures</span>(<span class="ty">Rectangle</span>) <span class="kw">returns</span> (<span class="kw">stream</span> <span class="ty">Feature</span>);
+
+  <span class="cm">// 3. Client streaming — a sequence of requests, one response.</span>
+  <span class="kw">rpc</span> <span class="fn">RecordRoute</span>(<span class="kw">stream</span> <span class="ty">Point</span>) <span class="kw">returns</span> (<span class="ty">RouteSummary</span>);
+
+  <span class="cm">// 4. Bidirectional streaming — two independent streams.</span>
+  <span class="kw">rpc</span> <span class="fn">RouteChat</span>(<span class="kw">stream</span> <span class="ty">RouteNote</span>) <span class="kw">returns</span> (<span class="kw">stream</span> <span class="ty">RouteNote</span>);
+}</code></pre>
+    <p data-anchor="grpc-p-four-2">
+      Read those four lines top to bottom and the pattern is unmistakable:
+      <code>stream</code> in front of the request means &ldquo;the client sends
+      many,&rdquo; <code>stream</code> in front of the response means &ldquo;the
+      server sends many.&rdquo; Everything else about the four is a consequence of
+      that. Here they are as pictures, because the message flow is the whole point.
+    </p>
+
+    <figure class="figbox" data-anchor="grpc-fig-four">
+      <svg viewBox="0 0 720 300" role="img" aria-labelledby="grpc-fig-four-title">
+        <title id="grpc-fig-four-title">The four gRPC RPC shapes: unary (one arrow each way), server-streaming (one up, many down), client-streaming (many up, one down), and bidirectional (many both ways)</title>
+        <defs>
+          <marker id="grpc-ar" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+        <!-- panel template: client on left, server on right -->
+        <!-- Row helper labels -->
+        <g font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)" text-anchor="middle">
+          <text x="45"  y="18">client</text><text x="205" y="18">server</text>
+          <text x="405" y="18">client</text><text x="565" y="18">server</text>
+          <text x="45"  y="162">client</text><text x="205" y="162">server</text>
+          <text x="405" y="162">client</text><text x="565" y="162">server</text>
+        </g>
+        <!-- vertical rails -->
+        <g stroke="var(--rule)" stroke-width="1">
+          <line x1="45"  y1="24" x2="45"  y2="120"/><line x1="205" y1="24" x2="205" y2="120"/>
+          <line x1="405" y1="24" x2="405" y2="120"/><line x1="565" y1="24" x2="565" y2="120"/>
+          <line x1="45"  y1="168" x2="45"  y2="264"/><line x1="205" y1="168" x2="205" y2="264"/>
+          <line x1="405" y1="168" x2="405" y2="264"/><line x1="565" y1="168" x2="565" y2="264"/>
+        </g>
+        <g stroke="var(--accent)" stroke-width="1.5" fill="none">
+          <!-- 1. Unary -->
+          <line x1="45"  y1="50" x2="205" y2="50"  marker-end="url(#grpc-ar)"/>
+          <line x1="205" y1="90" x2="45"  y2="90"  marker-end="url(#grpc-ar)"/>
+          <!-- 2. Server streaming: one up, three down -->
+          <line x1="405" y1="42" x2="565" y2="42"  marker-end="url(#grpc-ar)"/>
+          <line x1="565" y1="72" x2="405" y2="72"  marker-end="url(#grpc-ar)"/>
+          <line x1="565" y1="92" x2="405" y2="92"  marker-end="url(#grpc-ar)"/>
+          <line x1="565" y1="112" x2="405" y2="112" marker-end="url(#grpc-ar)"/>
+          <!-- 3. Client streaming: three up, one down -->
+          <line x1="45"  y1="192" x2="205" y2="192" marker-end="url(#grpc-ar)"/>
+          <line x1="45"  y1="212" x2="205" y2="212" marker-end="url(#grpc-ar)"/>
+          <line x1="45"  y1="232" x2="205" y2="232" marker-end="url(#grpc-ar)"/>
+          <line x1="205" y1="258" x2="45"  y2="258" marker-end="url(#grpc-ar)"/>
+          <!-- 4. Bidi: interleaved -->
+          <line x1="405" y1="188" x2="565" y2="188" marker-end="url(#grpc-ar)"/>
+          <line x1="565" y1="208" x2="405" y2="208" marker-end="url(#grpc-ar)"/>
+          <line x1="405" y1="228" x2="565" y2="228" marker-end="url(#grpc-ar)"/>
+          <line x1="565" y1="252" x2="405" y2="252" marker-end="url(#grpc-ar)"/>
+        </g>
+        <g font-family="var(--font-display)" font-size="12" fill="var(--ink)" text-anchor="middle">
+          <text x="125" y="140">Unary</text>
+          <text x="485" y="140">Server streaming</text>
+          <text x="125" y="284">Client streaming</text>
+          <text x="485" y="284">Bidirectional</text>
+        </g>
+      </svg>
+      <figcaption>
+        Each panel is time flowing downward between a client rail and a server rail.
+        <code>stream</code> on a side simply means &ldquo;this side may send more
+        than one message.&rdquo; In the bidirectional case the two streams are
+        independent &mdash; neither side has to wait its turn.
+      </figcaption>
+    </figure>
+
+    <table class="cmp" data-anchor="grpc-table-four">
+      <thead><tr><th>Kind</th><th>Signature</th><th>Reach for it when&hellip;</th></tr></thead>
+      <tbody>
+        <tr><td>Unary</td><td><code>rpc M(Req) returns (Resp)</code></td><td>A plain request/response &mdash; the default, and most RPCs.</td></tr>
+        <tr><td>Server&nbsp;streaming</td><td><code>rpc M(Req) returns (stream Resp)</code></td><td>One query, many results: search hits, a subscription feed, a large export.</td></tr>
+        <tr><td>Client&nbsp;streaming</td><td><code>rpc M(stream Req) returns (Resp)</code></td><td>Many inputs, one summary: uploading chunks, batching metrics.</td></tr>
+        <tr><td>Bidirectional</td><td><code>rpc M(stream Req) returns (stream Resp)</code></td><td>A live conversation: chat, telemetry with acks, interactive control.</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="grpc-p-four-3">
+      Two clarifications that save confusion. A stream carries a sequence of the
+      <em>same message type</em> &mdash; it is not a way to send different shapes;
+      it's the same <code>Feature</code>, many times. And &ldquo;streaming&rdquo;
+      here has nothing to do with how big the data is; it's about the
+      <em>conversation pattern</em>. A tiny chat message and a huge file upload can
+      both be streams; a hundred-megabyte response can still be unary. Pick the kind
+      by the shape of the interaction, not the size of the payload.
+    </p>
+
+    <h2 data-anchor="grpc-h2-stubs">Stubs and skeletons: what code generation gives you</h2>
+    <p data-anchor="grpc-p-stubs-1">
+      Now the payoff for writing that service down. Feed the <code>.proto</code> to
+      <code>protoc</code> with a gRPC plugin and, for each service, you get two
+      artifacts. On the calling side, a <strong>stub</strong> (sometimes called the
+      client): a local object whose methods are your RPCs. Call
+      <code>stub.GetFeature(point)</code> and it marshals the argument to protobuf
+      bytes, opens a call over the network, waits for the reply, decodes it, and
+      hands you back a <code>Feature</code>. The remote call reads exactly like a
+      local method call &mdash; hiding that gap is the entire reason the letters
+      &ldquo;RPC&rdquo; are in the name.
+    </p>
+    <p data-anchor="grpc-p-stubs-2">
+      On the serving side you get a <strong>skeleton</strong>: an abstract base
+      class or service interface with one method per RPC, each one empty. Your job
+      is to subclass it and fill in the business logic. gRPC's runtime does the rest
+      &mdash; it listens, decodes the incoming bytes into a <code>Point</code>, calls
+      your method, and serializes whatever you return. You write the <em>what</em>;
+      the generated skeleton handles the <em>how</em>.
+    </p>
+    <pre data-anchor="grpc-code-stub"><code><span class="cm">// CLIENT — the generated stub makes a remote call look local (Go-ish):</span>
+resp, err := client.<span class="fn">GetFeature</span>(ctx, &amp;pb.<span class="ty">Point</span>{Lat: <span class="num">409146138</span>, Lng: -<span class="num">746188906</span>})
+<span class="kw">if</span> err != <span class="kw">nil</span> { <span class="cm">/* err carries the gRPC status code */</span> }
+fmt.<span class="fn">Println</span>(resp.<span class="fn">GetName</span>())
+
+<span class="cm">// SERVER — you implement the generated interface; gRPC calls you:</span>
+<span class="kw">func</span> (s *server) <span class="fn">GetFeature</span>(ctx context.Context, p *pb.<span class="ty">Point</span>) (*pb.<span class="ty">Feature</span>, <span class="ty">error</span>) {
+  <span class="kw">return</span> &amp;pb.<span class="ty">Feature</span>{Name: s.<span class="fn">lookup</span>(p)}, <span class="kw">nil</span>
+}</code></pre>
+    <div class="callout warning" data-anchor="grpc-callout-plugins">
+      <span class="callout-label">Two plugins, not one &mdash; the gotcha that bites everyone</span>
+      Generating <em>messages</em> and generating <em>stubs</em> are separate jobs
+      done by separate plugins. In Go, <code>protoc-gen-go</code> emits the
+      <code>Point</code>/<code>Feature</code> structs, and a <em>different</em>
+      plugin, <code>protoc-gen-go-grpc</code>, emits the <code>RouteGuideClient</code>
+      stub and <code>RouteGuideServer</code> interface. Run only the first and your
+      services vanish with no warning &mdash; the exact &ldquo;protoc ignores
+      services&rdquo; behavior we flagged at the top. Other languages bundle the two
+      steps, but the mental model is the same: a message plugin plus a service plugin.
+    </div>
+
+    <h2 data-anchor="grpc-h2-http2">The transport: one call, over HTTP/2</h2>
+    <p data-anchor="grpc-p-http2-1">
+      So what actually happens when that stub method runs? gRPC's transport is
+      <strong>HTTP/2</strong>, and the choice is not incidental &mdash; it's what
+      makes the four RPC shapes possible. HTTP/2 multiplexes many independent
+      <em>streams</em> over one TCP connection, frames everything in binary, compresses
+      headers, and is full-duplex: both ends can send at once. A gRPC call <em>is</em>
+      one HTTP/2 stream. That's why a bidirectional RPC isn't a special trick &mdash;
+      it's just a stream where both sides keep sending DATA frames.
+    </p>
+    <p data-anchor="grpc-p-http2-2">
+      Mechanically, a call is an HTTP <code>POST</code>. The method name becomes the
+      URL path &mdash; <code>/&lt;package&gt;.&lt;Service&gt;/&lt;Method&gt;</code>,
+      e.g. <code>/routeguide.v1.RouteGuide/GetFeature</code> &mdash; and the
+      <code>content-type</code> is <code>application/grpc</code> (often
+      <code>+proto</code>). Your request messages travel in the stream's DATA frames,
+      each one wrapped in a tiny five-byte header so the receiver knows where one
+      message stops and the next begins:
+    </p>
+
+    <figure class="figbox" data-anchor="grpc-fig-frame">
+      <svg viewBox="0 0 700 180" role="img" aria-labelledby="grpc-fig-frame-title">
+        <title id="grpc-fig-frame-title">A gRPC length-prefixed message: a 1-byte compressed flag, a 4-byte big-endian length, then the serialized protobuf bytes</title>
+        <!-- flag byte -->
+        <rect x="20" y="60" width="70" height="56" rx="6" fill="none" stroke="var(--kw)" stroke-width="1.5"/>
+        <text x="55" y="86" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--kw)">flag</text>
+        <text x="55" y="103" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">1 byte</text>
+        <text x="55" y="138" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">0=raw 1=gzip</text>
+        <!-- length -->
+        <rect x="100" y="60" width="180" height="56" rx="6" fill="none" stroke="var(--ty)" stroke-width="1.5"/>
+        <text x="190" y="86" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--ty)">length</text>
+        <text x="190" y="103" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">4 bytes, big-endian</text>
+        <text x="190" y="138" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">how many message bytes follow</text>
+        <!-- message -->
+        <rect x="290" y="60" width="390" height="56" rx="6" fill="none" stroke="var(--fn)" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <text x="485" y="86" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--fn)">serialized protobuf message</text>
+        <text x="485" y="103" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">exactly &lt;length&gt; bytes &mdash; the encoding from Chapter 04</text>
+        <text x="485" y="138" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">carried inside HTTP/2 DATA frames</text>
+        <text x="350" y="30" text-anchor="middle" font-family="var(--font-display)" font-size="12" fill="var(--ink)">One length-prefixed gRPC message</text>
+      </svg>
+      <figcaption>
+        The 5-byte prefix (flag + length) is gRPC's contribution; the message bytes
+        after it are plain protobuf, exactly as Chapter 04 laid them out. Frame
+        boundaries in HTTP/2 are unrelated to these message boundaries &mdash; one
+        DATA frame may hold several messages, or a message may span frames.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="grpc-p-http2-3">
+      Alongside the payload, HTTP/2 headers carry the <em>metadata</em>: on the way
+      out, key/value pairs plus a <code>grpc-timeout</code> header that encodes the
+      call's <strong>deadline</strong> &mdash; a first-class idea in gRPC. Set a
+      deadline and a call that overruns it fails fast with
+      <code>DEADLINE_EXCEEDED</code> instead of hanging forever; forget to set one
+      and a dead server can wedge your client indefinitely. (Binary metadata is
+      allowed too: keys ending in <code>-bin</code> are base64-encoded.) Stubs issue
+      their calls over a <strong>channel</strong> &mdash; a managed, reusable
+      connection to an endpoint &mdash; so you're not paying for a new TCP handshake
+      per call.
+    </p>
+
+    <h2 data-anchor="grpc-h2-status">How a call ends: status codes and errors</h2>
+    <p data-anchor="grpc-p-status-1">
+      Here's a detail that surprises people who come from REST: the HTTP status of a
+      gRPC response is <strong>200</strong>, even when the call failed. The transport
+      succeeded &mdash; a well-formed response came back &mdash; so at the HTTP layer
+      everything is fine. The <em>real</em> outcome rides in a trailer: after the
+      response messages, gRPC sends a final HEADERS frame carrying
+      <code>grpc-status</code> (an integer) and an optional, percent-encoded
+      <code>grpc-message</code>. If you check the HTTP status to decide whether your
+      RPC worked, you will be wrong every time it matters.
+    </p>
+    <pre data-anchor="grpc-code-trailer"><code><span class="cm"># Response trailers — the actual result of the call:</span>
+grpc-status: <span class="num">5</span>
+grpc-message: Feature%20not%20found     <span class="cm"># NOT_FOUND, percent-encoded</span>
+
+<span class="cm"># (the HTTP :status was 200 the whole time)</span></code></pre>
+    <p data-anchor="grpc-p-status-2">
+      Every call therefore ends with a <strong>status</strong>: a code plus a
+      message. There are 17 canonical codes, <code>0</code>&ndash;<code>16</code>,
+      shared identically across every gRPC library and independent of whether the
+      payload was protobuf or something else. You don't need to memorize all of
+      them, but a working handful covers most days:
+    </p>
+    <table class="cmp" data-anchor="grpc-table-status">
+      <thead><tr><th>Code</th><th>#</th><th>What it means</th><th>Set by</th></tr></thead>
+      <tbody>
+        <tr><td><code>OK</code></td><td>0</td><td>Success.</td><td>&mdash;</td></tr>
+        <tr><td><code>INVALID_ARGUMENT</code></td><td>3</td><td>Caller sent a bad field.</td><td>app</td></tr>
+        <tr><td><code>DEADLINE_EXCEEDED</code></td><td>4</td><td>Ran past the deadline.</td><td>library</td></tr>
+        <tr><td><code>NOT_FOUND</code></td><td>5</td><td>No such entity.</td><td>app</td></tr>
+        <tr><td><code>ALREADY_EXISTS</code></td><td>6</td><td>Create collided.</td><td>app</td></tr>
+        <tr><td><code>PERMISSION_DENIED</code></td><td>7</td><td>Authenticated, not allowed.</td><td>app</td></tr>
+        <tr><td><code>FAILED_PRECONDITION</code></td><td>9</td><td>System in the wrong state.</td><td>app</td></tr>
+        <tr><td><code>UNIMPLEMENTED</code></td><td>12</td><td>Method not implemented.</td><td>library</td></tr>
+        <tr><td><code>INTERNAL</code></td><td>13</td><td>A broken invariant, a bug.</td><td>library</td></tr>
+        <tr><td><code>UNAVAILABLE</code></td><td>14</td><td>Transient &mdash; retry later.</td><td>library</td></tr>
+        <tr><td><code>UNAUTHENTICATED</code></td><td>16</td><td>Missing/invalid credentials.</td><td>library</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note" data-anchor="grpc-callout-codes">
+      <span class="callout-label">Who's allowed to say what</span>
+      Some codes only the <em>runtime</em> ever produces &mdash;
+      <code>DEADLINE_EXCEEDED</code>, <code>UNAVAILABLE</code>,
+      <code>UNIMPLEMENTED</code>, <code>CANCELLED</code>, <code>INTERNAL</code>,
+      <code>RESOURCE_EXHAUSTED</code>, <code>UNAUTHENTICATED</code>,
+      <code>UNKNOWN</code>. Others should <em>only</em> come from your application
+      code: <code>INVALID_ARGUMENT</code>, <code>NOT_FOUND</code>,
+      <code>ALREADY_EXISTS</code>, <code>FAILED_PRECONDITION</code>,
+      <code>ABORTED</code>, <code>OUT_OF_RANGE</code>, <code>DATA_LOSS</code>. The
+      practical lesson: don't reach for <code>INTERNAL</code> or <code>UNKNOWN</code>
+      when a caller simply sent a bad argument &mdash; that's <code>INVALID_ARGUMENT</code>,
+      and picking the right code is how a client knows whether retrying could ever
+      help. (There's no universal &ldquo;always retry these&rdquo; set; it depends on
+      your semantics and whether the call is idempotent.)
+    </div>
+
+    <div class="callout key-idea" data-anchor="grpc-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      A clean division of labor. Protobuf gave us a typed, evolvable schema and a
+      compact wire format &mdash; the bytes. gRPC borrowed that schema as its IDL and
+      built a runtime on top: it turns <code>service</code> and <code>rpc</code> into
+      real client stubs and server skeletons, carries the messages over HTTP/2 with
+      length-prefixed framing, offers four conversation shapes from a single
+      <code>stream</code> keyword, and reports every outcome through one shared status
+      model. Protobuf never had to know about any of it, and your business logic
+      never had to know about sockets. That seam &mdash; schema on one side, transport
+      on the other &mdash; is the whole idea.
+    </div>
+
+    <div class="callout note" data-anchor="grpc-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>You run <code>protoc --go_out=. routeguide.proto</code> and get
+        <code>Point</code> and <code>Feature</code> but no <code>RouteGuideClient</code>.
+        Nothing errored. What happened, and what's the fix?</li>
+        <li>Write the four <code>rpc</code> lines for a service that: fetches one user;
+        streams a user's notifications; accepts a stream of uploaded photo chunks and
+        returns a summary; and runs a live two-way chat. Where does each
+        <code>stream</code> go?</li>
+        <li>A client calls your RPC and gets back HTTP <code>200</code> but its result
+        is an error. Where is the real outcome carried, and why is the HTTP status
+        still 200?</li>
+        <li>Your handler receives a request whose <code>page_size</code> is
+        <code>-1</code>. Which status code should you return, and which code would be
+        <em>wrong</em> to return here even though it&rsquo;d &ldquo;work&rdquo;?</li>
+        <li>In one sentence each: name one thing protobuf owns and one thing gRPC
+        owns in the call you just traced.</li>
+      </ol>
+    </div>
+
+    <p data-anchor="grpc-sources" style="margin-top:2rem;font-size:.82em;color:var(--ink-soft);border-top:1px solid var(--rule);padding-top:.8rem;">
+      Sources: gRPC <a href="https://grpc.io/docs/what-is-grpc/core-concepts/">Core
+      concepts</a> and <a href="https://grpc.io/docs/what-is-grpc/introduction/">Introduction</a>;
+      the gRPC-over-HTTP/2 wire spec
+      (<a href="https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md">PROTOCOL-HTTP2.md</a>)
+      and <a href="https://github.com/grpc/grpc/blob/master/doc/statuscodes.md">status-code
+      reference</a>; protobuf
+      <a href="https://protobuf.dev/programming-guides/api/">API best practices</a>.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-advanced-schema-design.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-working-across-languages.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

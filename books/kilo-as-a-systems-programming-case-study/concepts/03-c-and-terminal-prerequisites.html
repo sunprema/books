@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C and Terminal Prerequisites — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="cterm-eyebrow">Chapter 03 &middot; Part I — Orientation</p>
+    <h1 data-anchor="cterm-h1">C and Terminal Prerequisites</h1>
+
+    <p class="lead" data-anchor="cterm-lead">Chapter 02 gave us the five jobs every editor does. Before we
+    watch Kilo do them, we need a shared vocabulary for <em>how</em> it does them — a handful of C idioms
+    that show up on nearly every page of <code class="inl">kilo.c</code>, and a handful of facts about what
+    a terminal actually is, underneath the blinking cursor. This isn't a C course. It's the specific,
+    reusable toolbox one very disciplined systems programmer reached for, over and over, to keep a real
+    program under a thousand lines.</p>
+
+    <div class="callout key" data-anchor="cterm-callout-scope">
+      <span class="tag">What this chapter is, and isn't</span>
+      <p>It is <em>not</em> a general introduction to C, and it won't teach you the language from zero. It
+      <em>is</em> a fast, concrete tour of the specific patterns Kilo leans on repeatedly — one global struct,
+      pointers with hand-tracked lengths, growing arrays with <code class="inl">realloc()</code>,
+      NULL-terminated arrays of strings, bitflags, variadic functions, and C's plain, exception-free way of
+      failing — plus the terminal facts (file descriptors, canonical vs. raw mode, what an escape sequence
+      even is) that Chapter 04 assumes you already have. If a term below is new, it will not be new again.</p>
+    </div>
+
+    <h2 data-anchor="cterm-h2-motivation">Motivation: name the tools before you watch someone use them</h2>
+    <p data-anchor="cterm-p-motivation-1">Reading someone else's C is a different skill from writing your
+    own. The syntax is familiar, but the <em>idioms</em> — the small, repeated decisions an experienced
+    systems programmer makes without comment — are not always obvious on a first pass. Kilo is short, but it
+    is not simplified for teaching; it is real code, written the way antirez writes real code. If you don't
+    already recognize &ldquo;grow this array by one and reassign the pointer&rdquo; or &ldquo;this struct is
+    one giant global and everything touches it&rdquo; as patterns, you'll spend Chapter 04 decoding syntax
+    instead of learning raw mode. So we decode the syntax now, once, here.</p>
+    <p data-anchor="cterm-p-motivation-2">The prerequisites split cleanly into two halves, and we'll take
+    them in order: first the C idioms, which apply to the whole file; then the terminal facts, which apply
+    specifically to the input/output layer we're about to build in Chapters 04 and 05.</p>
+
+    <h2 data-anchor="cterm-h2-c-global">One global struct, not a hundred parameters</h2>
+    <p data-anchor="cterm-p-global-1">Open <code class="inl">kilo.c</code> and search for
+    <code class="inl">struct editorConfig</code>. You'll find it defined once, near the top, and then a
+    single line right after it: <code class="inl">static struct editorConfig E;</code>. That's the entire
+    state of the editor — cursor position, scroll offsets, screen size, the array of rows, the dirty flag,
+    the open filename, the status message, the current syntax — as one global variable, declared
+    <code class="inl">static</code> so it's private to this file.<sup>[1]</sup> Nearly every function in
+    Kilo reads or writes a field of <code class="inl">E</code> directly, instead of receiving state through
+    parameters and returning it back out.</p>
+    <p data-anchor="cterm-p-global-2">That's a real design decision, not laziness, and it's worth naming the
+    trade-off honestly now because we'll live with it for the rest of the book. A single global struct means
+    no function signature ever has to grow just to thread one more piece of state through three layers of
+    calls — <code class="inl">editorMoveCursor()</code> just reaches into <code class="inl">E.cx</code> and
+    <code class="inl">E.cy</code> directly. The cost is that <em>every</em> function is implicitly coupled to
+    <em>all</em> of the editor's state, which only stays manageable because the program is small enough to
+    hold in your head — which was the entire premise of Chapter 01. We'll meet this struct properly, field by
+    field, in Chapter 07 (<em>Editor State</em>); for now, just recognize the pattern when you see bare
+    <code class="inl">E.something</code> appear with no argument list in sight.</p>
+
+    <h2 data-anchor="cterm-h2-c-pointers">Pointers, strings, and the length you track yourself</h2>
+    <p data-anchor="cterm-p-pointers-1">A C string is a convention, not a type: a <code class="inl">char
+    *</code> pointing at the first byte, with a <code class="inl">'\0'</code> byte marking the end. C itself
+    enforces none of this — <code class="inl">strlen()</code> will happily walk off the end of a buffer that
+    forgot its terminator. Kilo's answer is to not lean on <code class="inl">strlen()</code> for anything
+    that matters: every buffer that holds text also carries an explicit length field right next to the
+    pointer — <code class="inl">erow.size</code> and <code class="inl">erow.rsize</code> sit beside
+    <code class="inl">erow.chars</code> and <code class="inl">erow.render</code>; <code class="inl">struct
+    abuf</code> (the screen-write append buffer we met briefly in Chapter 02) pairs <code class="inl">char
+    *b</code> with an explicit <code class="inl">int len</code>.<sup>[1]</sup> Copies then use
+    <code class="inl">memcpy()</code> or <code class="inl">memmove()</code>, which take a length argument and
+    are <em>binary-safe</em> — they'll copy embedded zero bytes correctly — rather than
+    <code class="inl">strcpy()</code>, which stops at the first <code class="inl">'\0'</code> it finds.</p>
+    <p data-anchor="cterm-p-pointers-2">Keep that pairing in mind as a reading habit: whenever you see a
+    <code class="inl">char *</code> field in a Kilo struct, look for the sibling length field right next to
+    it. It's almost always there, and it's almost always what the code actually trusts.</p>
+
+    <div class="callout" data-anchor="cterm-callout-realloc">
+      <span class="tag">Dynamic memory: grow by one, reassign the pointer</span>
+      <p>Kilo never pre-allocates a big array and hopes it's big enough. It grows arrays one element at a
+      time with <code class="inl">realloc()</code>, and — this is the part worth memorizing —
+      <strong>always reassigns the result back into the owning pointer</strong>, because
+      <code class="inl">realloc()</code> is free to return a different address than the one it was given
+      (it may have had to move the whole block to find room):</p>
+      <pre class="tab"><span class="ty">void</span> <span class="fn">abAppend</span>(<span class="kw">struct</span> abuf *ab, <span class="kw">const</span> <span class="ty">char</span> *s, <span class="ty">int</span> len) {
+    <span class="ty">char</span> *new = <span class="fn">realloc</span>(ab-&gt;b,ab-&gt;len+len);
+    <span class="kw">if</span> (new == NULL) <span class="kw">return</span>;
+    <span class="fn">memcpy</span>(new+ab-&gt;len,s,len);
+    ab-&gt;b = new;
+    ab-&gt;len += len;
+}</pre>
+      <p>The row array grows the identical way, one line at a time, in
+      <code class="inl">editorInsertRow()</code>: <code class="inl">E.row = realloc(E.row,
+      sizeof(erow)*(E.numrows+1))</code>.<sup>[1]</sup> Same shape, same discipline, every time Kilo's data
+      needs to get bigger. You'll type this exact pattern yourself starting in Chapter 08.</p>
+    </div>
+
+    <p data-anchor="cterm-p-arrays-1">One more pointer idiom shows up wherever Kilo needs a
+    variable-length <em>list</em> of strings rather than one string: a plain C array carries no length of
+    its own, so the standard trick is to terminate the array with a <code class="inl">NULL</code> pointer and
+    walk it until you hit one. Kilo's syntax-highlighting table uses exactly this for both a language's file
+    extensions and its keyword list:</p>
+    <pre class="tab"><span class="kw">struct</span> editorSyntax {
+    <span class="ty">char</span> **filematch;
+    <span class="ty">char</span> **keywords;
+    <span class="ty">char</span> singleline_comment_start[2];
+    <span class="ty">char</span> multiline_comment_start[3];
+    <span class="ty">char</span> multiline_comment_end[3];
+    <span class="ty">int</span> flags;
+};</pre>
+    <p data-anchor="cterm-p-arrays-2"><code class="inl">char **filematch</code> is a pointer to an array of
+    C strings — a list of patterns like <code class="inl">".c"</code>, <code class="inl">".h"</code>,
+    <code class="inl">NULL</code> — and <code class="inl">char **keywords</code> is the same shape for a
+    language's reserved words. We'll fill this exact struct in for real in Chapter 16 (<em>File Types and
+    Highlight Rules</em>); for now, just recognize <code class="inl">char **</code> as &ldquo;a
+    NULL-terminated list of strings,&rdquo; not as anything more exotic.</p>
+
+    <h2 data-anchor="cterm-h2-c-macros">Macros, enums, and bitflags</h2>
+    <p data-anchor="cterm-p-macros-1">The very first non-comment lines of <code class="inl">kilo.c</code>
+    are preprocessor directives, and they matter more than they look:</p>
+    <pre class="tab"><span class="mac">#define</span> KILO_VERSION <span class="str">"0.0.1"</span>
+
+<span class="mac">#ifdef</span> __linux__
+<span class="mac">#define</span> _POSIX_C_SOURCE 200809L
+<span class="mac">#endif</span></pre>
+    <p data-anchor="cterm-p-macros-2">That <code class="inl">_POSIX_C_SOURCE</code> line is a
+    <em>feature-test macro</em>: it tells glibc &ldquo;expose the POSIX.1-2008 functions,&rdquo; unlocking
+    library calls like <code class="inl">getline()</code> that a strict-ISO-C build would otherwise hide.
+    Skip it, and functions Kilo depends on for file loading simply wouldn't be declared. It's easy to gloss
+    over as boilerplate; it's actually load-bearing.</p>
+    <p data-anchor="cterm-p-macros-3">Key handling leans on a plain C <code class="inl">enum</code>, and
+    it's worth reading closely because the values are not arbitrary:</p>
+    <pre class="tab"><span class="kw">enum</span> KEY_ACTION{
+    KEY_NULL = 0,
+    CTRL_C = 3,         <span class="cm">/* Ctrl-c */</span>
+    CTRL_D = 4,         <span class="cm">/* Ctrl-d */</span>
+    CTRL_F = 6,         <span class="cm">/* Ctrl-f */</span>
+    CTRL_H = 8,         <span class="cm">/* Ctrl-h */</span>
+    CTRL_L = 12,        <span class="cm">/* Ctrl+l */</span>
+    CTRL_Q = 17,        <span class="cm">/* Ctrl-q */</span>
+    CTRL_S = 19,        <span class="cm">/* Ctrl-s */</span>
+    CTRL_U = 21,        <span class="cm">/* Ctrl-u */</span>
+    ESC = 27,           <span class="cm">/* Escape */</span>
+    BACKSPACE = 127,    <span class="cm">/* Backspace */</span>
+    ARROW_LEFT = 1000,  <span class="cm">/* …and more soft codes above 1000 */</span>
+};</pre>
+    <p data-anchor="cterm-p-macros-4">Every one of those Ctrl-key numbers comes from the same rule: on an
+    ASCII terminal, holding <span class="kbd">Ctrl</span> while typing a letter clears bits 5 and 6 of that
+    letter's ASCII code — which is exactly <code class="inl">letter &amp; 0x1F</code>. The popular
+    community walkthrough of this same program even spells that rule out as a macro,
+    <code class="inl">#define CTRL_KEY(k) ((k) &amp; 0x1F)</code> — but the actual kilo.c you'll be reading
+    has no such macro; it just writes the already-computed numbers straight into the
+    <code class="inl">enum</code>.<sup>[3]</sup> Do the arithmetic once and you'll never be surprised by one
+    of these constants again:</p>
+    <table class="grid" data-anchor="cterm-table-ctrl">
+      <thead><tr><th>Key</th><th>Letter (ASCII, binary)</th><th><code class="mono">&amp; 0x1F</code></th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><span class="kbd">Ctrl-Q</span></td><td class="mono">'Q' = 0x51 = 0101&thinsp;0001</td><td class="mono">0001&thinsp;1111</td><td class="mono">0001&thinsp;0001 = 17</td></tr>
+        <tr><td><span class="kbd">Ctrl-S</span></td><td class="mono">'S' = 0x53 = 0101&thinsp;0011</td><td class="mono">0001&thinsp;1111</td><td class="mono">0001&thinsp;0011 = 19</td></tr>
+        <tr><td><span class="kbd">Ctrl-F</span></td><td class="mono">'F' = 0x46 = 0100&thinsp;0110</td><td class="mono">0001&thinsp;1111</td><td class="mono">0000&thinsp;0110 = 6</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="cterm-p-macros-5">Bitflags follow the same &ldquo;small integer, big meaning&rdquo;
+    spirit: Kilo's syntax-highlight flags are declared as <code class="inl">#define
+    HL_HIGHLIGHT_STRINGS (1&lt;&lt;0)</code> and <code class="inl">#define HL_HIGHLIGHT_NUMBERS
+    (1&lt;&lt;1)</code> — each one a single bit, combinable with <code class="inl">|</code>, testable with
+    <code class="inl">&amp;</code>. We'll use exactly this trick again in a moment, on the terminal side.</p>
+
+    <div class="callout warn" data-anchor="cterm-callout-variadic">
+      <span class="tag">One more idiom: variadic functions</span>
+      <p>You'll see calls like <code class="inl">editorSetStatusMessage("%d lines written to disk",
+      n)</code> scattered through Kilo — printf-style calls to a function Kilo wrote itself. It works because
+      the function is declared <em>variadic</em>, using the same <code class="inl">&lt;stdarg.h&gt;</code>
+      machinery <code class="inl">printf()</code> itself is built on:</p>
+      <pre class="tab"><span class="ty">void</span> <span class="fn">editorSetStatusMessage</span>(<span class="kw">const</span> <span class="ty">char</span> *fmt, ...) {
+    va_list ap;
+    <span class="fn">va_start</span>(ap,fmt);
+    <span class="fn">vsnprintf</span>(E.statusmsg,<span class="kw">sizeof</span>(E.statusmsg),fmt,ap);
+    <span class="fn">va_end</span>(ap);
+    E.statusmsg_time = <span class="fn">time</span>(NULL);
+}</pre>
+      <p><code class="inl">va_start</code>/<code class="inl">va_end</code> bracket access to the
+      <code class="inl">...</code> arguments, and <code class="inl">vsnprintf()</code> — the
+      &ldquo;v&rdquo; means &ldquo;takes a va_list&rdquo; — formats them into
+      <code class="inl">E.statusmsg[80]</code> safely, truncating instead of overflowing if the message runs
+      long. Recognize this shape and the status-bar code in Chapter 06 will read as plain arithmetic.</p>
+    </div>
+
+    <p data-anchor="cterm-p-errors-1">Finally: C has no exceptions, and Kilo doesn't fake any. Functions that
+    can fail return <code class="inl">-1</code>, often by jumping to a <code class="inl">goto fatal:</code>
+    label that sets <code class="inl">errno</code> first; failures the editor truly can't recover from — a
+    file that won't open, a terminal that won't report its size — call <code class="inl">perror()</code>
+    (print the C library's text for the current <code class="inl">errno</code>) and then
+    <code class="inl">exit(1)</code>. There's no try/catch anywhere in this file, and there never will
+    be — every error path is a return value or a process exit, checked (or knowingly not checked) right where
+    it happens.<sup>[1]</sup></p>
+
+    <h2 data-anchor="cterm-h2-terminal">The terminal side: what's actually underneath the cursor</h2>
+    <p data-anchor="cterm-p-terminal-1">Now the other half. A terminal — even a modern GPU-accelerated one
+    like iTerm2 or Windows Terminal — still behaves, by contract, like the physical VT100 terminals of the
+    1970s: it's a device your program writes bytes to and reads bytes from, mediated by a piece of the
+    operating system called the <strong>line discipline</strong>. Understanding that mediation is the whole
+    key to Chapter 04.</p>
+
+    <h3 data-anchor="cterm-h3-fds">File descriptors and raw syscalls</h3>
+    <p data-anchor="cterm-p-fds-1">Kilo doesn't use <code class="inl">printf()</code> or
+    <code class="inl">getchar()</code> for its interactive I/O. It talks to the terminal through the same two
+    syscalls everything in POSIX ultimately reduces to: <code class="inl">read()</code> and
+    <code class="inl">write()</code>, on plain integer file descriptors — <code class="inl">STDIN_FILENO</code>
+    (0) for keyboard input, <code class="inl">STDOUT_FILENO</code> (1) for screen output.
+    <code class="inl">editorReadKey()</code> is, at its core, one line: <code class="inl">read(fd,&amp;c,1)</code>
+    — read exactly one byte, blocking until it arrives.<sup>[1]</sup> There's no buffering layer, no
+    line-editing library, no curses. Just syscalls.</p>
+
+    <h3 data-anchor="cterm-h3-termios">Canonical mode vs. raw mode: the <code class="inl">termios</code> API</h3>
+    <p data-anchor="cterm-p-termios-1">By default, your shell's terminal is in <strong>canonical
+    mode</strong>. In canonical mode the kernel's line discipline buffers everything you type, handles
+    backspace and line-editing itself, and only hands your program a complete line once you press
+    <span class="kbd">Enter</span> — which is why, right now, a plain <code class="inl">C</code> program
+    calling <code class="inl">read()</code> would receive nothing at all until you hit Enter, and would
+    receive a whole line at once, backspaces already applied.<sup>[4]</sup> That's exactly wrong for an
+    editor: Kilo needs to react the instant you press an arrow key, not after you press Enter.</p>
+    <p data-anchor="cterm-p-termios-2">The fix is the POSIX <code class="inl">termios</code> API:
+    <code class="inl">tcgetattr()</code> reads the terminal's current settings into a
+    <code class="inl">struct termios</code>; <code class="inl">tcsetattr()</code> writes modified settings
+    back. Turning <strong>off</strong> the <code class="inl">ICANON</code> flag switches to
+    <strong>noncanonical (&ldquo;raw&rdquo;) mode</strong>, where <code class="inl">read()</code> can return
+    individual bytes as they arrive rather than waiting for a whole line; turning off
+    <code class="inl">ECHO</code> stops the terminal from printing back what you type (Kilo will decide for
+    itself what to draw); and in noncanonical mode, two more fields —
+    <code class="inl">c_cc[VMIN]</code> and <code class="inl">c_cc[VTIME]</code> — govern exactly how many
+    bytes, or how long, <code class="inl">read()</code> waits before it returns.<sup>[4]</sup> Here's Kilo
+    setting all of this at once:</p>
+    <pre class="tab">raw = orig_termios;  <span class="cm">/* modify the original mode */</span>
+raw.c_iflag &amp;= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+raw.c_oflag &amp;= ~(OPOST);
+raw.c_cflag |= (CS8);
+raw.c_lflag &amp;= ~(ECHO | ICANON | IEXTEN | ISIG);
+raw.c_cc[VMIN] = 0;   <span class="cm">/* Return each byte, or zero for timeout. */</span>
+raw.c_cc[VTIME] = 1;  <span class="cm">/* 100 ms timeout (unit is tens of second). */</span>
+<span class="kw">if</span> (<span class="fn">tcsetattr</span>(fd,TCSAFLUSH,&amp;raw) &lt; 0) <span class="kw">goto</span> fatal;</pre>
+    <p data-anchor="cterm-p-termios-3">Notice the bitflag idiom from the C section reappears immediately:
+    <code class="inl">&amp;= ~(...)</code> clears a set of flags, <code class="inl">|= (...)</code> sets
+    them — the exact same two operators, applied to the terminal's control struct instead of Kilo's own
+    <code class="inl">HL_*</code> constants. We'll walk this function line by line, flag by flag, in Chapter
+    04; for now, just recognize that &ldquo;raw mode&rdquo; is not a mysterious terminal superpower — it's a
+    handful of bits in a struct, turned off on purpose.</p>
+
+    <h3 data-anchor="cterm-h3-winsize">Asking the terminal how big it is</h3>
+    <p data-anchor="cterm-p-winsize-1">A full-screen editor needs to know its canvas size. Kilo asks the
+    kernel directly with <code class="inl">ioctl(1, TIOCGWINSZ, &amp;ws)</code> — a general-purpose
+    &ldquo;device, please tell me something about yourself&rdquo; syscall, here requesting the terminal's row
+    and column count. If that fails or reports zero columns (some terminal multiplexers don't support
+    <code class="inl">TIOCGWINSZ</code>), Kilo falls back to a cruder trick: move the cursor to the
+    bottom-right corner with a raw escape sequence, then ask the terminal to report back where the cursor
+    landed, and infer the screen size from that position.<sup>[1]</sup> Two different ways to ask the same
+    question — one a syscall, one a conversation conducted entirely in escape sequences.</p>
+
+    <h3 data-anchor="cterm-h3-escapes">A first look at escape sequences</h3>
+    <p data-anchor="cterm-p-escapes-1">That fallback is worth pausing on, because it previews all of Chapter
+    05. An <strong>escape sequence</strong> is nothing more than ordinary bytes — starting with the ESC
+    character (<code class="inl">0x1B</code>) followed by <code class="inl">'['</code> — written to the
+    terminal with the same <code class="inl">write()</code> call you'd use for any other text. Kilo's C
+    program has no direct access to &ldquo;the screen&rdquo;; it never draws a pixel and never calls a
+    graphics API. It writes text. The <em>terminal emulator</em> — a separate program, watching everything
+    written to it — recognizes the ESC-<code class="inl">[</code> prefix, parses what follows as a command,
+    and reacts: move the cursor, clear a line, change a color. Kilo and the terminal are two separate
+    programs, cooperating entirely through a shared, decades-old text protocol.</p>
+
+    <div class="reflect" data-anchor="cterm-reflect">
+      <h4>So what did we actually get out of this?</h4>
+      <p>A shared vocabulary, on both halves of the problem. On the C side: one global struct instead of
+      parameter-passing, pointers paired with hand-tracked lengths, <code class="inl">realloc()</code>-and-
+      reassign for growing arrays, NULL-terminated arrays of strings, macros and bitflags for compact state,
+      variadic functions for printf-style helpers, and return-value-based error handling. On the terminal
+      side: file descriptors and raw <code class="inl">read()</code>/<code class="inl">write()</code>
+      instead of stdio, canonical mode as the kernel's default line-buffered behavior, the
+      <code class="inl">termios</code> struct as the lever that turns it off, and escape sequences as plain
+      text a cooperating terminal chooses to interpret specially. Every one of these ideas gets used for
+      real, not just mentioned, starting in the next chapter.</p>
+    </div>
+
+    <div class="challenges" data-anchor="cterm-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Compute <code class="inl">'D' &amp; 0x1F</code> and <code class="inl">'U' &amp; 0x1F</code> by
+        hand, in binary. Do they match <code class="inl">CTRL_D</code> and <code class="inl">CTRL_U</code> in
+        the <code class="inl">enum KEY_ACTION</code> snippet above?</li>
+        <li>Find every <code class="inl">realloc()</code> call in <code class="inl">kilo.c</code>. For each
+        one, confirm the result is reassigned back into the same pointer it grew — and notice what would go
+        wrong, concretely, if it weren't.</li>
+        <li>Without looking ahead to Chapter 04, predict: which single <code class="inl">c_lflag</code> bit,
+        if you turned it off, would stop the terminal from printing the characters you type back at you? You
+        now have everything you need to find the answer yourself.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="cterm-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — editorConfig, enum KEY_ACTION, enableRawMode, editorSetStatusMessage, abAppend, editorSyntax</a> &middot;
+      <a href="https://github.com/antirez/kilo" target="_blank" rel="noopener">[2] antirez/kilo — GitHub repository &amp; README</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[3] Build Your Own Text Editor — snaptoken (CTRL_KEY macro)</a> &middot;
+      <a href="https://man7.org/linux/man-pages/man3/termios.3.html" target="_blank" rel="noopener">[4] termios(3) — Linux manual page</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-what-a-text-editor-must-do.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-raw-mode-and-key-input.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

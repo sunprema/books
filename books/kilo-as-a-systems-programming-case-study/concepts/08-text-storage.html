@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Text Storage — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="tst-eyebrow">Chapter 08 &middot; Part III — Data &amp; Navigation</p>
+    <h1 data-anchor="tst-h1">Text Storage</h1>
+
+    <p class="lead" data-anchor="tst-lead">Chapter 07 told you where the document lives: <code class="inl">E.row</code>,
+    a pointer, and <code class="inl">E.numrows</code>, a count. It deliberately didn't tell you what's on the other
+    end of that pointer. That's this chapter's whole job &mdash; one struct per line, a second buffer inside it that
+    exists only because tab characters are one byte but many columns, and the small, careful arithmetic that keeps
+    those two buffers in sync every time you type.</p>
+
+    <h2 data-anchor="tst-h2-motivation">Motivation: a file isn't the same shape as a screen</h2>
+    <p data-anchor="tst-p-motivation-1">Suppose Kilo stored a line exactly as the file has it &mdash; one C string,
+    nothing else &mdash; and drew that string straight to the terminal. Most bytes would draw fine: one byte, one
+    printed cell, one column. A tab breaks that assumption immediately. A tab is a single byte,
+    <code class="inl">'\t'</code>, ASCII 9. But a terminal that receives a raw tab byte jumps its cursor forward to
+    the next multiple of some tab-stop width &mdash; a variable amount of visual space from a fixed one-byte cause.
+    If the cursor's column in the file (&ldquo;you're at the 5th character of this line&rdquo;) and the cursor's
+    column on screen (&ldquo;you're 12 cells from the left edge&rdquo;) are the same number for every ordinary
+    character but diverge the moment a tab is involved, then one number can't answer both questions. Kilo needs two.</p>
+    <p data-anchor="tst-p-motivation-2">Its answer is to keep two buffers per line instead of one: the bytes you
+    actually typed, and a second, disposable buffer built from the first, with every tab expanded into the right
+    number of spaces. Editing always happens on the first buffer. The second is regenerated, in full, every time the
+    first one changes. That's the entire idea of this chapter &mdash; everything below is really just &ldquo;how is
+    that second buffer built, and what has to happen to keep a whole array of them consistent as lines are inserted,
+    deleted, and edited.&rdquo;</p>
+
+    <h2 data-anchor="tst-h2-design">Design: one struct per line, two buffers each</h2>
+    <p data-anchor="tst-p-design-1">Here's <code class="inl">erow</code> again, the struct Chapter 07 introduced but
+    didn't dwell on. <code class="inl">E.row</code> points at an array of these &mdash; one per line of the file,
+    in order:</p>
+    <pre class="tab"><span class="kw">typedef</span> <span class="kw">struct</span> erow {
+    <span class="ty">int</span> idx;            <span class="cm">/* Row index in the file, zero-based. */</span>
+    <span class="ty">int</span> size;           <span class="cm">/* Size of the row, excluding the null term. */</span>
+    <span class="ty">int</span> rsize;          <span class="cm">/* Size of the rendered row. */</span>
+    <span class="ty">char</span> *chars;        <span class="cm">/* Row content. */</span>
+    <span class="ty">char</span> *render;       <span class="cm">/* Row content "rendered" for screen (for TABs). */</span>
+    <span class="ty">unsigned</span> <span class="ty">char</span> *hl;  <span class="cm">/* Syntax highlight type for each character in render.*/</span>
+    <span class="ty">int</span> hl_oc;          <span class="cm">/* Row had open comment at end in last syntax highlight
+                       check. */</span>
+} erow;</pre>
+    <p data-anchor="tst-p-design-2">Two pairs do the work. <code class="inl">chars</code>/<code class="inl">size</code>
+    are the file's own bytes &mdash; exactly what you typed or loaded, exactly what gets saved back to disk.
+    <code class="inl">render</code>/<code class="inl">rsize</code> are a second, independently-allocated buffer built
+    <em>from</em> <code class="inl">chars</code>, with every tab expanded into spaces, that exists purely so the
+    screen has something honest to draw. Nothing about editing ever touches <code class="inl">render</code>
+    directly &mdash; you insert and delete characters in <code class="inl">chars</code>, and <code class="inl">render</code>
+    gets rebuilt, wholesale, as a consequence. <code class="inl">hl</code> rides along as a third buffer, sized to
+    match <code class="inl">render</code>/<code class="inl">rsize</code> rather than <code class="inl">chars</code>
+    &mdash; one highlight-class byte per <em>rendered</em> character, which is Chapters 14&ndash;16's business, not
+    this one's, but worth noting now: whatever rebuilds <code class="inl">render</code> is going to need to rebuild
+    <code class="inl">hl</code> too, in the same breath.</p>
+    <div class="callout warn" data-anchor="tst-callout-no-constant">
+      <span class="tag">A constant that doesn't exist</span>
+      <p>If you've read the popular &ldquo;Build Your Own Text Editor&rdquo; walkthrough of this same program, you
+      may be expecting a <code class="inl">KILO_TAB_STOP</code> constant somewhere near the top of the file. It
+      isn't there. antirez's shipped <code class="inl">kilo.c</code> hard-codes the tab width &mdash; 8 columns
+      &mdash; as a bare literal, repeated at three separate call sites you'll meet in this chapter. Both approaches
+      produce the same behavior; only one of them is what's actually in the repository this book studies.</p>
+    </div>
+
+    <h2 data-anchor="tst-h2-render">Implementation: building <code class="inl">render</code> from <code class="inl">chars</code></h2>
+    <p data-anchor="tst-p-render-1"><code class="inl">editorUpdateRow()</code> is the one function that performs this
+    rebuild, and it is called after <em>every</em> mutation to a row's characters &mdash; you'll see it at the tail
+    of every insert and delete function later in this chapter. It frees the old <code class="inl">render</code>,
+    sizes a fresh one, and refills it:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorUpdateRow</span>(erow *row) {
+    <span class="ty">unsigned</span> <span class="ty">int</span> tabs = 0, nonprint = 0;
+    <span class="ty">int</span> j, idx;
+
+    <span class="fn">free</span>(row-&gt;render);
+    <span class="kw">for</span> (j = 0; j &lt; row-&gt;size; j++)
+        <span class="kw">if</span> (row-&gt;chars[j] == TAB) tabs++;
+
+    <span class="ty">unsigned</span> <span class="ty">long</span> <span class="ty">long</span> allocsize =
+        (<span class="ty">unsigned</span> <span class="ty">long</span> <span class="ty">long</span>) row-&gt;size + tabs*8 + nonprint*9 + 1;
+    <span class="kw">if</span> (allocsize &gt; UINT32_MAX) {
+        <span class="fn">printf</span>(<span class="str">"Some line of the edited file is too long for kilo\n"</span>);
+        <span class="fn">exit</span>(1);
+    }
+
+    row-&gt;render = <span class="fn">malloc</span>(row-&gt;size + tabs*8 + nonprint*9 + 1);
+    idx = 0;
+    <span class="kw">for</span> (j = 0; j &lt; row-&gt;size; j++) {
+        <span class="kw">if</span> (row-&gt;chars[j] == TAB) {
+            row-&gt;render[idx++] = <span class="str">' '</span>;
+            <span class="kw">while</span>((idx+1) % 8 != 0) row-&gt;render[idx++] = <span class="str">' '</span>;
+        } <span class="kw">else</span> {
+            row-&gt;render[idx++] = row-&gt;chars[j];
+        }
+    }
+    row-&gt;rsize = idx;
+    row-&gt;render[idx] = <span class="str">'\0'</span>;
+
+    <span class="cm">/* Update the syntax highlighting attributes of the row. */</span>
+    <span class="fn">editorUpdateSyntax</span>(row);
+}</pre>
+    <p data-anchor="tst-p-render-2">Read it as two passes over the same line. The first pass just counts: how many
+    <code class="inl">TAB</code> bytes (ASCII 9) are in <code class="inl">chars</code>? That count sizes the
+    allocation &mdash; worst case, every tab costs 8 bytes of expansion, so <code class="inl">tabs*8</code> is a safe
+    upper bound, not an exact one. (There's also a hard ceiling here: if the computed size would overflow a 32-bit
+    length, Kilo refuses to open the file rather than silently under-allocate.) The second pass does the actual
+    expansion: an ordinary character copies straight across; a tab writes one space, then keeps writing spaces
+    (<code class="inl">while((idx+1) % 8 != 0)</code>) until the write position lands on a column that's a multiple
+    of 8. That's the whole tab-stop rule, stated as a loop instead of a formula.</p>
+    <div class="callout key" data-anchor="tst-callout-dead-var">
+      <span class="tag">A variable that does nothing</span>
+      <p><code class="inl">nonprint</code> is declared, folded into both size calculations
+      (<code class="inl">tabs*8 + nonprint*9</code>), and never incremented anywhere in this function or anywhere
+      else in the file. It is always zero &mdash; dead code, left over from what was presumably an earlier version
+      that reserved extra bytes in <code class="inl">render</code> for non-printable characters. Kilo does still
+      give non-printable bytes special visual treatment, but it does that later, at draw time in
+      <code class="inl">editorRefreshScreen()</code> (Chapter 06), not by budgeting for it here. Even a widely-read,
+      celebrated ~1000-line program ships the occasional variable that quietly does nothing &mdash; worth noticing,
+      not worth losing sleep over.</p>
+    </div>
+    <p data-anchor="tst-p-render-3">Notice the very last line of the function: <code class="inl">editorUpdateSyntax(row)</code>.
+    That call means <code class="inl">chars</code>, <code class="inl">render</code>, and <code class="inl">hl</code>
+    are not three independently-maintained buffers you have to remember to keep in sync by hand &mdash; they're one
+    pipeline. Change the characters, call <code class="inl">editorUpdateRow()</code>, and the rendered text and its
+    highlight colors come along for free. Every function later in this chapter ends by calling it.</p>
+
+    <h2 data-anchor="tst-h2-array">Implementation: the row array itself</h2>
+    <p data-anchor="tst-p-array-1">One <code class="inl">erow</code> knows how to render itself. The array of them
+    &mdash; <code class="inl">E.row</code>, <code class="inl">E.numrows</code> lines long &mdash; needs its own
+    operations: insert a line, delete a line. Both are C's classic array-shift dance, done with
+    <code class="inl">realloc()</code> and <code class="inl">memmove()</code>:</p>
+    <pre class="tab"><span class="cm">/* Insert a row at the specified position, shifting the other rows on the bottom
+ * if required. */</span>
+<span class="ty">void</span> <span class="fn">editorInsertRow</span>(<span class="ty">int</span> at, <span class="ty">char</span> *s, <span class="ty">size_t</span> len) {
+    <span class="kw">if</span> (at &gt; E.numrows) <span class="kw">return</span>;
+    E.row = <span class="fn">realloc</span>(E.row,<span class="kw">sizeof</span>(erow)*(E.numrows+1));
+    <span class="kw">if</span> (at != E.numrows) {
+        <span class="fn">memmove</span>(E.row+at+1,E.row+at,<span class="kw">sizeof</span>(E.row[0])*(E.numrows-at));
+        <span class="kw">for</span> (<span class="ty">int</span> j = at+1; j &lt;= E.numrows; j++) E.row[j].idx++;
+    }
+    E.row[at].size = len;
+    E.row[at].chars = <span class="fn">malloc</span>(len+1);
+    <span class="fn">memcpy</span>(E.row[at].chars,s,len+1);
+    E.row[at].hl = NULL;
+    E.row[at].hl_oc = 0;
+    E.row[at].render = NULL;
+    E.row[at].rsize = 0;
+    E.row[at].idx = at;
+    <span class="fn">editorUpdateRow</span>(E.row+at);
+    E.numrows++;
+    E.dirty++;
+}</pre>
+    <p data-anchor="tst-p-array-2">Every insertion grows the array by exactly one slot &mdash; a fresh
+    <code class="inl">realloc()</code> per line. That's O(n) work per insert, which means loading an
+    n-line file by inserting one row at a time costs O(n&sup2;) overall in the worst case. For the file sizes Kilo
+    targets, that's a perfectly reasonable price for the simplicity of &ldquo;an array, plus
+    <code class="inl">realloc</code>&rdquo;; it's exactly the kind of trade-off a 1000-line editor is allowed to
+    make and a text editor meant to handle gigabyte logs is not. If <code class="inl">at</code> isn't the very end
+    of the array, <code class="inl">memmove()</code> shoves every row at or after it one slot toward higher memory
+    to open a gap, and the loop right after renumbers each shifted row's <code class="inl">.idx</code> field to match
+    its new position. Then the new row's own fields get filled in: its bytes are deep-copied
+    (<code class="inl">len+1</code>, deliberately including one byte past the caller's stated length &mdash; the
+    caller is trusted to have a valid null terminator sitting right there), <code class="inl">render</code>/<code class="inl">hl</code>
+    are zeroed so <code class="inl">editorUpdateRow()</code> builds them fresh, and only then does
+    <code class="inl">E.numrows</code> actually grow.</p>
+    <p data-anchor="tst-p-array-3">Deletion is insertion run in reverse &mdash; almost:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorFreeRow</span>(erow *row) {
+    <span class="fn">free</span>(row-&gt;render);
+    <span class="fn">free</span>(row-&gt;chars);
+    <span class="fn">free</span>(row-&gt;hl);
+}
+
+<span class="cm">/* Remove the row at the specified position, shifting the remainign on the
+ * top. */</span>
+<span class="ty">void</span> <span class="fn">editorDelRow</span>(<span class="ty">int</span> at) {
+    erow *row;
+
+    <span class="kw">if</span> (at &gt;= E.numrows) <span class="kw">return</span>;
+    row = E.row+at;
+    <span class="fn">editorFreeRow</span>(row);
+    <span class="fn">memmove</span>(E.row+at,E.row+at+1,<span class="kw">sizeof</span>(E.row[0])*(E.numrows-at-1));
+    <span class="kw">for</span> (<span class="ty">int</span> j = at; j &lt; E.numrows-1; j++) E.row[j].idx++;
+    E.numrows--;
+    E.dirty++;
+}</pre>
+    <p data-anchor="tst-p-array-4"><code class="inl">editorFreeRow()</code> releases the three buffers one
+    <code class="inl">erow</code> owns &mdash; <code class="inl">render</code>, <code class="inl">chars</code>,
+    <code class="inl">hl</code> &mdash; but not the <code class="inl">erow</code> struct itself, because
+    <code class="inl">erow</code>s live inline inside <code class="inl">E.row</code>'s array, not as individual
+    heap allocations. <code class="inl">editorDelRow()</code> then closes the gap with a
+    <code class="inl">memmove()</code> in the opposite direction from insertion's, and shrinks
+    <code class="inl">E.numrows</code>. Notice what doesn't shrink: the array's actual allocated capacity. Delete
+    every line in a huge file and <code class="inl">E.row</code>'s underlying block is still sized for all of them
+    &mdash; only the count says otherwise.</p>
+    <div class="callout warn" data-anchor="tst-callout-idx-bug">
+      <span class="tag">A loop worth checking against your own clone</span>
+      <p>Look closely at that renumbering loop: <code class="inl">for (int j = at; j &lt; E.numrows-1; j++) E.row[j].idx++;</code>
+      &mdash; it <em>increments</em> the <code class="inl">.idx</code> of every row that just shifted down into a
+      lower array position. That's the same direction <code class="inl">editorInsertRow()</code> uses to shift rows
+      <em>up</em> out of an insertion's way. And <code class="inl">.idx</code> isn't decorative: the syntax
+      highlighter (Chapters 14&ndash;16) uses <code class="inl">row-&gt;idx</code> to look up a line's immediate
+      neighbor when deciding whether a multi-line comment is still open. Incrementing after a deletion, where every
+      surviving row's true position just went <em>down</em> by one, reads as a genuine indexing bug in the shipped
+      source &mdash; not a deliberate choice. It's a small, narrow-impact one (it can only misdirect a highlight
+      lookup by one row after a deletion), but it's real, and it's exactly the kind of thing worth verifying against
+      a fresh clone of the repository yourself rather than taking a book's word for it.</p>
+    </div>
+
+    <h2 data-anchor="tst-h2-chars">Implementation: editing bytes inside one row</h2>
+    <p data-anchor="tst-p-chars-1">One more layer down: inserting or deleting a single character within one line's
+    <code class="inl">chars</code> buffer. Three small functions, all following the same shape &mdash; resize with
+    <code class="inl">realloc()</code>, shift bytes with <code class="inl">memmove()</code>/<code class="inl">memcpy()</code>,
+    call <code class="inl">editorUpdateRow()</code>, bump <code class="inl">E.dirty</code>:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">editorRowInsertChar</span>(erow *row, <span class="ty">int</span> at, <span class="ty">int</span> c) {
+    <span class="kw">if</span> (at &gt; row-&gt;size) {
+        <span class="cm">/* Pad the string with spaces if the insert location is outside the
+         * current length by more than a single character. */</span>
+        <span class="ty">int</span> padlen = at-row-&gt;size;
+        <span class="cm">/* In the next line +2 means: new char and null term. */</span>
+        row-&gt;chars = <span class="fn">realloc</span>(row-&gt;chars,row-&gt;size+padlen+2);
+        <span class="fn">memset</span>(row-&gt;chars+row-&gt;size,<span class="str">' '</span>,padlen);
+        row-&gt;chars[row-&gt;size+padlen+1] = <span class="str">'\0'</span>;
+        row-&gt;size += padlen+1;
+    } <span class="kw">else</span> {
+        <span class="cm">/* If we are in the middle of the string just make space for 1 new
+         * char plus the (already existing) null term. */</span>
+        row-&gt;chars = <span class="fn">realloc</span>(row-&gt;chars,row-&gt;size+2);
+        <span class="fn">memmove</span>(row-&gt;chars+at+1,row-&gt;chars+at,row-&gt;size-at+1);
+        row-&gt;size++;
+    }
+    row-&gt;chars[at] = c;
+    <span class="fn">editorUpdateRow</span>(row);
+    E.dirty++;
+}</pre>
+    <p data-anchor="tst-p-chars-2">Two cases, and the split is the interesting part.
+    <strong>Typing past the end of a line</strong> &mdash; <code class="inl">at &gt; row-&gt;size</code>, the cursor
+    is sitting somewhere in the blank space after the last real character &mdash; pads the gap with literal spaces
+    up to the insertion point (the comment's own arithmetic note, <code class="inl">+2 means: new char and null term</code>,
+    is the kind of detail that's easy to skim past and worth reading twice). <strong>Typing inside or at the exact
+    end of existing text</strong> instead opens a single-byte gap with <code class="inl">memmove()</code>, carrying
+    the existing null terminator forward along with everything after the insertion point
+    (<code class="inl">row-&gt;size-at+1</code> &mdash; that trailing <code class="inl">+1</code> is the null byte).
+    Either way, the one new byte gets written, <code class="inl">render</code> gets rebuilt, and
+    <code class="inl">E.dirty</code> ticks up.</p>
+    <pre class="tab"><span class="cm">/* Append the string 's' at the end of a row */</span>
+<span class="ty">void</span> <span class="fn">editorRowAppendString</span>(erow *row, <span class="ty">char</span> *s, <span class="ty">size_t</span> len) {
+    row-&gt;chars = <span class="fn">realloc</span>(row-&gt;chars,row-&gt;size+len+1);
+    <span class="fn">memcpy</span>(row-&gt;chars+row-&gt;size,s,len);
+    row-&gt;size += len;
+    row-&gt;chars[row-&gt;size] = <span class="str">'\0'</span>;
+    <span class="fn">editorUpdateRow</span>(row);
+    E.dirty++;
+}
+
+<span class="cm">/* Delete the character at offset 'at' from the specified row. */</span>
+<span class="ty">void</span> <span class="fn">editorRowDelChar</span>(erow *row, <span class="ty">int</span> at) {
+    <span class="kw">if</span> (row-&gt;size &lt;= at) <span class="kw">return</span>;
+    <span class="fn">memmove</span>(row-&gt;chars+at,row-&gt;chars+at+1,row-&gt;size-at);
+    <span class="fn">editorUpdateRow</span>(row);
+    row-&gt;size--;
+    E.dirty++;
+}</pre>
+    <p data-anchor="tst-p-chars-3"><code class="inl">editorRowAppendString()</code> is a plain
+    <code class="inl">memcpy()</code> onto the end &mdash; it's what Chapter 10 will use to implement
+    &ldquo;Backspace at column zero merges this line onto the end of the previous one.&rdquo;
+    <code class="inl">editorRowDelChar()</code> closes a one-byte gap by <code class="inl">memmove()</code>-ing
+    everything after <code class="inl">at</code> (including the null terminator) one step left. Compare its last
+    three lines to the two functions above it: both of those update <code class="inl">size</code>
+    <em>before</em> calling <code class="inl">editorUpdateRow()</code>; this one calls
+    <code class="inl">editorUpdateRow()</code> <em>first</em>, then decrements <code class="inl">size</code>
+    afterward. The practical effect is harmless &mdash; a leftover duplicate byte at the old last position gets
+    ignored on the next real access &mdash; but it's a genuine inconsistency in an otherwise uniform pattern, and a
+    good instinct to develop: notice when three nearly-identical functions don't do their bookkeeping in quite the
+    same order.</p>
+
+    <h2 data-anchor="tst-h2-flatten">Implementation: flattening the array back into one file</h2>
+    <p data-anchor="tst-p-flatten-1">Saving (Chapter 12's subject) needs the whole document as one contiguous
+    buffer, not an array of independent allocations. <code class="inl">editorRowsToString()</code> is the function
+    that builds it &mdash; worth seeing now, because it's really a text-storage operation that happens to be used by
+    the save chapter, not the other way around:</p>
+    <pre class="tab"><span class="ty">char</span> *<span class="fn">editorRowsToString</span>(<span class="ty">int</span> *buflen) {
+    <span class="ty">char</span> *buf = NULL, *p;
+    <span class="ty">int</span> totlen = 0;
+    <span class="ty">int</span> j;
+
+    <span class="cm">/* Compute count of bytes */</span>
+    <span class="kw">for</span> (j = 0; j &lt; E.numrows; j++)
+        totlen += E.row[j].size+1; <span class="cm">/* +1 is for "\n" at end of every row */</span>
+    *buflen = totlen;
+    totlen++; <span class="cm">/* Also make space for nulterm */</span>
+
+    p = buf = <span class="fn">malloc</span>(totlen);
+    <span class="kw">for</span> (j = 0; j &lt; E.numrows; j++) {
+        <span class="fn">memcpy</span>(p,E.row[j].chars,E.row[j].size);
+        p += E.row[j].size;
+        *p = <span class="str">'\n'</span>;
+        p++;
+    }
+    *p = <span class="str">'\0'</span>;
+    <span class="kw">return</span> buf;
+}</pre>
+    <p data-anchor="tst-p-flatten-2">Two passes, same shape as <code class="inl">editorUpdateRow()</code>'s
+    count-then-fill: the first sums every row's <code class="inl">size+1</code> (the <code class="inl">+1</code> is
+    a <code class="inl">'\n'</code> this function appends after <em>every</em> row, including the last) to size one
+    allocation; the second copies each row's bytes across and manually writes that newline. The detail worth
+    circling: it copies <code class="inl">chars</code>, never <code class="inl">render</code>. Whatever tab
+    expansion the screen shows you, the file on disk gets the original bytes back, untouched.</p>
+    <div class="callout key" data-anchor="tst-callout-chars-vs-render">
+      <span class="tag">The rule that explains everything above</span>
+      <p>Every function in this chapter enforces the same boundary. <strong>Editing operates on
+      <code class="inl">chars</code>.</strong> <strong>Saving reads <code class="inl">chars</code>.</strong>
+      <strong><code class="inl">render</code> exists purely for the screen</strong>, is rebuilt from
+      <code class="inl">chars</code> on every change, and is never the source of truth for anything. If you remember
+      one sentence from this chapter, make it that one &mdash; it's the answer to almost every &ldquo;wait, which
+      buffer does this touch?&rdquo; question the rest of the book will raise.</p>
+    </div>
+
+    <h2 data-anchor="tst-h2-cursor">Implementation: turning a character index back into a screen column</h2>
+    <p data-anchor="tst-p-cursor-1">There's one more place tab expansion matters, and it's not inside any of the
+    row-storage functions above &mdash; it's inside <code class="inl">editorRefreshScreen()</code> (Chapter 06),
+    at the very moment it positions the terminal's actual cursor. <code class="inl">E.cx</code> is a character
+    index into <code class="inl">chars</code>; the terminal wants a column number. On a line with no tabs those are
+    the same number. On a line with tabs, they aren't &mdash; and kilo.c's own comment says so directly:</p>
+    <pre class="tab"><span class="cm">/* Put cursor at its current position. Note that the horizontal position
+ * at which the cursor is displayed may be different compared to 'E.cx'
+ * because of TABs. */</span>
+<span class="ty">int</span> j;
+<span class="ty">int</span> cx = 1;
+<span class="ty">int</span> filerow = E.rowoff+E.cy;
+erow *row = (filerow &gt;= E.numrows) ? NULL : &amp;E.row[filerow];
+<span class="kw">if</span> (row) {
+    <span class="kw">for</span> (j = E.coloff; j &lt; (E.cx+E.coloff); j++) {
+        <span class="kw">if</span> (j &lt; row-&gt;size &amp;&amp; row-&gt;chars[j] == TAB) cx += 7-((cx)%8);
+        cx++;
+    }
+}
+<span class="fn">snprintf</span>(buf,<span class="kw">sizeof</span>(buf),<span class="str">"\x1b[%d;%dH"</span>,E.cy+1,cx);</pre>
+    <p data-anchor="tst-p-cursor-2">This loop walks <code class="inl">row-&gt;chars</code> &mdash; the raw bytes,
+    not <code class="inl">render</code> &mdash; from the left edge of the current viewport out to the cursor's
+    logical position, and for every tab byte it passes, it jumps the running screen-column counter
+    <code class="inl">cx</code> forward to the next multiple of 8 before the ordinary <code class="inl">cx++</code>.
+    It's the same 8-column rule as <code class="inl">editorUpdateRow()</code>, arrived at through slightly different
+    arithmetic (<code class="inl">7-((cx)%8)</code> here, versus a <code class="inl">while</code> loop there) &mdash;
+    and there is no shared function or shared constant connecting the two. Search the file for
+    <code class="inl">editorRowCxToRx</code> or anything like it and you'll find nothing; this inline loop, run fresh
+    on every screen redraw, is the only cx-to-column conversion kilo.c has.</p>
+    <div class="callout warn" data-anchor="tst-callout-two-copies">
+      <span class="tag">One rule, two independent implementations</span>
+      <p>If Kilo's tab width ever needed to change, a maintainer would have to find and update it in three places:
+      twice inside <code class="inl">editorUpdateRow()</code> (the allocation-size formula and the expansion loop)
+      and once more here, inside <code class="inl">editorRefreshScreen()</code>. None of the three refer to a shared
+      constant. This is the direct, concrete cost of not naming that <code class="inl">8</code> &mdash; three
+      independent places carrying the same assumption, with nothing enforcing that they agree.</p>
+    </div>
+
+    <h2 data-anchor="tst-h2-edge">Edge cases: where the two-buffer design shows its seams</h2>
+    <ul data-anchor="tst-ul-edge">
+      <li data-anchor="tst-li-edge-1"><strong>Every row-array operation is O(n).</strong>
+      <code class="inl">editorInsertRow()</code> and <code class="inl">editorDelRow()</code> both
+      <code class="inl">realloc()</code>/<code class="inl">memmove()</code> the whole tail of the array on every
+      single call. Loading a file of <code class="inl">n</code> lines one <code class="inl">editorInsertRow()</code>
+      call at a time is O(n&sup2;) in the worst case. That's a real cost, accepted deliberately, because Kilo's
+      whole premise is a small program for small-to-medium files &mdash; it's the same trade-off Chapter 02's
+      buffer-design survey named: an array of lines is the simplest point on the spectrum, and simplicity is
+      exactly what a ~1000-line editor is buying with it.</li>
+      <li data-anchor="tst-li-edge-2"><strong>Deleting a row never shrinks the array's capacity.</strong>
+      <code class="inl">editorDelRow()</code> frees a row's own three buffers and shrinks
+      <code class="inl">E.numrows</code>, but never calls <code class="inl">realloc()</code> to give memory back to
+      the allocator. Delete every line in a large file and <code class="inl">E.row</code>'s block is still sized
+      for the largest the document ever was.</li>
+      <li data-anchor="tst-li-edge-3"><strong>The <code class="inl">.idx</code> renumbering after a delete looks
+      backwards.</strong> Covered above, worth repeating in the edge-case list because it's the kind of bug that
+      only bites in a narrow situation &mdash; a multi-line comment's open/closed state, computed via a neighbor
+      lookup through <code class="inl">row-&gt;idx</code>, could consult the wrong row immediately after a deletion.
+      Everyday single-line edits never trigger it.</li>
+      <li data-anchor="tst-li-edge-4"><strong>Typing past the end of a line is a padding operation, not an
+      error.</strong> <code class="inl">editorRowInsertChar()</code>'s <code class="inl">at &gt; row-&gt;size</code>
+      branch fills the gap with literal space characters. A cursor that's visually &ldquo;past the last
+      character&rdquo; (which the padding-and-scrolling logic in Chapter 09 allows) becomes real, saved spaces the
+      instant you type there &mdash; not an out-of-bounds write, and not silently ignored either.</li>
+      <li data-anchor="tst-li-edge-5"><strong><code class="inl">chars</code> and <code class="inl">render</code>
+      can only ever drift apart between an edit and the next call to <code class="inl">editorUpdateRow()</code>
+      &mdash; and every mutation function calls it before returning.</strong> There's no code path in kilo.c that
+      changes a row's characters and leaves the old <code class="inl">render</code> in place; the two buffers are
+      never observably out of sync from outside these functions.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="tst-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A precise answer to a question that sounds simple and isn't: what does &ldquo;the text&rdquo; actually
+      mean inside a running editor? Kilo's answer is that there are two texts, not one &mdash;
+      <code class="inl">chars</code>, which is the truth, and <code class="inl">render</code>, which is a
+      disposable, rebuilt-on-demand translation of that truth into what a terminal can honestly display. Every
+      operation in this chapter, from inserting one character to flattening the whole document for a save, respects
+      that boundary. You now know exactly which buffer any future feature should touch: if it's about what the file
+      <em>contains</em>, it's <code class="inl">chars</code>; if it's about what the file <em>looks like</em>, it's
+      <code class="inl">render</code>. Chapter 09 builds cursor movement and scrolling on top of this same split
+      &mdash; and reuses the very cx-to-column arithmetic you just read.</p>
+    </div>
+
+    <div class="challenges" data-anchor="tst-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Trace what happens, function by function, when the user presses Tab in the middle of a line that
+        already contains one tab earlier in it. Which fields of <code class="inl">erow</code> change, in what order,
+        and which function is ultimately responsible for making <code class="inl">render</code> agree with
+        <code class="inl">chars</code> again?</li>
+        <li>The tab width (8) appears as a bare literal in three independent places in kilo.c. Sketch how you'd
+        introduce a single named constant and thread it through all three &mdash; and consider whether a fourth,
+        currently-unnoticed use might be lurking somewhere you haven't checked.</li>
+        <li>Convince yourself, one way or the other, whether <code class="inl">editorDelRow()</code>'s
+        <code class="inl">E.row[j].idx++</code> loop is really a bug. What test case (a specific sequence of
+        keystrokes on a specific small file) would make the consequence &mdash; a wrong neighbor row consulted for
+        multi-line comment state &mdash; actually visible on screen?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="tst-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — erow, editorUpdateRow, editorInsertRow, editorDelRow/editorFreeRow, editorRowInsertChar/editorRowAppendString/editorRowDelChar, editorRowsToString, editorRefreshScreen's cx-to-column loop</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[2] Build Your Own Text Editor — snaptoken</a> &middot;
+      <a href="https://coredumped.dev/2023/08/09/text-showdown-gap-buffers-vs-ropes/" target="_blank" rel="noopener">[3] Text showdown: Gap Buffers vs Ropes — Core Dumped</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-editor-state.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-moving-around-the-file.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

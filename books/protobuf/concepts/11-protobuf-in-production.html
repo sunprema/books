@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Protobuf in Production — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="prod-kicker">Chapter 11 &middot; Production &amp; Beyond</span>
+    <h1 data-anchor="prod-h1">Protobuf in Production</h1>
+
+    <p class="lede" data-anchor="prod-lede">
+      Everything so far has been about getting a single schema <em>right</em>: the model,
+      the bytes, the codegen, the compatibility rules. This chapter is about what happens
+      when there are two hundred schemas, forty services, six languages, and a hundred
+      engineers who have never met &mdash; all of them depending on the same
+      <code>.proto</code> files, all deploying on their own schedule. The wire format was
+      never the hard part. The hard part is that your schema quietly became a
+      <strong>distributed contract</strong>, and nobody owns it the way they own their
+      own code. So we'll build the machinery that keeps a shared schema honest: a
+      <em>registry</em> to version and distribute it, a <em>CI gate</em> that refuses
+      breaking changes, a <em>build pipeline</em> that generates code the same way on
+      every machine, <em>rollout discipline</em> for producers and consumers that upgrade
+      out of step, and finally a way to actually <em>see</em> schema change as it happens.
+      This is protobuf as an operational practice, not a syntax.
+    </p>
+
+    <h2 data-anchor="prod-h2-contract">The schema is a distributed system now</h2>
+    <p data-anchor="prod-p-contract-1">
+      Let's start by naming the shift, because it reframes everything else. On one team,
+      a <code>.proto</code> file is just a file &mdash; you edit it, regenerate, run the
+      tests, ship. The moment a <em>second</em> team compiles that same file, it stops
+      being your file. It's an interface between programs that upgrade independently, and
+      &mdash; here's the sharp bit &mdash; those programs are running <em>right now</em>,
+      in production, at versions you don't control. A field you delete is a field some
+      binary out there still reads. A number you reuse is a landmine for a peer three
+      deploys behind you.
+    </p>
+    <p data-anchor="prod-p-contract-2">
+      This is why the recurring argument &mdash; the one we met back in Chapter&nbsp;1 &mdash;
+      is that protobuf's durable value isn't the compact bytes; it's the
+      <strong>enforceable contract</strong>. But a contract nobody enforces is just a
+      suggestion. Everything in this chapter exists to turn &ldquo;please don't break the
+      schema&rdquo; into something a machine checks, blocks, and records. Treat the schema
+      like what it has become: a shipped artifact with versions, a distribution channel, a
+      test suite, and an audit log.
+    </p>
+    <div class="callout key-idea" data-anchor="prod-callout-shift">
+      <span class="callout-label">The one-sentence version</span>
+      Once more than one independently-deployed program depends on your
+      <code>.proto</code> files, the schema is a distributed contract &mdash; and it needs
+      the same operational discipline as any other production artifact: it must be
+      <em>versioned</em>, <em>distributed</em>, <em>compatibility-checked in CI</em>,
+      <em>rolled out in a safe order</em>, and <em>observable</em>.
+    </div>
+
+    <h2 data-anchor="prod-h2-buf">buf: one workspace, one source of truth</h2>
+    <p data-anchor="prod-p-buf-1">
+      Before the machinery, meet the tool most of it runs on. Running <code>protoc</code>
+      by hand &mdash; a wall of <code>-I</code> paths and <code>--&lt;lang&gt;_out</code>
+      flags, retyped slightly differently on every laptop &mdash; doesn't survive contact
+      with a real organization. <strong>buf</strong> is the modern toolchain that replaces
+      it, and its central idea is simple: declare the workspace <em>once</em>, in a
+      <code>buf.yaml</code> at the repo root, and let every operation read that same
+      definition.
+    </p>
+    <pre data-anchor="prod-code-bufyaml"><code><span class="cm"># buf.yaml — the workspace contract, checked into the repo root</span>
+<span class="at">version</span>: v2
+<span class="at">modules</span>:
+  - <span class="at">path</span>: proto
+<span class="at">deps</span>:
+  - buf.build/googleapis/googleapis   <span class="cm"># resolved into buf.lock by `buf dep update`</span>
+<span class="at">lint</span>:
+  <span class="at">use</span>:
+    - STANDARD
+<span class="at">breaking</span>:
+  <span class="at">use</span>:
+    - WIRE_JSON            <span class="cm"># the recommended minimum; FILE is stricter</span></code></pre>
+    <p data-anchor="prod-p-buf-2">
+      With that one file in place, each subcommand is a verb over the same schema:
+      <code>buf&nbsp;build</code> compiles the workspace, <code>buf&nbsp;lint</code> catches
+      API-shape problems while you're still editing, <code>buf&nbsp;format</code> tidies,
+      <code>buf&nbsp;breaking</code> checks compatibility, <code>buf&nbsp;generate</code>
+      produces code, <code>buf&nbsp;dep</code> resolves dependencies, and
+      <code>buf&nbsp;push</code> publishes. They can't disagree about what &ldquo;the
+      schema&rdquo; is, because they all read <code>buf.yaml</code>. (A nice bonus: buf's
+      compiler uses every core and tends to be about twice as fast as <code>protoc</code>
+      on a non-trivial workspace &mdash; which you feel on every CI run.)
+    </p>
+    <div class="callout note" data-anchor="prod-callout-lint">
+      <span class="callout-label">Lint is the cheap half of the discipline</span>
+      <code>buf&nbsp;lint</code> won't stop a wire break &mdash; that's
+      <code>buf&nbsp;breaking</code>'s job &mdash; but it enforces the <em>style</em> rules
+      from earlier chapters (enum-zero values, <code>UPPER_SNAKE_CASE</code> enum names,
+      package-mirrors-directory) so a schema stays consistent across a hundred authors.
+      Consistency now is what makes the automated compatibility rules legible later.
+    </div>
+
+    <h2 data-anchor="prod-h2-registry">A schema registry: versioned, not vendored</h2>
+    <p data-anchor="prod-p-registry-1">
+      Here's the first real production question: how does the <em>payments</em> team get
+      the <em>catalog</em> team's <code>.proto</code> files? The naive answer &mdash; copy
+      them in, or git-submodule the other repo &mdash; is the origin of most schema pain.
+      Copies drift. Nobody can say which version of the contract a given service actually
+      compiled against. A fix in the source repo doesn't reach the ten repos that snapshotted
+      it months ago. You've turned a shared interface back into a pile of divergent files.
+    </p>
+    <p data-anchor="prod-p-registry-2">
+      A <strong>schema registry</strong> solves this the way a package manager solves it
+      for libraries. The reference implementation is the <strong>Buf Schema Registry
+      (BSR)</strong>. It turns a set of <code>.proto</code> files into a versioned,
+      addressable <em>module</em> &mdash; <code>buf.build/acme/catalog</code> &mdash; with
+      real history. <code>buf&nbsp;push</code> publishes the module, and <em>every push is
+      a commit</em>; labels mark specific commits for consumers, with a default label
+      tracking releases. A downstream repo doesn't copy anything &mdash; it declares a
+      dependency in <code>buf.yaml</code>, and <code>buf&nbsp;dep&nbsp;update</code>
+      resolves it into a <code>buf.lock</code>, exactly the lockfile idea you already trust
+      from npm or Go modules.
+    </p>
+
+    <figure class="figbox" data-anchor="prod-fig-registry">
+      <svg viewBox="0 0 720 250" role="img" aria-labelledby="prod-fig-registry-title">
+        <title id="prod-fig-registry-title">Producer teams push versioned schema modules to a central schema registry, which serves docs, generated SDKs, and descriptors to many consumer teams</title>
+        <!-- producers -->
+        <g font-family="var(--font-mono)" font-size="10">
+          <rect x="20" y="40" width="120" height="30" rx="6" fill="none" stroke="var(--ty)" stroke-width="1.3"/>
+          <text x="80" y="59" text-anchor="middle" fill="var(--ty)">catalog team</text>
+          <rect x="20" y="80" width="120" height="30" rx="6" fill="none" stroke="var(--ty)" stroke-width="1.3"/>
+          <text x="80" y="99" text-anchor="middle" fill="var(--ty)">payments team</text>
+        </g>
+        <text x="80" y="130" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">buf push  &rarr;  (each push = a commit)</text>
+        <g stroke="var(--rule)" stroke-width="1.2" fill="none">
+          <path d="M140 55 C 210 55, 230 108, 288 112"/>
+          <path d="M140 95 C 210 95, 230 116, 288 120"/>
+        </g>
+        <!-- registry -->
+        <rect x="290" y="86" width="150" height="76" rx="9" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="365" y="114" text-anchor="middle" font-family="var(--font-display)" font-size="14" fill="var(--ink)">schema registry</text>
+        <text x="365" y="132" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">versioned modules</text>
+        <text x="365" y="147" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">buf.build/acme/catalog</text>
+        <!-- outputs -->
+        <g stroke="var(--rule)" stroke-width="1.2" fill="none">
+          <path d="M440 108 C 500 108, 520 56, 566 54"/>
+          <path d="M440 120 C 500 120, 520 108, 566 108"/>
+          <path d="M440 132 C 500 132, 520 160, 566 162"/>
+          <path d="M440 144 C 500 144, 520 210, 566 214"/>
+        </g>
+        <g font-family="var(--font-mono)" font-size="10">
+          <rect x="568" y="38"  width="140" height="32" rx="6" fill="none" stroke="var(--fn)" stroke-width="1.3"/>
+          <text x="638" y="58"  text-anchor="middle" fill="var(--fn)">generated SDKs</text>
+          <rect x="568" y="92"  width="140" height="32" rx="6" fill="none" stroke="var(--mac)" stroke-width="1.3"/>
+          <text x="638" y="112" text-anchor="middle" fill="var(--mac)">hosted docs</text>
+          <rect x="568" y="146" width="140" height="32" rx="6" fill="none" stroke="var(--num)" stroke-width="1.3"/>
+          <text x="638" y="166" text-anchor="middle" fill="var(--num)">buf.lock deps</text>
+          <rect x="568" y="200" width="140" height="32" rx="6" fill="none" stroke="var(--kw)" stroke-width="1.3"/>
+          <text x="638" y="220" text-anchor="middle" fill="var(--kw)">descriptors</text>
+        </g>
+      </svg>
+      <figcaption>
+        The registry is the hub. Producers <code>push</code> versioned modules;
+        consumers pull generated SDKs, docs, pinned dependencies, and descriptors &mdash;
+        nobody vendors raw <code>.proto</code> files, and every dependency is a named
+        version, not a snapshot.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="prod-p-registry-3">
+      Distribution is the other half of the story, and it's where a registry earns its
+      keep every day. The BSR doesn't just <em>store</em> the schema &mdash; it serves
+      generated documentation, runs codegen plugins on demand, and publishes ready-made
+      <strong>SDKs into native package ecosystems</strong>: Go modules, PyPI, Maven, npm,
+      NuGet, Cargo, Swift Package Manager. A Python consumer runs <code>pip&nbsp;install</code>
+      on a normal package; it never sees a <code>.proto</code> file or runs
+      <code>protoc</code> at all. The schema's authors publish; the schema's users install.
+      That's the whole game.
+    </p>
+
+    <h2 data-anchor="prod-h2-breaking">The CI gate: breaking-change detection</h2>
+    <p data-anchor="prod-p-breaking-1">
+      Now the single most valuable piece of production tooling in the whole chapter. Back
+      in the evolution chapter we learned <em>which</em> changes are safe and which are
+      poison &mdash; adding a field is fine, reusing a number is a disaster. But knowing
+      the rules and <em>never once</em> violating them across thousands of PRs by tired
+      humans are very different things. So we don't rely on humans. We let
+      <code>buf&nbsp;breaking</code> compile the proposed schema and a past version, diff
+      them, and <strong>fail the build</strong> on any change that would break clients,
+      servers, or generated code.
+    </p>
+    <p data-anchor="prod-p-breaking-2">
+      What counts as &ldquo;breaking&rdquo; isn't one thing &mdash; it's a policy you
+      choose, expressed as one of four nested categories. They run from strictest to most
+      lenient, and passing a stricter one implies passing every looser one:
+    </p>
+
+    <table class="cmp" data-anchor="prod-table-categories">
+      <thead><tr><th>Category</th><th>Catches a break in&hellip;</th><th>Use it when</th></tr></thead>
+      <tbody>
+        <tr><td><code>FILE</code></td><td>generated source, per file (an import path, a symbol location)</td><td>consumers compile the generated code directly (esp. C++/Python)</td></tr>
+        <tr><td><code>PACKAGE</code></td><td>generated source, per package</td><td>you want source stability but tolerate file moves</td></tr>
+        <tr><td><code>WIRE_JSON</code></td><td>binary <em>or</em> JSON encoding</td><td><strong>the recommended minimum</strong> &mdash; services that also speak JSON</td></tr>
+        <tr><td><code>WIRE</code></td><td>binary encoding only</td><td>binary-only systems that never serialize JSON</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="prod-p-breaking-3">
+      The check always diffs against a <strong>baseline</strong>, and the
+      <code>--against</code> flag is refreshingly flexible about where that baseline lives:
+      a Git branch, tag, or commit; a module in the registry; a tarball or zip; a plain
+      directory; or a prebuilt Buf image. The everyday form compares your branch against
+      <code>main</code>:
+    </p>
+    <pre data-anchor="prod-code-breaking"><code><span class="cm"># does this branch break the schema on main?</span>
+<span class="fn">buf</span> breaking --against <span class="str">'.git#branch=main'</span>
+
+<span class="cm"># CI does shallow clones? point at the remote; buf fetches only the one</span>
+<span class="cm"># commit it needs for the diff.</span>
+<span class="fn">buf</span> breaking --against <span class="str">'https://github.com/acme/api.git#branch=main'</span></code></pre>
+    <div class="callout warning" data-anchor="prod-callout-policy">
+      <span class="callout-label">&ldquo;buf breaking passed&rdquo; is not the same claim as &ldquo;wire-compatible&rdquo;</span>
+      A breaking-change tool can be deliberately <em>stricter</em> than the raw wire
+      format. Moving an enum's definition to a different file, for instance, can be a
+      <code>FILE</code>-category break even though the bytes would round-trip perfectly.
+      That's a feature, not a bug &mdash; it protects source compatibility too &mdash; but
+      it means the category you enforce is a real decision. Pick <code>WIRE</code>/<code>WIRE_JSON</code>
+      if you only care about the bytes; pick <code>FILE</code> if your consumers depend on
+      the generated code's shape.
+    </div>
+
+    <h2 data-anchor="prod-h2-ci">Wiring the gate into CI</h2>
+    <p data-anchor="prod-p-ci-1">
+      A check nobody runs protects nothing, so the gate belongs in the pull-request
+      pipeline where it can't be skipped. The unified <code>bufbuild/buf-action</code>
+      GitHub Action runs the whole suite &mdash; build, lint, format, and breaking &mdash;
+      in one step, and can auto-publish to the registry on merge. Critically for reviewers,
+      it surfaces failures <em>where humans look</em>: lint and breaking violations become
+      GitHub annotations and inline comments right next to the offending lines, plus a
+      summary comment on the PR. An unsafe schema edit gets a red check and a comment
+      explaining exactly which field broke &mdash; at review time, before it can ever reach
+      a running peer.
+    </p>
+    <pre data-anchor="prod-code-ci"><code><span class="cm"># .github/workflows/buf.yaml — the gate</span>
+<span class="at">on</span>: pull_request
+<span class="at">jobs</span>:
+  <span class="at">buf</span>:
+    <span class="at">runs-on</span>: ubuntu-latest
+    <span class="at">steps</span>:
+      - <span class="at">uses</span>: actions/checkout@v4
+        <span class="at">with</span>: { fetch-depth: 0 }        <span class="cm"># breaking needs the baseline commit</span>
+      - <span class="at">uses</span>: bufbuild/buf-action@v1
+        <span class="at">with</span>:
+          <span class="cm"># build + lint + format + breaking; comments on the PR,</span>
+          <span class="cm"># diffs against the target branch, fails on a break</span>
+          <span class="at">breaking_against</span>: <span class="str">'https://github.com/acme/api.git#branch=main'</span></code></pre>
+    <div class="callout note" data-anchor="prod-callout-fetch">
+      <span class="callout-label">The one config that always trips people up</span>
+      Breaking detection needs to <em>see</em> the baseline. A default shallow checkout
+      (<code>fetch-depth: 1</code>) doesn't have <code>main</code>'s history, so the diff
+      silently has nothing to compare against. Either set
+      <code>fetch-depth:&nbsp;0</code> or point <code>--against</code> at the remote URL and
+      let buf fetch just the one commit. This is the single most common reason a
+      &ldquo;working&rdquo; breaking check quietly checks nothing.
+    </div>
+
+    <h2 data-anchor="prod-h2-codegen">Code generation as a build product</h2>
+    <p data-anchor="prod-p-codegen-1">
+      Generated code should be a <em>reproducible build output</em>, not an artisanal
+      thing each engineer conjures with slightly different flags. In production you want
+      two guarantees: the same schema produces the same code on every machine, and nobody
+      hand-edits the result. buf gets you there with a versioned
+      <code>buf.gen.yaml</code> and two features worth knowing by name.
+    </p>
+    <p data-anchor="prod-p-codegen-2">
+      The first is <strong>remote plugins</strong>. Instead of asking every laptop and CI
+      runner to install <code>protoc-gen-go</code> at exactly the right version, the
+      registry hosts plugins <em>pinned by version</em> and executes them server-side.
+      <code>buf&nbsp;generate</code> sends the schema up, the plugin runs, the code comes
+      back. Pin the version once (<code>...:v1.36.11</code>) and the output is identical
+      everywhere, forever. The second is <strong>managed mode</strong>, which moves the
+      language-specific file options &mdash; <code>go_package</code>,
+      <code>java_package</code>, <code>csharp_namespace</code> &mdash; <em>out</em> of the
+      shared <code>.proto</code> and into <code>buf.gen.yaml</code>. The schema stays
+      language-neutral (no consumer's convention leaks into the contract), yet every
+      consumer still gets correctly-namespaced code.
+    </p>
+    <pre data-anchor="prod-code-gen"><code><span class="cm"># buf.gen.yaml — codegen, made reproducible</span>
+<span class="at">version</span>: v2
+<span class="at">managed</span>:
+  <span class="at">enabled</span>: true              <span class="cm"># go_package etc. live HERE, not in the .proto</span>
+  <span class="at">override</span>:
+    - <span class="at">file_option</span>: go_package_prefix
+      <span class="at">value</span>: github.com/acme/gen/go
+<span class="at">plugins</span>:
+  <span class="cm"># remote + version-pinned -> identical output on every machine</span>
+  - <span class="at">remote</span>: buf.build/protocolbuffers/go:v1.36.11
+    <span class="at">out</span>: gen/go
+    <span class="at">opt</span>: paths=source_relative
+  - <span class="at">remote</span>: buf.build/grpc/go:v1.5.1
+    <span class="at">out</span>: gen/go
+    <span class="at">opt</span>: paths=source_relative</code></pre>
+    <div class="callout note" data-anchor="prod-callout-111">
+      <span class="callout-label">Layout is a build-performance decision too</span>
+      How you split <code>.proto</code> files feeds straight into this pipeline. The
+      <strong>1-1-1</strong> convention &mdash; one top-level type per file, one package,
+      one build rule, in a directory tree that mirrors the package &mdash; minimizes
+      transitive dependencies, so a small change recompiles and regenerates less, builds
+      faster, and produces leaner binaries. Moving a type becomes a file move instead of a
+      surgical extraction. It's an ideal to bend when messages are genuinely coupled or a
+      circular dependency forces your hand &mdash; but bend it knowingly.
+    </div>
+
+    <h2 data-anchor="prod-h2-rollout">Rollout discipline: producers and consumers out of step</h2>
+    <p data-anchor="prod-p-rollout-1">
+      Here's the fact that makes schema changes genuinely operational rather than
+      theoretical: <strong>a rolling deploy runs old and new binaries at the same
+      time</strong>. For minutes or hours, a v2 producer is sending data to a v1 consumer
+      that hasn't restarted yet &mdash; and a v1 producer is still emitting data a v2
+      consumer must accept. Two compatibility directions are in play at once, so let's be
+      precise about them:
+    </p>
+    <table class="cmp" data-anchor="prod-table-compat">
+      <thead><tr><th>Direction</th><th>Means</th><th>Who needs it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Backward</strong></td><td>new code reads <em>old</em> data</td><td>the upgraded reader, meeting not-yet-upgraded writers</td></tr>
+        <tr><td><strong>Forward</strong></td><td>old code reads <em>new</em> data</td><td>the not-yet-upgraded reader, meeting upgraded writers</td></tr>
+        <tr><td><strong>Full</strong></td><td>both at once</td><td>any rolling deploy where upgrade order is unknown</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="prod-p-rollout-2">
+      Full compatibility is the prize, because it's what lets producers and consumers
+      upgrade in <em>any order</em> &mdash; you stop having to choreograph deploys at all.
+      And it's exactly what protobuf's additive-change rules buy you: give new fields new
+      numbers, never reuse a retired number, <code>reserved</code> everything you delete.
+      A well-behaved old consumer even preserves fields it doesn't understand &mdash;
+      unknown fields survive a binary round-trip &mdash; so new data flows through it
+      intact.
+    </p>
+    <div class="callout warning" data-anchor="prod-callout-order">
+      <span class="callout-label">When a change is one-directional, order becomes correctness</span>
+      Not every change can be fully compatible. When one isn't, deployment
+      <em>order</em> stops being a preference and becomes a requirement:
+      <strong>teach every reader about the change before any writer produces it</strong> &mdash;
+      i.e. deploy consumers ahead of producers. Ship a producer first and an old reader
+      meets data it was never built for. The safe default is to prefer additive,
+      fully-compatible changes so order doesn't matter; reach for choreographed ordering
+      only when you truly can't.
+    </div>
+    <p data-anchor="prod-p-rollout-3">
+      And a trap that hides inside a change the tools call <em>safe</em>: widening
+      <code>int32</code> to <code>int64</code> is wire-compatible &mdash;
+      <code>buf&nbsp;breaking</code> waves it through &mdash; but an un-upgraded 32-bit
+      reader will <strong>truncate</strong> any value that overflows the old range. The
+      parser doesn't error; the number is just silently wrong. Wire-compatibility means
+      &ldquo;the decoder won't choke,&rdquo; not &ldquo;the value survives.&rdquo; During
+      such a migration, keep emitted values inside the old type's range until every reader
+      has upgraded.
+    </p>
+    <pre data-anchor="prod-code-order"><code><span class="kw">message</span> <span class="ty">Order</span> {
+  <span class="ty">string</span> id = <span class="num">1</span>;
+  <span class="cm">// v1 shipped this as int32. v2 widens to int64 — WIRE-compatible,</span>
+  <span class="cm">// but a v1 reader TRUNCATES values &gt; 2^31-1. Keep totals in range</span>
+  <span class="cm">// until every reader is on v2.</span>
+  <span class="ty">int64</span> total_cents = <span class="num">2</span>;
+
+  <span class="ty">string</span> coupon_code = <span class="num">3</span> [<span class="kw">deprecated</span> = <span class="kw">true</span>];  <span class="cm">// gradual retirement</span>
+  <span class="kw">reserved</span> <span class="num">4</span>;                                  <span class="cm">// a number we deleted, never to reuse</span>
+  <span class="kw">reserved</span> <span class="str">"legacy_status"</span>;
+}</code></pre>
+
+    <h2 data-anchor="prod-h2-testing">Compatibility testing beyond the gate</h2>
+    <p data-anchor="prod-p-testing-1">
+      <code>buf&nbsp;breaking</code> is a <em>static</em> check &mdash; it diffs schemas.
+      That catches the mechanical breaks, but it can't tell you whether a specific
+      producer/consumer pair actually round-trips real payloads, or whether your new Rust
+      client encodes a <code>oneof</code> the way your Go server expects. Mature teams add
+      two more layers. First, <strong>golden-payload tests</strong>: serialize a fixture
+      with the old schema, parse it with the new one (and vice-versa), and assert the
+      values you care about. This is where you'd catch that <code>int32</code>&rarr;<code>int64</code>
+      truncation with an actual over-range value, not just a rule. Second, the
+      <strong>conformance suite</strong> from the previous chapter, run against every
+      language runtime you deploy, so it's the <em>implementations</em> under test, not
+      just the schema.
+    </p>
+    <div class="callout key-idea" data-anchor="prod-callout-testing">
+      <span class="callout-label">Three layers, three different questions</span>
+      <code>buf&nbsp;breaking</code> asks &ldquo;is this schema change compatible in
+      principle?&rdquo; Golden-payload tests ask &ldquo;do <em>my</em> old and new versions
+      actually agree on <em>my</em> data?&rdquo; The conformance suite asks &ldquo;does each
+      language runtime implement the spec correctly at all?&rdquo; You want all three;
+      skipping the middle one is how a technically-compatible change still breaks a real
+      integration.
+    </div>
+
+    <h2 data-anchor="prod-h2-observability">Observability: seeing the schema change</h2>
+    <p data-anchor="prod-p-obs-1">
+      The last piece is knowing what's actually deployed. In a fleet of forty services you
+      can't answer &ldquo;which version of the <code>Order</code> contract is
+      <em>this</em> service running?&rdquo; by reading source. You answer it through
+      <strong>descriptors</strong>. A <code>FileDescriptorSet</code> is the compiled,
+      self-describing form of a schema &mdash; the schema <em>as data</em> &mdash; and a
+      registry (or a gRPC server's reflection endpoint) can serve it over HTTP. With it you
+      can introspect a running service's exact fields, options, and deprecation flags, and
+      hydrate dashboards or conformance checks from CI images that don't even have the buf
+      CLI installed.
+    </p>
+    <p data-anchor="prod-p-obs-2">
+      Two everyday practices fall out of this. The first is <strong>deprecation as a
+      visible signal</strong>: marking a field <code>[deprecated = true]</code> (or a
+      message/enum/service with <code>option deprecated = true;</code>) makes generators
+      emit the symbol as deprecated, so consumers get a compiler warning &mdash; a
+      loud, gradual &ldquo;this is going away&rdquo; long before the field is ever deleted
+      and its number reserved. That warning is observability at the source level. The
+      second is the registry as an <strong>audit log</strong>: because every push is an
+      immutable commit with an author and timestamp, the history of who changed the
+      contract, when, and how becomes queryable &mdash; a <code>git blame</code> across
+      every API in the organization. For most teams, <em>that</em> is what
+      &ldquo;observability of schema changes&rdquo; concretely means.
+    </p>
+    <div class="callout note" data-anchor="prod-callout-obs">
+      <span class="callout-label">A practical runtime signal to watch</span>
+      Unknown fields are protobuf's forward-compatibility mechanism &mdash; but a
+      <em>rising</em> count of unknown-field bytes at a consumer is also a signal:
+      producers are already emitting a newer schema this consumer hasn't caught up to.
+      Surfacing that as a metric turns &ldquo;we forgot to redeploy the reader&rdquo; into
+      a graph you can alert on, instead of a mystery you debug at 3&nbsp;a.m.
+    </div>
+
+    <div class="callout key-idea" data-anchor="prod-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      A schema that behaves like a real production artifact instead of a shared file
+      everyone hopes stays stable. The <em>registry</em> versions and distributes it, so
+      consumers install packages instead of vendoring drift. The <em>CI gate</em>
+      (<code>buf&nbsp;breaking</code>, surfaced as PR comments) makes an incompatible change
+      un-mergeable. The <em>build pipeline</em> (pinned remote plugins + managed mode)
+      makes generated code identical on every machine. <em>Rollout discipline</em> &mdash;
+      prefer fully-compatible changes; when you can't, deploy readers first &mdash; keeps
+      out-of-step producers and consumers honest. And <em>descriptors, deprecation, and
+      the registry's commit history</em> let you see schema change as it happens. None of
+      this is about bytes. All of it is about running a contract that outlives any single
+      deploy.
+    </div>
+
+    <div class="callout note" data-anchor="prod-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>Your teammate copies another team's <code>.proto</code> files into your repo
+        &ldquo;to keep it simple.&rdquo; Name two concrete failures this causes over the
+        next six months, and what a registry does instead.</li>
+        <li>A PR widens a field from <code>int32</code> to <code>int64</code>.
+        <code>buf&nbsp;breaking</code> passes. Is the change safe? Under what exact runtime
+        condition does it silently corrupt data, and what's the mitigation during rollout?</li>
+        <li>You must ship a one-directional schema change (not fully compatible). In which
+        order do you deploy producers and consumers, and why does the wrong order break?</li>
+        <li>Your breaking-change CI check has been green for months, but a wire break
+        reached production anyway. Give the single most likely misconfiguration &mdash; and
+        the one line that fixes it.</li>
+        <li>Someone asks &ldquo;which version of the <code>Order</code> schema is the
+        checkout service actually running right now?&rdquo; What artifact answers that, and
+        how do you fetch it without the service's source?</li>
+      </ol>
+    </div>
+
+    <p data-anchor="prod-sources" style="margin-top:2rem;font-size:.82em;color:var(--ink-soft);border-top:1px solid var(--rule);padding-top:.8rem;">
+      Sources: the <a href="https://github.com/bufbuild/buf">buf CLI README</a> (fetched
+      directly) for the subcommand surface and <code>buf.yaml</code>; Buf's
+      <a href="https://buf.build/docs/bsr/">Schema Registry</a>,
+      <a href="https://buf.build/docs/breaking/">breaking-change</a> (categories +
+      <code>--against</code> baselines),
+      <a href="https://buf.build/docs/generate/managed-mode/">managed mode</a>,
+      <a href="https://buf.build/docs/bsr/remote-plugins/">remote plugins</a>, and
+      <a href="https://buf.build/docs/reference/descriptors/">descriptors</a> docs;
+      the <a href="https://github.com/bufbuild/buf-action">bufbuild/buf-action</a> and
+      buf-breaking-action READMEs for the CI wiring; the protobuf
+      <a href="https://protobuf.dev/best-practices/1-1-1/">1-1-1</a> and
+      <a href="https://protobuf.dev/best-practices/dos-donts/">best-practices</a> guides;
+      and compatibility write-ups from
+      <a href="https://earthly.dev/blog/backward-and-forward-compatibility/">Earthly</a>,
+      <a href="https://yokota.blog/2021/08/26/understanding-protobuf-compatibility/">Robert
+      Yokota</a>, and OneUptime for rollout ordering. (buf.build/docs and protobuf.dev were
+      unreachable from this build's sandbox and were corroborated via search snippets and
+      reachable GitHub mirrors.)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="10-working-across-languages.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="12-performance-and-tradeoffs.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

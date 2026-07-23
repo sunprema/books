@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage and Event Systems — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="stor-kicker">Chapter 13 &middot; Production &amp; Beyond</span>
+    <h1 data-anchor="stor-h1">Storage and Event Systems</h1>
+
+    <p class="lede" data-anchor="stor-lede">
+      We've spent twelve chapters treating protobuf as a way to get a message from one process to
+      another and back &mdash; a <em>wire</em> format, born in the request/response world of gRPC. But
+      here's a quiet truth the RPC framing hides: protobuf doesn't know or care whether its bytes are
+      flying across a network or sitting on a disk. A serialized message is just a byte string. You can
+      send it, sure &mdash; or you can write it to a file, drop it into a database column, or append it
+      to a Kafka log where it might be read back <em>years</em> from now. And that last part changes
+      everything. A wire message lives for milliseconds; a stored message lives until someone deletes it.
+      This chapter is about what happens when protobuf stops being a courier and becomes an
+      <strong>archive</strong> &mdash; how you frame many messages into one stream, how bytes can carry
+      their own schema, how event systems like Kafka wire protobuf up to a schema registry, and why
+      <em>data at rest</em> demands a stricter schema discipline than anything on the wire ever did.
+    </p>
+
+    <h2 data-anchor="stor-h2-atrest">The same bytes, at rest</h2>
+    <p data-anchor="stor-p-atrest-1">
+      Start with the thing that's easy to miss because it's so simple: <code>SerializeToString</code>
+      returns a byte string, and a byte string doesn't care where it goes. The exact bytes you'd put on a
+      gRPC connection are the exact bytes you can write to <code>events.pb</code> on disk, stuff into a
+      <code>bytea</code> column in Postgres, cache in Redis, or store as the value of a Kafka record.
+      Google built protobuf for exactly this dual life &mdash; it has always been a format for
+      <em>storing</em> structured data as much as for exchanging it. Nothing special is required; the
+      write side is <code>SerializeToString</code>, the read side is <code>ParseFromString</code>, and in
+      between the bytes can sit still for as long as you like.
+    </p>
+    <div class="callout key-idea" data-anchor="stor-callout-atrest">
+      <span class="callout-label">The reframing</span>
+      A protobuf message is not &ldquo;an RPC payload.&rdquo; It's a compact, schema-defined byte string
+      that happens to work beautifully <em>on</em> the wire &mdash; and just as well in a file, a column,
+      or a log. Everything in this chapter falls out of taking that seriously: if the bytes can persist,
+      they will, and persistence has rules the wire never enforced.
+    </div>
+    <p data-anchor="stor-p-atrest-2">
+      But two problems appear the instant the bytes stop moving. First: a single serialized message has
+      no idea where it ends &mdash; fine when a connection or a length-header framed it for you, a real
+      question when you want to store <em>thousands</em> of messages in one file. Second: the bytes carry
+      field numbers, not field names, so a stored message is meaningless without the <code>.proto</code>
+      that describes it &mdash; and the <code>.proto</code> that described it might be long gone by the
+      time someone reads it back. Let's take those in order, because they're the two hinges this whole
+      chapter turns on: <strong>framing</strong> and <strong>self-description</strong>.
+    </p>
+
+    <h2 data-anchor="stor-h2-framing">Framing: where does one message end?</h2>
+    <p data-anchor="stor-p-framing-1">
+      Here's a fact that surprises people the first time it bites them: <strong>the protobuf wire format
+      is not self-delimiting.</strong> A parser reading a stream of bytes cannot, on its own, tell where
+      one message stops and the next begins. On a single request that's a non-issue &mdash; the whole
+      byte string <em>is</em> the message. But the moment you want to append a second message after the
+      first in the same file, you've created an ambiguity protobuf can't resolve for you.
+    </p>
+    <p data-anchor="stor-p-framing-2">
+      And it's worse than &ldquo;it can't tell&rdquo; &mdash; it will confidently do the
+      <em>wrong</em> thing. Recall from Chapter&nbsp;4 that concatenating two serialized messages of the
+      same type and parsing the result is <em>defined</em> to behave like <strong>merging</strong> them:
+      singular fields take the last value seen, repeated fields concatenate. So if you naively write
+      <code>msgA + msgB</code> to a file and read it back, you don't get two messages &mdash; you get one
+      Frankenstein message that's the merge of both, with no error to warn you. Raw concatenation
+      doesn't stream messages; it <em>silently fuses</em> them.
+    </p>
+    <div class="callout warning" data-anchor="stor-callout-concat">
+      <span class="callout-label">The trap in one line</span>
+      Two serialized messages stuck end-to-end don't parse as two messages &mdash; a same-type
+      concatenation parses as their <em>merge</em>, and a mixed-type one parses as garbage. There is no
+      exception thrown to save you. If a stream needs boundaries, <em>you</em> must put them there.
+    </div>
+    <p data-anchor="stor-p-framing-3">
+      The fix is the oldest trick in binary I/O: <strong>length-prefixing</strong>. Before each message,
+      write its size &mdash; as a varint, naturally, to keep it compact &mdash; then the message bytes.
+      To read, you decode the varint, read exactly that many bytes into a buffer, and parse the buffer.
+      The length tells the reader precisely where the message ends, so the next varint it reads is the
+      length of the <em>next</em> message. This is the canonical &ldquo;stream of messages&rdquo; layout,
+      and it's what turns a set of structures into a tidy set of byte strings you can append to forever.
+    </p>
+
+    <figure class="figbox" data-anchor="stor-fig-framing">
+      <svg viewBox="0 0 720 210" role="img" aria-labelledby="stor-fig-framing-title">
+        <title id="stor-fig-framing-title">A length-delimited stream writes each message's varint size before its bytes, so the reader always knows where one message ends and the next begins</title>
+        <text x="360" y="24" text-anchor="middle" font-family="var(--font-display)" font-size="15" fill="var(--ink)">A length-delimited stream</text>
+
+        <!-- naive concat (broken) -->
+        <text x="24" y="58" font-family="var(--font-mono)" font-size="10" fill="var(--kw)">naive concat &mdash; boundaries lost:</text>
+        <g font-family="var(--font-mono)" font-size="9">
+          <rect x="24"  y="66" width="150" height="26" rx="4" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.2"/>
+          <text x="99"  y="83" text-anchor="middle" fill="var(--ink-soft)">msg A bytes</text>
+          <rect x="174" y="66" width="150" height="26" rx="4" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.2"/>
+          <text x="249" y="83" text-anchor="middle" fill="var(--ink-soft)">msg B bytes</text>
+        </g>
+        <text x="174" y="112" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--kw)">&darr; parses as ONE merged message</text>
+
+        <!-- delimited (correct) -->
+        <text x="24" y="146" font-family="var(--font-mono)" font-size="10" fill="var(--en)">length-delimited &mdash; boundaries kept:</text>
+        <g font-family="var(--font-mono)" font-size="9">
+          <rect x="24"  y="154" width="40"  height="30" rx="4" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.4"/>
+          <text x="44"  y="173" text-anchor="middle" fill="var(--accent)">0x0A</text>
+          <rect x="64"  y="154" width="150" height="30" rx="4" fill="var(--code-bg)" stroke="var(--en)" stroke-width="1.2"/>
+          <text x="139" y="173" text-anchor="middle" fill="var(--ink-soft)">msg A bytes</text>
+          <rect x="214" y="154" width="40"  height="30" rx="4" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.4"/>
+          <text x="234" y="173" text-anchor="middle" fill="var(--accent)">0x11</text>
+          <rect x="254" y="154" width="150" height="30" rx="4" fill="var(--code-bg)" stroke="var(--en)" stroke-width="1.2"/>
+          <text x="329" y="173" text-anchor="middle" fill="var(--ink-soft)">msg B bytes</text>
+          <rect x="404" y="154" width="40"  height="30" rx="4" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.4"/>
+          <text x="424" y="173" text-anchor="middle" fill="var(--accent)">len&hellip;</text>
+          <rect x="444" y="154" width="90"  height="30" rx="4" fill="var(--code-bg)" stroke="var(--en)" stroke-width="1.2" stroke-dasharray="3 3"/>
+          <text x="489" y="173" text-anchor="middle" fill="var(--ink-soft)">msg C&hellip;</text>
+        </g>
+        <text x="44"  y="200" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--accent)">varint size</text>
+      </svg>
+      <figcaption>
+        The gold cells are varint length prefixes. Each one tells the reader exactly how many bytes the
+        following message occupies, so it can slice the stream at the right seams &mdash; the boundaries
+        the raw wire format refuses to carry.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="stor-p-framing-4">
+      Some languages hand you this for free. In Java, every message has
+      <code>writeDelimitedTo(OutputStream)</code> and the static
+      <code>parseDelimitedFrom(InputStream)</code> &mdash; they do exactly the varint-then-bytes dance,
+      and <code>parseDelimitedFrom</code> returns <code>null</code> at end-of-stream so you can loop
+      cleanly. Most other languages have <em>no</em> built-in delimited API: in C++ you reach for
+      <code>CodedOutputStream::WriteVarint32</code> plus the message's serialize call (and
+      <code>CodedInputStream</code> with a byte limit to read it back); in Python and Go you write the
+      length yourself. The <em>convention</em> is universal &mdash; a varint length before each message
+      &mdash; but the <em>convenience method</em> is Java's alone.
+    </p>
+    <pre data-anchor="stor-code-delimited"><code><span class="cm">// A length-delimited log of events, in one file (Java).</span>
+<span class="cm">// Each write emits: varint length, then the message bytes.</span>
+<span class="kw">try</span> (<span class="ty">OutputStream</span> out = <span class="ty">Files</span>.<span class="fn">newOutputStream</span>(path)) {
+  <span class="kw">for</span> (<span class="ty">Event</span> e : events) {
+    e.<span class="fn">writeDelimitedTo</span>(out);       <span class="cm">// framing handled for you</span>
+  }
+}
+
+<span class="cm">// Reading mirrors it — parseDelimitedFrom returns null at EOF.</span>
+<span class="kw">try</span> (<span class="ty">InputStream</span> in = <span class="ty">Files</span>.<span class="fn">newInputStream</span>(path)) {
+  <span class="ty">Event</span> e;
+  <span class="kw">while</span> ((e = <span class="ty">Event</span>.<span class="fn">parseDelimitedFrom</span>(in)) != <span class="kw">null</span>) {
+    <span class="fn">handle</span>(e);
+  }
+}</code></pre>
+    <div class="callout note" data-anchor="stor-callout-size">
+      <span class="callout-label">One message, or a stream of many?</span>
+      This is also the answer to a question Chapter&nbsp;12 raised: protobuf wants each message to stay
+      <em>small</em> &mdash; the project's own guidance is to keep individual messages well under a
+      megabyte and treat anything larger as a smell. A million-row export shouldn't be one giant
+      <code>repeated</code> field; it should be a <em>delimited stream</em> of a million small messages.
+      Same data, but now it parses incrementally, streams without buffering the whole thing, and never
+      triggers the multi-copy memory spikes a monster message causes.
+    </div>
+
+    <h2 data-anchor="stor-h2-selfdesc">When the schema travels with the data</h2>
+    <p data-anchor="stor-p-selfdesc-1">
+      Framing solves &ldquo;where does a message end?&rdquo; Now the second problem: a stored message is
+      <em>opaque</em>. Unlike JSON, protobuf bytes carry no field names &mdash; just numbers and wire
+      types. Hand someone a <code>.pb</code> file and no <code>.proto</code>, and the best they can do is
+      guess at a soup of tags and varints. On the wire that's fine, because both ends were compiled from
+      the same schema. But bytes on a disk might outlive the code that wrote them, and &ldquo;which
+      <code>.proto</code> was this?&rdquo; becomes a genuine archaeology problem.
+    </p>
+    <p data-anchor="stor-p-selfdesc-2">
+      Protobuf's answer is elegant and a little mind-bending: <strong>describe the schema using
+      protobuf itself.</strong> The structure of a <code>.proto</code> file &mdash; its messages,
+      fields, types, and dependencies &mdash; is itself modeled as a message, defined in
+      <code>google/protobuf/descriptor.proto</code>. The compiled, resolved form of one or more
+      <code>.proto</code> files is a <strong><code>FileDescriptorSet</code></strong>: literally the
+      parsed schema, as data. It's not some side artifact, either &mdash; it's the <em>same</em>
+      structure <code>protoc</code> feeds to every code-generator plugin (we'll meet it again from the
+      plugin side in Chapter&nbsp;14). You can emit one straight from the compiler:
+    </p>
+    <pre data-anchor="stor-code-descset"><code><span class="cm"># Compile the schema itself INTO data: a portable FileDescriptorSet.</span>
+<span class="cm"># --include_imports folds in every dependency so the set is self-contained.</span>
+<span class="fn">protoc</span> --include_imports \
+       --descriptor_set_out=schema.desc \
+       user.proto order.proto
+
+<span class="cm"># schema.desc IS a serialized FileDescriptorSet message. Ship it beside</span>
+<span class="cm"># your data and you can decode old blobs later with no .proto on hand.</span></code></pre>
+    <p data-anchor="stor-p-selfdesc-3">
+      Put those two ideas together &mdash; the schema-as-data and the payload &mdash; and you get a
+      <strong>self-describing message</strong>, the pattern the protobuf Techniques guide spells out. Wrap
+      the actual payload in a <code>google.protobuf.Any</code> (which carries a type URL plus the bytes),
+      and pair it with the <code>FileDescriptorSet</code> that defines that type. Now the message contains
+      <em>everything</em> a reader needs: the data, and the schema to interpret it.
+    </p>
+    <pre data-anchor="stor-code-selfdesc"><code><span class="cm">// The classic self-describing message (protobuf Techniques guide).</span>
+<span class="kw">syntax</span> = <span class="str">"proto2"</span>;   <span class="cm">// descriptor.proto is proto2</span>
+<span class="kw">import</span> <span class="str">"google/protobuf/any.proto"</span>;
+<span class="kw">import</span> <span class="str">"google/protobuf/descriptor.proto"</span>;
+
+<span class="kw">message</span> <span class="ty">SelfDescribingMessage</span> {
+  <span class="cm">// The schema: FileDescriptorProtos for the type and its deps.</span>
+  <span class="ty">google.protobuf.FileDescriptorSet</span> descriptor_set = <span class="num">1</span>;
+  <span class="cm">// The payload: the message and its type, as an Any.</span>
+  <span class="ty">google.protobuf.Any</span> message = <span class="num">2</span>;
+}</code></pre>
+    <p data-anchor="stor-p-selfdesc-4">
+      A tool that receives this needs no compiled stubs at all. It reads the <code>FileDescriptorSet</code>,
+      builds the type at runtime, and uses <strong><code>DynamicMessage</code></strong> (available in C++,
+      Java, and others) to walk the payload field by field &mdash; field <em>names</em> and all. This is
+      exactly how generic protobuf tooling works: a debugger that can pretty-print <em>any</em> message, a
+      log viewer, an archival format that stays readable decades later. The cost is real &mdash; you're
+      paying to carry the schema, and dynamic decoding is slower than generated code &mdash; so you reserve
+      it for genuinely generic or long-lived storage, not your hot path. But when you need bytes that can
+      explain themselves, this is the mechanism.
+    </p>
+
+    <h2 data-anchor="stor-h2-events">Protobuf in event systems: Kafka and the schema registry</h2>
+    <p data-anchor="stor-p-events-1">
+      A Kafka topic is the purest example of protobuf-as-storage. Producers <em>append</em> serialized
+      messages to a log; consumers read them back &mdash; maybe seconds later, maybe after replaying from
+      the beginning of a topic that's months old. Every message on that log is a stored protobuf message
+      with all the durability concerns we've been building toward. So how do you keep a fleet of
+      independently-deployed producers and consumers agreeing on the schema, without baking a
+      <code>FileDescriptorSet</code> into every single record?
+    </p>
+    <p data-anchor="stor-p-events-2">
+      The industry answer is a <strong>schema registry</strong> &mdash; a central service that stores each
+      schema once, under a named <em>subject</em>, and hands back a small integer ID. The most common is
+      Confluent's Schema Registry. Instead of embedding the schema, each message carries a tiny
+      <em>reference</em> to it. Confluent's serializer wraps the ordinary protobuf bytes in a small
+      envelope: a <strong>magic byte</strong> (<code>0x00</code>), a <strong>4-byte big-endian schema
+      ID</strong>, and &mdash; unique to protobuf &mdash; a <strong>message-index</strong> that names
+      <em>which</em> message type in the schema was used (a <code>.proto</code> can define several), which
+      is usually a single <code>0x00</code> for the first top-level message.
+    </p>
+    <pre data-anchor="stor-code-confluent"><code><span class="cm"># Confluent Schema Registry framing around a protobuf value:</span>
+
+  byte  <span class="num">0</span>      <span class="str">0x00</span>              <span class="cm"># magic byte — "this is registry wire format"</span>
+  bytes <span class="num">1..4</span>   <span class="str">00 00 00 2A</span>       <span class="cm"># schema ID = 42, big-endian int32</span>
+  byte  <span class="num">5</span>      <span class="str">00</span>                <span class="cm"># message-index (varint array; 0 = first msg)</span>
+  rest         <span class="str">08 96 01 12 03 ..</span> <span class="cm"># ordinary protobuf bytes</span>
+
+<span class="cm"># The consumer reads the schema ID, fetches THAT schema from the</span>
+<span class="cm"># registry (and caches it), then decodes the trailing protobuf bytes.</span></code></pre>
+    <figure class="figbox" data-anchor="stor-fig-registry">
+      <svg viewBox="0 0 720 220" role="img" aria-labelledby="stor-fig-registry-title">
+        <title id="stor-fig-registry-title">A producer registers its schema and gets an ID, stamps each Kafka message with that ID instead of the schema, and the consumer fetches the schema by ID from the registry to decode</title>
+        <!-- producer -->
+        <rect x="24" y="80" width="120" height="50" rx="8" fill="none" stroke="var(--ty)" stroke-width="1.4"/>
+        <text x="84" y="102" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ty)">Producer</text>
+        <text x="84" y="120" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">serialize + stamp id</text>
+        <!-- registry -->
+        <rect x="290" y="16" width="140" height="52" rx="8" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="360" y="38" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--accent)">Schema Registry</text>
+        <text x="360" y="56" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">subject &rarr; id &rarr; schema</text>
+        <!-- kafka log -->
+        <rect x="270" y="95" width="180" height="40" rx="6" fill="var(--code-bg)" stroke="var(--rule)" stroke-width="1.2"/>
+        <text x="360" y="112" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">Kafka topic (append-only)</text>
+        <text x="360" y="126" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--en)">[0x00][id][idx][bytes] &hellip;</text>
+        <!-- consumer -->
+        <rect x="576" y="80" width="120" height="50" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.4"/>
+        <text x="636" y="102" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--fn)">Consumer</text>
+        <text x="636" y="120" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">fetch schema, decode</text>
+        <!-- arrows -->
+        <g stroke="var(--rule)" stroke-width="1.3" fill="none">
+          <path d="M120 92 L288 52" marker-end="url(#stor-arrow)"/>
+          <path d="M144 112 L268 114" marker-end="url(#stor-arrow)"/>
+          <path d="M452 114 L574 110" marker-end="url(#stor-arrow)"/>
+          <path d="M600 84 L420 56" marker-end="url(#stor-arrow)"/>
+        </g>
+        <text x="196" y="58" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">register &rarr; id</text>
+        <text x="470" y="70" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">&larr; get schema by id</text>
+        <defs>
+          <marker id="stor-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0 0 L6 3 L0 6 z" fill="var(--rule)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        The schema lives in the registry, not the message. Each record carries only a 4-byte ID; the
+        consumer resolves it (once, then from cache) to get the schema it needs. Millions of messages, one
+        stored copy of the schema.
+      </figcaption>
+    </figure>
+    <p data-anchor="stor-p-events-3">
+      The registry does more than deduplicate the schema &mdash; it <em>governs</em> it. Every time a
+      producer tries to register a new version of a subject's schema, the registry checks it against a
+      configured <strong>compatibility mode</strong>. Confluent's default is <code>BACKWARD</code>: a new
+      schema must be able to read data written with the previous one. That specific direction is what makes
+      the common deploy safe &mdash; upgrade your <em>consumers</em> first, and they can still read every
+      old message already sitting on the topic, then producers roll forward behind them. Set it wrong (or
+      to <code>NONE</code>) and the registry will happily accept a change that orphans every message
+      written before it. The registry only enforces the rule you <em>told</em> it to enforce.
+    </p>
+    <div class="callout note" data-anchor="stor-callout-avro">
+      <span class="callout-label">Why Kafka reaches for a registry at all &mdash; the Avro contrast</span>
+      Chapter&nbsp;12 noted protobuf and Avro make <em>opposite</em> bets about where the schema lives.
+      It matters most here. Avro writes <em>no</em> field tags in the payload, so a reader needs the exact
+      <em>writer's</em> schema to decode anything &mdash; a registry is effectively mandatory. Protobuf
+      carries field numbers and wire types <em>in the bytes</em>, so it stays structurally parseable with
+      no registry at all. On Kafka you still use a registry with protobuf &mdash; for names, types, and
+      that governance &mdash; but understand what it's adding: <em>discipline</em>, not basic decodability.
+      That difference is a big part of why Avro grew up on Kafka and protobuf grew up on gRPC.
+    </div>
+
+    <h2 data-anchor="stor-h2-discipline">Data at rest is a stricter discipline</h2>
+    <p data-anchor="stor-p-disc-1">
+      Everything so far leads to one shift in mindset, and it's the real point of the chapter. On the
+      wire, a schema mismatch is a momentary bug: fix the deploy, retry the call, it's gone. In storage,
+      a schema mistake is <em>permanent</em>, because the bad bytes persist. The evolution rules from
+      Chapter&nbsp;7 weren't optional guidelines there &mdash; and for stored data they're closer to
+      sacred law. A <strong>field number is permanent identity</strong>, so you must <em>never</em> reuse
+      one; deleted fields and their numbers must be <code>reserved</code> so no future edit can recycle
+      them. Reuse a number on the wire and you break a deploy; reuse a number in storage and you silently
+      misread every record ever written with the old meaning &mdash; records that will outlive you on that
+      disk.
+    </p>
+    <p data-anchor="stor-p-disc-2">
+      There's a subtler durability property that stored data leans on hard: <strong>unknown-field
+      preservation</strong>. When a message arrives with fields your schema doesn't know about (a newer
+      producer, an older reader), proto3 &mdash; since v3.5, matching proto2 &mdash; keeps those unknown
+      fields and writes them back out on re-serialization. So a service can read a record, modify one
+      field, and save it, faithfully round-tripping data it doesn't even understand. That's forward
+      compatibility you get almost for free&hellip; <em>until you break it</em>. And it's startlingly easy
+      to break: projecting the message into typed database columns, converting it to JSON, or copying it
+      field-by-field into a fresh message all <strong>silently drop</strong> the unknowns. A relational
+      table has no column for a field it was never told about.
+    </p>
+    <div class="callout warning" data-anchor="stor-callout-unknown">
+      <span class="callout-label">If round-tripping matters, store the bytes</span>
+      The only way to guarantee end-to-end preservation of unknown fields is to keep the
+      <em>original serialized bytes</em> &mdash; a <code>bytea</code>/<code>BLOB</code> column, the raw
+      Kafka value &mdash; not an exploded set of typed columns. Shred the message into columns and you've
+      thrown away exactly the forward-compatibility protobuf handed you. Keep the blob (index a few
+      columns beside it if you must query), and old readers preserve tomorrow's fields untouched.
+    </div>
+    <p data-anchor="stor-p-disc-3">
+      And circle back to self-description one last time, because it's the quiet failure mode that ruins
+      archives. A raw protobuf blob is <em>not</em> readable without its schema. If the only copy of the
+      <code>.proto</code> that wrote a five-year-old record has been deleted, refactored beyond
+      recognition, or lost to a repo migration, that record is now undecodable garbage &mdash; the bytes
+      are intact and utterly meaningless. So durable storage carries an obligation the wire never did:
+      <strong>keep the schema recoverable.</strong> Pin the <code>.proto</code> version in source control,
+      store a <code>FileDescriptorSet</code> alongside the data, or lean on a registry that never forgets
+      an old version. Whichever you choose, decide it <em>on purpose</em> &mdash; because the bytes will
+      certainly outlast your memory of what they meant.
+    </p>
+
+    <div class="callout key-idea" data-anchor="stor-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      A second life for a format we thought we understood. The same protobuf we've used to <em>talk</em>
+      turns out to be a fine way to <em>remember</em> &mdash; provided we respect what remembering
+      demands. We learned to frame many messages into one stream with varint length prefixes (because the
+      wire format won't mark its own boundaries); to make bytes self-describing with a
+      <code>FileDescriptorSet</code> and <code>Any</code> when they must outlive their code; to lean on a
+      schema registry so an event log like Kafka can carry a 4-byte reference instead of a whole schema;
+      and to treat data at rest with a stricter discipline than any wire message &mdash; permanent field
+      numbers, preserved unknowns, a schema kept forever recoverable. The wire was forgiving because it
+      forgot. Storage remembers everything, including your mistakes &mdash; so here, more than anywhere,
+      the schema discipline this whole book has been teaching stops being good practice and becomes the
+      thing standing between you and an unreadable disk.
+    </div>
+
+    <div class="callout note" data-anchor="stor-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>You write three serialized <code>Event</code> messages to a file with plain
+        <code>out.write(bytes)</code> each, then read the file back with a single
+        <code>Event.parseFrom</code>. You get exactly one <code>Event</code> and no error. Explain
+        precisely what happened, and the one-word change to the write side that fixes it.</li>
+        <li>Your team stores a protobuf message by mapping each field to a Postgres column. A newer
+        producer starts sending a field the reader's schema doesn't have yet. After a read-modify-write
+        cycle through your service, where did that field go, and what storage layout would have preserved
+        it?</li>
+        <li>A Kafka consumer reads a message whose first byte is <code>0x00</code>. What are the next four
+        bytes, what does the consumer do with them, and why can't it simply <code>parseFrom</code> the
+        record value directly?</li>
+        <li>Someone proposes reusing field number <code>7</code> &mdash; freed when an old field was
+        deleted &mdash; for a brand-new field, arguing &ldquo;no current code uses 7 anymore.&rdquo;
+        Explain why this is far more dangerous for a database table than for a gRPC endpoint.</li>
+        <li>You must archive messages so they're still decodable in ten years with no assumptions about
+        the codebase surviving. Sketch two ways to keep the schema recoverable, and name the runtime tool
+        that lets a reader decode with no compiled stubs.</li>
+      </ol>
+    </div>
+
+    <p data-anchor="stor-sources" style="margin-top:2rem;font-size:.82em;color:var(--ink-soft);border-top:1px solid var(--rule);padding-top:.8rem;">
+      Sources: the protobuf
+      <a href="https://github.com/protocolbuffers/protocolbuffers.github.io/blob/main/content/programming-guides/techniques.md">Techniques guide</a>
+      (fetched from the GitHub docs mirror) for the not-self-delimiting wire format, the varint
+      length-prefix streaming pattern, the &ldquo;keep messages under ~1&nbsp;MB / stream many small
+      ones&rdquo; guidance, and the <code>SelfDescribingMessage</code> / <code>FileDescriptorSet</code> +
+      <code>Any</code> construction; Suresh Joshi's
+      <a href="https://sureshjoshi.com/development/streaming-protocol-buffers">streaming-protobuf writeup</a>
+      and the protobuf <code>CodedInputStream</code>/<code>CodedOutputStream</code> headers for the
+      cross-language framing story and Java's <code>writeDelimitedTo</code>/<code>parseDelimitedFrom</code>;
+      the <a href="https://buf.build/docs/reference/descriptors/">Buf Descriptors reference</a> for what a
+      <code>FileDescriptorSet</code> is and <code>--descriptor_set_out</code>/<code>--include_imports</code>;
+      Confluent's
+      <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/serdes-protobuf.html">Protobuf serdes</a>
+      and
+      <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html">schema-evolution</a>
+      docs (plus the &ldquo;<a href="https://dev.to/stevenjdh/demystifying-confluents-schema-registry-wire-format-5465">Demystifying the wire format</a>&rdquo;
+      writeup) for the magic-byte/schema-ID/message-index envelope and the <code>BACKWARD</code>-default
+      compatibility model; kmcd.dev's
+      <a href="https://kmcd.dev/posts/protobuf-unknown-fields/">Unknown Fields in Protobuf</a> for proto3's
+      v3.5 preservation behavior and how column/JSON projection drops it; and the
+      <a href="https://www.conduktor.io/glossary/avro-vs-protobuf-vs-json-schema">Avro-vs-protobuf</a>
+      comparison for the &ldquo;where does the schema live&rdquo; contrast.
+      (protobuf.dev was unreachable from this build's sandbox; its claims were corroborated via the
+      reachable GitHub docs mirror and search snippets.)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="12-performance-and-tradeoffs.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="14-custom-extensions-and-plugins.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

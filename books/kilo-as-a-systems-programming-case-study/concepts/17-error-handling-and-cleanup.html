@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Error Handling and Cleanup — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="ehc-eyebrow">Chapter 17 &middot; Part VI — Robustness</p>
+    <h1 data-anchor="ehc-h1">Error Handling and Cleanup</h1>
+
+    <p class="lead" data-anchor="ehc-lead">Every chapter so far has been about kilo.c doing something on
+    purpose: reading a key, drawing a screen, coloring a token. This chapter is about what happens when
+    something goes wrong, or when the user just wants out. Raw mode (Chapter 4) put the terminal into a
+    state no shell expects to inherit — <code class="inl">ECHO</code> off, <code class="inl">ICANON</code>
+    off, signals disabled. If Kilo exits without putting that back, the next thing you type into your shell
+    prompt won't echo, won't line-buffer, and will look like your terminal is broken. So before we can call
+    Kilo "done," we owe it one honest question: on every single way this program can stop running, does the
+    terminal get put back the way it found it?</p>
+
+    <h2 data-anchor="ehc-h2-motivation">Motivation: a program has more exits than a while loop</h2>
+    <p data-anchor="ehc-p-motivation-1">Look at the shape of <code class="inl">main()</code> and it's
+    tempting to think Kilo has exactly one way to end: the user hits <span class="kbd">Ctrl-Q</span>, the
+    <code class="inl">while(1)</code> loop breaks, the function returns. It doesn't work that way, and it
+    was never going to. Real programs die from bad arguments, missing files, I/O errors, and the occasional
+    line of source code so long it overflows an internal buffer — and every one of those is a legitimate
+    reason for kilo.c to call <code class="inl">exit()</code> from somewhere deep inside a helper function,
+    nowhere near <code class="inl">main</code>. Count them and there are seven separate call sites across
+    kilo.c that can end the process: a bad argument count, two different file-I/O failures, a read error on
+    the terminal itself, an over-long line, a window-size query failure, and the ordinary Ctrl-Q quit. Each
+    one needs the same answer to the same question &mdash; is the terminal still in raw mode right now,
+    and if so, who's putting it back?</p>
+    <div class="callout warn" data-anchor="ehc-callout-noguess">
+      <span class="tag">Don't reach for a die() helper</span>
+      <p>If you've read the popular snaptoken walkthrough of Kilo, you may remember a single <code
+      class="inl">die()</code> function that every error path calls. That's a teaching simplification from
+      that tutorial, not what antirez's actual kilo.c does. The real source has no such function — instead
+      each call site handles its own failure inline, with <code class="inl">perror()</code> and <code
+      class="inl">exit()</code>, or a local <code class="inl">goto</code> label for its own cleanup. It's
+      less uniform to read, but it's the real code, so that's what this chapter walks through.</p>
+    </div>
+
+    <h2 data-anchor="ehc-h2-design">Design: one flag, one atexit, one restore function</h2>
+    <p data-anchor="ehc-p-design-1">Kilo's whole cleanup story rests on three small pieces working together.
+    First, a place to remember what the terminal looked like <em>before</em> Kilo touched it &mdash; a
+    file-scope <code class="inl">struct termios</code> that Chapter 4's <code class="inl">enableRawMode</code>
+    already fills in with <code class="inl">tcgetattr</code>. Second, a function that puts it back. Third,
+    a way to guarantee that function actually runs, no matter which of those seven call sites is the one
+    that ends up calling <code class="inl">exit()</code>. Here's the first two pieces, read whole:</p>
+    <pre class="tab"><span class="kw">static struct</span> termios orig_termios; <span class="cm">/* In order to restore at exit.*/</span>
+
+<span class="ty">void</span> disableRawMode(<span class="ty">int</span> fd) {
+    <span class="cm">/* Don't even check the return value as it's too late. */</span>
+    <span class="kw">if</span> (E.rawmode) {
+        tcsetattr(fd,TCSAFLUSH,&amp;orig_termios);
+        E.rawmode = 0;
+    }
+}
+
+<span class="cm">/* Called at exit to avoid remaining in raw mode. */</span>
+<span class="ty">void</span> editorAtExit(<span class="ty">void</span>) {
+    disableRawMode(STDIN_FILENO);
+}</pre>
+    <p data-anchor="ehc-p-design-2"><code class="inl">disableRawMode</code> guards itself with <code
+    class="inl">E.rawmode</code>, the same flag <code class="inl">enableRawMode</code> sets to 1 on success
+    &mdash; call it when raw mode was never entered, or was already turned off, and it's a no-op. And notice
+    what it doesn't do: it doesn't check whether <code class="inl">tcsetattr</code> succeeded. That comment
+    isn't laziness, it's an honest admission. This call only ever runs while the process is already on its
+    way out. If restoring the terminal fails here, there is no next step to take &mdash; no retry, no
+    fallback, nowhere left in the program to report the failure to. Checking a return value only matters if
+    you have something different to do with the two outcomes; here you don't, so the code doesn't pretend
+    to.</p>
+    <p data-anchor="ehc-p-design-3"><code class="inl">editorAtExit</code> is the thin wrapper that makes
+    <code class="inl">disableRawMode</code> callable with the exact signature <code
+    class="inl">atexit()</code> requires &mdash; <code class="inl">void (*)(void)</code>, no arguments. It's
+    one line, and it exists purely so the C runtime has something to call for you.</p>
+
+    <h2 data-anchor="ehc-h2-atexit">Implementation: atexit() is the guarantee, and it's registered just in time</h2>
+    <p data-anchor="ehc-p-atexit-1">Here's where the guarantee actually gets made &mdash; inside <code
+    class="inl">enableRawMode</code> itself, the same function Chapter 4 walked through for what it does to
+    the terminal flags:</p>
+    <pre class="tab"><span class="ty">int</span> enableRawMode(<span class="ty">int</span> fd) {
+    <span class="kw">struct</span> termios raw;
+
+    <span class="kw">if</span> (E.rawmode) <span class="kw">return</span> 0; <span class="cm">/* Already enabled. */</span>
+    <span class="kw">if</span> (!isatty(STDIN_FILENO)) <span class="kw">goto</span> fatal;
+    atexit(editorAtExit);
+    <span class="kw">if</span> (tcgetattr(fd,&amp;orig_termios) == -1) <span class="kw">goto</span> fatal;
+
+    raw = orig_termios;
+    <span class="cm">/* ...clear ECHO, ICANON, ISIG, IXON, and friends (Chapter 4)... */</span>
+
+    <span class="kw">if</span> (tcsetattr(fd,TCSAFLUSH,&amp;raw) &lt; 0) <span class="kw">goto</span> fatal;
+    E.rawmode = 1;
+    <span class="kw">return</span> 0;
+
+fatal:
+    errno = ENOTTY;
+    <span class="kw">return</span> -1;
+}</pre>
+    <p data-anchor="ehc-p-atexit-2">Read the order of operations carefully, because it's the whole design in
+    three lines. <code class="inl">atexit(editorAtExit)</code> runs <em>before</em> <code
+    class="inl">tcgetattr</code> and <code class="inl">tcsetattr</code> &mdash; the two calls in this
+    function that can actually fail and jump to <code class="inl">fatal</code>. That's deliberate. Once
+    <code class="inl">enableRawMode</code> has committed to trying, the cleanup handler is armed for the rest
+    of the process's life, whether this particular attempt succeeds or not. From this point forward, calling
+    <code class="inl">exit()</code> from <em>anywhere</em> in the program &mdash; not just from this function,
+    not just from this file's obvious error paths, but from any function that happens to detect a fatal
+    condition ten call frames later &mdash; will run <code class="inl">editorAtExit</code> first. That's the
+    entire trick: register the safety net once, early, and then every unrelated piece of code that calls
+    <code class="inl">exit()</code> gets the benefit without having to know the net exists.</p>
+    <div class="callout key" data-anchor="ehc-callout-exitruns">
+      <span class="tag">exit() is not the only way a process ends</span>
+      <p><code class="inl">atexit()</code>-registered functions run when the process terminates
+      <em>normally</em> &mdash; a call to <code class="inl">exit()</code>, or falling off the end of <code
+      class="inl">main</code>. They do not run if the process is killed by an unhandled signal: a real
+      <code class="inl">SIGSEGV</code> from a memory bug, or a <code class="inl">SIGKILL</code> from outside
+      the process, both skip <code class="inl">editorAtExit</code> entirely. Since kilo.c's <code
+      class="inl">malloc</code>/<code class="inl">realloc</code> calls never check for a NULL return (more on
+      that below), a genuine out-of-memory fault is exactly the kind of bug that could leave your terminal
+      stuck in raw mode with no cleanup run at all &mdash; the reason <code class="inl">stty sane</code> or
+      <code class="inl">reset</code> exists as an escape hatch independent of the program that broke it.</p>
+    </div>
+
+    <h2 data-anchor="ehc-h2-order">Edge case: the exit that happens before raw mode ever starts</h2>
+    <p data-anchor="ehc-p-order-1">Now look at <code class="inl">main()</code> again, specifically the order
+    it calls things in:</p>
+    <pre class="tab"><span class="ty">int</span> main(<span class="ty">int</span> argc, <span class="ty">char</span> **argv) {
+    <span class="kw">if</span> (argc != 2) {
+        fprintf(stderr,<span class="str">"Usage: kilo &lt;filename&gt;\n"</span>);
+        exit(1);
+    }
+
+    initEditor();
+    editorSelectSyntaxHighlight(argv[1]);
+    editorOpen(argv[1]);
+    enableRawMode(STDIN_FILENO);
+    editorSetStatusMessage(
+        <span class="str">"HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find"</span>);
+    <span class="kw">while</span>(1) {
+        editorRefreshScreen();
+        editorProcessKeypress(STDIN_FILENO);
+    }
+    <span class="kw">return</span> 0;
+}</pre>
+    <p data-anchor="ehc-p-order-2">Three of Kilo's seven exit points sit above <code
+    class="inl">enableRawMode</code> in this call chain: the argument-count check right here, the window-size
+    query inside <code class="inl">initEditor</code>, and a file-open failure inside <code
+    class="inl">editorOpen</code>. None of those three register or rely on <code
+    class="inl">editorAtExit</code>, and none of them need to &mdash; at the moment any of them could fire,
+    <code class="inl">enableRawMode</code> hasn't run yet, so the terminal is still in whatever cooked,
+    normal state your shell left it in. There is nothing to restore, because nothing has been changed. This
+    is the payoff of putting <code class="inl">atexit(editorAtExit)</code> exactly where it sits, rather than
+    at the very top of <code class="inl">main</code>: the guarantee only needs to cover the exit points that
+    can happen after raw mode is actually on, and the source's own function ordering keeps every
+    before-raw-mode exit provably safe by construction, not by an extra check anyone had to remember to add.</p>
+    <p data-anchor="ehc-p-order-3">Here's <code class="inl">editorOpen</code>'s fatal path, one of those three:</p>
+    <pre class="tab"><span class="ty">int</span> editorOpen(<span class="ty">char</span> *filename) {
+    FILE *fp;
+    <span class="cm">/* ...set E.filename... */</span>
+
+    fp = fopen(filename,<span class="str">"r"</span>);
+    <span class="kw">if</span> (!fp) {
+        <span class="kw">if</span> (errno != ENOENT) {
+            perror(<span class="str">"Opening file"</span>);
+            exit(1);
+        }
+        <span class="kw">return</span> 1;
+    }
+    <span class="cm">/* ...getline() loop building rows... */</span>
+    <span class="kw">return</span> 0;
+}</pre>
+    <p data-anchor="ehc-p-order-4">Notice the two outcomes are treated completely differently, on purpose. A
+    missing file (<code class="inl">errno == ENOENT</code>) is not an error at all &mdash; it's the ordinary
+    case of running <code class="inl">kilo notes.txt</code> against a file you haven't created yet. <code
+    class="inl">editorOpen</code> just returns 1 and lets the editor open on an empty buffer, ready to create
+    that file on save. Anything else &mdash; permission denied, a directory instead of a file, whatever else
+    <code class="inl">fopen</code> can fail on &mdash; is treated as genuinely fatal: report it with <code
+    class="inl">perror</code>, which prints the message plus a human-readable <code class="inl">strerror</code>
+    of <code class="inl">errno</code>, and exit. Since this call happens before <code
+    class="inl">enableRawMode</code>, that <code class="inl">exit(1)</code> drops the user straight back to a
+    perfectly normal shell prompt with a one-line explanation on stderr &mdash; no raw-mode cleanup required,
+    none skipped either.</p>
+
+    <h2 data-anchor="ehc-h2-afterward">Implementation: the exits that happen after raw mode is on</h2>
+    <p data-anchor="ehc-p-afterward-1">The remaining four exit points all happen from inside the main loop,
+    after <code class="inl">enableRawMode</code> has already succeeded and armed <code
+    class="inl">editorAtExit</code>. First, a hard read error on the terminal itself, inside <code
+    class="inl">editorReadKey</code>:</p>
+    <pre class="tab"><span class="ty">int</span> editorReadKey(<span class="ty">int</span> fd) {
+    <span class="ty">int</span> nread;
+    <span class="ty">char</span> c, seq[3];
+    <span class="kw">while</span> ((nread = read(fd,&amp;c,1)) == 0);
+    <span class="kw">if</span> (nread == -1) exit(1);
+    <span class="cm">/* ...escape-sequence parsing (Chapter 5)... */</span>
+}</pre>
+    <p data-anchor="ehc-p-afterward-2">The <code class="inl">while</code> loop spins on a <code
+    class="inl">read</code> returning exactly 0 &mdash; the VTIME timeout with no byte available, from
+    Chapter 4's <code class="inl">VMIN=0, VTIME=1</code> setup, which is completely normal and just means
+    "no key yet." A return of <code class="inl">-1</code> is different: that's a real error on the file
+    descriptor, and Kilo doesn't try to interpret which one &mdash; it exits immediately. Because this line
+    can only run once the editor's main loop is going, raw mode is already on, and this <code
+    class="inl">exit(1)</code> is exactly the case the earlier <code class="inl">atexit</code> registration
+    was for: it runs <code class="inl">editorAtExit</code> before the process actually dies, and the
+    terminal comes back.</p>
+    <p data-anchor="ehc-p-afterward-3">Second, the ordinary way out &mdash; <span class="kbd">Ctrl-Q</span>,
+    gated by a small quit-confirmation counter:</p>
+    <pre class="tab"><span class="mac">#define</span> KILO_QUIT_TIMES 3
+<span class="cm">/* inside editorProcessKeypress(int fd): */</span>
+<span class="kw">static</span> <span class="ty">int</span> quit_times = KILO_QUIT_TIMES;
+<span class="cm">/* ... */</span>
+<span class="kw">case</span> CTRL_Q:        <span class="cm">/* Ctrl-q */</span>
+    <span class="cm">/* Quit if the file was already saved. */</span>
+    <span class="kw">if</span> (E.dirty &amp;&amp; quit_times) {
+        editorSetStatusMessage(<span class="str">"WARNING!!! File has unsaved changes. "</span>
+            <span class="str">"Press Ctrl-Q %d more times to quit."</span>, quit_times);
+        quit_times--;
+        <span class="kw">return</span>;
+    }
+    exit(0);
+    <span class="kw">break</span>;
+<span class="cm">/* ...at the very end of editorProcessKeypress: */</span>
+quit_times = KILO_QUIT_TIMES; <span class="cm">/* Reset it to the original value. */</span></pre>
+    <p data-anchor="ehc-p-afterward-4"><code class="inl">quit_times</code> is a function-local <code
+    class="inl">static</code>, so it persists between calls without being part of the global editor state.
+    If the buffer is unmodified (<code class="inl">E.dirty == 0</code>), Ctrl-Q exits on the first press,
+    same as always. If it's dirty, the first two presses just count down and warn; only the third
+    <span class="kbd">Ctrl-Q</span> in a row actually calls <code class="inl">exit(0)</code>. The "in a row"
+    part matters: that last line resets <code class="inl">quit_times</code> to 3 after <em>every</em>
+    keypress that reaches it, so pressing Ctrl-Q twice, typing one character, then pressing Ctrl-Q again
+    starts the countdown over from three, not from one. And <span class="kbd">Ctrl-C</span> gets its own
+    explicit case, right above this one, that does nothing at all:</p>
+    <pre class="tab"><span class="kw">case</span> CTRL_C:        <span class="cm">/* Ctrl-c */</span>
+    <span class="cm">/* We ignore ctrl-c, it can't be so simple to lose the changes
+     * to the edited file. */</span>
+    <span class="kw">break</span>;</pre>
+    <p data-anchor="ehc-p-afterward-5">Raw mode's <code class="inl">ISIG</code> flag being off (Chapter 4)
+    already means the terminal driver won't turn <span class="kbd">Ctrl-C</span> into a <code
+    class="inl">SIGINT</code> before Kilo even sees it &mdash; it arrives as an ordinary byte, like any other
+    key. This <code class="inl">case</code> is what happens to that byte: nothing, silently, so a stray
+    Ctrl-C out of muscle memory can never be the thing that throws away unsaved work.</p>
+    <p data-anchor="ehc-p-afterward-6">Third, an over-long line during rendering, inside <code
+    class="inl">editorUpdateRow</code>:</p>
+    <pre class="tab"><span class="ty">unsigned long long</span> allocsize =
+    (<span class="ty">unsigned long long</span>) row-&gt;size + tabs*8 + nonprint*9 + 1;
+<span class="kw">if</span> (allocsize &gt; UINT32_MAX) {
+    printf(<span class="str">"Some line of the edited file is too long for kilo\n"</span>);
+    exit(1);
+}
+row-&gt;render = malloc(row-&gt;size + tabs*8 + nonprint*9 + 1);</pre>
+    <p data-anchor="ehc-p-afterward-7">This one is defending against a specific, narrow failure mode: the
+    render buffer's size is computed by widening every term to <code class="inl">unsigned long long</code>
+    first, precisely so the overflow check itself can't overflow, and only <em>then</em> compared against
+    <code class="inl">UINT32_MAX</code>. Without that check, a pathological line (megabytes of tabs, say)
+    could compute a size that wraps around back to something small once it's actually passed to <code
+    class="inl">malloc</code>, which would allocate far less memory than the code goes on to write into.
+    Refusing to proceed and exiting is the honest choice here &mdash; better than silently corrupting memory
+    on a line no reasonable source file should ever contain.</p>
+    <p data-anchor="ehc-p-afterward-8">Fourth, a window-size query failure, which can be reached either
+    once at startup or again on every resize, via <code class="inl">SIGWINCH</code>:</p>
+    <pre class="tab"><span class="ty">void</span> updateWindowSize(<span class="ty">void</span>) {
+    <span class="kw">if</span> (getWindowSize(STDIN_FILENO,STDOUT_FILENO,
+                      &amp;E.screenrows,&amp;E.screencols) == -1) {
+        perror(<span class="str">"Unable to query the screen for size (columns / rows)"</span>);
+        exit(1);
+    }
+    E.screenrows -= 2; <span class="cm">/* Get room for status bar. */</span>
+}
+
+<span class="ty">void</span> handleSigWinCh(<span class="ty">int</span> unused __attribute__((unused))) {
+    updateWindowSize();
+    <span class="kw">if</span> (E.cy &gt; E.screenrows) E.cy = E.screenrows - 1;
+    <span class="kw">if</span> (E.cx &gt; E.screencols) E.cx = E.screencols - 1;
+    editorRefreshScreen();
+}
+
+<span class="ty">void</span> initEditor(<span class="ty">void</span>) {
+    <span class="cm">/* ...zero E.cx, E.cy, E.rowoff, E.numrows, etc... */</span>
+    updateWindowSize();
+    signal(SIGWINCH, handleSigWinCh);
+}</pre>
+    <p data-anchor="ehc-p-afterward-9"><code class="inl">initEditor</code> calls <code
+    class="inl">updateWindowSize</code> once, directly, and only then installs the <code
+    class="inl">SIGWINCH</code> handler that will call it again on every terminal resize for the rest of the
+    session. That first call happens before <code class="inl">enableRawMode</code>, in the same "nothing to
+    restore yet" window as the argument check and <code class="inl">editorOpen</code>'s fatal path. But
+    <code class="inl">SIGWINCH</code> can fire again at any point after that &mdash; the user resizes their
+    terminal emulator mid-session, well after raw mode is on &mdash; and if <code class="inl">getWindowSize</code>
+    fails on that later call, the same <code class="inl">exit(1)</code> runs with <code
+    class="inl">editorAtExit</code> already registered, so cleanup still happens correctly either way. Same
+    function, same failure branch, safe under both timings &mdash; not because anyone special-cased the
+    signal-handler call, but because the <code class="inl">atexit</code> registration doesn't care who calls
+    <code class="inl">exit()</code> or when.</p>
+
+    <div class="term" data-anchor="ehc-term-exits">
+      <div class="term-bar">
+        <span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span>
+        <span class="term-title">kilo.c — every process-ending call site</span>
+      </div>
+      <pre>main()                argc != 2                fprintf + exit(1)    before enableRawMode — safe
+initEditor()          getWindowSize() fails    perror  + exit(1)    before enableRawMode — safe
+editorOpen()          fopen fails, !ENOENT     perror  + exit(1)    before enableRawMode — safe
+enableRawMode()       isatty/tcgetattr/        errno=ENOTTY,
+                      tcsetattr fail            return -1  <span class="cur">(not exit — caller ignores it!)</span>
+editorReadKey()       read() returns -1        exit(1)               atexit() covers it
+editorUpdateRow()     render size &gt; UINT32_MAX printf  + exit(1)    atexit() covers it
+handleSigWinCh()      getWindowSize() fails    perror  + exit(1)    atexit() covers it
+editorProcessKeypress Ctrl-Q, not dirty /      exit(0)               atexit() covers it
+                      quit_times exhausted</pre>
+    </div>
+    <div class="callout warn" data-anchor="ehc-callout-ignored">
+      <span class="tag">A return value nobody checks</span>
+      <p>Go back to <code class="inl">main()</code>: <code class="inl">enableRawMode(STDIN_FILENO);</code>
+      is called as a bare statement. The function's <code class="inl">int</code> return value &mdash; 0 on
+      success, -1 if <code class="inl">isatty</code>, <code class="inl">tcgetattr</code>, or <code
+      class="inl">tcsetattr</code> failed &mdash; is silently discarded. If raw mode setup fails (stdin
+      redirected from a file instead of a real terminal, say), the editor doesn't stop or warn; it proceeds
+      straight into the main loop as though everything worked. <code class="inl">editorReadKey</code> then
+      reads from a terminal still in canonical mode &mdash; line-buffered, still echoing, still delivering
+      Ctrl-C as <code class="inl">SIGINT</code> &mdash; and every symptom of that looks like a bug in Kilo's
+      input handling rather than what it actually is: a setup failure nobody was told about. It's the one
+      real gap in an otherwise careful chain, worth remembering the next time a program's own error code
+      goes unchecked at its only call site.</p>
+    </div>
+
+    <h2 data-anchor="ehc-h2-save">Design: saving fails softly, on purpose</h2>
+    <p data-anchor="ehc-p-save-1">Not every error in kilo.c ends the process. <code
+    class="inl">editorSave</code> is the clearest counter-example &mdash; a failure here is reported to the
+    user and handed back as a return code, never <code class="inl">exit()</code>ed:</p>
+    <pre class="tab"><span class="ty">int</span> editorSave(<span class="ty">void</span>) {
+    <span class="ty">int</span> len;
+    <span class="ty">char</span> *buf = editorRowsToString(&amp;len);
+    <span class="ty">int</span> fd = open(E.filename,O_RDWR|O_CREAT,0644);
+    <span class="kw">if</span> (fd == -1) <span class="kw">goto</span> writeerr;
+
+    <span class="cm">/* Use truncate + a single write(2) call in order to make saving
+     * a bit safer, under the limits of what we can do in a small editor. */</span>
+    <span class="kw">if</span> (ftruncate(fd,len) == -1) <span class="kw">goto</span> writeerr;
+    <span class="kw">if</span> (write(fd,buf,len) != len) <span class="kw">goto</span> writeerr;
+
+    close(fd);
+    free(buf);
+    E.dirty = 0;
+    editorSetStatusMessage(<span class="str">"%d bytes written on disk"</span>, len);
+    <span class="kw">return</span> 0;
+
+writeerr:
+    free(buf);
+    <span class="kw">if</span> (fd != -1) close(fd);
+    editorSetStatusMessage(<span class="str">"Can't save! I/O error: %s"</span>,strerror(errno));
+    <span class="kw">return</span> 1;
+}</pre>
+    <p data-anchor="ehc-p-save-2">This is the same idea as <code class="inl">enableRawMode</code>'s <code
+    class="inl">goto fatal</code>, reused for a very different situation: one shared cleanup block that
+    every failing step jumps to, instead of duplicating the same <code class="inl">free</code>/<code
+    class="inl">close</code> pair at each <code class="inl">if</code>. But the ending is different on
+    purpose. There's no unsaved-terminal-state problem to worry about here &mdash; raw mode isn't touched by
+    any of this &mdash; so there's no reason to kill the whole editing session over a disk error. Instead
+    <code class="inl">writeerr</code> frees the buffer, closes the descriptor if it was ever opened, and
+    reports the failure the same way any other status message appears, through <code
+    class="inl">editorSetStatusMessage</code> with <code class="inl">strerror(errno)</code> spelling out
+    exactly what went wrong. The user keeps their in-memory edits (<code class="inl">E.dirty</code> stays
+    set) and can just try <span class="kbd">Ctrl-S</span> again.</p>
+    <div class="callout key" data-anchor="ehc-callout-notatomic">
+      <span class="tag">"A bit safer," not fully safe — read the comment literally</span>
+      <p>The comment above the <code class="inl">ftruncate</code>/<code class="inl">write</code> pair says
+      exactly what it is: safer than the alternative, not bulletproof. <code class="inl">ftruncate</code>
+      shortens the file to the new length <em>before</em> <code class="inl">write</code> puts the new bytes
+      in, so if the write fails partway &mdash; a full disk, an <code class="inl">ENOSPC</code> &mdash; the
+      file on disk can end up shorter than either the version you started with or the version you meant to
+      save. A more defensive editor writes to a fresh temporary file and <code class="inl">rename()</code>s
+      it over the original only once the write fully succeeds, so a failed save can never corrupt the file
+      that was already there. Kilo doesn't do that &mdash; it favors the simpler, more readable two-syscall
+      version, and reports honestly when it isn't enough. That's a tradeoff a ~1000-line editor is allowed
+      to make; it's not one a program guarding files you can't afford to lose should copy without noticing.</p>
+    </div>
+
+    <h2 data-anchor="ehc-h2-nullchecks">Edge case: the failure mode Kilo doesn't handle at all</h2>
+    <p data-anchor="ehc-p-nullchecks-1">Scan back through every snippet in this chapter and one thing is
+    conspicuously absent: nowhere does kilo.c check whether <code class="inl">malloc</code> or <code
+    class="inl">realloc</code> returned <code class="inl">NULL</code>. Not in <code
+    class="inl">editorInsertRow</code>, not in the append buffer, not in <code class="inl">editorOpen</code>'s
+    <code class="inl">E.filename</code> allocation, not in <code class="inl">editorRowsToString</code>'s
+    save buffer. Every allocation in this program is written as though it cannot fail.</p>
+    <p data-anchor="ehc-p-nullchecks-2">On a modern Linux system with memory overcommit, that assumption is
+    usually harmless in practice &mdash; the kernel will hand out virtual address space it doesn't back with
+    real memory until you touch it, and an editor working on ordinary source files is unlikely to ever ask
+    for enough to matter. But "usually harmless" is not "handled." If an allocation genuinely did fail, the
+    very next line dereferences a <code class="inl">NULL</code> pointer, the process receives <code
+    class="inl">SIGSEGV</code>, and &mdash; per the callout earlier in this chapter &mdash; a signal-based
+    death skips every <code class="inl">atexit()</code> handler, including <code
+    class="inl">editorAtExit</code>. That's the one path in this whole chapter where the terminal really can
+    get left in raw mode with nothing left to fix it automatically.</p>
+    <p data-anchor="ehc-p-nullchecks-3">Naming this clearly beats pretending it isn't there. A ~1000-line
+    editor built for reading, not for running unattended on a server with someone else's data, can
+    reasonably decide that a <code class="inl">NULL</code> check on every one of a dozen or so allocation
+    sites isn't worth the line count it would add. Whether that's the right call depends entirely on where
+    the program runs and what happens if it's wrong &mdash; which is exactly the kind of judgment call
+    Chapter 18's look at Kilo's portability and limitations will keep making, one assumption at a time.</p>
+
+    <div class="reflect" data-anchor="ehc-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A precise accounting of every way kilo.c's process can end, and proof &mdash; not a hand-wave, an
+      actual trace through the source &mdash; that raw mode is restored on all of them. The trick was never
+      complicated: one flag (<code class="inl">E.rawmode</code>) guards a restore function that doesn't
+      bother checking its own return value, one <code class="inl">atexit()</code> call arms that function for
+      the rest of the process's life, and that registration is placed exactly where it needs to be &mdash;
+      inside <code class="inl">enableRawMode</code>, before the calls that could fail &mdash; so it's live
+      for every exit that can happen once raw mode is actually on, while every exit that can happen before
+      that is safe for the much simpler reason that there's nothing yet to clean up. What this chapter also
+      surfaced, by reading the code instead of assuming it, is where that guarantee has real edges: <code
+      class="inl">enableRawMode</code>'s own failure return is silently ignored by its only caller, <code
+      class="inl">editorSave</code>'s two-syscall write can leave a file shorter than either version if it
+      fails midway, and every unchecked allocation is one out-of-memory condition away from a signal death
+      that <code class="inl">atexit()</code> can't reach at all. None of these are secret bugs &mdash;
+      they're the visible, honest shape of the tradeoffs a program this size makes on purpose.</p>
+    </div>
+
+    <div class="challenges" data-anchor="ehc-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Change <code class="inl">main()</code> so that a failed <code class="inl">enableRawMode</code>
+        call actually stops the program with a clear error message, instead of silently continuing in cooked
+        mode. What has to happen differently for the terminal to end up back in its original state on that
+        path, given raw mode was never fully entered?</li>
+        <li><code class="inl">editorSave</code>'s failure path can leave a truncated file on disk. Sketch,
+        in plain language (or pseudocode), the write-to-temp-file-then-rename approach mentioned in this
+        chapter, and explain specifically which of Kilo's existing failure branches (<code
+        class="inl">open</code>, <code class="inl">ftruncate</code>, <code class="inl">write</code>) that
+        approach would make safe to fail on, without losing the original file.</li>
+        <li>Suppose you added a NULL check after one allocation &mdash; say, <code
+        class="inl">E.filename = malloc(fnlen)</code> in <code class="inl">editorOpen</code>. Is the terminal
+        in raw mode at the point that allocation runs? Walk through <code class="inl">main()</code>'s call
+        order to justify your answer, and say what the "safe" response to a failed allocation should be at
+        that specific point in the program.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="ehc-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — disableRawMode, editorAtExit, enableRawMode, editorReadKey, editorOpen, editorSave, editorUpdateRow, updateWindowSize, handleSigWinCh, initEditor, editorProcessKeypress, main()</a> &middot;
+      <a href="https://man7.org/linux/man-pages/man3/atexit.3.html" target="_blank" rel="noopener">[2] atexit(3) — Linux manual page</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="16-file-types-and-highlight-rules.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="18-portability-and-limitations.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

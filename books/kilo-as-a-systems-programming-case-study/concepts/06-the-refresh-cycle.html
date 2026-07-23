@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Refresh Cycle — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="cyc-eyebrow">Chapter 06 &middot; Part II — The Terminal &amp; The Loop</p>
+    <h1 data-anchor="cyc-h1">The Refresh Cycle</h1>
+
+    <p class="lead" data-anchor="cyc-lead">Chapter 04 gave you a raw stream of keystrokes. Chapter 05 gave you a
+    way to paint a screen. Neither one, on its own, is an editor. What actually makes Kilo <em>run</em> is the
+    thing sitting between them — a loop so small it's easy to skim past, and so central that everything else in
+    this book only ever executes because that loop calls it. Read <code class="inl">main()</code> once you know
+    what to look for, and you've read the architecture.</p>
+
+    <h2 data-anchor="cyc-h2-motivation">Motivation: an editor is a loop, not an event system</h2>
+    <p data-anchor="cyc-p-motivation-1">Modern UI frameworks train you to think in callbacks and event queues —
+    register a handler, let the framework decide when to call it, trust some scheduler to interleave input,
+    timers, and redraws. Kilo has none of that. It has no event loop library, no dispatcher, no concurrency at
+    all. It has one function, running forever, doing exactly two things in exactly the same order, every single
+    time:</p>
+    <pre class="tab"><span class="kw">while</span>(1) {
+    <span class="fn">editorRefreshScreen</span>();
+    <span class="fn">editorProcessKeypress</span>(STDIN_FILENO);
+}</pre>
+    <p data-anchor="cyc-p-motivation-2">That's it. That's the whole runtime. Paint the screen, then wait for and
+    react to one keystroke. Paint again, then wait for the next one. Forever, until something inside the loop
+    calls <code class="inl">exit()</code>. There's no branch that skips the paint because &ldquo;nothing
+    changed,&rdquo; and no branch that reads more than one key before painting. The entire mental model of how
+    Kilo behaves &mdash; why it feels instant, why it never redraws stale content, why a resize just works &mdash;
+    falls out of taking those two lines completely literally.</p>
+
+    <h2 data-anchor="cyc-h2-design">Design: paint first, then block</h2>
+    <p data-anchor="cyc-p-design-1">The order of the two calls is the whole design decision, and it's easy to
+    read past. <code class="inl">editorRefreshScreen()</code> runs <em>before</em>
+    <code class="inl">editorProcessKeypress()</code> on every trip through the loop. That means each iteration
+    opens by showing the user the result of whatever the <em>previous</em> iteration's keystroke did, and only
+    then blocks waiting for the next one. The very first iteration, before any key has ever been read, paints the
+    editor's just-opened, unedited state &mdash; there's no keystroke to react to yet, and none is needed for the
+    first frame to appear.</p>
+    <div class="callout key" data-anchor="cyc-callout-order">
+      <span class="tag">Why this order and not the reverse</span>
+      <p>Flip the two calls &mdash; process a keypress, <em>then</em> refresh &mdash; and the program would still
+      basically work, but the very first thing the user would ever see is a blank blocking wait with nothing
+      painted yet, and every subsequent frame would still be correct only by accident of the loop repeating
+      forever. Painting first guarantees the screen is never more than one keystroke stale, starting from
+      the very first frame.</p>
+    </div>
+    <p data-anchor="cyc-p-design-2">The &ldquo;block&rdquo; half deserves a second look too, because it isn't a
+    naive spin. <code class="inl">editorProcessKeypress()</code> calls <code class="inl">editorReadKey()</code>,
+    which you first saw in Chapter 04 wrapped in this loop:</p>
+    <pre class="tab"><span class="kw">while</span> ((nread = <span class="fn">read</span>(fd,&amp;c,1)) == 0);
+<span class="kw">if</span> (nread == -1) <span class="fn">exit</span>(1);</pre>
+    <p data-anchor="cyc-p-design-3">Recall from Chapter 04 that raw mode sets <code class="inl">VMIN=0</code> and
+    <code class="inl">VTIME=1</code>: <code class="inl">read()</code> returns <em>zero</em> bytes read if 100ms
+    passes with nothing typed, rather than blocking indefinitely or erroring. That zero isn't treated as an
+    event &mdash; the <code class="inl">while</code> condition just loops back around and calls
+    <code class="inl">read()</code> again. So &ldquo;blocking&rdquo; here really means: sleep in short,
+    OS-scheduled bursts, waking every tenth of a second to check for a byte, until one actually shows up. Only a
+    genuine error (<code class="inl">nread == -1</code>) breaks that loop abnormally, with
+    <code class="inl">exit(1)</code>. The refresh cycle isn't burning CPU between keystrokes; the kernel is doing
+    the waiting.</p>
+
+    <h2 data-anchor="cyc-h2-impl">Implementation: what one iteration actually does</h2>
+    <p data-anchor="cyc-p-impl-1">With the shape of the loop settled, the interesting work is entirely inside
+    <code class="inl">editorProcessKeypress()</code>. One key comes in from
+    <code class="inl">editorReadKey()</code>, and one <code class="inl">switch</code> decides what happens to
+    it:</p>
+    <pre class="tab"><span class="mac">#define</span> KILO_QUIT_TIMES 3
+<span class="ty">void</span> <span class="fn">editorProcessKeypress</span>(<span class="ty">int</span> fd) {
+    <span class="cm">/* When the file is modified, requires Ctrl-q to be pressed N times
+     * before actually quitting. */</span>
+    <span class="kw">static</span> <span class="ty">int</span> quit_times = KILO_QUIT_TIMES;
+
+    <span class="ty">int</span> c = <span class="fn">editorReadKey</span>(fd);
+    <span class="kw">switch</span>(c) {
+    <span class="kw">case</span> ENTER:
+        <span class="fn">editorInsertNewline</span>();
+        <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_C:
+        <span class="cm">/* We ignore ctrl-c, it can't be so simple to lose the changes
+         * to the edited file. */</span>
+        <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_Q:
+        <span class="cm">/* Quit if the file was already saved. */</span>
+        <span class="kw">if</span> (E.dirty &amp;&amp; quit_times) {
+            <span class="fn">editorSetStatusMessage</span>(<span class="str">"WARNING!!! File has unsaved changes. "</span>
+                <span class="str">"Press Ctrl-Q %d more times to quit."</span>, quit_times);
+            quit_times--;
+            <span class="kw">return</span>;
+        }
+        <span class="fn">exit</span>(0);
+        <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_S:
+        <span class="fn">editorSave</span>();
+        <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_F:
+        <span class="fn">editorFind</span>(fd);
+        <span class="kw">break</span>;
+    <span class="kw">case</span> BACKSPACE:
+    <span class="kw">case</span> CTRL_H:
+    <span class="kw">case</span> DEL_KEY:
+        <span class="fn">editorDelChar</span>();
+        <span class="kw">break</span>;
+    <span class="kw">case</span> PAGE_UP:
+    <span class="kw">case</span> PAGE_DOWN:
+        <span class="kw">if</span> (c == PAGE_UP &amp;&amp; E.cy != 0)
+            E.cy = 0;
+        <span class="kw">else</span> <span class="kw">if</span> (c == PAGE_DOWN &amp;&amp; E.cy != E.screenrows-1)
+            E.cy = E.screenrows-1;
+        {
+        <span class="ty">int</span> times = E.screenrows;
+        <span class="kw">while</span>(times--)
+            <span class="fn">editorMoveCursor</span>(c == PAGE_UP ? ARROW_UP: ARROW_DOWN);
+        }
+        <span class="kw">break</span>;
+    <span class="kw">case</span> ARROW_UP:
+    <span class="kw">case</span> ARROW_DOWN:
+    <span class="kw">case</span> ARROW_LEFT:
+    <span class="kw">case</span> ARROW_RIGHT:
+        <span class="fn">editorMoveCursor</span>(c);
+        <span class="kw">break</span>;
+    <span class="kw">case</span> CTRL_L:
+        <span class="cm">/* Just refresht the line as side effect. */</span>
+        <span class="kw">break</span>;
+    <span class="kw">case</span> ESC:
+        <span class="cm">/* Nothing to do for ESC in this mode. */</span>
+        <span class="kw">break</span>;
+    <span class="kw">default</span>:
+        <span class="fn">editorInsertChar</span>(c);
+        <span class="kw">break</span>;
+    }
+
+    quit_times = KILO_QUIT_TIMES; <span class="cm">/* Reset it to the original value. */</span>
+}</pre>
+    <p data-anchor="cyc-p-impl-2">A few things are worth naming explicitly here, because they're easy to read
+    past on a first pass:</p>
+    <p data-anchor="cyc-p-impl-3"><strong>Every unlisted key is text.</strong> There's no separate
+    &ldquo;is this printable?&rdquo; check anywhere in this function. The <code class="inl">default</code> case
+    &mdash; anything that didn't match one of the explicit control keys above it &mdash; is treated as literal
+    content and handed to <code class="inl">editorInsertChar(c)</code>. The switch isn't a filter for
+    &ldquo;interesting&rdquo; keys; it's a short list of exceptions to the rule that a keystroke becomes a
+    character.</p>
+    <p data-anchor="cyc-p-impl-4"><strong>Paging reuses arrow movement, one line at a time.</strong>
+    <code class="inl">PAGE_UP</code>/<code class="inl">PAGE_DOWN</code> don't have their own scrolling logic here
+    at all &mdash; they snap the cursor to the top or bottom of the visible screen, then call
+    <code class="inl">editorMoveCursor()</code> &mdash; the exact same function the arrow keys call &mdash;
+    <code class="inl">E.screenrows</code> times in a row. A page-down is implemented as &ldquo;press down-arrow
+    once per visible row,&rdquo; not as a distinct operation. (The actual scrolling of the viewport happens later,
+    inside <code class="inl">editorRefreshScreen()</code>, based on where the cursor ends up &mdash; Chapter 09
+    picks that up.)</p>
+
+    <div class="callout warn" data-anchor="cyc-callout-quit">
+      <span class="tag">Where quit_times actually lives</span>
+      <p>Look again at the top of the function: <code class="inl">static int quit_times =
+      KILO_QUIT_TIMES;</code> is declared <em>inside</em> <code class="inl">editorProcessKeypress()</code>, as a
+      C <code class="inl">static</code> local &mdash; not as a field on <code class="inl">E</code>. That's a real
+      exception to the pattern Chapter 07 is about to make explicit: almost everything Kilo remembers between
+      calls lives in one global struct, and this three-integer countdown deliberately doesn't. It only needs to
+      persist across calls to this one function, so C's function-local <code class="inl">static</code> storage
+      &mdash; initialized once, alive for the life of the process &mdash; is exactly the right tool, and putting
+      it in <code class="inl">E</code> would have made it visible (and mutable) from code that has no business
+      touching it.</p>
+    </div>
+    <p data-anchor="cyc-p-impl-5">Walk the quit logic itself carefully, because its behavior is stricter than it
+    looks. <code class="inl">CTRL_Q</code> only exits immediately, via <code class="inl">exit(0)</code>, if
+    <em>either</em> <code class="inl">E.dirty</code> is false (nothing unsaved) <em>or</em>
+    <code class="inl">quit_times</code> has already reached zero. Otherwise it prints a warning, decrements the
+    counter, and <code class="inl">return</code>s &mdash; skipping the very last line of the function. And that
+    last line matters: <code class="inl">quit_times = KILO_QUIT_TIMES;</code> runs unconditionally after the
+    switch, for <em>any</em> key that reaches it. Press Ctrl-Q once on a modified file, then press an arrow key by
+    habit, then Ctrl-Q again, and you haven't used up two of your three warnings &mdash; the arrow key silently
+    reset the count back to three. Quitting an unsaved file takes three Ctrl-Q presses <em>in a row</em>, with
+    nothing else typed in between, not three presses total over the course of editing.</p>
+
+    <h2 data-anchor="cyc-h2-startup">Where the loop's inputs come from: initEditor()</h2>
+    <p data-anchor="cyc-p-startup-1">The loop assumes <code class="inl">E.screenrows</code> and
+    <code class="inl">E.screencols</code> are already correct the moment
+    <code class="inl">editorRefreshScreen()</code> runs for the very first time. That's guaranteed by what happens
+    one step earlier, in <code class="inl">main()</code>, before raw mode is even enabled:</p>
+    <pre class="tab"><span class="ty">void</span> <span class="fn">initEditor</span>(<span class="ty">void</span>) {
+    E.cx = 0;
+    E.cy = 0;
+    E.rowoff = 0;
+    E.coloff = 0;
+    E.numrows = 0;
+    E.row = NULL;
+    E.dirty = 0;
+    E.filename = NULL;
+    E.syntax = NULL;
+    <span class="fn">updateWindowSize</span>();
+    <span class="fn">signal</span>(SIGWINCH, handleSigWinCh);
+}</pre>
+    <p data-anchor="cyc-p-startup-2">Two lines at the end of an otherwise unremarkable zero-everything
+    initializer do real work. <code class="inl">updateWindowSize()</code> queries the terminal's dimensions
+    (Chapter 05) and reserves the two status rows right here, before the loop has run even once. And
+    <code class="inl">signal(SIGWINCH, handleSigWinCh)</code> registers a handler for the kernel's
+    &ldquo;your terminal window was resized&rdquo; signal &mdash; which is the one documented place in
+    <code class="inl">kilo.c</code> where a repaint can happen <em>outside</em> the loop's own scheduled call.</p>
+    <p data-anchor="cyc-p-startup-3">The full sequence in <code class="inl">main()</code>, in order, is: check
+    <code class="inl">argc</code>, <code class="inl">initEditor()</code>, pick a syntax highlighter for the given
+    filename, <code class="inl">editorOpen()</code> the file, <em>then</em>
+    <code class="inl">enableRawMode()</code>, then one status message, then the loop:</p>
+    <pre class="tab"><span class="ty">int</span> <span class="fn">main</span>(<span class="ty">int</span> argc, <span class="ty">char</span> **argv) {
+    <span class="kw">if</span> (argc != 2) {
+        <span class="fn">fprintf</span>(stderr,<span class="str">"Usage: kilo &lt;filename&gt;\n"</span>);
+        <span class="fn">exit</span>(1);
+    }
+
+    <span class="fn">initEditor</span>();
+    <span class="fn">editorSelectSyntaxHighlight</span>(argv[1]);
+    <span class="fn">editorOpen</span>(argv[1]);
+    <span class="fn">enableRawMode</span>(STDIN_FILENO);
+    <span class="fn">editorSetStatusMessage</span>(
+        <span class="str">"HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find"</span>);
+    <span class="kw">while</span>(1) {
+        <span class="fn">editorRefreshScreen</span>();
+        <span class="fn">editorProcessKeypress</span>(STDIN_FILENO);
+    }
+    <span class="kw">return</span> 0;
+}</pre>
+    <p data-anchor="cyc-p-startup-4">Notice the file is opened <em>before</em> the terminal is put into raw mode.
+    That ordering isn't about the refresh cycle directly, but it's a small piece of the same discipline: set up
+    everything that can fail in an ordinary, easy-to-debug mode first (normal terminal, normal
+    <code class="inl">stderr</code>), and only flip the terminal into the unusual raw state once there's an
+    editor's worth of state ready to actually run the loop against.</p>
+
+    <h2 data-anchor="cyc-h2-edge">Edge cases: the exceptions worth naming</h2>
+    <ul data-anchor="cyc-ul-edge">
+      <li data-anchor="cyc-li-edge-1"><strong>SIGWINCH breaks the &ldquo;loop is the only place that
+      repaints&rdquo; rule.</strong> <code class="inl">handleSigWinCh()</code> calls
+      <code class="inl">updateWindowSize()</code> and then <code class="inl">editorRefreshScreen()</code>
+      directly, from signal-handler context, whenever the kernel reports the terminal was resized. If you resize
+      your terminal window mid-edit, a repaint happens asynchronously, not because the loop reached its
+      scheduled call &mdash; worth remembering before you assume every visible redraw traces back to one
+      iteration of <code class="inl">while(1)</code>.</li>
+      <li data-anchor="cyc-li-edge-2"><strong>Ctrl-C does nothing, on purpose, twice over.</strong> Chapter 04's
+      raw mode already clears <code class="inl">ISIG</code>, so the terminal driver no longer turns Ctrl-C into a
+      <code class="inl">SIGINT</code> before Kilo ever sees it &mdash; the raw byte
+      (<code class="inl">CTRL_C = 3</code>) reaches <code class="inl">editorProcessKeypress()</code> like any
+      other key. And once it arrives, the <code class="inl">case CTRL_C:</code> branch is an empty
+      <code class="inl">break</code>, with a comment explaining the choice: it &ldquo;can't be so simple to lose
+      the changes to the edited file.&rdquo; Two separate decisions &mdash; disable the signal, then ignore the
+      byte &mdash; combine to make the editor's most habitual &ldquo;get me out of here&rdquo; keystroke
+      completely harmless.</li>
+      <li data-anchor="cyc-li-edge-3"><strong>A read() timeout is not a loop iteration.</strong> The
+      <code class="inl">VMIN=0</code>/<code class="inl">VTIME=1</code> retry inside
+      <code class="inl">editorReadKey()</code> happens entirely underneath <code class="inl">while(1)</code>'s
+      one call to <code class="inl">editorProcessKeypress()</code> &mdash; the outer loop doesn't see, and
+      doesn't repaint for, every 100ms timeout while the user is thinking. One trip through
+      <code class="inl">while(1)</code> corresponds to exactly one successfully read key, however long the wait
+      for it took.</li>
+      <li data-anchor="cyc-li-edge-4"><strong>CTRL_L looks like it should do something and doesn't need
+      to.</strong> As Chapter 05 flagged, the conventional &ldquo;redraw the screen&rdquo; keystroke is an empty
+      case here. It doesn't need a special action because <code class="inl">editorRefreshScreen()</code> already
+      runs unconditionally on every single loop iteration &mdash; there is no state where the screen is stale and
+      waiting for a manual refresh request to catch up.</li>
+    </ul>
+
+    <div class="reflect" data-anchor="cyc-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A name for the shape of the whole program: <strong>read, react, repaint</strong> &mdash; paint the
+      current state, block for one key, dispatch it through one switch, loop. No event queue, no scheduler, no
+      threads, and (with one narrow, named exception for terminal resizes) no repaint that isn't the loop's own
+      doing. Everything from Chapter 07 onward &mdash; the state you track, the text you store, the moves and
+      edits you make, the files you open and save, the search and highlighting you add &mdash; is just more work
+      that gets slotted into one of these two calls. You now know exactly where in the program any given feature
+      has to hook in: either it changes what gets painted, or it's a new case in that switch.</p>
+    </div>
+
+    <div class="challenges" data-anchor="cyc-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>Suppose the two calls in <code class="inl">while(1)</code> were swapped &mdash;
+        <code class="inl">editorProcessKeypress()</code> first, then
+        <code class="inl">editorRefreshScreen()</code>. Walk through the first three keystrokes of a session and
+        describe exactly what the user would (and wouldn't) see differently, frame by frame.</li>
+        <li><code class="inl">quit_times</code> resets to <code class="inl">KILO_QUIT_TIMES</code> for
+        <em>any</em> key that reaches the bottom of <code class="inl">editorProcessKeypress()</code> &mdash;
+        including keys whose case is a no-op, like <code class="inl">ESC</code>. Trace why a no-op case still
+        reaches that reset line, and what would change if the <code class="inl">CTRL_L</code>/<code class="inl">ESC</code>
+        cases used <code class="inl">return;</code> instead of <code class="inl">break;</code>.</li>
+        <li><code class="inl">handleSigWinCh()</code> calls <code class="inl">editorRefreshScreen()</code>
+        directly from a signal handler, while the main loop might be blocked inside
+        <code class="inl">editorReadKey()</code>'s own <code class="inl">read()</code> call at that exact moment.
+        What has to be true about <code class="inl">editorRefreshScreen()</code>'s use of global state (the
+        <code class="inl">E</code> struct, the append buffer) for that to be safe rather than a data race?</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="cyc-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — main(), editorProcessKeypress, editorReadKey, initEditor, handleSigWinCh</a> &middot;
+      <a href="https://man7.org/linux/man-pages/man3/termios.3.html" target="_blank" rel="noopener">[2] termios(3) — VMIN/VTIME noncanonical read behavior</a> &middot;
+      <a href="https://viewsourcecode.org/snaptoken/kilo/" target="_blank" rel="noopener">[3] Build Your Own Text Editor — snaptoken</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-escape-sequences-and-screen-drawing.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-editor-state.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

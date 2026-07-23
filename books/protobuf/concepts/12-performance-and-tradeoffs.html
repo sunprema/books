@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance and Tradeoffs — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="perf-kicker">Chapter 12 &middot; Production &amp; Beyond</span>
+    <h1 data-anchor="perf-h1">Performance and Tradeoffs</h1>
+
+    <p class="lede" data-anchor="perf-lede">
+      Every protobuf tutorial opens the same way: <em>&ldquo;it's smaller and faster than
+      JSON.&rdquo;</em> It's true, mostly, and it's also the least interesting thing you can say
+      about it. Because the honest questions a working engineer actually has are narrower and
+      sharper: <em>how much</em> faster, and for <em>which</em> payloads? Where does the time
+      really go, and which of protobuf's performance knobs &mdash; arenas, lazy parsing &mdash;
+      are worth reaching for? What can protobuf structurally <em>not</em> do that a zero-copy
+      format can? And &mdash; the question most books quietly skip &mdash; when is protobuf the
+      <strong>wrong</strong> tool, and what should you pick instead? This chapter is that honest
+      conversation. We'll measure before we praise, we'll name the costs alongside the wins, and
+      by the end you'll be able to defend the sentence <em>&ldquo;yes, protobuf, here's why&rdquo;</em>
+      &mdash; or, just as usefully, <em>&ldquo;no, not here, use that instead.&rdquo;</em>
+    </p>
+
+    <h2 data-anchor="perf-h2-howfast">How fast, exactly?</h2>
+    <p data-anchor="perf-p-howfast-1">
+      Let's start with the claim itself and refuse to leave it vague. Protobuf is genuinely faster
+      to serialize and parse than JSON, and its payloads are genuinely smaller &mdash; the common
+      shorthand is <em>&ldquo;3&ndash;10&times; faster, 2&ndash;5&times; smaller.&rdquo;</em> But
+      that's an average of averages, and the moment you look at real benchmarks the single number
+      shatters into a <em>range</em> that depends almost entirely on what your data is <em>made
+      of</em>. So the useful mental model isn't &ldquo;protobuf is N times faster.&rdquo; It's
+      &ldquo;protobuf's advantage tracks how much of your payload is numbers versus strings.&rdquo;
+    </p>
+    <p data-anchor="perf-p-howfast-2">
+      Here's the intuition, and it falls straight out of the wire format from Chapter&nbsp;4. Protobuf
+      wins two ways at once: it never writes field <em>names</em> (just field numbers, packed into a
+      tag byte), and it encodes integers, enums, and booleans as <strong>varints</strong> &mdash;
+      often one or two bytes where JSON spends a whole ASCII decimal string plus quotes and a key.
+      Both of those wins <em>compound</em> on number-heavy data. But a long string field?
+      Protobuf writes a length prefix and then the exact same UTF-8 bytes JSON would &mdash; so on
+      string-dominated payloads the advantage shrinks toward parity. In one well-known JavaScript
+      benchmark, <code>protobuf.js</code> actually came out <em>slower</em> than the browser's native
+      <code>JSON.parse</code>, because V8's JSON parser is hand-tuned C++ and the string data gave
+      protobuf nothing to compress.
+    </p>
+
+    <table class="cmp" data-anchor="perf-table-vsjson">
+      <thead><tr><th>Payload shape</th><th>Protobuf vs JSON, roughly</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Integers / enums / booleans</td><td>largest win &mdash; cited up to ~30&times;+ on parse</td><td>varints + no field names, compounding</td></tr>
+        <tr><td>Mixed records (typical API object)</td><td>~5&ndash;6&times; faster, ~2&times; smaller</td><td>some varint wins, some string parity</td></tr>
+        <tr><td>Long strings / free text</td><td>near parity; occasionally slower</td><td>strings encode the same bytes in both</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="perf-p-howfast-3">
+      A representative Go benchmark on a small user record lands protobuf marshaling around
+      <code>~200&ndash;250&nbsp;ns/op</code> against JSON's <code>~1300&nbsp;ns/op</code> &mdash; call it
+      five or six to one. That's a real, everyday number for a real, everyday object, and it's the
+      figure you should carry in your head, not the 30&times; headline. Treat any single multiplier
+      you read as a fact about <em>that author's payload</em>, not a law of nature.
+    </p>
+    <div class="callout note" data-anchor="perf-callout-gzip">
+      <span class="callout-label">And then there's compression</span>
+      On the wire, both formats are usually gzip- or br-compressed anyway. Compression narrows the
+      <em>size</em> gap: JSON's repetitive field names compress beautifully, while protobuf &mdash;
+      having already omitted those names &mdash; has less redundancy left to squeeze. Protobuf still
+      wins post-compression, but by less than the raw-bytes ratio suggests. When someone quotes you
+      an uncompressed size ratio, ask what it looks like after gzip; that's the number your bandwidth
+      bill actually sees.
+    </div>
+
+    <h2 data-anchor="perf-h2-wheretime">Where the time actually goes</h2>
+    <p data-anchor="perf-p-wheretime-1">
+      To optimize anything you have to know where the cost lives, so let's name it. When you parse a
+      protobuf message, the runtime walks the bytes and <strong>builds an object graph</strong>: it
+      allocates a message object, then submessage objects, then storage for strings and repeated
+      fields, filling each one in as it decodes. Serialization is the mirror image &mdash; walk the
+      objects, emit the bytes. The varint decoding itself is cheap. The thing that quietly dominates,
+      especially in a hot loop that handles millions of messages, is <em>memory allocation</em>: one
+      heap allocation for the message, more for each submessage, more for each string. Malloc, malloc,
+      malloc &mdash; then, when the message dies, a matching cascade of destructors and frees.
+    </p>
+    <p data-anchor="perf-p-wheretime-2">
+      This is the single most important performance fact about standard protobuf, and it's worth
+      sitting with: <strong>protobuf is a parse-into-objects format.</strong> Reading a field means
+      first materializing the whole message as native objects. That design is what gives you the
+      ergonomic, mutable, language-native structs you've enjoyed for eleven chapters &mdash; and it's
+      also the source of nearly all the runtime cost, and the thing the next two sections exist to
+      soften. (Hold onto that phrase &ldquo;parse-into-objects.&rdquo; When we meet zero-copy formats
+      later, the entire difference is that they <em>don't</em>.)
+    </p>
+    <div class="callout key-idea" data-anchor="perf-callout-cost">
+      <span class="callout-label">The one-sentence version</span>
+      In a high-throughput protobuf workload, the bottleneck is rarely the varint math &mdash; it's
+      the <em>allocator</em>. Every parse builds a tree of heap objects and every free tears one down,
+      so the highest-leverage optimizations are the ones that attack <em>allocation</em>, not
+      decoding.
+    </div>
+
+    <h2 data-anchor="perf-h2-arena">Arenas: making allocation almost free</h2>
+    <p data-anchor="perf-p-arena-1">
+      If allocation is the cost, the fix is to stop doing it one object at a time. That's exactly what
+      <strong>arena allocation</strong> is. Instead of asking the general-purpose allocator for a
+      little memory per object, you hand the runtime one big preallocated block &mdash; the
+      <em>arena</em> &mdash; and every message, submessage, and field for that parse gets carved out of
+      it. Allocation stops being a trip through <code>malloc</code> and becomes a <strong>pointer
+      increment</strong>: bump the offset, hand back the address. And deallocation? You don't free the
+      objects at all. You throw away the entire arena in one move, ideally without running a single
+      destructor. Thousands of little frees collapse into one.
+    </p>
+    <pre data-anchor="perf-code-arena"><code><span class="cm">// Arena allocation (C++): one bump-allocated block per request.</span>
+<span class="ty">google::protobuf::Arena</span> arena;
+
+<span class="cm">// Message + submessages + string storage all come from the arena.</span>
+<span class="ty">MyRequest</span>* req = <span class="ty">google::protobuf::Arena</span>::<span class="fn">CreateMessage</span>&lt;<span class="ty">MyRequest</span>&gt;(&amp;arena);
+req-&gt;<span class="fn">ParseFromString</span>(bytes);
+
+<span class="cm">// ... handle the request, reading fields off req ...</span>
+
+<span class="cm">// No delete. When `arena` goes out of scope the whole object</span>
+<span class="cm">// tree is freed at once — usually with no per-object destructors.</span></code></pre>
+    <p data-anchor="perf-p-arena-2">
+      There's a second, quieter win hiding in here: <strong>cache locality</strong>. Because a parsed
+      message's objects are carved sequentially out of one contiguous block, walking that message tends
+      to march through adjacent memory instead of chasing pointers all over the heap &mdash; so more of
+      your reads hit hot cache lines. For a server, the sweet spot is the <em>arena-per-request</em>
+      model: spin up one arena at the start of a request, allocate everything for that request out of
+      it, and discard the whole thing when you send the response. It maps cleanly onto how servers
+      already think about lifetimes, and it's where arenas pay off most.
+    </p>
+    <div class="callout warning" data-anchor="perf-callout-arena-caveats">
+      <span class="callout-label">Arenas are a scalpel, not a magic wand</span>
+      Reach for them knowingly, because they come with real edges:
+      <ul>
+        <li><strong>It's a C++ optimization.</strong> Java, Go, C#, and Python lean on their own
+        garbage collector or allocator and don't expose this arena API &mdash; so it is <em>not</em>
+        a portable, cross-language lever you can pull everywhere.</li>
+        <li><strong>Strings still hit the heap.</strong> Even with the parent message on an arena,
+        string field storage is allocated normally &mdash; arenas don't make string-heavy messages
+        free.</li>
+        <li><strong><code>Arena::Reset()</code> isn't thread-safe.</strong> Allocation from an arena is
+        thread-safe, but resetting one is not &mdash; the resetting thread must synchronize with every
+        thread still allocating from or reading objects on that arena.</li>
+        <li><strong>Crossing arenas can deep-copy.</strong> Moving a message from one arena to another
+        (or off an arena) may trigger a full deep copy where a heap-allocated message would have needed
+        only a cheap shallow move.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="perf-h2-lazy">Lazy parsing: pay for what you read</h2>
+    <p data-anchor="perf-p-lazy-1">
+      Arenas make the allocations you <em>do</em> perform cheaper. Lazy parsing attacks the problem
+      from the other side: it tries to make you skip some of them entirely. The idea is simple and
+      appealing. Suppose your <code>Envelope</code> message wraps a big <code>Payload</code> submessage
+      that's almost always <em>present</em> but only occasionally <em>read</em> &mdash; a routing layer
+      that inspects the envelope's headers and forwards the payload untouched, say. Parsing that whole
+      payload into objects on every hop is pure waste. Mark it <code>[lazy = true]</code> and the
+      runtime keeps the inner message as a raw byte blob when it parses the outer one, only decoding it
+      into objects the first time you actually reach for a field inside it.
+    </p>
+    <pre data-anchor="perf-code-lazy"><code><span class="kw">message</span> <span class="ty">Envelope</span> {
+  <span class="ty">string</span> route = <span class="num">1</span>;
+  <span class="cm">// Big, usually-present, rarely-read submessage:</span>
+  <span class="cm">// keep it as bytes until someone actually touches it.</span>
+  <span class="ty">Payload</span> payload = <span class="num">2</span> [<span class="kw">lazy</span> = <span class="kw">true</span>];
+}</code></pre>
+    <p data-anchor="perf-p-lazy-2">
+      It's a genuinely useful tool, but read the fine print before you sprinkle it everywhere, because
+      the constraints are strict. Lazy parsing applies <strong>only to singular message-type
+      fields</strong> &mdash; not scalars, and (importantly) not <em>repeated</em> fields, which can't
+      be lazy at all. And the <code>lazy</code> keyword is officially just a <em>hint</em>: an
+      implementation is free to parse eagerly anyway, and lazy fields carry extra bookkeeping overhead
+      to track their parsed-or-not state. So it earns its place on a specific shape &mdash; a large,
+      expensive submessage you frequently carry but rarely open &mdash; and it's dead weight (or worse)
+      anywhere else. Measure the field you're tempted to mark; don't guess.
+    </p>
+    <div class="callout note" data-anchor="perf-callout-lazy">
+      <span class="callout-label">A good lazy candidate, in one line</span>
+      &ldquo;This submessage is big, it rides along on nearly every message, and most code paths never
+      look inside it.&rdquo; If you can't say all three honestly about a field, <code>lazy</code>
+      probably isn't buying you anything.
+    </div>
+
+    <h2 data-anchor="perf-h2-zerocopy">The thing protobuf can't do: zero-copy</h2>
+    <p data-anchor="perf-p-zerocopy-1">
+      Arenas and lazy parsing both <em>soften</em> the parse-into-objects cost. Neither one
+      <em>removes</em> it, because it's structural &mdash; standard protobuf fundamentally must decode
+      bytes into native objects before you can read a field. That's the boundary. And it's precisely
+      the boundary a whole family of formats was built to cross: <strong>zero-copy</strong>
+      serialization, whose two best-known members &mdash; <strong>FlatBuffers</strong> and
+      <strong>Cap'n Proto</strong> &mdash; both came out of Google's own protobuf lineage (Cap'n Proto
+      from Kenton Varda, the primary author of open-source protobuf v2).
+    </p>
+    <p data-anchor="perf-p-zerocopy-2">
+      Their trick is to make the <em>serialized buffer itself</em> the in-memory representation. The
+      bytes are laid out so that a field's value lives at a computable offset, so reading it is a
+      pointer-and-offset dereference straight into the buffer &mdash; no parse step, no object graph,
+      no allocation. You can <code>mmap</code> a gigabyte file and read one field near the end without
+      touching the rest of it. For workloads where you pull a few fields out of large buffers, or where
+      deserialization CPU and memory are the bottleneck, that's transformative.
+    </p>
+
+    <figure class="figbox" data-anchor="perf-fig-zerocopy">
+      <svg viewBox="0 0 720 250" role="img" aria-labelledby="perf-fig-zerocopy-title">
+        <title id="perf-fig-zerocopy-title">Protobuf parses the wire bytes into a separate tree of allocated objects before a field can be read; a zero-copy format reads the field directly from the buffer at an offset with no intermediate objects</title>
+        <!-- protobuf side -->
+        <text x="180" y="26" text-anchor="middle" font-family="var(--font-display)" font-size="14" fill="var(--ink)">Protobuf: parse into objects</text>
+        <g font-family="var(--font-mono)" font-size="9">
+          <rect x="40" y="44" width="280" height="26" rx="4" fill="var(--code-bg)" stroke="var(--rule)" stroke-width="1.2"/>
+          <text x="180" y="61" text-anchor="middle" fill="var(--ink-soft)">wire bytes  08 96 01 12 03 ...</text>
+        </g>
+        <text x="180" y="92" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--kw)">decode + allocate &darr;</text>
+        <g stroke="var(--kw)" stroke-width="1.2" fill="none"><path d="M180 96 L180 112"/></g>
+        <g font-family="var(--font-mono)" font-size="9">
+          <rect x="70"  y="116" width="90" height="24" rx="4" fill="none" stroke="var(--ty)" stroke-width="1.3"/>
+          <text x="115" y="132" text-anchor="middle" fill="var(--ty)">Message</text>
+          <rect x="40"  y="156" width="80" height="22" rx="4" fill="none" stroke="var(--fn)" stroke-width="1.2"/>
+          <text x="80"  y="171" text-anchor="middle" fill="var(--fn)">sub-obj</text>
+          <rect x="128" y="156" width="80" height="22" rx="4" fill="none" stroke="var(--num)" stroke-width="1.2"/>
+          <text x="168" y="171" text-anchor="middle" fill="var(--num)">string</text>
+          <path d="M115 140 L80 156 M115 140 L168 156" stroke="var(--rule)" stroke-width="1.1" fill="none"/>
+        </g>
+        <text x="180" y="200" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">read field &rarr; from the objects (heap)</text>
+        <!-- divider -->
+        <line x1="360" y1="40" x2="360" y2="212" stroke="var(--rule)" stroke-width="1" stroke-dasharray="3 4"/>
+        <!-- zero-copy side -->
+        <text x="540" y="26" text-anchor="middle" font-family="var(--font-display)" font-size="14" fill="var(--ink)">Zero-copy: read in place</text>
+        <g font-family="var(--font-mono)" font-size="9">
+          <rect x="400" y="100" width="280" height="30" rx="4" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+          <text x="540" y="119" text-anchor="middle" fill="var(--ink-soft)">buffer = the representation (mmap-able)</text>
+        </g>
+        <g stroke="var(--en)" stroke-width="1.3" fill="none"><path d="M540 150 L540 132" marker-end=""/></g>
+        <text x="540" y="168" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--en)">read field &rarr; offset into buffer</text>
+        <text x="540" y="186" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">no parse, no objects, no allocation</text>
+      </svg>
+      <figcaption>
+        The whole difference in one picture. Protobuf must build a separate tree of allocated objects
+        before you can read a field; a zero-copy format reads the field straight out of the buffer at a
+        computed offset. That's why zero-copy wins on read-side CPU and memory &mdash; and why it gives
+        up the flexibility we're about to pay for.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="perf-p-zerocopy-3">
+      So why isn't everything zero-copy? Because that layout is a bargain, and you pay for the read
+      speed with <strong>flexibility</strong>. FlatBuffers makes you finish building one object before
+      you start the next, since an object's size depends on its contents &mdash; a real constraint on
+      how you assemble messages, compared to protobuf's build-in-any-order mutability. Cap'n Proto has
+      a more intricate encoding and historically less room to deprecate fields cleanly. And gradually
+      <em>mutating</em> a long-lived zero-copy message is awkward: the arena-style layout can't free
+      individual sub-objects, so a message you edit many times tends to only grow. There's a size cost
+      too &mdash; because the layout leaves room for direct access, FlatBuffers messages are often
+      <em>larger</em> on the wire (protobuf commonly produces roughly 3&times; smaller messages), and
+      protobuf usually serializes faster. The trade is clean and symmetric:
+    </p>
+    <table class="cmp" data-anchor="perf-table-zerocopy">
+      <thead><tr><th></th><th>Protobuf</th><th>FlatBuffers / Cap'n Proto</th></tr></thead>
+      <tbody>
+        <tr><td>Read a field</td><td>parse whole message into objects first</td><td>direct offset into the buffer, no parse</td></tr>
+        <tr><td>Deserialization cost</td><td>allocates an object tree</td><td>~zero &mdash; the buffer <em>is</em> the object</td></tr>
+        <tr><td>Wire size</td><td>usually smaller (often ~3&times;)</td><td>usually larger (room for direct access)</td></tr>
+        <tr><td>Building a message</td><td>any order, freely mutable</td><td>constrained order; awkward to mutate later</td></tr>
+        <tr><td>Best when</td><td>bytes-on-wire &amp; serialize speed matter</td><td>read-side CPU/memory is the bottleneck</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="perf-h2-wrongtool">When protobuf is the wrong tool</h2>
+    <p data-anchor="perf-p-wrongtool-1">
+      Now the section the tutorials skip. A tool you can't say &ldquo;no&rdquo; to isn't engineering,
+      it's a reflex &mdash; so let's be specific about the places protobuf is a genuinely bad fit, not
+      out of disloyalty but so that when you <em>do</em> choose it, you're choosing it.
+    </p>
+    <p data-anchor="perf-p-wrongtool-2">
+      <strong>When humans need to read it.</strong> Protobuf is not human-readable and, crucially, not
+      <em>self-describing</em>: the bytes carry field numbers and wire types but no field names, so a
+      payload is meaningless without its matching <code>.proto</code>. Log a raw message and you get an
+      unreadable blob; there's no <code>curl | less</code> that tells you what's inside. For
+      configuration files, documents a person edits by hand, or an API you want a stranger to poke at
+      with no toolchain, that opacity is a daily tax. JSON or YAML win outright here &mdash; their
+      whole point is that a human can read and write them.
+    </p>
+    <p data-anchor="perf-p-wrongtool-3">
+      <strong>When the data is a large blob or a stream.</strong> Protobuf assumes an entire message
+      fits comfortably in memory and isn't much bigger than an ordinary object graph. The project's own
+      guidance says to reach for something else past a few megabytes &mdash; and for good reason:
+      serializing or parsing can transiently hold <em>several copies</em> of the payload at once,
+      producing memory spikes that surprise you in production. A video file, a multi-gigabyte dataset,
+      an unbounded event stream &mdash; these want chunking, streaming, or a format built for bulk, not
+      a single monolithic message.
+    </p>
+    <p data-anchor="perf-p-wrongtool-4">
+      <strong>When the data is genuinely schemaless.</strong> Protobuf's superpower is a fixed,
+      compiler-checked schema. Point it at data whose shape is unknown, dynamic, or changes per record
+      and you're fighting the tool &mdash; you end up smuggling everything through <code>Struct</code>
+      or <code>Any</code> and throwing away the very type safety you came for (we saw those escape
+      hatches, and their costs, back in Chapter&nbsp;8). If your data is fundamentally
+      &ldquo;arbitrary JSON,&rdquo; use something that embraces that.
+    </p>
+    <p data-anchor="perf-p-wrongtool-5">
+      <strong>When it's big multi-dimensional numeric arrays.</strong> The project itself notes protobuf
+      is less than maximally efficient for scientific and engineering data made of large,
+      multi-dimensional arrays of floating-point numbers. A million <code>double</code>s wrapped in a
+      <code>repeated double</code> field carries per-element overhead and copying that a purpose-built
+      columnar or array format &mdash; Arrow, Parquet, HDF5, or plain packed binary &mdash; simply
+      doesn't. Right tool, right shape.
+    </p>
+    <div class="callout warning" data-anchor="perf-callout-wrongtool">
+      <span class="callout-label">Four smells that say &ldquo;not protobuf&rdquo;</span>
+      A human has to read or hand-edit it &middot; the payload is a multi-megabyte blob or an unbounded
+      stream &middot; the data has no stable schema &middot; it's mostly a giant array of floats. Hit
+      one of these and the burden of proof flips: now <em>you</em> have to justify protobuf, rather
+      than assume it.
+    </div>
+
+    <h2 data-anchor="perf-h2-alternatives">The alternatives, honestly</h2>
+    <p data-anchor="perf-p-alt-1">
+      Protobuf lives in a crowded neighborhood, and each neighbor is genuinely better at something.
+      Knowing the field is how you make the call with a straight face. Here's the honest lay of the
+      land &mdash; not &ldquo;protobuf wins,&rdquo; but &ldquo;here's what each one is <em>for</em>.&rdquo;
+    </p>
+    <table class="cmp" data-anchor="perf-table-alternatives">
+      <thead><tr><th>Format</th><th>Shape</th><th>Picks it up where protobuf puts it down</th></tr></thead>
+      <tbody>
+        <tr><td><strong>JSON</strong></td><td>schemaless text</td><td>human-readable, universal, zero toolchain &mdash; public APIs, config, debugging</td></tr>
+        <tr><td><strong>MessagePack / CBOR</strong></td><td>schemaless binary</td><td>&ldquo;binary JSON&rdquo;: self-describing, no codegen, ~40&ndash;60% smaller than JSON &mdash; caches, Redis values, IoT</td></tr>
+        <tr><td><strong>Avro</strong></td><td>schema-driven binary</td><td>no inline field tags &rarr; often slightly smaller; the Kafka/Hadoop default &mdash; but needs the writer schema at read time</td></tr>
+        <tr><td><strong>FlatBuffers</strong></td><td>zero-copy binary</td><td>read fields with no parse/alloc; mmap huge buffers &mdash; games, read-heavy hot paths</td></tr>
+        <tr><td><strong>Cap'n Proto</strong></td><td>zero-copy binary</td><td>zero-copy with an RPC story; when read-side cost dominates and you don't need FlatBuffers' flexibility</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="perf-p-alt-2">
+      Two of those deserve a sentence more, because their differences from protobuf are subtle and
+      operationally important. <strong>Avro</strong> is protobuf's closest cousin &mdash; also
+      schema-driven, also compact &mdash; but it makes the opposite bet on where the schema lives.
+      Avro writes <em>no</em> field tags inline, which can make its payloads a touch smaller than
+      protobuf's (which always carries field numbers); the catch is that a reader needs the exact
+      <em>writer's</em> schema to decode anything, so Avro all but requires a schema registry both
+      sides can reach. Protobuf carries its field numbers <em>in the bytes</em>, so it can evolve and
+      be read without a shared registry &mdash; a real reason it dominates gRPC while Avro dominates
+      Kafka. <strong>MessagePack</strong>, by contrast, keeps JSON's dynamic, self-describing model and
+      just makes it binary: no <code>.proto</code>, no codegen, modest savings &mdash; wonderful as a
+      drop-in JSON replacement, useless as a compiler-checked contract.
+    </p>
+
+    <div class="callout key-idea" data-anchor="perf-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      A more honest reason to reach for protobuf. Its speed edge over JSON is real but <em>bounded and
+      payload-shaped</em>; arenas and lazy parsing soften the allocation cost but can't make it
+      zero-copy; and half a dozen alternatives each beat it in some corner &mdash; JSON on readability,
+      MessagePack on schemaless simplicity, Avro on registry-backed size, FlatBuffers and Cap'n Proto
+      on read-in-place access. So protobuf's <em>durable</em> advantage was never &ldquo;fastest.&rdquo;
+      It's the compiler-checked, registry-free, evolvable <strong>schema</strong> &mdash; the same
+      contract we spent eleven chapters learning to steward. Which means the decision question isn't
+      <em>&ldquo;is protobuf the fastest?&rdquo;</em> It's <em>&ldquo;is protobuf fast enough for this
+      workload, and is the schema discipline worth it here?&rdquo;</em> Answer <em>that</em> honestly,
+      and you'll reach for protobuf when it fits &mdash; and reach past it, without guilt, when it
+      doesn't.
+    </div>
+
+    <div class="callout note" data-anchor="perf-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>A colleague benchmarks protobuf at &ldquo;30&times; faster than JSON&rdquo; and wants to
+        headline it. What single question about their payload tells you whether that number will
+        survive contact with <em>your</em> data &mdash; and what shape of data would drag it down toward
+        1&times;?</li>
+        <li>Your C++ service parses millions of messages per second and profiling shows the allocator on
+        fire. You switch to an arena-per-request model. Name one field type that <em>still</em>
+        heap-allocates anyway, and one threading rule you must not violate around
+        <code>Reset()</code>.</li>
+        <li>You mark a big submessage <code>[lazy = true]</code> and see no improvement. Give two
+        reasons this can legitimately happen even when the option is spelled correctly.</li>
+        <li>A teammate proposes moving a read-heavy, mmap-from-disk hot path from protobuf to
+        FlatBuffers &ldquo;because zero-copy is faster.&rdquo; What do you give up in exchange, and what
+        would you measure before agreeing?</li>
+        <li>For each of these, name a better-fitting format and why: a video-upload endpoint; a
+        user-editable config file; a Kafka topic where wire size is paramount and both sides share a
+        registry; an API you want strangers to explore with nothing but <code>curl</code>.</li>
+      </ol>
+    </div>
+
+    <p data-anchor="perf-sources" style="margin-top:2rem;font-size:.82em;color:var(--ink-soft);border-top:1px solid var(--rule);padding-top:.8rem;">
+      Sources: the protobuf
+      <a href="https://github.com/protocolbuffers/protocolbuffers.github.io/blob/main/content/reference/cpp/arenas.md">C++ Arena Allocation guide</a>
+      (fetched from the GitHub docs mirror) for the arena mechanics, cache-locality and thread-safety
+      caveats; the protobuf lazy-parsing discussion (<a href="https://github.com/protocolbuffers/protobuf/issues/3601">issue #3601</a>
+      and the Java <code>LazyField</code> docs) for the singular-message-only, hint-not-guarantee
+      semantics; Kenton Varda's
+      <a href="https://capnproto.org/news/2014-06-17-capnproto-flatbuffers-sbe.html">Cap'n Proto, FlatBuffers, and SBE</a>
+      comparison and the <a href="https://flatbuffers.dev/benchmarks/">FlatBuffers benchmarks</a> for the
+      zero-copy tradeoffs; the protobuf
+      <a href="https://github.com/protocolbuffers/protobuf/issues/7968">large-messages</a> discussion for
+      the &ldquo;keep it under a few MB&rdquo; and floating-point-array guidance; and a consensus of
+      JSON-vs-protobuf benchmarks (<a href="https://auth0.com/blog/beating-json-performance-with-protobuf/">Auth0</a>,
+      Go/JS micro-benchmarks) plus Avro/MessagePack comparisons
+      (<a href="https://www.conduktor.io/glossary/avro-vs-protobuf-vs-json-schema">Conduktor</a> and the
+      Linköping serialization study) for the payload-dependent ratios and alternative-format shapes.
+      (protobuf.dev and capnproto.org were unreachable directly from this build's sandbox; their claims
+      were corroborated via search snippets and the reachable GitHub docs mirror.)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="11-protobuf-in-production.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="13-storage-and-event-systems.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

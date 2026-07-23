@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Serialization Works — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="hsw-kicker">Chapter 04 &middot; Encoding &amp; Tooling</span>
+    <h1 data-anchor="hsw-h1">How Serialization Works</h1>
+
+    <p class="lede" data-anchor="hsw-lede">
+      We closed the last chapter with a promise to stop gesturing at the wire
+      format and actually look at the bytes. So here's the question this
+      chapter answers, as concretely as possible: you call
+      <code>product.SerializeToString()</code> on a <code>Product</code>
+      message with <code>name = "ink"</code> and <code>quantity = 300</code>.
+      What comes back is eight bytes:
+      <code>0A 03 69 6E 6B 10 AC 02</code>. Every one of those bytes has a
+      reason to be exactly what it is, and by the end of this chapter you'll
+      be able to derive all eight by hand.
+    </p>
+
+    <h2 data-anchor="hsw-h2-tag">The tag: one small integer doing two jobs</h2>
+    <p data-anchor="hsw-p-tag-1">
+      Start with the smallest unit of the format: the <strong>tag</strong>.
+      Every field, when it's about to be written to the wire, is preceded by
+      one tag that packs two pieces of information into a single varint:
+    </p>
+    <pre data-anchor="hsw-code-tag-formula"><code>tag = (field_number &lt;&lt; 3) | wire_type</code></pre>
+    <p data-anchor="hsw-p-tag-2">
+      The field number is the same integer from Chapter 2 &mdash; the one
+      thing that actually identifies a field on the wire, never the name.
+      <strong>Wire type</strong> is new: a 3-bit code, 0 through 5, that says
+      what shape of data follows. Six wire types cover every protobuf value:
+    </p>
+    <table class="cmp" data-anchor="hsw-table-wiretypes">
+      <thead><tr><th>Code</th><th>Name</th><th>Carries</th></tr></thead>
+      <tbody>
+        <tr><td><code>0</code></td><td>VARINT</td><td>int32/int64/uint32/uint64/sint32/sint64, bool, enum</td></tr>
+        <tr><td><code>1</code></td><td>I64 (64-bit)</td><td>fixed64, sfixed64, double</td></tr>
+        <tr><td><code>2</code></td><td>LEN (length-delimited)</td><td>string, bytes, embedded messages, packed repeated fields</td></tr>
+        <tr><td><code>3</code></td><td>SGROUP</td><td>deprecated proto2 <code>group</code> start &mdash; not used in proto3</td></tr>
+        <tr><td><code>4</code></td><td>EGROUP</td><td>deprecated proto2 <code>group</code> end &mdash; not used in proto3</td></tr>
+        <tr><td><code>5</code></td><td>I32 (32-bit)</td><td>fixed32, sfixed32, float</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="hsw-p-tag-3">
+      Notice what the wire type is <em>for</em>. It's fully determined by a
+      field's declared type &mdash; every <code>int32</code> field always gets
+      wire type 0, every <code>string</code> field always gets wire type 2 &mdash;
+      so it's redundant information as far as a schema-aware reader is
+      concerned. But strip the schema away, and the wire type is the only
+      thing telling a decoder how many bytes to skip. Hold onto that; it's
+      the hinge the last section of this chapter swings on.
+    </p>
+    <figure data-anchor="hsw-fig-tag">
+      <svg viewBox="0 0 640 190" role="img" aria-labelledby="hsw-fig-tag-title">
+        <title id="hsw-fig-tag-title">One tag byte, 0x08, decomposed into a 5-bit field number and a 3-bit wire type</title>
+        <text x="20" y="30" font-family="var(--font-mono)" font-size="12" fill="var(--ink-soft)">tag for field 1, wire type 0 (VARINT) &mdash; the tag byte in front of &ldquo;quantity&rdquo;'s sibling, id</text>
+        <g font-family="var(--font-mono)" font-size="15">
+          <rect x="40"  y="55" width="60" height="46" fill="none" stroke="var(--rule)" stroke-width="1.3"/>
+          <rect x="100" y="55" width="60" height="46" fill="none" stroke="var(--rule)" stroke-width="1.3"/>
+          <rect x="160" y="55" width="60" height="46" fill="none" stroke="var(--rule)" stroke-width="1.3"/>
+          <rect x="220" y="55" width="60" height="46" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.6"/>
+          <rect x="280" y="55" width="60" height="46" fill="none" stroke="var(--rule)" stroke-width="1.3"/>
+          <rect x="340" y="55" width="60" height="46" fill="none" stroke="var(--ty)" stroke-width="1.6"/>
+          <rect x="400" y="55" width="60" height="46" fill="none" stroke="var(--ty)" stroke-width="1.6"/>
+          <rect x="460" y="55" width="60" height="46" fill="none" stroke="var(--ty)" stroke-width="1.6"/>
+          <text x="70"  y="84" text-anchor="middle" fill="var(--ink-soft)">0</text>
+          <text x="130" y="84" text-anchor="middle" fill="var(--ink-soft)">0</text>
+          <text x="190" y="84" text-anchor="middle" fill="var(--ink-soft)">0</text>
+          <text x="250" y="84" text-anchor="middle" fill="var(--kw)">1</text>
+          <text x="310" y="84" text-anchor="middle" fill="var(--ink-soft)">0</text>
+          <text x="370" y="84" text-anchor="middle" fill="var(--ty)">0</text>
+          <text x="430" y="84" text-anchor="middle" fill="var(--ty)">0</text>
+          <text x="490" y="84" text-anchor="middle" fill="var(--ty)">0</text>
+        </g>
+        <path d="M220 112 L280 112 L280 122 L220 122 Z" fill="var(--kw)" opacity=".15" stroke="var(--kw)" stroke-width="1"/>
+        <text x="250" y="140" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--kw)">field number = 1</text>
+        <path d="M340 112 L460 112 L460 122 L340 122 Z" fill="var(--ty)" opacity=".15" stroke="var(--ty)" stroke-width="1"/>
+        <text x="400" y="160" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ty)">wire type = 0 (VARINT), bits 0&ndash;2</text>
+        <text x="580" y="84" text-anchor="middle" font-family="var(--font-mono)" font-size="14" fill="var(--accent)">= 0x08</text>
+      </svg>
+      <figcaption>
+        (1 &lt;&lt; 3) | 0 = 8. One byte, two answers: which field, and what shape
+        of value comes next.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="hsw-h2-varint">Varints: small numbers, small bytes</h2>
+    <p data-anchor="hsw-p-varint-1">
+      The tag itself is a varint, and so is most of the rest of the format,
+      so let's actually build one. A <strong>varint</strong> spends one or
+      more bytes on a number, and the rule per byte is simple: the low 7
+      bits carry data, and the high (8th) bit is a <em>continuation flag</em>
+      &mdash; 1 means &ldquo;another byte follows,&rdquo; 0 means &ldquo;you're
+      done.&rdquo; The 7-bit groups go out least-significant first. In
+      pseudocode:
+    </p>
+    <pre data-anchor="hsw-code-varint-algo"><code><span class="fn">encode_varint</span>(n):
+  bytes = []
+  <span class="kw">loop</span>:
+    b = n &amp; <span class="num">0x7F</span>          <span class="cm">// low 7 bits</span>
+    n = n &gt;&gt; <span class="num">7</span>
+    <span class="kw">if</span> n != <span class="num">0</span>: b |= <span class="num">0x80</span>  <span class="cm">// more bytes follow</span>
+    bytes.append(b)
+    <span class="kw">if</span> n == <span class="num">0</span>: <span class="kw">break</span>
+  <span class="kw">return</span> bytes</code></pre>
+    <p data-anchor="hsw-p-varint-2">
+      Trace it on 300, which is <code>1 0010 1100</code> in binary &mdash; nine
+      significant bits, more than fits in one byte's 7 data bits. Split it
+      into 7-bit groups, low group first: <code>0101100</code> (44) and
+      <code>0000010</code> (2). The first byte still has a group after it,
+      so its continuation bit is set: <code>10101100</code> = <code>0xAC</code>.
+      The second byte is the last one, continuation bit clear:
+      <code>00000010</code> = <code>0x02</code>. So <code>300</code> encodes
+      as the two bytes <code>AC 02</code> &mdash; which is exactly the
+      <code>quantity</code> value in this chapter's opening example, sitting
+      right after its tag byte <code>0x10</code> (field 2, wire type 0:
+      <code>(2 &lt;&lt; 3) | 0 = 16</code>).
+    </p>
+    <p class="code-cap" data-anchor="hsw-code-cap-widget">Drag the value below and watch the byte count change at every multiple of 128</p>
+    <figure class="figbox" data-widget="varint" data-value="300" data-max="2097151" data-anchor="hsw-fig-varint">
+      <canvas></canvas>
+      <div class="controls">
+        <input class="v" type="range" min="0" max="2097151" step="1" value="300">
+        <button type="button" class="btn" data-set="127">127 &middot; 1-byte max</button>
+        <button type="button" class="btn" data-set="128">128 &middot; 2-byte min</button>
+        <button type="button" class="btn" data-set="16384">16384 &middot; 3-byte min</button>
+      </div>
+      <p class="readout"></p>
+      <figcaption>
+        Each box is one byte of the varint: the dot marks its continuation
+        bit, the big digits are its 7 data bits, the small text is the hex
+        value. Crossing 128 or 16384 grows the encoding by a byte, because
+        that's one more 7-bit group than fits in the bytes before it.
+      </figcaption>
+    </figure>
+    <div class="callout note" data-anchor="hsw-callout-max-bytes">
+      <span class="callout-label">Why varints stop at 10 bytes</span>
+      Protobuf caps a varint's length in theory it could encode any integer,
+      arbitrarily large, but the format is built for 64-bit values, so 10
+      bytes (70 usable bits) is the ceiling. A conformant decoder rejects
+      anything longer as malformed rather than reading forever.
+    </div>
+
+    <h2 data-anchor="hsw-h2-zigzag">The catch: a negative number is never small</h2>
+    <p data-anchor="hsw-p-zigzag-1">
+      Here's a trap the varint algorithm doesn't warn you about. Plain
+      <code>int32</code>/<code>int64</code> fields use ordinary two's
+      complement, and a negative value gets sign-extended to a full 64-bit
+      pattern <em>before</em> it's varint-encoded. That sets the top bit,
+      which means <code>n = -2</code> in a plain <code>int64</code> field
+      costs the full 10-byte varint &mdash; the same 10 bytes as the largest
+      value the format can represent, for one of the smallest-magnitude
+      numbers there is.
+    </p>
+    <div class="callout warning" data-anchor="hsw-callout-negative-pitfall">
+      <span class="callout-label">The mistake this causes</span>
+      Reach for <code>int32</code> on a field you expect to sometimes hold
+      small negative numbers &mdash; a temperature delta, a signed offset &mdash;
+      and every negative value on the wire quietly costs 10 bytes instead of
+      1 or 2. Nothing errors. The schema still compiles, the values still
+      round-trip correctly. The only symptom is a payload that's larger than
+      it has any reason to be.
+    </div>
+    <p data-anchor="hsw-p-zigzag-2">
+      <code>sint32</code>/<code>sint64</code> exist specifically to close
+      this gap, using <strong>ZigZag encoding</strong>: instead of writing a
+      signed integer's two's-complement bits directly, it remaps signed
+      values onto unsigned ones so that small magnitudes &mdash; positive
+      <em>or</em> negative &mdash; land near zero:
+    </p>
+    <table class="cmp" data-anchor="hsw-table-zigzag">
+      <thead><tr><th>Signed value</th><th>0</th><th>-1</th><th>1</th><th>-2</th><th>2</th><th>-3</th><th>3</th></tr></thead>
+      <tbody><tr><td>ZigZag-encoded</td><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td></tr></tbody>
+    </table>
+    <p data-anchor="hsw-p-zigzag-3">
+      The exact formula, straight from protobuf's own C++ source:
+    </p>
+    <pre data-anchor="hsw-code-zigzag"><code><span class="cm">// google/protobuf/wire_format_lite.h</span>
+<span class="kw">uint32_t</span> <span class="fn">ZigZagEncode32</span>(<span class="kw">int32_t</span> n) {
+  <span class="kw">return</span> (<span class="kw">uint32_t</span>(n) &lt;&lt; <span class="num">1</span>) ^ <span class="kw">uint32_t</span>(n &gt;&gt; <span class="num">31</span>);
+}</code></pre>
+    <p data-anchor="hsw-p-zigzag-4">
+      <code>n &gt;&gt; 31</code> is an <em>arithmetic</em> shift, so it produces
+      all-1-bits when <code>n</code> is negative and all-0-bits when it
+      isn't. XOR-ing against that either flips every bit of
+      <code>n &lt;&lt; 1</code> (negative case) or leaves it alone (non-negative
+      case) &mdash; which is exactly the zig, and the zag. Once ZigZag has
+      remapped the number, the result gets varint-encoded exactly like any
+      other unsigned value, small numbers, small bytes, no exception this
+      time.
+    </p>
+
+    <h2 data-anchor="hsw-h2-fixed">Fixed-width types: when predictability beats compactness</h2>
+    <p data-anchor="hsw-p-fixed-1">
+      Not every type wants varint's variable length. <code>fixed32</code>,
+      <code>sfixed32</code>, and <code>float</code> use wire type 5 (I32);
+      <code>fixed64</code>, <code>sfixed64</code>, and <code>double</code>
+      use wire type 1 (I64). Both skip the continuation-bit machinery
+      entirely: they're always exactly 4 or 8 bytes, little-endian, no more,
+      no less.
+    </p>
+    <table class="cmp" data-anchor="hsw-table-fixed-vs-varint">
+      <thead><tr><th></th><th>varint types (int32/int64/&hellip;)</th><th>fixed types (fixed32/fixed64/&hellip;)</th></tr></thead>
+      <tbody>
+        <tr><td>Size</td><td>1&ndash;10 bytes, value-dependent</td><td>always 4 or 8 bytes</td></tr>
+        <tr><td>Best for</td><td>small or usually-small numbers</td><td>large, high-entropy, or already-binary values</td></tr>
+        <tr><td>Worst for</td><td>large or negative (non-ZigZag) numbers</td><td>values that are usually small &mdash; still 4/8 bytes</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="hsw-p-fixed-2">
+      That's the honest reason <code>float</code> and <code>double</code>
+      land here rather than getting some clever variable encoding: an
+      IEEE-754 float's bits already <em>are</em> its value, bit for bit.
+      There's nothing to compress without lying about the number, so
+      protobuf just writes the bits and moves on. And for hashes, UUIDs
+      split into two <code>fixed64</code>s, or random IDs &mdash; values with
+      no small-magnitude case to optimize for &mdash; a predictable 8 bytes
+      beats a varint that's almost always going to cost 10 anyway.
+    </p>
+
+    <h2 data-anchor="hsw-h2-length-delimited">Length-delimited: one shape, four different payloads</h2>
+    <p data-anchor="hsw-p-len-1">
+      Wire type 2 is the workhorse of the format, and its shape is exactly
+      three parts: a tag, a length (itself a varint), then that many raw
+      bytes.
+    </p>
+    <pre data-anchor="hsw-code-len-shape"><code>[tag varint][length varint][ &hellip;length bytes of payload&hellip; ]</code></pre>
+    <p data-anchor="hsw-p-len-2">
+      That one shape covers four genuinely different kinds of field, and the
+      wire can't tell them apart &mdash; only the schema can:
+    </p>
+    <table class="cmp" data-anchor="hsw-table-len-uses">
+      <thead><tr><th>Field kind</th><th>What the payload bytes are</th></tr></thead>
+      <tbody>
+        <tr><td><code>string</code></td><td>UTF-8 bytes of the text, unescaped</td></tr>
+        <tr><td><code>bytes</code></td><td>opaque bytes, no encoding assumed at all</td></tr>
+        <tr><td>an embedded message</td><td>that message's own <em>complete</em> serialization, inlined as-is</td></tr>
+        <tr><td>a packed repeated scalar field</td><td>each element's own varint/fixed encoding, concatenated with no per-element tag</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="hsw-p-len-3">
+      Now finish the opening example. <code>name = "ink"</code> is field 1
+      &mdash; tag <code>(1 &lt;&lt; 3) | 2 = 0x0A</code> &mdash; followed by length
+      <code>0x03</code>, followed by the three ASCII bytes of
+      <code>"ink"</code>: <code>69 6E 6B</code>. Put that ahead of
+      <code>quantity</code>'s three bytes from earlier
+      (<code>10 AC 02</code>) and you have the whole message:
+    </p>
+    <pre data-anchor="hsw-code-full-trace"><code><span class="num">0A</span> <span class="num">03</span> <span class="num">69</span> <span class="num">6E</span> <span class="num">6B</span>   <span class="num">10</span> <span class="num">AC</span> <span class="num">02</span>
+<span class="cm">└─┬─┘ └┬┘ └──────┬──────┘   └┬┘ └──┬──┘</span>
+<span class="cm">  tag  len   "ink"       tag   300 (varint)</span>
+<span class="cm">(field 1, LEN)      (field 2, VARINT)</span></code></pre>
+    <p data-anchor="hsw-p-len-4">
+      Eight bytes, every one of them accounted for &mdash; and notice an
+      embedded <code>Dimensions</code> submessage from Chapter 2 would slot
+      in exactly the same way: its own tag, its own length, then its own
+      fully-formed bytes, produced by running this entire process again, one
+      level deeper.
+    </p>
+    <div class="callout key-idea" data-anchor="hsw-callout-packed">
+      <span class="callout-label">A quiet compatibility rule</span>
+      A proto3 writer emits <code>repeated</code> scalar fields <em>packed</em>
+      &mdash; one length-delimited entry &mdash; by default. But every proto3
+      parser is still required to accept the older <em>unpacked</em> form too
+      (one ordinary tag+value pair per element). That's what lets a peer
+      compiled against an old protobuf release, writing unpacked, interoperate
+      with one that packs.
+    </div>
+
+    <h2 data-anchor="hsw-h2-unknown">Reading a tag you don't recognize</h2>
+    <p data-anchor="hsw-p-unknown-1">
+      Now the payoff for tracking wire types so carefully. Say a peer running
+      an older copy of this schema receives a message with a field 11 it's
+      never heard of. It can't interpret field 11 &mdash; it has no idea what
+      that data <em>means</em> &mdash; but it doesn't need to interpret it to
+      get past it. It reads the tag, reads off the wire type, and skips
+      exactly the right number of bytes for that type:
+    </p>
+    <table class="cmp" data-anchor="hsw-table-skip-rules">
+      <thead><tr><th>Wire type</th><th>How to skip it without the schema</th></tr></thead>
+      <tbody>
+        <tr><td>0 VARINT</td><td>read one varint, discard it</td></tr>
+        <tr><td>1 I64</td><td>discard the next 8 bytes</td></tr>
+        <tr><td>2 LEN</td><td>read the length varint, discard that many bytes</td></tr>
+        <tr><td>5 I32</td><td>discard the next 4 bytes</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="hsw-p-unknown-2">
+      That's the entire trick: the wire type is self-describing enough to
+      skip, even though it isn't self-describing enough to interpret.
+      Protobuf's own C++ implementation goes one step further than just
+      skipping, though &mdash; it keeps what it skipped. Unrecognized
+      (field number, wire type, raw bytes) triples get stored in an
+      <code>UnknownFieldSet</code> attached to the message, specifically so
+      that re-serializing the message later writes those bytes right back
+      out, unchanged.
+    </p>
+    <figure data-anchor="hsw-fig-unknown">
+      <svg viewBox="0 0 700 200" role="img" aria-labelledby="hsw-fig-unknown-title">
+        <title id="hsw-fig-unknown-title">A schema-v1 relay forwards a schema-v2 message, preserving the field it doesn't recognize</title>
+        <rect x="20" y="70" width="150" height="60" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.5"/>
+        <text x="95" y="96" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--fn)">Writer</text>
+        <text x="95" y="114" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">schema v2</text>
+
+        <path d="M170 100 L262 100" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#hsw-arrow)"/>
+        <text x="216" y="88" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent)">bytes incl. field 11</text>
+
+        <rect x="262" y="60" width="176" height="80" rx="8" fill="none" stroke="var(--kw)" stroke-dasharray="3 4" stroke-width="1.5"/>
+        <text x="350" y="88" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--kw)">Relay</text>
+        <text x="350" y="106" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">schema v1</text>
+        <text x="350" y="124" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">field 11 unknown &mdash; kept, not read</text>
+
+        <path d="M438 100 L530 100" stroke="var(--accent)" stroke-width="1.5" fill="none" marker-end="url(#hsw-arrow)"/>
+        <text x="484" y="88" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent)">same bytes, re-emitted</text>
+
+        <rect x="530" y="70" width="150" height="60" rx="8" fill="none" stroke="var(--fn)" stroke-width="1.5"/>
+        <text x="605" y="96" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--fn)">Reader</text>
+        <text x="605" y="114" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">schema v2</text>
+
+        <defs>
+          <marker id="hsw-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        The relay never rebuilds the message from fields it understands &mdash;
+        it forwards the object it parsed, unknown bytes and all.
+      </figcaption>
+    </figure>
+    <div class="callout warning" data-anchor="hsw-callout-unknown-pitfall">
+      <span class="callout-label">Where this guarantee quietly breaks</span>
+      Preservation is a promise about <em>binary</em> reserialization of the
+      original parsed object &mdash; nothing more. Convert that message to
+      JSON, or build a brand-new message by copying over only the fields you
+      recognize, and field 11 is gone. It was never read, and now it's never
+      written either. (It's also worth knowing this wasn't always true:
+      early proto3 releases dropped unknown fields outright; the language
+      restored preservation in v3.5, matching proto2's original behavior.)
+    </div>
+    <p data-anchor="hsw-p-unknown-3">
+      One more piece falls out of everything in this chapter almost for
+      free: the wire format never promises field order, and the same field
+      number can legally appear more than once (think of two serialized
+      messages simply concatenated). A conformant decoder has to accept
+      fields in any order, and for a non-repeated field, the rule is
+      last-one-wins. None of that requires special-case code &mdash; a decoder
+      that already reads tag, dispatches on wire type, and stores the result
+      by field number handles it automatically.
+    </p>
+
+    <h2 data-anchor="hsw-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="hsw-p-reflect-1">
+      We opened this chapter with eight mystery bytes and closed it having
+      derived every one of them by hand: a tag that fuses field number and
+      wire type into one varint, a varint algorithm that spends bytes only
+      on the bits a number actually needs, ZigZag as the fix for the one
+      case plain varints handle badly, fixed-width types for when
+      predictability matters more than compactness, and a length-delimited
+      shape flexible enough to carry a string, a blob, a nested message, or
+      a whole packed array. And running underneath every one of those: a
+      wire type that lets any decoder, schema or no schema, skip past what
+      it doesn't understand instead of choking on it.
+    </p>
+    <p data-anchor="hsw-p-reflect-2">
+      That last part is the one worth carrying forward. It's not a footnote
+      about error handling &mdash; it's the whole reason Chapter 7's schema
+      evolution rules work at all. You'll never hand-write a single byte of
+      this by hand in real code, though; that's <code>protoc</code>'s job,
+      and the shape of exactly what it generates is next.
+    </p>
+
+    <div class="callout note" data-anchor="hsw-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>Encode the number 16384 as a varint by hand, byte by byte. How
+        many bytes did you need, and why does that number sit right at a
+        boundary?</li>
+        <li>A teammate stores a signed delta (&plusmn;a few hundred) in a
+        plain <code>int32</code> field instead of <code>sint32</code>. Say
+        exactly what that costs on the wire for a typical negative value,
+        in bytes.</li>
+        <li>A relay service parses a message, logs
+        <code>message.quantity</code>, and forwards the same in-memory
+        object onward. A second relay instead reads every known field into
+        a freshly built message before forwarding <em>that</em>. Which one
+        keeps a field 11 it's never heard of, and which one silently drops
+        it?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-writing-your-first-proto-file.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-code-generation-and-tooling.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing a Terminal App — Kilo as a Systems-Programming Case Study</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&gt;_</span> Kilo as a Systems-Programming Case Study</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="tta-eyebrow">Chapter 21 &middot; Part VII — Beyond the Tutorial</p>
+    <h1 data-anchor="tta-h1">Testing a Terminal App</h1>
+
+    <p class="lead" data-anchor="tta-lead">Chapter 20 closed by promising that "verified" would mean more than
+    "I tried it once," and that promise is due now. Chapter 19 already found the uncomfortable fact this chapter
+    has to answer: antirez/kilo ships with zero automated tests and no CI configuration at all &mdash; a direct
+    check for every common test/CI path on the repository comes back 404, across the board. That's not a defect
+    unique to Kilo; it's the default state of a program written, by its own README, "in just a few hours." But it
+    means this chapter can't show you Kilo's tests, because there aren't any. It has to design them from a cold
+    start, against a program that was never given a seam to test through.</p>
+
+    <h2 data-anchor="tta-h2-motivation">Motivation: why kilo.c resists testing as written</h2>
+    <p data-anchor="tta-p-motivation-1">Two structural facts about kilo.c, both established earlier in this book,
+    are exactly what make testing it hard. First, almost everything hangs off one global
+    <code class="inl">struct editorConfig E</code> (Chapter 7) &mdash; a function that reads and writes a global
+    can't be run twice, in isolation, with two different states in the same process, the same problem Chapter 19
+    named when it discussed threading state through as a parameter instead. Second, Kilo talks to the terminal
+    directly: <code class="inl">enableRawMode</code> calls <code class="inl">tcgetattr</code>/
+    <code class="inl">tcsetattr</code> (Chapter 4), and those calls fail outright with <code class="inl">ENOTTY</code>
+    unless the file descriptor genuinely refers to a terminal device. Redirect Kilo's stdin from a plain pipe or
+    a file &mdash; the way you'd naively script any other command-line program &mdash; and <code class="inl">isatty()</code>
+    returns false. Raw mode never engages. You haven't tested the raw-mode path; you've silently tested a
+    different, uninteresting one.</p>
+    <div class="callout warn" data-anchor="tta-callout-pipe">
+      <span class="tag">A pipe is not a terminal</span>
+      <p>This is the trap that swallows a first attempt at testing almost every terminal program, not just Kilo.
+      <code class="inl">subprocess.Popen(..., stdin=PIPE)</code> or ordinary shell redirection hands the child
+      process a pipe, and a pipe is not a terminal device &mdash; <code class="inl">isatty()</code> on it returns
+      false. What you need instead is a <strong>pseudo-terminal</strong> (a PTY): a kernel-provided pair of
+      devices where one end genuinely presents as a terminal to whatever program is attached to it. Every testing
+      approach in this chapter that drives the real binary end-to-end depends on getting this right.</p>
+    </div>
+
+    <h2 data-anchor="tta-h2-design">Design: three layers, three different tools</h2>
+    <p data-anchor="tta-p-design-1">Not every part of kilo.c has the same relationship to the terminal, and
+    treating them as one testing problem is why testing a program like this feels harder than it needs to be.
+    Split it into three layers, and each one has an obvious tool once you see it that way.</p>
+    <table class="grid" data-anchor="tta-table-layers">
+      <tr><th>Layer</th><th>Example</th><th>What it needs to run</th><th>How to test it</th></tr>
+      <tr><td>Pure logic</td><td class="mono">editorRowInsertChar</td><td>nothing but memory</td>
+      <td>an ordinary unit test, no terminal at all</td></tr>
+      <tr><td>Terminal-shaped, but captured</td><td class="mono">editorRefreshScreen</td><td>a byte sink to write
+      into</td><td>capture the bytes it would have written; assert on those</td></tr>
+      <tr><td>Whole program</td><td class="mono">the full keypress&rarr;redraw loop</td><td>a real terminal
+      device</td><td>a pseudo-terminal, scripted end-to-end</td></tr>
+    </table>
+    <p data-anchor="tta-p-design-2">The rest of this chapter takes those three rows one at a time, in the same
+    motivation&rarr;design&rarr;implementation shape every chapter here has used &mdash; because the tools differ,
+    but the underlying question doesn't: what's the smallest thing that has to be real for this test to mean
+    anything?</p>
+
+    <h2 data-anchor="tta-h2-pure">Testing the pure logic: a seam that already exists</h2>
+    <p data-anchor="tta-p-pure-1">Not every function in kilo.c touches the global <code class="inl">E</code>.
+    Chapter 10 covered <code class="inl">editorRowInsertChar(erow *row, int at, int c)</code> in detail: it takes
+    the row it mutates as an explicit pointer argument, reallocates <em>that row's</em> buffer, and returns.
+    It never reads or writes <code class="inl">E</code> at all. Compare that to
+    <code class="inl">editorInsertRow(int at, char *s, size_t len)</code>, which reallocates
+    <code class="inl">E.row</code> directly &mdash; a function that can't run without the global existing first.
+    <code class="inl">editorRowInsertChar</code> is already, with zero refactoring, callable in isolation: build an
+    <code class="inl">erow</code> by hand, call it, check the result.</p>
+    <pre class="tab"><span class="cm">/* Illustrative sketch — not in antirez's source. */</span>
+<span class="mac">#include</span> <span class="str">"minunit.h"</span>
+
+MU_TEST(row_insert_char_grows_row) {
+    erow row = {<span class="num">0</span>};
+    row.chars = malloc(<span class="num">1</span>);
+    row.chars[<span class="num">0</span>] = <span class="str">'\0'</span>;
+    row.size = <span class="num">0</span>;
+
+    editorRowInsertChar(&amp;row, <span class="num">0</span>, <span class="str">'h'</span>);
+    editorRowInsertChar(&amp;row, <span class="num">1</span>, <span class="str">'i'</span>);
+
+    mu_assert_int_eq(<span class="num">2</span>, row.size);
+    mu_check(strncmp(row.chars, <span class="str">"hi"</span>, <span class="num">2</span>) == <span class="num">0</span>);
+}</pre>
+    <p data-anchor="tta-p-pure-2"><a href="https://github.com/siu/minunit" target="_blank" rel="noopener">minunit</a>
+    is a fitting choice here for a reason beyond convenience: it's a single-header C testing framework built
+    around a handful of macros (<code class="inl">MU_TEST</code>, <code class="inl">MU_TEST_SUITE</code>,
+    <code class="inl">mu_check</code>, <code class="inl">mu_assert_int_eq</code>) with no dependency beyond the
+    standard library. A project whose own README brags "does not depend on any library" (Chapter 3) shouldn't
+    reach for a test framework that quietly undoes that. The point generalizes past minunit specifically: general
+    console-app testing practice is to write logic against explicit, passed-in parameters rather than global state
+    or direct I/O calls, precisely so it can run under a fake in a test and under the real thing in production
+    without being duplicated.</p>
+    <div class="callout key" data-anchor="tta-callout-seam">
+      <span class="tag">Look for functions that already take a pointer</span>
+      <p><code class="inl">editorDelChar</code>, by contrast, recomputes <code class="inl">filerow</code>/
+      <code class="inl">filecol</code> from <code class="inl">E.rowoff</code>/<code class="inl">E.cy</code>/
+      <code class="inl">E.coloff</code>/<code class="inl">E.cx</code> before it does anything (Chapter 10) &mdash;
+      it can't run without <code class="inl">E</code> populated first. That's not a flaw to fix before writing any
+      tests; it's information. Test what's already shaped for testing first, and let which functions are hard to
+      test tell you where Chapter 19's refactor would pay off most.</p>
+    </div>
+
+    <h2 data-anchor="tta-h2-capture">Testing the redraw: the append buffer is already a seam</h2>
+    <p data-anchor="tta-p-capture-1">Chapter 5 covered Kilo's <code class="inl">struct abuf</code>: before a
+    single byte reaches the terminal, <code class="inl">editorRefreshScreen</code> assembles the <em>entire</em>
+    redrawn frame &mdash; every escape sequence, every row of text &mdash; into one heap-growing append buffer.
+    The source's own comment explains why: batching "avoid[s] flickering effects." That design decision, made for
+    a completely different reason, hands testing exactly what it needs. You don't have to intercept a
+    <code class="inl">write()</code> syscall or fake a file descriptor to see what Kilo would draw &mdash; the
+    fully-assembled frame already exists, in memory, as an ordinary buffer, for one instant before it's flushed.
+    Capture it there.</p>
+    <div class="callout warn" data-anchor="tta-callout-rawbytes">
+      <span class="tag">Don't assert on the raw bytes</span>
+      <p>Two escape-sequence strings can render an <em>identical</em> screen while differing byte-for-byte &mdash;
+      a cursor-position command reissued with the same coordinates, a color re-set to the color it already was.
+      Asserting directly on the captured bytes makes a test fail on changes that have no visible effect at all.
+      <a href="https://pyte.readthedocs.io/en/latest/" target="_blank" rel="noopener">pyte</a>, an in-memory
+      VTXXX-compatible terminal emulator, solves this the way a real terminal would: feed the captured bytes into
+      its <code class="inl">Stream</code>, and its <code class="inl">Screen</code> maintains the resulting
+      character grid and cursor position &mdash; so the test asserts on <em>rendered content</em>
+      (<code class="inl">screen.display</code>), the same thing a person looking at their terminal would judge
+      Kilo by.</p>
+    </div>
+
+    <h2 data-anchor="tta-h2-pty">Testing the whole program: through a real pseudo-terminal</h2>
+    <p data-anchor="tta-p-pty-1">Some questions can only be answered by running the actual binary: does pressing
+    Ctrl-F, typing a query, and pressing Enter really land the cursor on the match (Chapter 13)? Does
+    Ctrl-S really write the file and clear the dirty flag (Chapter 12)? For that, you need the real terminal
+    device the callout above insisted on. <a href="https://github.com/pexpect/pexpect" target="_blank"
+    rel="noopener">pexpect</a> spawns a child process inside an actual PTY and scripts it the way a person would:
+    send bytes as if typed, then <code class="inl">expect()</code> blocks until a specific pattern appears in the
+    output, with a timeout. Because the child's stdin really is a terminal, <code class="inl">enableRawMode</code>'s
+    <code class="inl">isatty()</code> check succeeds and the raw-mode path actually runs &mdash; the exact thing a
+    plain pipe couldn't give you.</p>
+    <pre class="tab"><span class="cm"># Illustrative sketch — not from any single source verbatim.</span>
+<span class="kw">import</span> pexpect, pyte
+
+child = pexpect.spawn(<span class="str">"./kilo scratch.txt"</span>, dimensions=(<span class="num">24</span>, <span class="num">80</span>))
+screen = pyte.Screen(<span class="num">80</span>, <span class="num">24</span>)
+stream = pyte.Stream(screen)
+
+child.send(<span class="str">"hello"</span>)
+child.expect(pexpect.TIMEOUT, timeout=<span class="num">0.2</span>)   <span class="cm"># let the redraw happen</span>
+stream.feed(child.before.decode(<span class="str">"utf-8"</span>, <span class="str">"replace"</span>))
+
+<span class="kw">assert</span> <span class="str">"hello"</span> <span class="kw">in</span> screen.display[<span class="num">0</span>]</pre>
+    <p data-anchor="tta-p-pty-2">If pulling in Python for this feels like the wrong trade for a project this
+    committed to having no dependencies, there's a shell-native version of the same idea: <code class="inl">tmux
+    new-session -d</code> starts the real binary attached to a real pty in a detached session,
+    <code class="inl">tmux send-keys</code> delivers keystrokes to it, and <code class="inl">tmux capture-pane</code>
+    reads back the rendered pane content as plain text. Same PTY, same principle, no Python interpreter required
+    to drive it.</p>
+    <div class="callout key" data-anchor="tta-callout-goldenmaster">
+      <span class="tag">You don't need a refactor to start</span>
+      <p>Everything above the append-buffer seam assumes kilo.c stays exactly as it is today &mdash; and that's
+      the point. A <strong>characterization test</strong> (Michael Feathers's term, also called a golden master
+      test) records the current, actual output of existing code for a fixed input and asserts future runs match
+      it, without requiring the code to be decomposed into testable units first. Run the real
+      <code class="inl">kilo</code> binary through a PTY with a fixed keystroke script, save the resulting screen
+      as the golden file, and Chapter 19's refactor now has a safety net <em>before</em> a single line moves
+      &mdash; solving the chicken-and-egg of "you need tests to refactor safely, but refactoring is what the
+      untested code needs."</p>
+    </div>
+
+    <h2 data-anchor="tta-h2-edge">Edge cases: where a PTY test quietly lies to you</h2>
+    <p data-anchor="tta-p-edge-1">A PTY makes <code class="inl">isatty()</code> pass, but it doesn't make a test
+    deterministic for free. Two specific things bite here, both traceable to earlier chapters.</p>
+    <div class="callout warn" data-anchor="tta-callout-timing">
+      <span class="tag">Kilo's read loop can outrun your test</span>
+      <p>Chapter 4 set <code class="inl">c_cc[VMIN]=0</code> and <code class="inl">c_cc[VTIME]=1</code>, so
+      <code class="inl">read()</code> can return before a just-sent keystroke has been fully processed and
+      redrawn. A script that fires off a long chain of keystrokes and only checks the result at the very end can
+      race the program under test and produce results that depend on scheduling, not logic. Send one action,
+      wait for confirmation, then send the next &mdash; the same discipline good PTY-testing practice recommends
+      generally.</p>
+    </div>
+    <div class="callout warn" data-anchor="tta-callout-winsize">
+      <span class="tag">An unpinned window size breaks reproducibility</span>
+      <p>Chapter 9's <code class="inl">getWindowSize</code>/<code class="inl">SIGWINCH</code> handling recomputes
+      <code class="inl">E.screenrows</code>/<code class="inl">E.screencols</code> from whatever size the terminal
+      reports. A PTY's dimensions are configurable (pexpect's <code class="inl">dimensions=</code> argument
+      above pins them); leave them unset and a captured screen dump depends on whatever size your terminal or CI
+      runner happens to default to &mdash; the same golden file passing on your machine and failing in CI, for a
+      reason that has nothing to do with a real bug.</p>
+    </div>
+    <p data-anchor="tta-p-edge-2">Once the pure-logic layer is genuinely isolated from <code class="inl">E</code>
+    and from the terminal, it becomes a fuzzing target worth naming even briefly: Kilo's keypress dispatch parses
+    raw bytes, including multi-byte escape sequences (Chapter 4's arrow-key and Page-Up/Page-Down decoding).
+    Feeding that parser truncated or malformed escape byte sequences &mdash; the kind a flaky terminal emulator or
+    a half-received network packet could actually produce &mdash; is exactly the kind of input space a person
+    writing a keystroke script by hand won't think to cover, but a fuzzer will.</p>
+
+    <div class="reflect" data-anchor="tta-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>Not a test suite &mdash; kilo.c still doesn't have one, and this chapter didn't write it one. What it
+      gained is a map of where three different kinds of test actually belong, and why reaching for the wrong one
+      is the reason testing a terminal program feels harder than it is. Functions like
+      <code class="inl">editorRowInsertChar</code> that already take their state as a parameter need nothing but
+      an ordinary unit test. The append buffer <code class="inl">editorRefreshScreen</code> already builds, for
+      one instant, before it's flushed &mdash; capture that, and feed it through a terminal emulator like pyte so
+      the assertion is about what a person would actually see. And for the whole program, a pseudo-terminal
+      &mdash; not a pipe &mdash; is what lets <code class="inl">enableRawMode</code> behave as it would for a real
+      user, which is what makes a golden-master test over that PTY session a legitimate safety net for Chapter
+      19's refactor, starting from exactly the untouched code that exists today. Chapter 22 is where all of this
+      &mdash; the terminal handling, the data model, the editing operations, and now the seams for testing
+      them &mdash; gets held in your head all at once, as one architecture rather than twenty-one chapters.</p>
+    </div>
+
+    <div class="challenges" data-anchor="tta-challenges">
+      <span class="tag">Before you turn the page</span>
+      <ol>
+        <li>For each of these three functions &mdash; <code class="inl">editorRowInsertChar</code>,
+        <code class="inl">editorInsertRow</code>, <code class="inl">editorDelChar</code> &mdash; say which of this
+        chapter's three layers it belongs to, and why, using what each one actually reads or writes as your
+        evidence.</li>
+        <li>Sketch the minunit test you'd write for <code class="inl">editorRowDelChar</code> (Chapter 10):
+        what erow would you construct, what would you call, and what field(s) would you assert on afterward?</li>
+        <li>Using this chapter's PTY sketch as a starting point, describe the keystroke script and the
+        <code class="inl">screen.display</code> assertion you'd write as a characterization test for Chapter 13's
+        incremental search &mdash; specifically, for the case where the search query matches nothing at all.</li>
+      </ol>
+    </div>
+
+    <p class="sources" data-anchor="tta-sources">
+      Sources: <a href="https://raw.githubusercontent.com/antirez/kilo/master/kilo.c" target="_blank" rel="noopener">[1] kilo.c — raw source</a> &middot;
+      <a href="https://man7.org/linux/man-pages/man3/termios.3.html" target="_blank" rel="noopener">[2] termios(3) — Linux manual page</a> &middot;
+      <a href="https://github.com/pexpect/pexpect" target="_blank" rel="noopener">[3] pexpect — controlling interactive programs in a pseudo-terminal</a> &middot;
+      <a href="https://pyte.readthedocs.io/en/latest/" target="_blank" rel="noopener">[4] pyte — an in-memory VTXXX-compatible terminal emulator</a> &middot;
+      <a href="https://drmaciver.com/2015/05/using-tmux-to-test-your-console-applications/" target="_blank" rel="noopener">[5] Using tmux to test your console applications — David R. MacIver</a> &middot;
+      <a href="https://en.wikipedia.org/wiki/Characterization_test" target="_blank" rel="noopener">[6] Characterization test — Wikipedia</a> &middot;
+      <a href="https://github.com/siu/minunit" target="_blank" rel="noopener">[7] minunit — a minimal C/C++ unit testing framework</a> &middot;
+      <a href="https://jmmv.dev/2020/12/unit-testing-a-console-app.html" target="_blank" rel="noopener">[8] Unit-testing a console app — Julio Merino</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="20-adding-features-carefully.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="22-rebuilding-the-editor-from-memory.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Working Across Languages — Protobuf</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+
+<header class="book-topbar">
+  <a rel="home" href="../index.html" class="topbar-title">Protobuf</a>
+  <span class="topbar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker" data-anchor="wal-kicker">Chapter 10 &middot; Evolution &amp; Interop</span>
+    <h1 data-anchor="wal-h1">Working Across Languages</h1>
+
+    <p class="lede" data-anchor="wal-lede">
+      Here is the promise that has been humming under every chapter so far, finally
+      said out loud: a Go service writes a message, a Python worker reads it, a
+      TypeScript front-end renders it, and a C++ batch job archives it &mdash; and not
+      one of them shares a line of code with the others. All they share is a
+      <code>.proto</code> file. In this chapter we'll take that promise apart to see
+      why it holds. We'll watch one schema become idiomatic types in four different
+      languages, meet the <em>second</em> wire format (canonical JSON) that every
+      implementation must agree on, and then spend real time in the places where the
+      abstraction leaks &mdash; presence, 64-bit integers in JavaScript, and enums &mdash;
+      because knowing exactly where interop <em>almost</em> works is the difference
+      between a system that ships and one that corrupts data at 3&nbsp;a.m. We'll close
+      with the machinery that keeps every language honest: the conformance suite.
+    </p>
+
+    <h2 data-anchor="wal-h2-contract">The contract is the schema, not the library</h2>
+    <p data-anchor="wal-p-contract-1">
+      Let's fix the mental model first, because everything else falls out of it. When
+      two programs in different languages talk protobuf, <strong>they are not sharing a
+      library</strong>. There is no common runtime they both link against, no shared
+      object passed between them. What they share is the <code>.proto</code> file &mdash;
+      a language-neutral description of the data &mdash; and two things that every
+      conformant implementation independently agrees to produce: the same
+      <strong>binary wire format</strong> and the same <strong>canonical JSON mapping</strong>.
+      That's the whole contract. The Go library and the Python library were written by
+      different people, in different decades, and they interoperate because they both
+      obey the same spec, not because they descend from the same code.
+    </p>
+    <div class="callout key-idea" data-anchor="wal-callout-contract">
+      <span class="callout-label">The one-sentence version</span>
+      A <code>.proto</code> file plus a per-language plugin generates <em>native</em>
+      types in each language; interoperability comes from every implementation
+      independently honoring the <em>same two serialization formats</em> &mdash; binary
+      and canonical JSON &mdash; not from any shared code. The schema is the API; the
+      generated code is disposable.
+    </div>
+
+    <p data-anchor="wal-p-contract-2">
+      This is why, back in the tooling chapter, running <code>protoc</code> for a new
+      language felt so anticlimactic: you point the compiler at the same file with a
+      different <code>--&lt;lang&gt;_out</code> flag and get idiomatic code for free.
+      Each generator's job is to make the schema feel <em>native</em> &mdash; like a
+      library a human wrote for that language &mdash; while keeping the bytes on the
+      wire bit-for-bit identical to every other generator's.
+    </p>
+
+    <figure class="figbox" data-anchor="wal-fig-fanout">
+      <svg viewBox="0 0 720 260" role="img" aria-labelledby="wal-fig-fanout-title">
+        <title id="wal-fig-fanout-title">One .proto file compiled by protoc into idiomatic Go, Java, Python, C#, and TypeScript types, all agreeing on one shared binary + JSON wire format</title>
+        <!-- source proto -->
+        <rect x="24" y="96" width="150" height="66" rx="8" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="99" y="124" text-anchor="middle" font-family="var(--font-mono)" font-size="13" fill="var(--accent)">product.proto</text>
+        <text x="99" y="142" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">the one contract</text>
+        <!-- protoc -->
+        <text x="215" y="124" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">protoc</text>
+        <text x="215" y="137" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">+ plugin</text>
+        <g stroke="var(--rule)" stroke-width="1.2" fill="none">
+          <path d="M174 118 C 210 100, 230 60, 268 56"/>
+          <path d="M174 124 C 210 118, 232 100, 268 100"/>
+          <path d="M174 129 C 214 129, 232 140, 268 144"/>
+          <path d="M174 134 C 210 150, 232 182, 268 188"/>
+          <path d="M174 140 C 210 172, 232 224, 268 232"/>
+        </g>
+        <!-- language boxes -->
+        <g font-family="var(--font-mono)" font-size="11">
+          <rect x="272" y="40"  width="150" height="32" rx="6" fill="none" stroke="var(--ty)" stroke-width="1.3"/>
+          <text x="347" y="60"  text-anchor="middle" fill="var(--ty)">Go struct</text>
+          <rect x="272" y="84"  width="150" height="32" rx="6" fill="none" stroke="var(--fn)" stroke-width="1.3"/>
+          <text x="347" y="104" text-anchor="middle" fill="var(--fn)">Java class + Builder</text>
+          <rect x="272" y="128" width="150" height="32" rx="6" fill="none" stroke="var(--mac)" stroke-width="1.3"/>
+          <text x="347" y="148" text-anchor="middle" fill="var(--mac)">Python class</text>
+          <rect x="272" y="172" width="150" height="32" rx="6" fill="none" stroke="var(--num)" stroke-width="1.3"/>
+          <text x="347" y="192" text-anchor="middle" fill="var(--num)">C# properties</text>
+          <rect x="272" y="216" width="150" height="32" rx="6" fill="none" stroke="var(--kw)" stroke-width="1.3"/>
+          <text x="347" y="236" text-anchor="middle" fill="var(--kw)">TS interface</text>
+        </g>
+        <!-- converge onto the wire -->
+        <g stroke="var(--rule)" stroke-width="1.2" fill="none">
+          <path d="M422 56  C 500 56, 520 118, 566 122"/>
+          <path d="M422 100 C 500 100, 522 122, 566 128"/>
+          <path d="M422 144 C 500 144, 522 132, 566 132"/>
+          <path d="M422 188 C 500 188, 522 140, 566 138"/>
+          <path d="M422 232 C 500 232, 520 148, 566 144"/>
+        </g>
+        <rect x="570" y="100" width="128" height="66" rx="8" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="634" y="126" text-anchor="middle" font-family="var(--font-display)" font-size="12" fill="var(--ink)">one wire format</text>
+        <text x="634" y="145" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">binary + canonical JSON</text>
+      </svg>
+      <figcaption>
+        The fan-out and the fan-in. One <code>.proto</code> becomes five idiomatic
+        shapes, but they all serialize to &mdash; and parse &mdash; the exact same
+        bytes. The generated code diverges so the humans are comfortable; the wire
+        format converges so the machines agree.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="wal-h2-idioms">One schema, many idioms</h2>
+    <p data-anchor="wal-p-idioms-1">
+      Let's make it concrete with a message we'll carry through the whole chapter. It's
+      deliberately loaded: a 64-bit id, an enum, a <code>bytes</code> field, and a
+      timestamp &mdash; the four fields that expose almost every cross-language wrinkle.
+    </p>
+    <pre data-anchor="wal-code-proto"><code><span class="kw">syntax</span> = <span class="str">"proto3"</span>;
+<span class="kw">package</span> catalog.v1;
+
+<span class="kw">import</span> <span class="str">"google/protobuf/timestamp.proto"</span>;
+
+<span class="kw">enum</span> <span class="ty">Availability</span> {
+  <span class="en">AVAILABILITY_UNSPECIFIED</span> = <span class="num">0</span>;   <span class="cm">// the required zero value</span>
+  <span class="en">AVAILABILITY_IN_STOCK</span>    = <span class="num">1</span>;
+  <span class="en">AVAILABILITY_BACKORDER</span>   = <span class="num">2</span>;
+}
+
+<span class="kw">message</span> <span class="ty">Product</span> {
+  <span class="ty">int64</span>  sku          = <span class="num">1</span>;   <span class="cm">// a 64-bit id</span>
+  <span class="ty">string</span> display_name = <span class="num">2</span>;
+  <span class="ty">Availability</span> status  = <span class="num">3</span>;
+  <span class="ty">bytes</span>  thumbnail    = <span class="num">4</span>;
+  google.protobuf.<span class="ty">Timestamp</span> updated_at = <span class="num">5</span>;
+}</code></pre>
+    <p data-anchor="wal-p-idioms-2">
+      Notice one style rule doing quiet work here: in the <code>.proto</code> the field
+      is <code>display_name</code>, <code>lower_snake_case</code>, always. We never write
+      the field the way any one language spells it, because the file belongs to <em>all</em>
+      of them. It's each generator's job to translate that single canonical name into
+      whatever reads as natural locally. Watch the same <code>sku</code> field land in
+      four languages:
+    </p>
+    <pre data-anchor="wal-code-idioms"><code><span class="cm">// proto:   int64 sku = 1;        // one field, four renderings</span>
+
+<span class="cm">// Go     — exported CamelCase field, nil-safe getter</span>
+p.<span class="fn">GetSku</span>()                 <span class="cm">// int64</span>
+
+<span class="cm">// Java   — getter/Builder setter off the snake_case name</span>
+p.<span class="fn">getSku</span>();                <span class="cm">// long;  builder.setSku(long)</span>
+
+<span class="cm">// Python — a plain snake_case attribute</span>
+p.sku                       <span class="cm"># an int, arbitrary precision</span>
+
+<span class="cm">// C#     — a PascalCase property</span>
+p.<span class="ty">Sku</span>;                     <span class="cm">// long { get; set; }</span></code></pre>
+    <p data-anchor="wal-p-idioms-3">
+      Each generator also matches its language's grain in bigger ways. Go emits a
+      struct with exported <code>CamelCase</code> fields and <code>GetX()</code>
+      accessors that are safe to call on a <code>nil</code> pointer. Java gives you an
+      <em>immutable</em> message plus a mutable <code>Builder</code> to construct it,
+      with <code>getSongName()</code>-style accessors. Python's generated module is
+      really just a static descriptor &mdash; the actual class is conjured at
+      <em>import time</em> by a metaclass, with the fast <code>upb</code> C library doing
+      the real work underneath since protobuf 4.21. C# produces <code>PascalCase</code>
+      properties and even trims the enum's own name off its values so
+      <code>AVAILABILITY_IN_STOCK</code> reads as <code>InStock</code>. Five faces, one
+      schema.
+    </p>
+
+    <table class="cmp" data-anchor="wal-table-idioms">
+      <thead><tr><th>Language</th><th>Message shape</th><th><code>sku</code> access</th><th>Enum value</th></tr></thead>
+      <tbody>
+        <tr><td>Go</td><td>struct, exported fields</td><td><code>p.GetSku()</code></td><td><code>Availability_AVAILABILITY_IN_STOCK</code></td></tr>
+        <tr><td>Java</td><td>immutable class + <code>Builder</code></td><td><code>p.getSku()</code></td><td><code>Availability.AVAILABILITY_IN_STOCK</code></td></tr>
+        <tr><td>Python</td><td>metaclass-built class</td><td><code>p.sku</code></td><td><code>Availability.AVAILABILITY_IN_STOCK</code></td></tr>
+        <tr><td>C#</td><td>partial class, properties</td><td><code>p.Sku</code></td><td><code>Availability.InStock</code></td></tr>
+        <tr><td>TS (Protobuf-ES)</td><td><code>Message</code> subclass</td><td><code>p.sku</code> (<code>bigint</code>)</td><td><code>Availability.IN_STOCK</code></td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="wal-p-idioms-4">
+      A quiet note on that last row: TypeScript has no single blessed generator the way
+      Go or Java does. Two live options dominate &mdash; <strong>ts-proto</strong>, which
+      emits lean idiomatic interfaces and functions, and <strong>Protobuf-ES</strong>
+      (<code>@bufbuild/protobuf</code>), which chases full spec conformance. It's the
+      one ecosystem where <em>you</em> pick the runtime, so pick deliberately.
+    </p>
+
+    <h2 data-anchor="wal-h2-presence">Where it first leaks: field presence</h2>
+    <p data-anchor="wal-p-presence-1">
+      Now the leaks. The first one is subtle and it's caused by a decision we made
+      chapters ago: proto3's <strong>implicit presence</strong>. For a plain scalar
+      field &mdash; no <code>optional</code> label &mdash; a value equal to the default
+      (<code>0</code>, <code>""</code>, an empty list) is <em>indistinguishable from
+      never having been set</em>. On the wire, a zero-valued field simply isn't written.
+      And here's the interop bite: this shows up <em>differently</em> in each language's
+      API even though the bytes are identical.
+    </p>
+    <p data-anchor="wal-p-presence-2">
+      In Go, an implicit <code>int64 sku</code> is just an <code>int64</code> &mdash;
+      there's no <code>HasSku()</code>, so you literally <em>cannot</em> ask whether the
+      sender meant &ldquo;zero&rdquo; or &ldquo;didn't set it.&rdquo; Java is the same for
+      implicit fields: no hazzer. The fix is the same everywhere and we've seen it
+      before &mdash; add the <code>optional</code> label to opt into
+      <strong>explicit presence</strong>, and now every language generates a
+      <code>hasSku()</code>/<code>HasSku()</code> that tells the truth.
+    </p>
+    <pre data-anchor="wal-code-presence"><code><span class="cm">// implicit presence (proto3 default): 0 and "unset" are the same fact</span>
+<span class="ty">int64</span> sku = <span class="num">1</span>;
+
+<span class="cm">// explicit presence: adds has-methods in every language</span>
+<span class="kw">optional</span> <span class="ty">int64</span> sku = <span class="num">1</span>;   <span class="cm">// Go: HasSku()  Java: hasSku()  ...</span></code></pre>
+    <div class="callout warning" data-anchor="wal-callout-presence">
+      <span class="callout-label">The presence gotcha that crosses a language boundary</span>
+      If your Go producer leaves <code>sku</code> at <code>0</code> and your Python
+      consumer branches on &ldquo;is <code>sku</code> present?&rdquo;, the two disagree
+      about reality &mdash; not because of a bug, but because implicit presence
+      <em>defines</em> <code>0</code> as absent. Reach for <code>optional</code> the
+      moment &ldquo;set to the default&rdquo; and &ldquo;not set&rdquo; must mean
+      different things. (One oddity worth knowing: <strong>Dart</strong> is the outlier
+      that generates <code>has_</code> methods even for implicit proto3 fields &mdash;
+      don't let it lull you into assuming the others do too.)
+    </div>
+
+    <h2 data-anchor="wal-h2-json">The second wire format: canonical JSON</h2>
+    <p data-anchor="wal-p-json-1">
+      So far &ldquo;the wire&rdquo; has meant the compact binary encoding from Chapter&nbsp;04.
+      But protobuf actually mandates <em>two</em> serializations, and every conformant
+      library must implement both: the binary format, and a <strong>canonical JSON
+      mapping</strong> &mdash; often called <strong>ProtoJSON</strong>. It exists for the
+      moments binary can't reach: a browser's dev-tools, a REST gateway, a log line a
+      human has to read, a config file. Crucially it is a <em>specified</em> mapping, not
+      &ldquo;whatever your library felt like emitting,&rdquo; which is exactly what lets a
+      C# service and a TypeScript client exchange JSON and agree on what it means.
+    </p>
+    <p data-anchor="wal-p-json-2">
+      Here is our <code>Product</code> as ProtoJSON. Read it slowly &mdash; almost every
+      token is a rule you have to know:
+    </p>
+    <pre data-anchor="wal-code-json"><code>{
+  <span class="at">"sku"</span>: <span class="str">"90071992547409910"</span>,          <span class="cm">// int64 -> a QUOTED string</span>
+  <span class="at">"displayName"</span>: <span class="str">"Field Notebook"</span>,       <span class="cm">// display_name -> lowerCamelCase</span>
+  <span class="at">"status"</span>: <span class="str">"AVAILABILITY_IN_STOCK"</span>,    <span class="cm">// enum -> its value NAME</span>
+  <span class="at">"thumbnail"</span>: <span class="str">"iVBORw0KGgoAAA=="</span>,       <span class="cm">// bytes -> base64</span>
+  <span class="at">"updatedAt"</span>: <span class="str">"2026-07-20T17:04:00Z"</span>    <span class="cm">// Timestamp -> RFC-3339 UTC string</span>
+}
+<span class="cm">// A field left at its default (sku==0, empty string) is OMITTED entirely.</span></code></pre>
+    <p data-anchor="wal-p-json-3">
+      Let's name the rules, because &ldquo;it's just JSON&rdquo; is the fastest way to
+      ship a bug. Field names become <strong>lowerCamelCase</strong> (or the
+      <code>json_name</code> option's value if you set one); a good parser accepts
+      <em>both</em> that and the original <code>snake_case</code>. Enums serialize as
+      their <strong>value name</strong> by default (a number is also legal on input).
+      <code>bytes</code> is <strong>base64</strong>. Floating point is a normal JSON
+      number &mdash; except the three values JSON can't spell, which become the strings
+      <code>"NaN"</code>, <code>"Infinity"</code>, and <code>"-Infinity"</code>. And the
+      one that surprises everyone: the 64-bit integer types (<code>int64</code>,
+      <code>uint64</code>, <code>fixed64</code>, <code>sint64</code>&hellip;) are emitted
+      as <strong>quoted strings</strong>. Hold that thought &mdash; it's about to earn a
+      whole section.
+    </p>
+
+    <figure class="figbox" data-anchor="wal-fig-two-formats">
+      <svg viewBox="0 0 720 210" role="img" aria-labelledby="wal-fig-two-formats-title">
+        <title id="wal-fig-two-formats-title">One Product message serializing two ways: a compact binary byte strip, and a verbose but human-readable canonical JSON object</title>
+        <rect x="286" y="86" width="148" height="52" rx="8" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="360" y="108" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ink)">Product</text>
+        <text x="360" y="126" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">in-memory message</text>
+        <!-- to binary -->
+        <path d="M286 100 C 210 100, 200 60, 150 58" stroke="var(--rule)" stroke-width="1.2" fill="none"/>
+        <text x="150" y="34" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ty)">binary</text>
+        <g font-family="var(--font-mono)" font-size="9">
+          <rect x="20"  y="44" width="34" height="28" rx="4" fill="var(--code-bg)" stroke="var(--rule)"/>
+          <rect x="58"  y="44" width="34" height="28" rx="4" fill="var(--code-bg)" stroke="var(--rule)"/>
+          <rect x="96"  y="44" width="34" height="28" rx="4" fill="var(--code-bg)" stroke="var(--rule)"/>
+          <rect x="134" y="44" width="34" height="28" rx="4" fill="var(--code-bg)" stroke="var(--rule)"/>
+          <rect x="172" y="44" width="34" height="28" rx="4" fill="var(--code-bg)" stroke="var(--rule)"/>
+          <rect x="210" y="44" width="34" height="28" rx="4" fill="var(--code-bg)" stroke="var(--rule)"/>
+          <text x="37"  y="62" text-anchor="middle" fill="var(--ink)">08</text>
+          <text x="75"  y="62" text-anchor="middle" fill="var(--ink)">B6</text>
+          <text x="113" y="62" text-anchor="middle" fill="var(--ink)">01</text>
+          <text x="151" y="62" text-anchor="middle" fill="var(--ink)">12</text>
+          <text x="189" y="62" text-anchor="middle" fill="var(--ink)">0D</text>
+          <text x="227" y="62" text-anchor="middle" fill="var(--ink)">&hellip;</text>
+        </g>
+        <text x="132" y="88" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">compact &middot; machines &middot; the default</text>
+        <!-- to json -->
+        <path d="M434 124 C 510 124, 520 150, 560 154" stroke="var(--rule)" stroke-width="1.2" fill="none"/>
+        <text x="560" y="34" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--fn)">canonical JSON</text>
+        <rect x="470" y="42" width="234" height="120" rx="8" fill="var(--code-bg)" stroke="var(--fn)" stroke-width="1.2"/>
+        <g font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">
+          <text x="482" y="60">{</text>
+          <text x="492" y="76"><tspan fill="var(--at)">"sku"</tspan>: <tspan fill="var(--str)">"90071992547409910"</tspan>,</text>
+          <text x="492" y="92"><tspan fill="var(--at)">"displayName"</tspan>: <tspan fill="var(--str)">"Field Notebook"</tspan>,</text>
+          <text x="492" y="108"><tspan fill="var(--at)">"status"</tspan>: <tspan fill="var(--str)">"...IN_STOCK"</tspan>,</text>
+          <text x="492" y="124"><tspan fill="var(--at)">"thumbnail"</tspan>: <tspan fill="var(--str)">"iVBORw0K.."</tspan>,</text>
+          <text x="492" y="140"><tspan fill="var(--at)">"updatedAt"</tspan>: <tspan fill="var(--str)">"2026-...Z"</tspan></text>
+          <text x="482" y="156">}</text>
+        </g>
+      </svg>
+      <figcaption>
+        The same message, two mandated formats. Binary is the default &mdash; small and
+        fast, for machines. Canonical JSON is the escape hatch &mdash; verbose but
+        human- and web-friendly &mdash; and it's a <em>spec</em>, so its shape is the
+        same in every language.
+      </figcaption>
+    </figure>
+
+    <div class="callout note" data-anchor="wal-callout-wkt">
+      <span class="callout-label">The well-known types have their own JSON forms</span>
+      A handful of <code>google.protobuf</code> types get bespoke ProtoJSON shapes you
+      can't guess from the message-as-object rule: <code>Timestamp</code> is an RFC-3339
+      UTC string ending in <code>Z</code>; <code>Duration</code> is decimal seconds with
+      an <code>s</code> suffix (<code>"3.5s"</code>); <code>Struct</code>/<code>Value</code>/<code>ListValue</code>
+      round-trip to plain JSON; the wrapper types collapse to just their wrapped value
+      (or <code>null</code>); and <code>Any</code> becomes an object carrying a special
+      <code>"@type"</code> key. A generic JSON consumer that doesn't know these will be
+      baffled by them &mdash; and that's a very common integration surprise.
+    </div>
+
+    <h2 data-anchor="wal-h2-js64">The 64-bit integer trap in JavaScript</h2>
+    <p data-anchor="wal-p-js64-1">
+      Why on earth does ProtoJSON wrap 64-bit integers in quotes? Because of one of the
+      most consequential facts in cross-language data: <strong>JavaScript has no integer
+      type</strong>. Every JS <code>Number</code> is an IEEE-754 double, which can
+      represent integers <em>exactly</em> only up to <code>2^53 - 1</code>. Past that,
+      arithmetic silently lies. A <code>uint64</code> is a perfectly ordinary id in Go
+      or Java; drop it into a JS number and it rounds out from under you:
+    </p>
+    <pre data-anchor="wal-code-js64"><code><span class="cm">// Why ProtoJSON strings 64-bit ints — run this in any JS console:</span>
+<span class="ty">JSON</span>.<span class="fn">parse</span>(<span class="str">'{"sku": 90071992547409910}'</span>).sku    <span class="cm">// 90071992547409920  <-- WRONG</span>
+<span class="ty">JSON</span>.<span class="fn">parse</span>(<span class="str">'{"sku": "90071992547409910"}'</span>).sku  <span class="cm">// "90071992547409910" exact</span>
+<span class="ty">Number</span>.<span class="at">MAX_SAFE_INTEGER</span>                          <span class="cm">// 9007199254740991  (2^53 - 1)</span></code></pre>
+    <p data-anchor="wal-p-js64-2">
+      Look at the first line: the last two digits changed, with no error, no warning.
+      An order id, a ledger balance, a Snowflake timestamp &mdash; quietly corrupted the
+      instant it crossed into a JS number. The quoted-string mapping in ProtoJSON is the
+      spec's defense against exactly this. And it's why serious JS protobuf runtimes
+      never hand you a bare <code>number</code> for a 64-bit field: they give you a
+      <strong>string</strong>, a <strong>Long</strong> object, or, in Protobuf-ES, a
+      native <strong>BigInt</strong>. The value is preserved; you just have to remember
+      it isn't a plain number.
+    </p>
+    <div class="callout warning" data-anchor="wal-callout-js64">
+      <span class="callout-label">The rule that saves you</span>
+      In any JavaScript/TypeScript that touches protobuf, treat every
+      <code>int64</code>/<code>uint64</code>/<code>fixed64</code> as opaque &mdash;
+      keep it a string or <code>BigInt</code>, never coerce it to <code>Number</code>,
+      and never let it flow through <code>JSON.parse</code> as an unquoted numeric
+      literal. The bug is invisible in tests with small ids and catastrophic in
+      production with real ones.
+    </div>
+
+    <h2 data-anchor="wal-h2-wire">Wire-compatibility &mdash; and its one sharp edge</h2>
+    <p data-anchor="wal-p-wire-1">
+      Here's the reassuring half. The binary wire format is the <em>same algorithm</em>
+      in every language &mdash; a message is nothing but a flat stream of
+      <span class="tag-badge"><span class="n">field&nbsp;#</span> &middot; <span class="t">wire&nbsp;type</span> &middot; value</span>
+      records, as we dissected in Chapter&nbsp;04. There is no per-language dialect of the
+      bytes. So anything a Go service serializes, a Python service parses, and vice
+      versa, forever, without either knowing the other exists. This is the bedrock the
+      whole promise rests on, and it genuinely just works.
+    </p>
+    <p data-anchor="wal-p-wire-2">
+      Now the sharp edge, and it cuts people who assume &ldquo;same message &rArr; same
+      bytes.&rdquo; <strong>It does not.</strong> Protobuf gives you no guarantee that two
+      implementations &mdash; or even two runs of the <em>same</em> implementation &mdash;
+      produce byte-for-byte identical output for equal messages. Fields may be emitted in
+      any order. Most notoriously, <strong>map iteration order is unspecified</strong> and
+      routinely differs. Every reader still parses every ordering correctly, because the
+      field numbers carry the meaning. But the bytes are not canonical.
+    </p>
+    <div class="callout warning" data-anchor="wal-callout-wire">
+      <span class="callout-label">Never treat serialized bytes as a canonical fingerprint</span>
+      Do not hash serialized protobuf and compare the hashes for equality across
+      languages, across library versions, or even across two runs. Do not sign the raw
+      bytes and expect another language to reproduce them. Do not deduplicate records by
+      their serialized form. The moment a second implementation (or an upgraded map
+      library) touches the data, &ldquo;equal message, different bytes&rdquo; breaks all
+      three. If you truly need a stable digest, normalize into a canonical form
+      yourself &mdash; the wire format won't do it for you.
+    </div>
+
+    <h2 data-anchor="wal-h2-enums">Enums across runtimes: open vs. closed</h2>
+    <p data-anchor="wal-p-enums-1">
+      Enums are the last big leak, and it comes from forward compatibility. Picture a new
+      server that adds <code>AVAILABILITY_PREORDER = 3</code> and sends it to an old
+      client whose schema stops at <code>2</code>. The value <code>3</code> is
+      unrecognized &mdash; so what does the old client <em>do</em> with it? The answer
+      depends on the language, and it's the difference between <em>open</em> and
+      <em>closed</em> enums.
+    </p>
+    <p data-anchor="wal-p-enums-2">
+      In <strong>open</strong> enums &mdash; C++ and Go &mdash; the runtime keeps the raw
+      integer <code>3</code> as-is; the field just holds a value your generated enum
+      doesn't have a name for. In Java's generated <strong>closed-style</strong> enums,
+      the value maps to a synthetic <code>UNRECOGNIZED</code> sentinel, and you fish the
+      original number out through a separate accessor. Either way &mdash; and this is the
+      saving grace &mdash; the original <code>3</code> <em>round-trips</em>: if the old
+      client reserializes the message untouched, <code>3</code> goes back out on the
+      wire intact. But your <code>switch</code> statement won't agree across languages.
+    </p>
+    <div class="callout warning" data-anchor="wal-callout-enums">
+      <span class="callout-label">The enum switch that misbehaves in exactly one language</span>
+      Always have a default / unknown arm when you branch on an enum. A value from the
+      future arrives as a raw int in Go and C++ but as <code>UNRECOGNIZED</code> in Java,
+      so a naive <code>switch</code> with no fallthrough handles it in one language and
+      silently mis-handles it in another. And never renumber or reuse enum values across a
+      schema change &mdash; <code>reserved</code> the retired names and numbers, exactly as
+      the evolution chapter warned. (The zero value stays special: it must be the first
+      entry and it's the default for implicit-presence fields.)
+    </div>
+
+    <h2 data-anchor="wal-h2-conformance">Keeping everyone honest: the conformance suite</h2>
+    <p data-anchor="wal-p-conf-1">
+      One last question hangs over all of this: if there's no shared code, only a spec,
+      how do we <em>know</em> a brand-new Rust or Swift or TypeScript library actually
+      obeys it? You test it &mdash; against the same battery of tests every other language
+      faces. That battery is the <strong>protobuf conformance suite</strong>: over 2,000
+      cases that probe binary and JSON, parsing and serializing, well-known types, the
+      awkward edges of presence and defaults.
+    </p>
+    <p data-anchor="wal-p-conf-2">
+      The mechanism is beautifully low-tech. A tester process speaks to your
+      implementation over <strong>stdin/stdout</strong>. It writes a
+      <code>ConformanceRequest</code> &mdash; a payload plus &ldquo;now give it back to me
+      in <em>this</em> format&rdquo; &mdash; and reads back a <code>ConformanceResponse</code>
+      with either the re-serialized bytes or an error. Your job is a tiny harness that
+      parses the payload and re-emits it; the C++ reference is about 150 lines. Pass all
+      2,000+ and your library is, by definition, interoperable.
+    </p>
+    <pre data-anchor="wal-code-conf"><code><span class="cm">// conformance.proto — the contract for testing a contract (abridged):</span>
+<span class="kw">message</span> <span class="ty">ConformanceRequest</span> {
+  <span class="kw">oneof</span> payload {
+    <span class="ty">bytes</span>  protobuf_payload = <span class="num">1</span>;
+    <span class="ty">string</span> json_payload     = <span class="num">2</span>;
+  }
+  <span class="ty">WireFormat</span> requested_output_format = <span class="num">3</span>;
+  <span class="ty">string</span>     message_type            = <span class="num">4</span>;
+}
+<span class="kw">message</span> <span class="ty">ConformanceResponse</span> {
+  <span class="kw">oneof</span> result {
+    <span class="ty">string</span> parse_error      = <span class="num">1</span>;
+    <span class="ty">bytes</span>  protobuf_payload = <span class="num">3</span>;
+    <span class="ty">string</span> json_payload     = <span class="num">4</span>;
+    <span class="ty">string</span> skipped          = <span class="num">5</span>;
+  }
+}
+<span class="kw">enum</span> <span class="ty">WireFormat</span> { <span class="en">UNSPECIFIED</span>=<span class="num">0</span>; <span class="en">PROTOBUF</span>=<span class="num">1</span>; <span class="en">JSON</span>=<span class="num">2</span>; <span class="en">JSPB</span>=<span class="num">3</span>; <span class="en">TEXT_FORMAT</span>=<span class="num">4</span>; }</code></pre>
+
+    <figure class="figbox" data-anchor="wal-fig-conf">
+      <svg viewBox="0 0 700 170" role="img" aria-labelledby="wal-fig-conf-title">
+        <title id="wal-fig-conf-title">The conformance test runner writes a ConformanceRequest to the implementation over stdin and reads a ConformanceResponse from stdout, looping over 2000-plus cases</title>
+        <rect x="30" y="52" width="180" height="66" rx="8" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="120" y="80" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ink)">test runner</text>
+        <text x="120" y="99" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">2000+ cases</text>
+        <rect x="490" y="52" width="180" height="66" rx="8" fill="var(--code-bg)" stroke="var(--ty)" stroke-width="1.5"/>
+        <text x="580" y="80" text-anchor="middle" font-family="var(--font-display)" font-size="13" fill="var(--ink)">your library</text>
+        <text x="580" y="99" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">a ~150-line harness</text>
+        <defs>
+          <marker id="wal-ar" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+        <line x1="212" y1="70" x2="488" y2="70" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#wal-ar)"/>
+        <text x="350" y="62" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">stdin: ConformanceRequest</text>
+        <line x1="488" y1="100" x2="212" y2="100" stroke="var(--ty)" stroke-width="1.5" marker-end="url(#wal-ar)"/>
+        <text x="350" y="116" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">stdout: ConformanceResponse</text>
+        <text x="350" y="146" text-anchor="middle" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">parse the payload &middot; re-serialize to the requested format &middot; repeat</text>
+      </svg>
+      <figcaption>
+        Interop, made testable. No shared code &mdash; just a pipe, a request, and a
+        response, run a couple thousand times. Buf's <strong>Protobuf-ES</strong> made a
+        name partly by passing the whole suite when older JavaScript libraries failed
+        broad swaths of it &mdash; a reminder that &ldquo;implements protobuf&rdquo; and
+        &ldquo;is <em>conformant</em>&rdquo; are not the same claim.
+      </figcaption>
+    </figure>
+
+    <div class="callout key-idea" data-anchor="wal-callout-reflect">
+      <span class="callout-label">So what did we actually gain?</span>
+      A genuinely language-neutral contract &mdash; and a clear-eyed map of where it
+      holds and where it leaks. It <em>holds</em> because every implementation obeys the
+      same binary and JSON specs, so one schema becomes idiomatic Go, Java, Python, C#,
+      and TypeScript that all interoperate without sharing a line of code, and the
+      conformance suite proves each one honest. It <em>leaks</em> in a handful of named,
+      learnable places: implicit presence makes &ldquo;zero&rdquo; and &ldquo;unset&rdquo;
+      the same fact, JavaScript can't hold a 64-bit integer, serialized bytes aren't
+      canonical, and a future enum value lands differently in open vs. closed runtimes.
+      Know those four and cross-language protobuf stops being magic and becomes
+      engineering.
+    </div>
+
+    <div class="callout note" data-anchor="wal-callout-challenges">
+      <span class="callout-label">Before you turn the page</span>
+      <ol>
+        <li>Your Go producer sets <code>sku</code> to <code>0</code> and your Python
+        consumer asks &ldquo;was <code>sku</code> provided?&rdquo; Why can't it tell, and
+        what one-word change to the <code>.proto</code> fixes it?</li>
+        <li>A teammate hashes serialized <code>Product</code> bytes to dedupe records
+        across a Go writer and a Java writer. Predict the bug, and name the specific
+        wire-format property that causes it.</li>
+        <li>Given <code>int64 sku = 90071992547409910</code>, write the exact ProtoJSON
+        for that field &mdash; and explain, in one sentence, why the naive JSON is wrong.</li>
+        <li>An old client without <code>AVAILABILITY_PREORDER = 3</code> in its schema
+        receives a message with <code>status = 3</code>. What does it observe in Go? In
+        Java? What happens to that <code>3</code> if it reserializes untouched?</li>
+        <li>Sketch the two messages a conformance harness exchanges over stdin/stdout,
+        and say in one line what the harness itself has to do between reading and writing.</li>
+      </ol>
+    </div>
+
+    <p data-anchor="wal-sources" style="margin-top:2rem;font-size:.82em;color:var(--ink-soft);border-top:1px solid var(--rule);padding-top:.8rem;">
+      Sources: protobuf
+      <a href="https://protobuf.dev/programming-guides/json/">ProtoJSON Format</a> and
+      <a href="https://protobuf.dev/programming-guides/field_presence/">Field Presence</a>
+      guides; the
+      <a href="https://github.com/protocolbuffers/protobuf/blob/main/conformance/README.md">conformance
+      suite</a> and
+      <a href="https://github.com/protocolbuffers/protobuf/blob/main/conformance/conformance.proto">conformance.proto</a>
+      (fetched directly); the Go, C#, and Python generated-code guides; the
+      <a href="https://github.com/protocolbuffers/protobuf-javascript/issues/34">BigInt/64-bit
+      JavaScript</a> issue; and Buf's
+      <a href="https://buf.build/blog/protobuf-conformance">Protobuf-ES conformance</a>
+      write-up. (protobuf.dev pages were unreachable from this build's sandbox and were
+      corroborated via search and reachable GitHub mirrors.)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-grpc-and-service-definitions.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="11-protobuf-in-production.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>
