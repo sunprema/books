@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replication and Clustering &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 9 &middot; Replication &amp; Clustering</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch9-kicker">Chapter 9 of 12 &middot; Replication and clustering</p>
+    <h1 data-anchor="ch9-h1">Replication and Clustering: Scaling <span class="hl">Beyond One Box</span></h1>
+
+    <p class="lede" data-anchor="ch9-lede">
+      Point a second Redis at a running one and watch it catch up:
+    </p>
+
+    <pre class="code" data-anchor="ch9-code1"><span class="cap">Terminal &mdash; replica B catching up to primary A</span><code><span class="cm">$</span> redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli -p 6380 INFO replication | grep master_link_status
+<span class="cm">master_link_status:up</span>
+<span class="cm">$</span> redis-cli -p 6379 SET k v <span class="cm"># write on the primary&#8230;</span>
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli -p 6380 GET k       <span class="cm"># &#8230;shows up on the replica</span>
+<span class="str">"v"</span></code></pre>
+
+    <h2 data-anchor="ch9-h2-handshake">The Handshake: Full Sync, Then a Stream</h2>
+    <p data-anchor="ch9-p1">
+      A fresh replica has to get a full copy of the dataset before it can
+      start applying live updates. The handshake, built around the
+      <code>PSYNC</code> command, does exactly that: the replica connects,
+      exchanges a <code>PING</code> and some <code>REPLCONF</code>
+      capability negotiation, then sends <code>PSYNC &lt;replid&gt;
+      &lt;offset&gt;</code>. If the primary doesn't recognize that replication
+      ID or offset (a brand-new replica sends <code>?</code> and
+      <code>-1</code>), the primary triggers a <strong>full
+      resynchronization</strong>: it forks exactly the way <code>BGSAVE</code>
+      does (Chapter 8) to produce a consistent RDB snapshot, streams that to
+      the replica, and the replica loads it wholesale before switching to
+      live updates.
+    </p>
+
+    <h2 data-anchor="ch9-h2-backlog">The Replication Backlog: Avoiding a Full Sync on Every Blip</h2>
+    <p data-anchor="ch9-p2">
+      A full resync means forking and re-transferring the entire dataset
+      &mdash; expensive, and unnecessary for something as ordinary as a
+      replica's network blipping for a few seconds. The primary keeps a
+      <strong>replication backlog</strong>, a fixed-size ring buffer of the
+      most recent write stream. When a replica reconnects, if its last known
+      offset still falls inside that backlog's window, the primary does a
+      <strong>partial resynchronization</strong> instead: it just replays the
+      missing slice of the backlog, and the replica is caught up in
+      proportion to how much it missed, not how large the whole dataset is.
+    </p>
+
+    <figure class="diagram" data-anchor="ch9-diagram">
+      <svg viewBox="0 0 720 250" role="img" aria-labelledby="ch9-svg-title">
+        <title id="ch9-svg-title">A primary with a replication backlog ring buffer feeding two replicas; a reconnecting replica whose offset still falls inside the backlog window gets a partial resync, replaying only the missing slice, instead of a full RDB transfer.</title>
+        <g font-family="var(--font-mono)" font-size="10.5">
+          <rect x="270" y="20" width="180" height="50" rx="8" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="2"></rect>
+          <text x="360" y="42" text-anchor="middle" fill="var(--accent)" font-weight="700">primary</text>
+          <text x="360" y="58" text-anchor="middle" fill="var(--ink-soft)" font-size="9">replid + replid2</text>
+
+          <rect x="230" y="95" width="260" height="40" rx="20" fill="var(--bg-2)" stroke="var(--mac)" stroke-width="1.6"></rect>
+          <text x="360" y="119" text-anchor="middle" fill="var(--mac)" font-size="9.5">replication backlog (ring buffer)</text>
+          <path d="M360,70 L360,95" stroke="var(--accent)" stroke-width="1.4" fill="none" marker-end="url(#arrow9)"></path>
+
+          <rect x="60" y="175" width="150" height="46" rx="8" fill="var(--code-bg)" stroke="var(--fn)" stroke-width="1.6"></rect>
+          <text x="135" y="197" text-anchor="middle" fill="var(--fn)" font-weight="700">replica 1</text>
+          <text x="135" y="212" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">live stream</text>
+          <path d="M230,115 C170,140 150,150 135,175" stroke="var(--fn)" stroke-width="1.4" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow9)"></path>
+
+          <rect x="510" y="175" width="180" height="46" rx="8" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.6"></rect>
+          <text x="600" y="197" text-anchor="middle" fill="var(--kw)" font-weight="700">replica 2: reconnecting</text>
+          <text x="600" y="212" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">offset still in window &rarr; partial resync</text>
+          <path d="M490,115 C560,140 590,150 600,175" stroke="var(--kw)" stroke-width="1.4" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow9)"></path>
+        </g>
+        <defs>
+          <marker id="arrow9" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--mac)"></path></marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>The backlog is what makes reconnects cheap.</strong> A
+        secondary replication ID, <code>replid2</code>, lets this partial-sync
+        trick keep working even across a failover &mdash; a promoted replica
+        remembers its old primary's identity and offset long enough for
+        <em>its own</em> replicas to reattach without a full resync.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ch9-h2-failover">Failover and Topology</h2>
+    <p data-anchor="ch9-p3">
+      Replication by itself is passive &mdash; a primary doesn't promote a
+      replica on its own if it dies. Redis Sentinel (a separate monitoring
+      process, run alongside your Redis instances) watches primaries and
+      replicas, and when a quorum of Sentinels agree a primary is genuinely
+      down (not just having a network hiccup one Sentinel saw alone), it
+      picks a replica, promotes it with <code>REPLICAOF NO ONE</code>, and
+      reconfigures the remaining replicas to follow the new primary.
+      Well-behaved clients subscribe to Sentinel for the current primary's
+      address rather than hardcoding it, so they can redirect automatically
+      when a promotion happens.
+    </p>
+
+    <h2 data-anchor="ch9-h2-cluster">Cluster: Sharding by Hash Slot</h2>
+    <p data-anchor="ch9-p4">
+      Replication solves availability and read scaling &mdash; every replica
+      holds the <em>whole</em> dataset. Redis Cluster solves the different
+      problem of a dataset too large for one primary to hold at all, by
+      splitting the keyspace into exactly <strong>16384 hash slots</strong>.
+      Every key maps to a slot with <code>CRC16(key) mod 16384</code> (or, if
+      the key contains a <code>{hash tag}</code>, only the part inside the
+      braces is hashed &mdash; the standard way to force related keys onto
+      the same slot so they can be operated on together). Each slot is owned
+      by exactly one primary node; 16384 was chosen deliberately small enough
+      that a full slot ownership bitmap still fits comfortably in a cluster
+      gossip heartbeat message, while staying large enough to divide sensibly
+      across hundreds of nodes.
+    </p>
+
+    <table data-anchor="ch9-table-redirect">
+      <thead><tr><th>Redirect</th><th>Meaning</th><th>Duration</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">-MOVED</td><td>this key's slot now permanently lives on a different node</td><td>permanent (update your slot cache)</td></tr>
+        <tr><td class="mono">-ASK</td><td>this slot is mid-migration; try the migration target, once</td><td>temporary, per-request</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout tip" data-anchor="ch9-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        A cluster-aware client keeps a local map of slot &rarr; node and only
+        pays the redirect cost once, right after the map goes stale (e.g.
+        after a resharding). If you're calling Redis Cluster directly with
+        <code>redis-cli -c</code>, the <code>-c</code> flag tells it to
+        follow <code>MOVED</code>/<code>ASK</code> redirects for you
+        automatically &mdash; without it you'll just see the raw redirect
+        error.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch9-h2-consistency">What Cluster Deliberately Doesn't Solve</h2>
+    <p data-anchor="ch9-p5">
+      Redis Cluster keeps its coordination model simple on purpose: node
+      state and slot ownership are propagated via a gossip protocol between
+      nodes rather than a strongly-consistent external coordinator, and
+      replication to a slot's replicas is asynchronous. That means a failover
+      can, in rare cases, lose a handful of the most recent writes that
+      hadn't yet reached a replica &mdash; Redis accepts this as a deliberate
+      trade-off for a simpler, faster, self-contained cluster rather than
+      paying the latency and complexity cost of a strongly consistent
+      commit protocol across nodes. There is also no cross-slot
+      multi-key transaction guarantee: an operation touching keys in two
+      different slots is simply rejected unless you've forced them into the
+      same slot with a hash tag.
+    </p>
+
+    <div class="callout key" data-anchor="ch9-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Both replication and clustering repeat Chapter 1's founding trade at
+        a bigger scale: Redis picks simplicity and predictable behavior
+        (async replication, gossip-based slot ownership, no distributed
+        transactions) over the strongest possible consistency guarantee,
+        because the stronger guarantee would cost latency and operational
+        complexity that most workloads using Redis don't actually need.
+      </p>
+    </div>
+
+    <p data-anchor="ch9-close-p1">
+      Replication and clustering are about keeping data available and
+      distributed. The next problem is the opposite instinct: actively
+      forgetting data, on purpose, on a schedule &mdash; expiring keys and
+      evicting them under memory pressure. That's next.
+    </p>
+
+    <p class="sources" data-anchor="ch9-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/" target="_blank" rel="noopener">redis.io &mdash; Replication</a>
+      &middot;
+      <a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/" target="_blank" rel="noopener">redis.io &mdash; Cluster Specification</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="08-persistence-rdb-and-aof.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="10-expiration-eviction-and-housekeeping.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

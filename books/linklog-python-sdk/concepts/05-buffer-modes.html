@@ -1,0 +1,277 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buffer Modes: Anonymous vs Staging — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="bm-eyebrow">Chapter 05</p>
+    <h1 data-anchor="bm-title">Buffer Modes: Anonymous vs Staging</h1>
+    <p class="lede" data-anchor="bm-lede">Here is the one config choice that decides whether you can see a whole <em>class</em> of failures. Both modes produce byte-identical artifacts and differ in exactly one respect: <strong>whether the buffer can survive its own process.</strong> Get this right and an OOM-kill becomes a readable checkpoint; get it wrong and it vanishes without a trace.</p>
+
+    <h2 data-anchor="bm-h-example">Start with the switch</h2>
+    <p data-anchor="bm-p-ex1">Everything you built in Chapters 1–4 ran in the default mode. To change the survival property, you change one keyword argument at <code>init()</code>:</p>
+
+    <pre data-anchor="bm-code-init"><code><span class="cm"># The default — what you have been running so far.</span>
+<span class="kw">import</span> llog
+llog.<span class="fn">init</span>(service=<span class="str">"payment-api"</span>)                    <span class="cm"># mode="anonymous"</span>
+
+<span class="cm"># Opt in to a buffer that outlives a hard crash.</span>
+llog.<span class="fn">init</span>(service=<span class="str">"payment-api"</span>, mode=<span class="str">"staging"</span>)   <span class="cm"># named buffer + watchdog</span></code></pre>
+
+    <p data-anchor="bm-p-ex2">That single argument moves the buffer from an <em>anonymous inode</em> to a <em>named file</em>, and — as a side effect worth understanding — starts a background heartbeat thread. Before you decide which to use, let's see why the difference matters at all.</p>
+
+    <h2 data-anchor="bm-h-anon">Anonymous: zero trace, one blind spot</h2>
+    <p data-anchor="bm-p-anon1">In <code>mode="anonymous"</code> (the default) the buffer is an <code>O_TMPFILE</code> — a real file with <strong>no name</strong>, an unnamed inode living in <code>/dev/shm</code>. Its two fates are the ones you already know:</p>
+    <ul>
+      <li><strong>Success</strong> is <code>close(fd)</code>. The kernel reclaims the pages and the inode is gone. There was never a directory entry, so there is nothing to clean up.</li>
+      <li><strong>Ordinary failure</strong> is a metadata-only hard link from <code>/proc/self/fd/{fd}</code> into <code>events/{uuid}.llog</code>. No bytes are copied to keep a failure.</li>
+    </ul>
+    <p data-anchor="bm-p-anon2">The property this buys you is precious: <strong>a successful request leaves zero trace on disk, ever.</strong> Nothing to sample, rotate, or bill for. But that same anonymity has a hard edge.</p>
+
+    <div class="callout key" data-anchor="bm-key-boundary">
+      <span class="ct">The detection boundary</span>
+      <p>If the process is killed <strong>uncatchably</strong> — OOM-kill, <code>SIGKILL</code>, a native segfault — no Python code runs on the way out. The <code>O_TMPFILE</code> inode dies with the process's last descriptor, <em>before</em> anything can react. There is no checkpoint, not even a partial one. This is a property of anonymous inodes, not a bug to fix later.</p>
+    </div>
+
+    <p data-anchor="bm-p-anon3">Sit with why that matters in production. In Kubernetes, an OOM-kill is one of the <em>most</em> valuable failure classes to capture — a pod hits its memory limit and the kernel reaps it with no stack trace, no 500, no warning. And it is exactly the class the default mode <strong>cannot see.</strong> The excepthook never fires; the middleware never runs; the buffer is already gone.</p>
+
+    <h2 data-anchor="bm-h-staging">Staging: a name is what survives</h2>
+    <p data-anchor="bm-p-staging1">In <code>mode="staging"</code> the buffer is a <strong>named</strong> file at <code>/dev/shm/llog/staging/{pid}-{uuid}.llog</code>. The lifecycle mirrors anonymous mode but runs one step in reverse:</p>
+    <ul>
+      <li><strong>Success</strong> is <code>unlink()</code> <em>then</em> <code>close()</code> — remove the name first, then release the fd.</li>
+      <li><strong>Ordinary failure</strong> is a <code>rename()</code> of the named file into <code>events/</code>.</li>
+    </ul>
+    <p data-anchor="bm-p-staging2">Because the file has a <strong>name</strong>, it is no longer tied to the life of any file descriptor. On a hard crash the process dies but the named file remains on tmpfs — an <em>orphan</em>. The sidecar can then walk in, find it, and rescue it. That is the whole trick: a name is a handle the kernel keeps even after your process is gone.</p>
+
+    <figure class="diagram" data-anchor="bm-fig-lifecycle">
+      <svg viewBox="0 0 720 430" role="img" aria-label="Anonymous versus staging buffer lifecycles across three outcomes: success, ordinary failure, and hard crash">
+        <defs>
+          <marker id="bm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+        </defs>
+
+        <!-- column headers -->
+        <text x="255" y="30" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="13" text-anchor="middle" font-weight="bold">ANONYMOUS</text>
+        <text x="255" y="46" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">O_TMPFILE — unnamed inode</text>
+        <text x="560" y="30" fill="#7fd1c8" font-family="ui-monospace,monospace" font-size="13" text-anchor="middle" font-weight="bold">STAGING</text>
+        <text x="560" y="46" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">named file on tmpfs</text>
+
+        <line x1="405" y1="20" x2="405" y2="410" stroke="#244a63" stroke-width="1" stroke-dasharray="3 4"></line>
+
+        <!-- row labels -->
+        <text x="14" y="112" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="11">success</text>
+        <text x="14" y="222" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="11">failure</text>
+        <text x="14" y="332" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11">hard</text>
+        <text x="14" y="346" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11">crash</text>
+        <line x1="10" y1="150" x2="710" y2="150" stroke="#244a63" stroke-width="1"></line>
+        <line x1="10" y1="260" x2="710" y2="260" stroke="#244a63" stroke-width="1"></line>
+
+        <!-- SUCCESS row -->
+        <rect x="120" y="86" width="120" height="40" rx="6" fill="#0a1b28" stroke="#46b1e0" stroke-width="1.3"></rect>
+        <text x="180" y="110" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">close(fd)</text>
+        <text x="290" y="106" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="11">→ gone</text>
+        <rect x="470" y="86" width="150" height="40" rx="6" fill="#0a1b28" stroke="#7fd1c8" stroke-width="1.3"></rect>
+        <text x="545" y="110" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">unlink() → close()</text>
+        <text x="632" y="106" fill="#5b7d92" font-family="ui-monospace,monospace" font-size="10">gone</text>
+
+        <!-- FAILURE row -->
+        <rect x="120" y="196" width="120" height="40" rx="6" fill="#0a1b28" stroke="#f0a15a" stroke-width="1.3"></rect>
+        <text x="180" y="220" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">link()</text>
+        <line x1="245" y1="216" x2="330" y2="216" stroke="#46b1e0" stroke-width="1.3" marker-end="url(#bm-arrow)"></line>
+        <text x="368" y="212" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">events/</text>
+        <rect x="470" y="196" width="120" height="40" rx="6" fill="#0a1b28" stroke="#f0a15a" stroke-width="1.3"></rect>
+        <text x="530" y="220" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">rename()</text>
+        <line x1="595" y1="216" x2="660" y2="216" stroke="#46b1e0" stroke-width="1.3" marker-end="url(#bm-arrow)"></line>
+        <text x="688" y="212" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">events/</text>
+
+        <!-- HARD CRASH row -->
+        <rect x="120" y="306" width="150" height="52" rx="6" fill="#1a0f14" stroke="#ef6a6a" stroke-width="1.3"></rect>
+        <text x="195" y="328" fill="#ef6a6a" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">inode reclaimed</text>
+        <text x="195" y="346" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">NOTHING survives</text>
+        <rect x="440" y="306" width="150" height="52" rx="6" fill="#0a1b28" stroke="#7fd1c8" stroke-width="1.3"></rect>
+        <text x="515" y="328" fill="#7fd1c8" font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">orphan remains</text>
+        <text x="515" y="346" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">sidecar reaps it</text>
+        <line x1="595" y1="332" x2="660" y2="332" stroke="#46b1e0" stroke-width="1.3" marker-end="url(#bm-arrow)"></line>
+        <text x="688" y="328" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">events/</text>
+      </svg>
+      <figcaption>Same three outcomes, two survival properties — they diverge only on the last row.</figcaption>
+    </figure>
+
+    <p data-anchor="bm-p-staging3">Nothing is free. Because a successful request's buffer briefly exists under a real name before <code>unlink()</code> runs, staging opens a <strong>small exposure window</strong>: for that instant, raw request state is a readable file on tmpfs. That is the price of survivability, and it is why the SDK refuses to enable staging into a world-readable directory.</p>
+
+    <h2 data-anchor="bm-h-compare">The two modes, side by side</h2>
+    <table data-anchor="bm-table-compare">
+      <thead>
+        <tr><th>&nbsp;</th><th>Anonymous <span class="pill default">default</span></th><th>Staging <span class="pill">opt-in</span></th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Buffer</td><td><code>O_TMPFILE</code> (unnamed)</td><td><code>staging/{pid}-{uuid}.llog</code></td></tr>
+        <tr><td>Success</td><td><code>close(fd)</code></td><td><code>unlink()</code> then <code>close()</code></td></tr>
+        <tr><td>Ordinary failure</td><td><code>link()</code> via <code>/proc/self/fd</code></td><td><code>rename()</code> → <code>events/</code></td></tr>
+        <tr><td>Hard crash</td><td>buffer lost — no checkpoint</td><td>sidecar reaps the orphan</td></tr>
+        <tr><td>Success-path trace</td><td>zero, ever</td><td>brief named-file window</td></tr>
+        <tr><td>Extra machinery</td><td>none</td><td>liveness heartbeat thread</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout note" data-anchor="bm-note-identical">
+      <span class="ct">Byte-identical, remember</span>
+      <p>The artifacts these two modes commit are the <strong>same bytes</strong>. Downstream — the sidecar, the reader, the checkpoint you read — cannot tell which mode wrote a given <code>.llog</code>. The mode changes only <em>which failures can produce an artifact at all</em>, never what the artifact looks like.</p>
+    </div>
+
+    <h2 data-anchor="bm-h-heartbeat">Why staging needs a heartbeat</h2>
+    <p data-anchor="bm-p-hb1">When you pass <code>mode="staging"</code>, <code>init()</code> <strong>automatically</strong> starts a watchdog thread. You do not wire it up — it is a consequence of the mode:</p>
+
+    <pre data-anchor="bm-code-hb"><code>llog.<span class="fn">init</span>(service=<span class="str">"payment-api"</span>, mode=<span class="str">"staging"</span>)
+<span class="cm"># └─ starts one daemon thread that touches, every ~5s:</span>
+<span class="cm">#      /dev/shm/llog/live/{pid}</span></code></pre>
+
+    <p data-anchor="bm-p-hb2">That thread does one job: touch a <strong>liveness heartbeat</strong> file at <code>/dev/shm/llog/live/{pid}</code>. Here is the WHY, and it is the subtle part. The sidecar's reaper does not key on <em>pid liveness</em> — it cannot. It runs in a <strong>separate container</strong>, and Kubernetes pods do not share a PID namespace by default, so from the sidecar's vantage point your app's pids are invisible. A "is this pid alive?" check would silently reap nothing. Instead, the reaper keys on the <strong>staleness of the heartbeat file</strong>: when <code>live/{pid}</code> stops being touched, the process is presumed dead and its staging orphans are fair game.</p>
+
+    <div class="callout warn" data-anchor="bm-warn-heartbeat">
+      <span class="ct">Without the heartbeat, tmpfs fills</span>
+      <p>The heartbeat is not optional dressing — it is what makes reaping possible. If it never runs (or the <code>live/</code> directory is unwritable), the reaper can never conclude a process is dead, orphans are <strong>never</strong> reaped, and staging files accumulate on tmpfs until <code>/dev/shm</code> fills — which then breaks the very SDK that was meant to capture the failure. The thread is a daemon and never raises, so a missed beat degrades reaping; it does not crash your app.</p>
+    </div>
+
+    <h2 data-anchor="bm-h-truncated">What a reaped orphan looks like</h2>
+    <p data-anchor="bm-p-trunc1">A buffer rescued by the reaper was never finished by your process — the crash cut it off mid-flight. So it has <strong>no TRAILER</strong>. The reader classifies a trailer-less artifact as <strong>TRUNCATED</strong>, and — this is important — <em>that is a normal outcome, not corruption.</em> Truncated means "the recording was cut short," which is precisely what an OOM-kill does.</p>
+    <p data-anchor="bm-p-trunc2">The payoff is in the graph. The checkpoint shows the scope that was still <strong>OPEN</strong> when the process died — the <code>SCOPE_START</code> that never got its <code>SPAN_END</code>. That open scope is <em>where</em> the kill struck:</p>
+
+    <pre data-anchor="bm-code-trunc"><code><span class="cm"># inspecting a reaped orphan</span>
+ProcessRefund
+├─ ValidateCard          <span class="cm"># completed</span>
+└─ ChargeGateway <span class="num">[OPEN]</span>    <span class="cm">← still open: killed here</span></code></pre>
+
+    <p data-anchor="bm-p-trunc3">In anonymous mode that same OOM-kill produces an empty <code>events/</code> directory and a shrug. In staging mode it produces a checkpoint that points a finger at <code>ChargeGateway</code>. Same failure, wildly different amount of knowledge.</p>
+
+    <h2 data-anchor="bm-h-demo">See it with the hang demo</h2>
+    <p data-anchor="bm-p-demo1">The repo ships <code>demo/refund_hang.py</code> to make this concrete. It wedges a request forever inside <code>ChargeGateway</code> — no exception is ever raised, so nothing but a kill ends it. Run it in staging mode and <code>SIGKILL</code> it:</p>
+
+    <pre data-anchor="bm-code-demo-staging"><code class="sh"><span class="pr">$</span> LLOG_MODE=staging python demo/refund_hang.py &amp;
+<span class="cm"># refund-hang[staging]: pid 4127 is now wedged inside ChargeGateway</span>
+<span class="pr">$</span> kill -9 %1
+<span class="cm"># liveness file goes stale → agent reaps the orphan →</span>
+<span class="cm"># TRUNCATED checkpoint showing ChargeGateway [OPEN]</span></code></pre>
+
+    <p data-anchor="bm-p-demo2">Now run the <em>same</em> script in the default anonymous mode and kill it the same way:</p>
+
+    <pre data-anchor="bm-code-demo-anon"><code class="sh"><span class="pr">$</span> LLOG_MODE=anonymous python demo/refund_hang.py &amp;
+<span class="pr">$</span> kill -9 %1
+<span class="cm"># events/ is empty. You get NOTHING.</span>
+<span class="cm"># The O_TMPFILE inode died with the process. Correct, not a bug.</span></code></pre>
+
+    <div class="callout note" data-anchor="bm-note-envvar">
+      <span class="ct">LLOG_MODE is a demo convention, not an SDK feature</span>
+      <p><code>LLOG_MODE</code> is <strong>not</strong> a built-in environment variable the SDK reads. The demo reads <code>os.environ</code> itself and passes the result to <code>init(mode=...)</code>. In your own app you pass <code>mode="staging"</code> to <code>init()</code> directly (or wire your own env plumbing if you want one). Don't go looking for an <code>LLOG_MODE</code> knob inside <code>llog</code> — there isn't one.</p>
+    </div>
+
+    <div class="callout trap" data-anchor="bm-trap-exdev">
+      <span class="ct">One hard constraint: same tmpfs</span>
+      <p>The buffer and the <code>events/</code> directory <strong>must</strong> live on the same filesystem. Hard links and <code>rename()</code> cannot cross filesystems — attempt it and you get <code>EXDEV</code>, and the commit silently fails. Never point <code>root</code> at <code>/tmp</code> (often a different mount); keep it on <code>/dev/shm</code>. The sidecar is what moves artifacts to durable storage <em>after</em> pickup — that copy is allowed to cross filesystems; your commit is not.</p>
+    </div>
+
+    <h2 data-anchor="bm-h-choose">Which one should you pick?</h2>
+    <p data-anchor="bm-p-choose1">Default to anonymous. Reach for staging only when the failures you must capture include the ones anonymous mode is blind to.</p>
+
+    <table data-anchor="bm-table-choose">
+      <thead>
+        <tr><th>Choose…</th><th>When…</th><th>Because</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Anonymous</strong> <span class="pill default">default</span></td>
+          <td>the common case — request failures, exceptions, 5xx</td>
+          <td>zero success-path trace, no exposure window, no extra thread. Simplest thing that works.</td>
+        </tr>
+        <tr>
+          <td><strong>Staging</strong></td>
+          <td>OOM-kills and hard crashes are failures you must capture</td>
+          <td>memory-limited K8s pods, workers prone to being killed. The only way to see the class anonymous can't.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="bm-p-choose2">A useful way to frame it: anonymous mode captures failures your <em>code</em> can observe; staging mode also captures the failures that kill your code before it can observe anything. If your pods get OOM-killed and you have never seen a checkpoint for it, that is not the absence of a problem — it is the detection boundary, and staging is how you cross it.</p>
+
+    <p class="soft" data-anchor="bm-p-next">You now control <em>whether</em> a failure is captured. Chapter 6 turns to <em>what</em> is captured — the privacy allowlist that decides which fields ever make it into an artifact in the first place.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-detection.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-privacy-allowlist.html">Next: Privacy ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->

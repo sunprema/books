@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Let It Crash — Elixir OTP</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Elixir OTP<span class="dot">.</span></span>
+  <span class="chip">02 · Let It Crash</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 02 · Failure as a Feature</p>
+    <h1>Let It Crash</h1>
+    <p class="dek">The bravest error-handling strategy is to not handle the error.</p>
+
+    <p class="lead">Coming from most languages, "let it crash" sounds reckless — even negligent. But
+    it's the single most important cultural idea in OTP, and once it clicks, half your defensive
+    <code>try/rescue</code> code evaporates. The claim is this: a process that hits an unexpected
+    state should <em>die immediately and cleanly</em>, and something else — a supervisor — should
+    start a fresh one. We don't nurse a sick process back to health; we replace it.</p>
+
+    <p>This only works because processes are isolated (Chapter 01). One process crashing can't
+    corrupt another's memory, because they share none. So a crash stays local — a blast radius of
+    exactly one process — <em>unless we deliberately wire processes together</em>. Wiring them
+    together is what this chapter is about. There are exactly two wires: <strong>links</strong> and
+    <strong>monitors</strong>.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p>A <strong>link</strong> is a two-way tie: if either linked process dies abnormally, the other
+      is sent an exit signal and, by default, dies too. A <strong>monitor</strong> is a one-way
+      watch: the watcher gets a friendly <code>:DOWN</code> <em>message</em> in its mailbox when the
+      target dies, and carries on. Supervisors are built on links; request/reply code and
+      <code>Task.await</code> are built on monitors.</p>
+    </div>
+
+    <h2>The two wires, side by side</h2>
+    <figure class="svg-card">
+      <svg viewBox="0 0 640 250" role="img" aria-label="Diagram comparing links and monitors. A link is bidirectional and propagates exit signals; a monitor is one-directional and delivers a DOWN message.">
+        <!-- LINK side -->
+        <text x="150" y="26" text-anchor="middle" font-family="monospace" font-size="14" fill="#6b3fa0" font-weight="700">LINK — spawn_link</text>
+        <rect x="60" y="60" width="80" height="46" rx="9" fill="#f1e9da" stroke="#6b3fa0" stroke-width="2"/>
+        <text x="100" y="88" text-anchor="middle" font-family="monospace" font-size="12" fill="#4a2a72">A</text>
+        <rect x="200" y="60" width="80" height="46" rx="9" fill="#f1e9da" stroke="#6b3fa0" stroke-width="2"/>
+        <text x="240" y="88" text-anchor="middle" font-family="monospace" font-size="12" fill="#4a2a72">B</text>
+        <!-- bidirectional link -->
+        <line x1="140" y1="83" x2="200" y2="83" stroke="#6b3fa0" stroke-width="3"/>
+        <polygon points="140,83 152,78 152,88" fill="#6b3fa0"/>
+        <polygon points="200,83 188,78 188,88" fill="#6b3fa0"/>
+        <text x="170" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5c5164">B dies →</text>
+        <text x="170" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#b23a48" font-weight="700">A gets an EXIT signal</text>
+        <text x="170" y="162" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5c5164">(and dies too, by default)</text>
+
+        <!-- divider -->
+        <line x1="320" y1="45" x2="320" y2="205" stroke="#cdbb9c" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+        <!-- MONITOR side -->
+        <text x="490" y="26" text-anchor="middle" font-family="monospace" font-size="14" fill="#167f6c" font-weight="700">MONITOR — Process.monitor</text>
+        <rect x="400" y="60" width="80" height="46" rx="9" fill="#f1e9da" stroke="#167f6c" stroke-width="2"/>
+        <text x="440" y="88" text-anchor="middle" font-family="monospace" font-size="12" fill="#0f5b4d">Watcher</text>
+        <rect x="540" y="60" width="80" height="46" rx="9" fill="#f1e9da" stroke="#167f6c" stroke-width="2"/>
+        <text x="580" y="88" text-anchor="middle" font-family="monospace" font-size="12" fill="#0f5b4d">Target</text>
+        <!-- one-directional watch -->
+        <line x1="540" y1="83" x2="480" y2="83" stroke="#167f6c" stroke-width="3" stroke-dasharray="6 4"/>
+        <polygon points="480,83 492,78 492,88" fill="#167f6c"/>
+        <text x="510" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5c5164">Target dies →</text>
+        <text x="510" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#167f6c" font-weight="700">Watcher gets a :DOWN message</text>
+        <text x="510" y="162" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5c5164">(and keeps running)</text>
+      </svg>
+      <figcaption>Links are symmetric and lethal by default; monitors are one-way and informational.
+      Rule of thumb: use a <em>link</em> when two processes should live and die together; use a
+      <em>monitor</em> when you just want to <em>know</em> that something ended.</figcaption>
+    </figure>
+
+    <h2>Links: shared fate</h2>
+    <p><code>spawn_link/1</code> spawns a process already linked to you. If it crashes, the exit
+    signal travels the link and takes you down too — which sounds bad until you realize that's
+    precisely what you want inside a supervision tree: a broken subtree should collapse so the
+    supervisor can rebuild it whole.</p>
+
+    <pre><span class="cap">iex — a link propagates the crash</span><code>parent = <span class="fn">self</span>()
+<span class="fn">spawn_link</span>(<span class="k">fn</span> -&gt; <span class="fn">raise</span> <span class="str">"boom"</span> <span class="k">end</span>)
+<span class="co"># ** the linked child raises, the signal propagates, and *we* exit too.</span></code></pre>
+
+    <h3>Trapping exits: turning a signal into a message</h3>
+    <p>Sometimes you don't want to die with your child — you want to <em>hear about it</em> and
+    react. Set <code>trap_exit</code> and the lethal exit signal is converted into an ordinary
+    <code>{:EXIT, pid, reason}</code> message in your mailbox. This is the mechanism a supervisor
+    uses internally to notice a child died and restart it.</p>
+
+    <pre><span class="cap">trapping exits</span><code><span class="mod">Process</span>.<span class="fn">flag</span>(<span class="at">:trap_exit</span>, <span class="k">true</span>)
+<span class="fn">spawn_link</span>(<span class="k">fn</span> -&gt; <span class="fn">exit</span>(<span class="at">:kaboom</span>) <span class="k">end</span>)
+
+<span class="k">receive</span> <span class="k">do</span>
+  {<span class="at">:EXIT</span>, from, reason} -&gt;
+    <span class="mod">IO</span>.<span class="fn">puts</span>(<span class="str">"child #{inspect(from)} died: #{inspect(reason)}"</span>)
+<span class="k">end</span></code></pre>
+
+    <div class="callout note">
+      <span class="tag">:normal doesn't kill</span>
+      <p>A process exiting with reason <code>:normal</code> (it simply finished) does <em>not</em>
+      take its links down — only abnormal exits propagate. So linking is safe for the common case;
+      it only bites when something genuinely went wrong, which is exactly when you want it to.</p>
+    </div>
+
+    <h2>Monitors: watch without dying</h2>
+    <p>A monitor is the tool when you want information, not shared fate. <code>Process.monitor/1</code>
+    returns a unique reference; when the target dies you get a <code>:DOWN</code> message tagged with
+    that reference. It's one-directional and it never kills the watcher.</p>
+
+    <pre><span class="cap">iex — monitoring</span><code>ref = <span class="mod">Process</span>.<span class="fn">monitor</span>(pid)
+
+<span class="k">receive</span> <span class="k">do</span>
+  {<span class="at">:DOWN</span>, ^ref, <span class="at">:process</span>, ^pid, reason} -&gt;
+    <span class="mod">IO</span>.<span class="fn">puts</span>(<span class="str">"it's gone: #{inspect(reason)}"</span>)
+<span class="k">end</span></code></pre>
+
+    <p>The <code>^ref</code> pin means "match only the message carrying <em>this</em> reference" — so
+    even if you monitor several processes, each <code>:DOWN</code> is unambiguous. Under the hood,
+    <code>GenServer.call/3</code> monitors the server it's calling, which is how it can raise a clean
+    error the instant the server dies instead of hanging until timeout.</p>
+
+    <div class="reflect">So what did we actually gain? A vocabulary for <b>failure relationships</b>.
+    We no longer sprinkle <code>try/rescue</code> hoping to catch every possible fault inside a
+    process. Instead we let a faulty process die, and we decide, per relationship, who should share
+    its fate (link) and who should merely be told (monitor). Everything in the next chapters —
+    supervisors, DynamicSupervisor, Task.await — is just links and monitors with good packaging.</div>
+
+    <h3>Challenges</h3>
+    <ol class="challenges">
+      <li>Spawn a linked child that exits <code>:normal</code>. Confirm you survive. Now make it
+      <code>raise</code>. Confirm you don't (without trapping).</li>
+      <li>Write a process that monitors three others and prints which one died first.</li>
+      <li>Why does a supervisor set <code>trap_exit</code>? Answer it in one sentence using this
+      chapter's vocabulary.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Elixir hexdocs, <code>Process.monitor/1</code>,
+    <code>Process.flag/2</code>, <code>Kernel.spawn_link/1</code> · Erlang/OTP docs, "Processes:
+    Links &amp; Monitors" · Elixir Getting Started, "Processes."</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="01-processes.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="03-genserver.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

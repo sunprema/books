@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 &middot; LLM Inference Exposes the Bottleneck &mdash; The Memory Wall</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="chalk-mark">&#10022;</span> The Memory Wall</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="llm-eyebrow">Chapter 03 &middot; Inference</p>
+    <h1 data-anchor="llm-h1">LLM Inference Exposes the Bottleneck</h1>
+    <div class="chalk-rule" aria-hidden="true"><svg viewBox="0 0 88 10" preserveAspectRatio="none"><path d="M2 6 Q12 2 22 6 T42 6 T62 6 T86 6" fill="none" stroke-width="2" stroke-linecap="round" stroke-dasharray="1 4.2" style="stroke:var(--accent)"/></svg></div>
+
+    <p class="lead" data-anchor="llm-p1">If chapters 1 and 2 sounded abstract, here's the workload that made everyone care:
+    talking to a chatbot. Every time it prints the next word of its answer, it's
+    doing a tiny amount of arithmetic and a <em>huge</em> amount of memory traffic. LLM
+    inference didn't invent the memory wall &mdash; it just walked straight into it, in
+    front of a billion daily users, which is why every hardware roadmap in this book
+    is currently obsessed with it.</p>
+
+    <p class="voice" data-anchor="llm-voice1">Here's the thing that surprised me most researching this: the "thinking" part of a
+    chatbot &mdash; reading your prompt &mdash; is actually the easy part for the hardware. It's
+    the typing-the-answer part that's brutal. Let me show you why.</p>
+
+    <h2 data-anchor="llm-h-phases">Two very different phases: prefill and decode</h2>
+    <p data-anchor="llm-p2">Serving one request to a large language model happens in two phases with opposite
+    personalities:</p>
+    <ul data-anchor="llm-list1">
+      <li><strong>Prefill</strong> &mdash; the model reads your whole prompt at once. That's a big
+      matrix-times-matrix computation, which keeps the GPU's math units genuinely busy.
+      This phase is <em>compute-bound</em>: more FLOPs helps.</li>
+      <li><strong>Decode</strong> &mdash; the model then generates your answer one token at a
+      time, and to produce each new token it has to re-read the entire accumulated
+      context via a matrix-times-<em>vector</em> operation. That's an enormous memory
+      fetch (megabytes to gigabytes of weights and cached state) attached to a tiny
+      amount of arithmetic.</li>
+    </ul>
+    <p data-anchor="llm-p3">The measure architects use for this is <em class="term">arithmetic intensity</em>
+    &mdash; FLOPs of math performed per byte of data moved. Decode runs at roughly
+    <strong>1 FLOP per byte</strong>, which is about two orders of magnitude below the
+    "ridge point" where a modern accelerator's compute and memory capabilities are
+    balanced. In plain terms: during decode, the GPU's math units spend most of their
+    time <em>waiting</em> for the next byte to arrive, not running out of arithmetic
+    horsepower. That's the whole chapter in one sentence &mdash; decode is memory-bound,
+    not compute-bound, and no amount of extra FLOPs fixes that on its own.</p>
+
+    <h2 data-anchor="llm-h-kv">The KV cache has to live somewhere</h2>
+    <p data-anchor="llm-p4">What decode is actually re-reading each step is the <em class="term">KV
+    cache</em> &mdash; the saved "keys" and "values" from every previous token's attention
+    calculation, kept around so the model doesn't have to recompute the whole
+    conversation from scratch on every new word. That cache grows with context length
+    and with how many requests you're serving at once, and it can get big &mdash; tens of
+    gigabytes for a long conversation. When it doesn't fit in the GPU's own HBM, the
+    obvious move is to spill it out to ordinary CPU DRAM, which is far cheaper and more
+    plentiful. The catch is the road between them: PCIe&nbsp;5.0 delivers roughly
+    <strong>64&nbsp;GB/s &mdash; about 2% of HBM's bandwidth</strong>. Concretely: moving a
+    50&nbsp;GB KV cache takes about <strong>15&nbsp;ms</strong> from GPU HBM, but roughly
+    <strong>800&nbsp;ms</strong> from CPU DRAM over PCIe &mdash; more than fifty times
+    slower, for the same data, just because of which bus it rode in on.</p>
+
+    <div class="chalk-fig">
+      <svg class="figure-svg" viewBox="0 0 600 250" role="img" aria-labelledby="llm-fig1-title llm-fig1-desc">
+        <title id="llm-fig1-title">KV cache data movement: GPU HBM lane vs. CPU DRAM over PCIe lane</title>
+        <desc id="llm-fig1-desc">Two lanes run from memory boxes to a GPU compute box. The top lane, from GPU HBM, is short and fast. The bottom lane, from CPU DRAM across a PCIe link, is longer and much slower, illustrated by two animated dots traveling at very different speeds.</desc>
+
+        <rect x="20" y="30" width="110" height="60" rx="6" style="fill:none;stroke:var(--fn);stroke-width:2" stroke-dasharray="3 3"/>
+        <text x="75" y="65" text-anchor="middle" class="svg-txt" style="fill:var(--fn);font-size:12px">GPU HBM</text>
+
+        <rect x="20" y="160" width="110" height="60" rx="6" style="fill:none;stroke:var(--ty);stroke-width:2" stroke-dasharray="3 3"/>
+        <text x="75" y="195" text-anchor="middle" class="svg-txt" style="fill:var(--ty);font-size:12px">CPU DRAM</text>
+
+        <rect x="470" y="95" width="110" height="60" rx="6" style="fill:none;stroke:var(--accent);stroke-width:2" stroke-dasharray="3 3"/>
+        <text x="525" y="130" text-anchor="middle" class="svg-txt" style="fill:var(--accent);font-size:12px">GPU compute</text>
+
+        <path id="fastlane" d="M130,60 C 260,60 340,110 470,120" fill="none" style="stroke:var(--fn);stroke-width:2" stroke-dasharray="1 5"/>
+        <path id="slowlane" d="M130,190 C 260,190 340,140 470,130" fill="none" style="stroke:var(--ty);stroke-width:2" stroke-dasharray="1 5"/>
+
+        <circle r="5" style="fill:var(--fn);offset-path:path('M130,60 C 260,60 340,110 470,120')" class="data-mote"/>
+        <circle r="5" style="fill:var(--ty);offset-path:path('M130,190 C 260,190 340,140 470,130')" class="data-mote-slow"/>
+
+        <text x="300" y="45" text-anchor="middle" class="svg-txt" style="fill:var(--fn);font-size:10px">~15 ms for 50 GB (HBM)</text>
+        <text x="300" y="230" text-anchor="middle" class="svg-txt" style="fill:var(--ty);font-size:10px">~800 ms for 50 GB (CPU DRAM over PCIe 5.0)</text>
+      </svg>
+      <figcaption>Same 50&nbsp;GB of KV cache, two different roads. The dots move at their
+      relative real-world speeds &mdash; watch how far behind the DRAM lane falls (static
+      readers: the top dot simply arrives about 50&times; sooner).</figcaption>
+    </div>
+
+    <h2 data-anchor="llm-h-worse">MoE and long context make it worse, not better</h2>
+    <p data-anchor="llm-p5">You'd think Mixture-of-Experts (MoE) models would ease this, since they only
+    activate 2&ndash;4 "expert" sub-networks per token instead of the whole model. They
+    do shrink the <em>compute</em> and the <em>weight-loading</em> bill &mdash; but the KV
+    cache doesn't care which experts fired. Every token still has to store its full
+    attention state regardless of routing, so a modest 7B-parameter MoE model with a
+    128K-token context and 16 experts can burn through <strong>24&nbsp;GB of KV cache
+    alone</strong>. Long-context features (the whole industry trend toward
+    million-token windows) multiply the same problem. The current mitigations are all
+    variations on "store less, more cleverly": aggressive KV-cache quantization down to
+    a few bits per value, expert-aware cache sharding, and GPU&ndash;CPU cooperative
+    schemes that compute attention on the CPU side instead of shipping the whole cache
+    back and forth. None of them make the wall disappear &mdash; they just help you live
+    closer to it.</p>
+
+    <div class="callout key" data-anchor="llm-callout1">
+      <span class="tag">Key idea</span>
+      A chatbot feels slow to type not because your GPU can't do the math &mdash; it's
+      because, every single token, it's waiting on a delivery truck. Speeding up the
+      truck (Chapter&nbsp;4) or shrinking the delivery (Chapter&nbsp;5) are the only two
+      real levers.
+    </div>
+
+    <div class="matters" data-anchor="llm-matters">
+      <h4>Why this matters</h4>
+      <p>If you've ever wondered why NVIDIA ships GPUs and CPUs <em>fused together</em>
+      on one coherent interconnect (Grace Hopper, Grace Blackwell), this chapter is the
+      answer: at 900&nbsp;GB/s, NVLink-C2C is about 7&times; a plain PCIe&nbsp;5.0 link,
+      which is precisely the gap this chapter just showed you. The next chapter is
+      about that fix &mdash; and why the wire between chips has become as important as
+      the chips themselves.</p>
+    </div>
+
+    <div class="sources" data-anchor="llm-sources">
+      Sources: <a href="https://arxiv.org/pdf/2601.19910" target="_blank" rel="noopener">"Understanding Bottlenecks for Efficiently Serving LLM Inference With KV Offloading"</a> (arXiv) &middot;
+      <a href="https://developer.nvidia.com/blog/accelerate-large-scale-llm-inference-and-kv-cache-offload-with-cpu-gpu-memory-sharing/" target="_blank" rel="noopener">NVIDIA Technical Blog on CPU&ndash;GPU KV cache offload</a> &middot;
+      <a href="https://www.arunbaby.com/ml-system-design/0070-kv-cache-for-moe-memory-wall/" target="_blank" rel="noopener">"KV cache for MoE: the memory wall blocking mixture-of-experts at scale"</a>.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-memory-hierarchy-is-the-real-cpu.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-interconnects-are-the-new-bus.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

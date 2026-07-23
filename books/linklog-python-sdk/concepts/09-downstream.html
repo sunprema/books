@@ -1,0 +1,182 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Downstream: The Sidecar &amp; Replay Harness — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="dn-eyebrow">Chapter 09</p>
+    <h1 data-anchor="dn-title">Downstream: The Sidecar &amp; Replay Harness</h1>
+    <p class="lede" data-anchor="dn-lede">Your process commits a <code>.llog</code> artifact and moves on — its job is done in microseconds. Everything valuable happens <em>after</em> that, out of your process, in a separate container. You don't build any of it. But understanding it tells you why the capture is shaped the way it is, and pins down the <strong>one thing you control</strong> that turns a checkpoint into a runnable failing test: the <code>replay_boundary</code> flag.</p>
+
+    <h2 data-anchor="dn-h-sidecar">Where the checkpoint goes</h2>
+    <p data-anchor="dn-p-sidecar1">The committed artifact lands in <code>/dev/shm/llog/events/</code>. From there a Go <strong>sidecar</strong> — the <code>llog-agent</code> daemon — takes over. It runs as its own process, typically a separate container in the same pod, deliberately decoupled from your application: your app never blocks on it, and it never reaches back into your app.</p>
+    <p data-anchor="dn-p-sidecar2">The sidecar watches the events directory, then runs each checkpoint through a fixed pipeline:</p>
+
+    <figure class="diagram" data-anchor="dn-fig-pipeline">
+      <svg viewBox="0 0 720 340" role="img" aria-label="The downstream pipeline from committed artifact to diagnosis, dispatch, and replay test">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#46b1e0"></path>
+          </marker>
+        </defs>
+        <!-- your process -->
+        <rect x="20" y="24" width="150" height="52" rx="8" fill="#0a1b28" stroke="#9fd35a" stroke-width="1.4"></rect>
+        <text x="95" y="46" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">your app</text>
+        <text x="95" y="63" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">llog SDK</text>
+        <line x1="170" y1="50" x2="230" y2="50" stroke="#46b1e0" stroke-width="1.4" marker-end="url(#a2)"></line>
+        <rect x="230" y="24" width="170" height="52" rx="8" fill="#0a1b28" stroke="#f0a15a" stroke-width="1.4"></rect>
+        <text x="315" y="46" fill="#f0a15a" font-family="ui-monospace,monospace" font-size="12" text-anchor="middle">/dev/shm/llog</text>
+        <text x="315" y="63" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">events/{uuid}.llog</text>
+        <line x1="315" y1="76" x2="315" y2="108" stroke="#46b1e0" stroke-width="1.4" marker-end="url(#a2)"></line>
+        <!-- sidecar box -->
+        <rect x="70" y="112" width="580" height="92" rx="10" fill="rgba(18,48,73,.5)" stroke="#244a63" stroke-width="1.2"></rect>
+        <text x="86" y="132" fill="#46b1e0" font-family="ui-monospace,monospace" font-size="11">llog-agent (sidecar)</text>
+        <g font-family="ui-monospace,monospace" font-size="11" text-anchor="middle">
+          <rect x="92" y="146" width="80" height="40" rx="6" fill="#0a1b28" stroke="#244a63"></rect>
+          <text x="132" y="164" fill="#dbeaf4">move</text><text x="132" y="178" fill="#8fb0c4" font-size="9">off tmpfs</text>
+          <rect x="188" y="146" width="80" height="40" rx="6" fill="#0a1b28" stroke="#244a63"></rect>
+          <text x="228" y="164" fill="#dbeaf4">parse</text><text x="228" y="178" fill="#8fb0c4" font-size="9">LGP reader</text>
+          <rect x="284" y="146" width="90" height="40" rx="6" fill="#0a1b28" stroke="#7fd1c8"></rect>
+          <text x="329" y="164" fill="#7fd1c8">sanitize</text><text x="329" y="178" fill="#8fb0c4" font-size="9">scrub PII</text>
+          <rect x="390" y="146" width="96" height="40" rx="6" fill="#0a1b28" stroke="#244a63"></rect>
+          <text x="438" y="164" fill="#dbeaf4">fingerprint</text><text x="438" y="178" fill="#8fb0c4" font-size="9">dedup</text>
+          <rect x="502" y="146" width="90" height="40" rx="6" fill="#0a1b28" stroke="#244a63"></rect>
+          <text x="547" y="164" fill="#dbeaf4">dispatch</text><text x="547" y="178" fill="#8fb0c4" font-size="9">plugins</text>
+        </g>
+        <line x1="150" y1="146" x2="150" y2="146"></line>
+        <line x1="172" y1="166" x2="188" y2="166" stroke="#244a63" stroke-width="1.2" marker-end="url(#a2)"></line>
+        <line x1="268" y1="166" x2="284" y2="166" stroke="#244a63" stroke-width="1.2" marker-end="url(#a2)"></line>
+        <line x1="374" y1="166" x2="390" y2="166" stroke="#244a63" stroke-width="1.2" marker-end="url(#a2)"></line>
+        <line x1="486" y1="166" x2="502" y2="166" stroke="#244a63" stroke-width="1.2" marker-end="url(#a2)"></line>
+        <!-- outputs -->
+        <line x1="547" y1="204" x2="547" y2="236" stroke="#46b1e0" stroke-width="1.4" marker-end="url(#a2)"></line>
+        <rect x="452" y="240" width="200" height="30" rx="6" fill="#0a1b28" stroke="#244a63"></rect>
+        <text x="552" y="259" fill="#dbeaf4" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">AI diagnosis · GitHub PR · Jira</text>
+        <line x1="329" y1="204" x2="329" y2="290" stroke="#9fd35a" stroke-width="1.4" marker-end="url(#a2)"></line>
+        <rect x="210" y="294" width="240" height="34" rx="6" fill="#0a1b28" stroke="#9fd35a"></rect>
+        <text x="330" y="311" fill="#9fd35a" font-family="ui-monospace,monospace" font-size="10" text-anchor="middle">replay: a runnable failing test</text>
+        <text x="330" y="324" fill="#8fb0c4" font-family="ui-monospace,monospace" font-size="8" text-anchor="middle">from your replay_boundary snapshots</text>
+      </svg>
+      <figcaption>Move off tmpfs → parse → sanitize → fingerprint → dispatch. Sanitization is where raw data is scrubbed, before anything leaves the host.</figcaption>
+    </figure>
+
+    <p data-anchor="dn-p-sidecar3">Two of those stages connect straight back to earlier chapters. <strong>Sanitize</strong> is the host-side half of the privacy story from Chapter 6: key filtering, pattern detection, and entropy detection run here, and raw execution data never leaves the host — the sidecar-to-platform link is mTLS. <strong>Fingerprint</strong> is the downstream half of storm containment from Chapter 7: the sidecar dedupes by failure signature before any expensive AI analysis, and caps AI/PR/ticket actions per fingerprint per window.</p>
+
+    <h2 data-anchor="dn-h-cli">You can inspect a checkpoint yourself</h2>
+    <p data-anchor="dn-p-cli">The pipeline stages are composable filters — each reads a checkpoint and writes one back, over a JSON envelope — and they're exposed as CLI verbs in <code>llog-ctl</code>. When you're integrating and want to see exactly what your instrumentation produced, reach for these:</p>
+    <pre data-anchor="dn-pre-cli"><code><span class="sh">$</span> llog-ctl inspect events/3f9c.llog   <span class="cm"># human-readable: the graph, intent, error, frames</span>
+<span class="sh">$</span> llog-ctl verify  events/3f9c.llog   <span class="cm"># checksum + classification (COMPLETE / TRUNCATED / ...)</span>
+<span class="sh">$</span> llog-ctl cat     events/3f9c.llog   <span class="cm"># the checkpoint as a JSON envelope</span>
+
+<span class="cm"># the stages are pipeable — the sidecar just runs them in-process:</span>
+<span class="sh">$</span> llog-ctl cat events/3f9c.llog | llog-ctl sanitize | llog-ctl fingerprint</code></pre>
+
+    <h2 data-anchor="dn-h-replay">The payoff: a checkpoint becomes a failing test</h2>
+    <p data-anchor="dn-p-replay1">Here is where the flag you set in Chapter 3 earns its keep. The <strong>Replay Harness Generator</strong> turns a Failure Checkpoint into a <em>runnable failing test</em> plus sanitized fixtures. The scopes you marked <code>replay_boundary=True</code> become <strong>mock seams</strong>: the generated test stubs each one with the snapshot captured at that boundary, so the reproduction runs offline and deterministically, without ever touching the real external service.</p>
+    <p data-anchor="dn-p-replay2">The discipline that makes this correct: <strong>you stub a completed seam; you never stub the scope the error died in.</strong> Stubbing the failing scope would erase the very failure under test. Look at the refund flow from Chapter 3:</p>
+
+    <pre data-anchor="dn-pre-replay"><code><span class="cap">demo/refund.py — the seam vs. the bug</span><span class="kw">with</span> llog.<span class="fn">scope</span>(<span class="str">"ChargeGateway"</span>, replay_boundary=<span class="kw">True</span>):
+    llog.<span class="fn">snapshot</span>(<span class="str">"gateway_request"</span>, {<span class="str">"amount"</span>: amount, <span class="str">"retries"</span>: divisor})
+    charge = <span class="fn">charge_gateway</span>(amount)            <span class="cm"># external call — the SEAM</span>
+    llog.<span class="fn">snapshot</span>(<span class="str">"gateway_response"</span>, charge)   <span class="cm"># ← becomes the stub's return value</span>
+
+<span class="kw">with</span> llog.<span class="fn">scope</span>(<span class="str">"SettleLedger"</span>):
+    fee = amount / divisor                    <span class="cm"># the BUG — replays for real → ZeroDivisionError</span>
+    <span class="kw">return</span> charge[<span class="str">"net"</span>] - fee</code></pre>
+
+    <p data-anchor="dn-p-replay3">On replay, <code>ChargeGateway</code> is <em>not</em> executed — it's patched to return the captured <code>gateway_response</code>, so the test needs no network. But <code>SettleLedger</code> runs for real, and reproduces the exact <code>ZeroDivisionError</code> that a gateway <code>retries</code> count of 0 caused. Stubbing the completed seam is what lets the test run offline; running the failing scope for real is what reproduces the bug. That generated test then runs in CI as a regression guard, and is the validation gate for any AI-proposed fix — diagnosis ships first, and PR generation is gated behind sandbox validation.</p>
+
+    <div class="callout key" data-anchor="dn-key-takeaway">
+      <span class="ct">Your one job here</span>
+      <p>Put <code>replay_boundary=True</code> on the scopes that wrap your <strong>external-call seams</strong> — payment gateways, HTTP clients, third-party APIs, database calls you'd want stubbed — and snapshot their responses. That single flag is what lets a production failure come back to you as an offline, deterministic, reproducing test. Everything else downstream is automatic.</p>
+    </div>
+
+    <h2 data-anchor="dn-h-story">The whole arc, in one line</h2>
+    <p data-anchor="dn-p-story">A production failure happens → LinkLog captures the execution context → the sidecar sanitizes it → an analyzer explains the root cause → and you get a failing test that reproduces it. That is the entire point of the four chapters of capture you just wired up.</p>
+
+    <div class="callout note" data-anchor="dn-note-offline">
+      <span class="ct">Two reassurances</span>
+      <p>The sidecar is <strong>offline-first</strong>: it completes its whole job — capture through dispatch — even with the control channel down, which is exactly when it matters most. And that channel is outbound-only, agent-initiated, and default-off: no downstream system can name a file on your host or reach into your app. You are shipping a recorder, not a remote-control surface.</p>
+    </div>
+
+    <p class="soft" data-anchor="dn-p-next">That's the full integration path, from <code>init()</code> to a reproducing test. Flip to the Cheatsheet for the whole API, every config knob, and the traps — on one page you can keep open while you wire it in.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-guarantees.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Next: Cheatsheet ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->

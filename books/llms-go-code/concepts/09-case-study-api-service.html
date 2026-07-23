@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Study: an API Service — LLMs, Go Code!</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="gopher-mark">
+      <svg width="20" height="16" viewBox="0 0 20 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <ellipse cx="10" cy="9" rx="9" ry="6.5" fill="#00add8"/>
+        <circle cx="10" cy="3.6" r="3.4" fill="#00add8"/>
+        <circle cx="6.6" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="13.4" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="6.9" cy="2.7" r=".7" fill="#142229"/>
+        <circle cx="13.1" cy="2.7" r=".7" fill="#142229"/>
+      </svg>
+    </span>
+    LLMs, Go Code! <span class="pick">&mdash; a BookBank field guide</span>
+  </span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<p class="eyebrow">Part III &middot; Built With an Agent</p>
+<p class="chapno">Chapter 9</p>
+<h1>Case Study: Building an API Service with a Human Architect</h1>
+
+<p class="lead">Eight chapters ago we started with plain structs. Along the way we picked up implicit interfaces, honest errors, context-aware concurrency, a toolchain that argues back, and a way to turn all of that into a specification an agent can't wiggle out of. This chapter is Part III's opening move &mdash; &ldquo;Built With an Agent&rdquo; &mdash; where none of those ideas stay theoretical anymore. We're going to build one small, completely real REST resource: a bookmarks service. You, the human, will design the data, the route, and the interface. Then you'll hand an agent a failing test and watch it write the rest.</p>
+
+<h2>Motivation: who draws the property line?</h2>
+<p>Here's the question this whole case study answers: when a human and an agent build an API endpoint together, who decides what, exactly? Get this division wrong and you end up in one of two bad places. Either you're back to typing every line yourself, agent along for the ride doing nothing, or you're pasting a one-sentence prompt into a chat window and hoping the shape of the JSON matches what your frontend expects. Neither is the point of this book.</p>
+<p>The division that actually works, and the one this chapter walks through end to end, is the one we've been building toward since Chapter 2: <strong>the human owns the contract, the agent owns the fill-in</strong>. Structs and interfaces (Chapters 2 and 3) give us a contract with a compiler behind it. Errors as values (Chapter 4) and context (Chapter 5) tell us what that contract has to look like to be trustworthy. Executable specifications (Chapter 7) and test-driven agent development (Chapter 8) give us a way to hand that contract to an agent without writing a paragraph of prose that it can quietly misread. This chapter is what happens when you run all of that on one ticket: <em>&ldquo;add an endpoint to save a bookmark.&rdquo;</em></p>
+
+<h2>Design: the contract the human writes</h2>
+<p>Before any agent sees a prompt, we do the part that stays ours: decide what a bookmark <em>is</em>, and what a caller can do to it. That's a data-modeling exercise, straight out of Chapter 2 &mdash; small, explicit structs, no premature abstraction.</p>
+<pre class="tab"><code><span class="cm">// package bookmarks</span>
+<span class="kw">package</span> bookmarks
+
+<span class="kw">import</span> (
+	<span class="str">"context"</span>
+	<span class="str">"time"</span>
+)
+
+<span class="cm">// Bookmark is the resource we expose over the API and persist in a Store.</span>
+<span class="kw">type</span> Bookmark <span class="kw">struct</span> {
+	ID        <span class="ty">string</span>    <span class="at">`json:"id"`</span>
+	URL       <span class="ty">string</span>    <span class="at">`json:"url"`</span>
+	Title     <span class="ty">string</span>    <span class="at">`json:"title"`</span>
+	CreatedAt <span class="ty">time</span>.Time <span class="at">`json:"created_at"`</span>
+}
+
+<span class="cm">// CreateBookmarkRequest is the wire shape a client sends us.</span>
+<span class="cm">// It is deliberately narrower than Bookmark — callers don't get to set</span>
+<span class="cm">// an ID or a CreatedAt; the server decides those.</span>
+<span class="kw">type</span> CreateBookmarkRequest <span class="kw">struct</span> {
+	URL   <span class="ty">string</span> <span class="at">`json:"url"`</span>
+	Title <span class="ty">string</span> <span class="at">`json:"title"`</span>
+}
+</code></pre>
+<p>Next, the interface. This is the single most important artifact the human produces this chapter &mdash; it's the sandbox wall from Chapter 3, drawn around exactly the storage operations a handler needs and nothing else:</p>
+<pre class="tab"><code><span class="cm">// Store persists bookmarks. Core handler code depends only on this</span>
+<span class="cm">// interface — never on a concrete database.</span>
+<span class="kw">type</span> Store <span class="kw">interface</span> {
+	Get(ctx <span class="ty">context</span>.Context, id <span class="ty">string</span>) (Bookmark, <span class="ty">error</span>)
+	Create(ctx <span class="ty">context</span>.Context, b Bookmark) (Bookmark, <span class="ty">error</span>)
+	List(ctx <span class="ty">context</span>.Context) ([]Bookmark, <span class="ty">error</span>)
+}
+
+<span class="cm">// ErrNotFound is the sentinel a Store returns when Get can't find the id.</span>
+<span class="kw">var</span> ErrNotFound = errors.<span class="fn">New</span>(<span class="str">"bookmarks: not found"</span>)
+</code></pre>
+<p>Notice the fingerprints of earlier chapters all over these eleven lines. <code class="inl">context.Context</code> comes first in every method, per Chapter 5 &mdash; a Store call that talks to a database or the network has no business ignoring cancellation. Errors come back as values, not exceptions, and <code class="inl">ErrNotFound</code> is a sentinel the handler can check with <code class="inl">errors.Is</code>, per Chapter 4. And the interface itself is small &mdash; three methods, each nameable, each obviously necessary &mdash; because a bloated interface is a bloated sandbox.</p>
+<p>Finally we design the route, in a one-line spec any agent (or teammate) can read without ambiguity: <code class="inl">POST /bookmarks</code> accepts a <code class="inl">CreateBookmarkRequest</code> body and returns <code class="inl">201 Created</code> with the saved <code class="inl">Bookmark</code>, or <code class="inl">400 Bad Request</code> if the URL is missing or the body doesn't parse.</p>
+
+<h2>Design: the failing test is the handoff</h2>
+<p>Chapter 8 argued that a prose description is a lossy way to brief an agent, and a failing test is a lossless one. This is where that pays off. Instead of writing three paragraphs about status codes, we write the test we want to see turn green, using a hand-rolled stub that satisfies our own <code class="inl">Store</code> interface &mdash; no mocking framework required, just a struct with a function field:</p>
+<pre class="tab"><code><span class="kw">type</span> stubStore <span class="kw">struct</span> {
+	createFn <span class="kw">func</span>(ctx <span class="ty">context</span>.Context, b Bookmark) (Bookmark, <span class="ty">error</span>)
+}
+
+<span class="kw">func</span> (s *stubStore) <span class="fn">Get</span>(ctx <span class="ty">context</span>.Context, id <span class="ty">string</span>) (Bookmark, <span class="ty">error</span>) {
+	<span class="kw">return</span> Bookmark{}, ErrNotFound
+}
+<span class="kw">func</span> (s *stubStore) <span class="fn">Create</span>(ctx <span class="ty">context</span>.Context, b Bookmark) (Bookmark, <span class="ty">error</span>) {
+	<span class="kw">return</span> s.createFn(ctx, b)
+}
+<span class="kw">func</span> (s *stubStore) <span class="fn">List</span>(ctx <span class="ty">context</span>.Context) ([]Bookmark, <span class="ty">error</span>) {
+	<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">nil</span>
+}
+
+<span class="kw">func</span> <span class="fn">TestCreateBookmarkHandler</span>(t *testing.T) {
+	tests := []<span class="kw">struct</span> {
+		name       <span class="ty">string</span>
+		body       <span class="ty">string</span>
+		store      *stubStore
+		wantStatus <span class="ty">int</span>
+		wantBody   <span class="ty">string</span>
+	}{
+		{
+			name: <span class="str">"valid bookmark is created"</span>,
+			body: <span class="str">`{"url":"https://go.dev","title":"Go"}`</span>,
+			store: &amp;stubStore{createFn: <span class="kw">func</span>(ctx <span class="ty">context</span>.Context, b Bookmark) (Bookmark, <span class="ty">error</span>) {
+				b.ID = <span class="str">"bm_1"</span>
+				<span class="kw">return</span> b, <span class="kw">nil</span>
+			}},
+			wantStatus: http.StatusCreated,
+			wantBody:   <span class="str">`"id":"bm_1"`</span>,
+		},
+		{
+			name:       <span class="str">"missing url is rejected"</span>,
+			body:       <span class="str">`{"title":"No URL"}`</span>,
+			store:      &amp;stubStore{},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       <span class="str">"malformed json is rejected"</span>,
+			body:       <span class="str">`{"url": `</span>,
+			store:      &amp;stubStore{},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	<span class="kw">for</span> _, tt := <span class="kw">range</span> tests {
+		t.<span class="fn">Run</span>(tt.name, <span class="kw">func</span>(t *testing.T) {
+			req := httptest.<span class="fn">NewRequest</span>(http.MethodPost, <span class="str">"/bookmarks"</span>, strings.<span class="fn">NewReader</span>(tt.body))
+			rec := httptest.<span class="fn">NewRecorder</span>()
+
+			<span class="fn">NewCreateBookmarkHandler</span>(tt.store).<span class="fn">ServeHTTP</span>(rec, req)
+
+			<span class="kw">if</span> rec.Code != tt.wantStatus {
+				t.<span class="fn">Fatalf</span>(<span class="str">"status = %d, want %d"</span>, rec.Code, tt.wantStatus)
+			}
+			<span class="kw">if</span> tt.wantBody != <span class="str">""</span> &amp;&amp; !strings.<span class="fn">Contains</span>(rec.Body.<span class="fn">String</span>(), tt.wantBody) {
+				t.<span class="fn">Errorf</span>(<span class="str">"body = %s, want substring %q"</span>, rec.Body.<span class="fn">String</span>(), tt.wantBody)
+			}
+		})
+	}
+}
+</code></pre>
+<p>That's the whole handoff. No architecture doc, no chat transcript &mdash; just <code class="inl">bookmark.go</code> (structs and interface), <code class="inl">handler_test.go</code> (the test above, currently red because <code class="inl">NewCreateBookmarkHandler</code> doesn't exist yet), and the instruction: <em>&ldquo;make this pass.&rdquo;</em> The test pins down status codes, JSON shape, and validation behavior all at once &mdash; three things a prose prompt would need several careful sentences to nail down, and would still leave room to misread.</p>
+
+<h2>Implementation: the agent writes the handler</h2>
+<p>Handed that interface and that test, here's a reasonable, idiomatic handler an agent can produce &mdash; and did, in our own dry run of this exact prompt:</p>
+<pre class="tab"><code><span class="kw">func</span> <span class="fn">NewCreateBookmarkHandler</span>(store Store) http.Handler {
+	<span class="kw">return</span> http.HandlerFunc(<span class="kw">func</span>(w http.ResponseWriter, r *http.Request) {
+		<span class="kw">var</span> req CreateBookmarkRequest
+		<span class="kw">if</span> err := json.<span class="fn">NewDecoder</span>(r.Body).<span class="fn">Decode</span>(&amp;req); err != <span class="kw">nil</span> {
+			http.<span class="fn">Error</span>(w, <span class="str">"invalid JSON body"</span>, http.StatusBadRequest)
+			<span class="kw">return</span>
+		}
+		<span class="kw">if</span> req.URL == <span class="str">""</span> {
+			http.<span class="fn">Error</span>(w, <span class="str">"url is required"</span>, http.StatusBadRequest)
+			<span class="kw">return</span>
+		}
+
+		b := Bookmark{URL: req.URL, Title: req.Title, CreatedAt: time.<span class="fn">Now</span>()}
+		saved, err := store.<span class="fn">Create</span>(r.<span class="fn">Context</span>(), b)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			http.<span class="fn">Error</span>(w, <span class="str">"could not save bookmark"</span>, http.StatusInternalServerError)
+			<span class="kw">return</span>
+		}
+
+		w.Header().<span class="fn">Set</span>(<span class="str">"Content-Type"</span>, <span class="str">"application/json"</span>)
+		w.<span class="fn">WriteHeader</span>(http.StatusCreated)
+		json.<span class="fn">NewEncoder</span>(w).<span class="fn">Encode</span>(saved)
+	})
+}
+</code></pre>
+<p>Run <code class="inl">go test ./...</code> and the three cases go green. Notice the three habits the test forced into existence: the decode error is checked and turned into a <code class="inl">400</code>, the empty-URL case is checked <em>before</em> anything touches the store, and <code class="inl">r.Context()</code> &mdash; not <code class="inl">context.Background()</code> &mdash; is what gets threaded into <code class="inl">store.Create</code>. None of that was spelled out in a design doc. It fell out of a test the human already had reason to write.</p>
+
+<h2>Implementation: the agent writes the Store</h2>
+<p>The same prompt, extended with &ldquo;now implement <code class="inl">Store</code> in memory, safe for concurrent use,&rdquo; produces something like this:</p>
+<pre class="tab"><code><span class="kw">type</span> MemoryStore <span class="kw">struct</span> {
+	mu   sync.Mutex
+	data <span class="kw">map</span>[<span class="ty">string</span>]Bookmark
+	next <span class="ty">int</span>
+}
+
+<span class="kw">func</span> <span class="fn">NewMemoryStore</span>() *MemoryStore {
+	<span class="kw">return</span> &amp;MemoryStore{data: <span class="kw">make</span>(<span class="kw">map</span>[<span class="ty">string</span>]Bookmark)}
+}
+
+<span class="kw">func</span> (s *MemoryStore) <span class="fn">Create</span>(ctx <span class="ty">context</span>.Context, b Bookmark) (Bookmark, <span class="ty">error</span>) {
+	s.mu.<span class="fn">Lock</span>()
+	<span class="kw">defer</span> s.mu.<span class="fn">Unlock</span>()
+	s.next++
+	b.ID = fmt.<span class="fn">Sprintf</span>(<span class="str">"bm_%d"</span>, s.next)
+	s.data[b.ID] = b
+	<span class="kw">return</span> b, <span class="kw">nil</span>
+}
+</code></pre>
+<p>For a real deployment, the SQL-backed twin implements the same three methods against a database. <code class="inl">Get</code> and <code class="inl">Create</code> touch one row, so they're natural fits for <code class="inl">QueryRowContext</code>. <code class="inl">List</code> is the one that returns multiple rows, and it's worth showing in full because its cleanup is exactly the kind of thing an agent gets right when it's copying an idiom it's seen a thousand times, and wrong when it isn't paying attention:</p>
+<pre class="tab"><code><span class="kw">func</span> (s *SQLStore) <span class="fn">List</span>(ctx <span class="ty">context</span>.Context) ([]Bookmark, <span class="ty">error</span>) {
+	rows, err := s.db.<span class="fn">QueryContext</span>(ctx, <span class="str">`SELECT id, url, title, created_at FROM bookmarks`</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="fn">Errorf</span>(<span class="str">"bookmarks: list: %w"</span>, err)
+	}
+	<span class="kw">defer</span> rows.<span class="fn">Close</span>()
+
+	<span class="kw">var</span> out []Bookmark
+	<span class="kw">for</span> rows.<span class="fn">Next</span>() {
+		<span class="kw">var</span> b Bookmark
+		<span class="kw">if</span> err := rows.<span class="fn">Scan</span>(&amp;b.ID, &amp;b.URL, &amp;b.Title, &amp;b.CreatedAt); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="fn">Errorf</span>(<span class="str">"bookmarks: scan: %w"</span>, err)
+		}
+		out = <span class="kw">append</span>(out, b)
+	}
+	<span class="kw">return</span> out, rows.<span class="fn">Err</span>()
+}
+</code></pre>
+<p>Three lines are doing quiet, load-bearing work here: <code class="inl">defer rows.Close()</code> right after the error check, so a mid-loop return still releases the connection back to the pool; and <code class="inl">rows.Err()</code> at the very end, because <code class="inl">rows.Next()</code> returning <code class="inl">false</code> means either &ldquo;done&rdquo; or &ldquo;something broke,&rdquo; and only <code class="inl">Err()</code> tells you which.</p>
+
+<figure>
+  <svg class="figure-svg" viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="apifig-title apifig-desc">
+    <title id="apifig-title">Request flow through the human-designed contract and the agent-written fill-in</title>
+    <desc id="apifig-desc">An HTTP POST request enters the handler, which was human-tested and agent-written. The handler calls the Store interface, which the human designed. The interface is satisfied by an agent-written MemoryStore or SQLStore implementation.</desc>
+
+    <rect x="20" y="118" width="140" height="64" rx="10" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="2"/>
+    <text x="90" y="144" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">POST /bookmarks</text>
+    <text x="90" y="162" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent-deep)">incoming request</text>
+
+    <rect x="200" y="110" width="180" height="80" rx="10" fill="var(--bg-2)" stroke="var(--yellow)" stroke-width="2"/>
+    <text x="290" y="134" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">CreateBookmarkHandler</text>
+    <text x="290" y="152" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="#8a6d00">agent-written</text>
+    <text x="290" y="168" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent-deep)">human-tested (Ch.8)</text>
+
+    <rect x="420" y="20" width="160" height="66" rx="10" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="2"/>
+    <text x="500" y="44" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">interface Store</text>
+    <text x="500" y="62" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent-deep)">human-designed</text>
+
+    <rect x="410" y="204" width="120" height="66" rx="10" fill="var(--bg-2)" stroke="var(--yellow)" stroke-width="2"/>
+    <text x="470" y="228" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">MemoryStore</text>
+    <text x="470" y="246" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="#8a6d00">agent-written</text>
+
+    <rect x="550" y="204" width="120" height="66" rx="10" fill="var(--bg-2)" stroke="var(--yellow)" stroke-width="2"/>
+    <text x="610" y="228" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">SQLStore</text>
+    <text x="610" y="246" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="#8a6d00">agent-written</text>
+
+    <line x1="160" y1="150" x2="200" y2="150" stroke="var(--ink-soft)" stroke-width="1.5" marker-end="url(#arrow9)"/>
+    <line x1="380" y1="130" x2="420" y2="70" stroke="var(--ink-soft)" stroke-width="1.5" marker-end="url(#arrow9)"/>
+    <line x1="480" y1="86" x2="475" y2="204" stroke="var(--ink-soft)" stroke-width="1.5" marker-end="url(#arrow9)"/>
+    <line x1="520" y1="86" x2="600" y2="204" stroke="var(--ink-soft)" stroke-width="1.5" marker-end="url(#arrow9)"/>
+
+    <defs>
+      <marker id="arrow9" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 Z" fill="var(--ink-soft)"/>
+      </marker>
+    </defs>
+
+    <text x="200" y="290" font-family="var(--font-body)" font-size="11" fill="var(--ink-soft)">Blue border = human-owned contract. Yellow border = agent-written, satisfies that contract.</text>
+  </svg>
+  <figcaption>The handler and both Store implementations were agent-written against a human-designed interface and a human-written test — the pattern from Chapters 3, 7, and 8, applied to one endpoint.</figcaption>
+</figure>
+
+<h2>Edge cases: where this exact scenario goes wrong</h2>
+<p>A green test suite for the happy path is not the same thing as a safe handler. In practice, when we've watched agents build handlers like this one, the same five mistakes show up again and again &mdash; and they're worth naming precisely, because a table-driven test rarely catches them unless someone thought to write a case for them.</p>
+<table class="grid">
+  <tr><th>Mistake</th><th>What it looks like</th><th>Why the happy-path test misses it</th></tr>
+  <tr><td>Ignoring request cancellation</td><td>A slow handler calls <code class="inl">context.Background()</code> instead of <code class="inl">r.Context()</code>, or never checks <code class="inl">ctx.Err()</code> before expensive work</td><td>The test client never disconnects mid-request</td></tr>
+  <tr><td>Unclosed response body</td><td>The handler calls another service with <code class="inl">http.Get</code> or a bare <code class="inl">client.Do</code> and never <code class="inl">defer resp.Body.Close()</code></td><td>One test run doesn't leak enough connections to notice</td></tr>
+  <tr><td>Unclosed <code class="inl">sql.Rows</code></td><td>A <code class="inl">List</code>-style method calls <code class="inl">QueryContext</code> but skips <code class="inl">defer rows.Close()</code></td><td>An in-memory stub store never touches a real connection pool</td></tr>
+  <tr><td>Swallowed decode errors</td><td><code class="inl">json.NewDecoder(r.Body).Decode(&amp;v)</code> with the error thrown away or logged and ignored</td><td>Test bodies are always well-formed unless someone wrote a malformed-JSON case</td></tr>
+  <tr><td>Missing validation before the store call</td><td>An empty or malformed field reaches <code class="inl">store.Create</code>, which either panics or silently persists garbage</td><td>Table-driven tests only cover the inputs someone thought to list</td></tr>
+</table>
+<p>The first two deserve a closer look, because they compound: imagine we extend the handler to enrich a bookmark by fetching its page title from the URL the caller submitted. That means the handler is now itself an HTTP client, calling someone else's server, and both mistakes above can hide in the same four lines.</p>
+<p><strong>Spot the bug.</strong> Here's a first draft an agent might hand back:</p>
+<pre class="tab"><code><span class="kw">func</span> (h *Handler) <span class="fn">fetchTitle</span>(ctx <span class="ty">context</span>.Context, url <span class="ty">string</span>) (<span class="ty">string</span>, <span class="ty">error</span>) {
+	resp, err := http.<span class="fn">Get</span>(url) <span class="cm">// bug: ignores ctx entirely</span>
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="str">""</span>, err
+	}
+	body, err := io.<span class="fn">ReadAll</span>(resp.Body) <span class="cm">// bug: resp.Body is never closed</span>
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="str">""</span>, err
+	}
+	<span class="kw">return</span> <span class="fn">parseTitle</span>(body), <span class="kw">nil</span>
+}
+</code></pre>
+<p>It compiles, it passes a happy-path test against a local test server, and it will slowly leak a file descriptor and an idle connection for every bookmark saved &mdash; and it will never notice when the parent request is canceled, because <code class="inl">http.Get</code> has no idea a context even exists. Here's the fix, and it's smaller than the bug:</p>
+<pre class="tab"><code><span class="kw">func</span> (h *Handler) <span class="fn">fetchTitle</span>(ctx <span class="ty">context</span>.Context, url <span class="ty">string</span>) (<span class="ty">string</span>, <span class="ty">error</span>) {
+	req, err := http.<span class="fn">NewRequestWithContext</span>(ctx, http.MethodGet, url, <span class="kw">nil</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="str">""</span>, err
+	}
+	resp, err := h.client.<span class="fn">Do</span>(req)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="str">""</span>, err
+	}
+	<span class="kw">defer</span> resp.Body.<span class="fn">Close</span>()
+
+	body, err := io.<span class="fn">ReadAll</span>(resp.Body)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="str">""</span>, err
+	}
+	<span class="kw">return</span> <span class="fn">parseTitle</span>(body), <span class="kw">nil</span>
+}
+</code></pre>
+<p><code class="inl">http.NewRequestWithContext</code> ties the outbound call's lifetime to the inbound request's; if the original caller hangs up, this call gets canceled instead of running to completion for no one. And <code class="inl">defer resp.Body.Close()</code>, placed immediately after the error check that guarantees <code class="inl">resp</code> is non-nil, closes the connection whether the function returns cleanly or through an early error path below it. Neither line changes what the function returns on the happy path &mdash; which is exactly why a happy-path test can't tell the two versions apart.</p>
+
+<div class="callout agent">
+  <span class="tag">The Agent Angle</span>
+  Notice that none of these five mistakes are exotic. They're all places where the &ldquo;obviously correct&rdquo; code and the &ldquo;actually correct&rdquo; code produce identical output on the request the agent tested against, and only diverge under conditions &mdash; a canceled request, a malformed body, a thousandth call in a row &mdash; that a quick manual check doesn't create. That's precisely why this book leans so hard on tests and audits instead of trusting a glance at the diff. Ask the agent directly: &ldquo;show me the test case where the client disconnects mid-request&rdquo; or &ldquo;show me the test where the JSON body is truncated.&rdquo; If it can't produce one, that's your cue to write it yourself before merging.
+</div>
+
+<h2>Reflection</h2>
+<p>Step back and look at what actually happened in this chapter. We didn't invent a new methodology. We took the struct discipline from Chapter 2, the sandboxed interface from Chapter 3, the sentinel errors from Chapter 4, the context-first signatures from Chapter 5, and the red-test handoff from Chapters 7 and 8, and pointed all of it at one ordinary endpoint. The agent wrote real code &mdash; a working handler, a working store, a passing test suite &mdash; and it did so without ever seeing the rest of our codebase, because the interface was the only door we opened. The mistakes it could still make weren't mistakes of syntax; they were mistakes of omission, in exactly the corners a green test suite doesn't shine a light into. That's the shape of the job now: design the contract narrowly enough that an agent can't misunderstand it, and audit narrowly enough that you're checking the corners it's most likely to skip.</p>
+
+<div class="audit">
+<h4>Audit Checklist</h4>
+<ul>
+  <li><b>Context flows through.</b> Every Store call inside the handler uses <code class="inl">r.Context()</code>, not <code class="inl">context.Background()</code> or <code class="inl">context.TODO()</code> — and any outbound call the handler makes uses <code class="inl">http.NewRequestWithContext</code> with that same context.</li>
+  <li><b>Every response body is closed.</b> If the handler is itself a client of another service, grep for <code class="inl">.Do(</code> or <code class="inl">http.Get(</code> and confirm a <code class="inl">defer resp.Body.Close()</code> sits immediately after the nil-error check.</li>
+  <li><b>Every <code class="inl">sql.Rows</code> is closed and checked.</b> A <code class="inl">defer rows.Close()</code> right after the query, and a <code class="inl">rows.Err()</code> check after the loop — not just a <code class="inl">rows.Scan()</code> error check inside it.</li>
+  <li><b>Decode errors are handled, not discarded.</b> <code class="inl">json.NewDecoder(r.Body).Decode(&amp;v)</code>'s error return must reach an <code class="inl">http.Error</code> call, never a blank identifier or a bare log line the caller never sees.</li>
+  <li><b>Validation happens before the Store call.</b> Required fields are checked and rejected with <code class="inl">400</code> before <code class="inl">store.Create</code> or <code class="inl">store.Get</code> is ever reached — the store should never be the thing catching bad input.</li>
+  <li><b>The test suite has an unhappy path for each of the above.</b> A canceled context, a truncated body, a missing field — if the table-driven test doesn't cover it, assume the agent didn't either.</li>
+</ul>
+</div>
+
+<div class="sources">Sources: <a href="https://pkg.go.dev/net/http/httptest">net/http/httptest package documentation</a>, <a href="https://pkg.go.dev/encoding/json">encoding/json package documentation</a>, <a href="https://pkg.go.dev/database/sql">database/sql package documentation</a>, <a href="https://www.coderabbit.ai/blog/state-of-ai-vs-human-code-generation-report">CodeRabbit, &ldquo;State of AI vs. Human Code Generation&rdquo;</a></div>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-test-driven-agent-development.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-case-study-cli-tool.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,70 @@
+name: Publish on book merge
+
+# Fires when a book lands on main — i.e. a fully art-complete book PR merges,
+# pushing changes under books/**. The book was NEVER on Pages before this
+# (it lived on its PR branch, art was placed there first), so the FIRST time
+# it's ever live it's already complete — no prompt placeholders, ever, in
+# anyone's cache. This job just regenerates the generated front door.
+#
+# Loop-safety: the regen only writes index.html / catalog.json / assets/**,
+# never books/**, so the `paths` filter below means the publish commit can't
+# re-trigger this workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'books/**'
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # build-library.py + defaults/personas from the pinned kit plugin.
+      # Bump the SHA deliberately to adopt kit's shelf/generator fixes.
+      - name: Fetch bookbank plugin (pinned)
+        run: |
+          git clone --filter=blob:none --sparse https://github.com/sunprema/kit /tmp/kit
+          git -C /tmp/kit sparse-checkout set bookbank/library bookbank/defaults
+          git -C /tmp/kit checkout d7c63ab7a5b774912499931238ade41d8935efc7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Regenerate index.html + catalog.json IN PLACE from the book.json's on
+      # main. --root == --out == "." → same-clone, no re-sync. CLAUDE_PLUGIN_ROOT
+      # is required or persona names render blank. `sips` share-JPEG is macOS-only
+      # and skipped gracefully on Ubuntu (cosmetic).
+      - name: Rebuild shelf & catalog
+        env:
+          CLAUDE_PLUGIN_ROOT: /tmp/kit/bookbank
+        run: |
+          python3 /tmp/kit/bookbank/library/build-library.py \
+            --out . --root . --repo "${{ github.repository }}"
+
+      - name: Commit regenerated front door
+        run: |
+          git config user.name  "bookbank-bot"
+          git config user.email "bookbank-bot@users.noreply.github.com"
+          git add index.html catalog.json assets
+          if git diff --cached --quiet; then
+            echo "::notice::Shelf already current — nothing to publish."
+            exit 0
+          fi
+          git commit -m "Publish: rebuild shelf after ${{ github.sha }}"
+          git push origin main
+      # GitHub Pages auto-deploys the push to main.

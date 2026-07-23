@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stashing: Temporary Storage for In-Progress Work — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 11 · Stashing</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="stash-kicker">Chapter 11 of 17 &middot; The side pocket</p>
+    <h1 data-anchor="stash-h1">Stashing: <span class="hl">Temporary Storage</span> for In-Progress Work</h1>
+
+    <p class="lede" data-anchor="stash-lede">
+      Chapter 10 closed with a promise: this chapter is about the opposite
+      problem &mdash; not undoing work, but <em>pausing</em> it mid-flight.
+      Here's the scenario it was pointing at: you're elbow-deep in a feature,
+      half the file is broken on purpose while you're mid-refactor, and then
+      &mdash; Slack ping &mdash; a teammate needs you on a different branch
+      <em>right now</em>. You're not ready to commit this mess. You don't
+      want to lose it either. <code>git stash</code> is Git's answer to
+      exactly that moment: a side pocket where in-progress work waits,
+      untouched, while you go deal with something else.
+    </p>
+
+    <h2 data-anchor="stash-problem-h">The Problem: Switch Tasks, Keep the Work</h2>
+    <p data-anchor="stash-problem-p1">
+      Try to <code>git switch</code> or <code>git checkout</code> to another
+      branch while you have uncommitted edits, and Git will often refuse
+      outright &mdash; "your local changes would be overwritten by
+      checkout." Even when it lets you through, those edits ride along into
+      the new branch with you, which is rarely what you want. You're left
+      with three bad options: commit half-finished, broken code just to
+      clear the deck (and now your history has a "wip please ignore" commit
+      in it forever); throw the work away and redo it later; or just... not
+      switch, and leave the teammate waiting. None of those are good.
+      Stashing is the fourth option &mdash; the one that actually works.
+    </p>
+
+    <h2 data-anchor="stash-push-h">git stash push: Off to the Side, Not Gone</h2>
+    <p data-anchor="stash-push-p1">
+      <code>git stash push</code> takes every change in your working
+      directory and index that differs from <code>HEAD</code>, tucks it
+      away in a safe place, and then resets both your working directory
+      <em>and</em> your index back to match <code>HEAD</code> exactly &mdash;
+      a clean slate, as if you'd never touched anything. Nothing is deleted.
+      It's more like a coat check than a trash can: hand over the mess,
+      get a claim ticket, walk away with empty hands. Give it a
+      <code>-m</code> message the same way you'd write a commit message
+      &mdash; future-you, staring at a list of stashes next week, will thank
+      present-you for not just calling it "stuff":
+    </p>
+    <pre class="code" data-anchor="stash-push-code1"><span class="cap">Terminal — an edit, mid-thought</span><code><span class="cm">$</span> mkdir stash-quest &amp;&amp; cd stash-quest &amp;&amp; git init -q -b main
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Start the story"</span>
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\nInventory: sword\n"</span> &gt; player.txt
+<span class="cm">$</span> git status
+On branch main
+Changes not staged for commit:
+  (use <span class="str">"git add &lt;file&gt;..."</span> to update what will be committed)
+  (use <span class="str">"git restore &lt;file&gt;..."</span> to discard changes in working directory)
+	modified:   player.txt
+
+no changes added to commit (use <span class="str">"git add"</span> and/or <span class="str">"git commit -a"</span>)</code></pre>
+    <p data-anchor="stash-push-p2">
+      Half a thought, sitting unstaged. Stash it, and watch both the status
+      and the file itself snap back to a clean <code>HEAD</code>:
+    </p>
+    <pre class="code" data-anchor="stash-push-code2"><span class="cap">Terminal — git stash push -m, then a clean slate</span><code><span class="cm">$</span> git stash push -m <span class="str">"WIP: sword inventory"</span>
+Saved working directory and index state On main: WIP: sword inventory
+<span class="cm">$</span> git status
+On branch main
+nothing to commit, working tree clean
+<span class="cm">$</span> cat player.txt
+Welcome to Staging Quest!
+HP: 100</code></pre>
+    <p data-anchor="stash-push-p3">
+      "Nothing to commit, working tree clean" &mdash; the exact phrase
+      Chapter 10 taught you to treat as a warning sign after
+      <code>reset --hard</code>. Here it means something completely
+      different: your edit isn't gone, it's <em>filed</em>. (Bare
+      <code>git stash</code>, no subcommand, is shorthand for
+      <code>git stash push</code> &mdash; you'll see both spellings in the
+      wild.)
+    </p>
+
+    <div class="callout warn" data-anchor="stash-warn-untracked">
+      <span class="co-tag">Warning</span>
+      <p>
+        By default, <code>git stash push</code> only picks up changes to
+        files Git is already <strong>tracking</strong>. A brand-new file
+        you haven't <code>git add</code>-ed yet is invisible to a plain
+        <code>git stash</code> &mdash; it'll still be sitting in your
+        working directory, unstashed, when you switch branches. If you want
+        untracked files swept up too, add <code>-u</code> (or
+        <code>--include-untracked</code>): <code>git stash push -u -m
+        "&hellip;"</code>. Easy to forget, and the classic way a stash
+        "loses" a file that was never in it to begin with.
+      </p>
+    </div>
+
+    <h2 data-anchor="stash-list-h">git stash list: A Stack, Not a Slot</h2>
+    <p data-anchor="stash-list-p1">
+      You're not limited to one stash at a time. Every <code>git stash
+      push</code> adds a new entry to a <strong>LIFO stack</strong> &mdash;
+      last in, first out, same discipline as a stack of trays in a
+      cafeteria. Ask what's waiting with <code>git stash list</code>:
+    </p>
+    <pre class="code" data-anchor="stash-list-code1"><span class="cap">Terminal — one entry on the stack</span><code><span class="cm">$</span> git stash list
+<span class="num">stash@{0}</span>: On main: WIP: sword inventory</code></pre>
+    <p data-anchor="stash-list-p1b">
+      <code>stash@{0}</code> is always the most recent entry &mdash; the
+      top of the stack. Stash something else without touching this one
+      first, and it becomes <code>stash@{1}</code>, pushed one slot down,
+      while the new one claims <code>stash@{0}</code>. Most of the commands
+      below default to <code>stash@{0}</code> when you don't name one
+      explicitly, which is exactly the LIFO behavior you'd expect: "give me
+      back the thing I most recently set aside."
+    </p>
+
+    <figure class="diagram" data-anchor="stash-diagram">
+      <svg viewBox="0 0 760 380" role="img" aria-labelledby="stash-diagram-title">
+        <title id="stash-diagram-title">A working directory box on the left, connected to a vertical LIFO stack of stash entries on the right, labeled stash at index 0 on top down to older entries below. A solid arrow labeled git stash push runs from the working directory up to the top of the stack, adding a new entry and pushing older ones down. Two dashed return arrows run from the top of the stack back to the working directory: one labeled git stash pop, which removes the top entry from the stack, and one labeled git stash apply, which copies it back but leaves the stack unchanged. A side note explains that refs/stash points at the top entry and every push and pop is recorded in the reflog of refs/stash, the same mechanism Chapter 9 covered for HEAD.</title>
+
+        <text x="380" y="24" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-mono)" font-size="11" letter-spacing=".06em">the stash stack &mdash; last in, first out</text>
+
+        <!-- working directory box -->
+        <rect x="20" y="150" width="180" height="90" rx="10" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="2"></rect>
+        <text x="110" y="180" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-display)" font-size="10.5" font-weight="800" letter-spacing=".03em">WORKING</text>
+        <text x="110" y="196" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-display)" font-size="10.5" font-weight="800" letter-spacing=".03em">DIRECTORY</text>
+        <text x="110" y="216" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">+ index</text>
+        <text x="110" y="230" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">your in-progress edit</text>
+
+        <!-- the stack: bottom (oldest, faint) drawn first, top (newest) drawn last -->
+        <rect x="470" y="230" width="220" height="56" rx="8" fill="var(--bg-2)" stroke="var(--edge)" stroke-width="1" opacity=".45"></rect>
+        <text x="580" y="253" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--ink-soft)">stash@{2} &hellip;</text>
+        <text x="580" y="270" text-anchor="middle" font-family="var(--font-body)" font-size="8" fill="var(--ink-soft)">older entries, same stack</text>
+
+        <rect x="480" y="170" width="220" height="56" rx="8" fill="var(--bg-2)" stroke="var(--edge)" stroke-width="1.5" opacity=".72"></rect>
+        <text x="590" y="193" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">stash@{1}</text>
+        <text x="590" y="210" text-anchor="middle" font-family="var(--font-body)" font-size="8.5" fill="var(--ink-soft)">On main: WIP: healing potion</text>
+
+        <rect x="490" y="100" width="220" height="60" rx="9" fill="var(--code-bg)" stroke="var(--accent-2)" stroke-width="2.5"></rect>
+        <text x="600" y="124" text-anchor="middle" font-family="var(--font-mono)" font-size="11" font-weight="700" fill="var(--accent-2)">stash@{0}</text>
+        <text x="600" y="142" text-anchor="middle" font-family="var(--font-body)" font-size="9" fill="var(--ink)">On main: WIP: sword inventory</text>
+        <text x="600" y="154" text-anchor="middle" font-family="var(--font-body)" font-size="7.5" fill="var(--accent-2)">top of stack &mdash; refs/stash points here</text>
+
+        <!-- push arrow: working dir -> top of stack -->
+        <path d="M205,165 C 320,110 400,105 486,120" stroke="var(--accent)" stroke-width="1.6" fill="none"></path>
+        <polygon points="486,120 472,116 475,128" fill="var(--accent)"></polygon>
+        <text x="335" y="100" text-anchor="middle" fill="var(--accent)" font-family="var(--font-mono)" font-size="10.5" font-weight="700">git stash push</text>
+        <text x="335" y="115" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5">new entry lands on top, older ones shift down</text>
+
+        <!-- pop arrow: top of stack -> working dir, removes entry -->
+        <path d="M486,150 C 380,200 300,215 205,205" stroke="var(--danger)" stroke-width="1.6" fill="none" stroke-dasharray="4 4"></path>
+        <polygon points="205,205 219,201 218,213" fill="var(--danger)"></polygon>
+        <text x="335" y="235" text-anchor="middle" fill="var(--danger)" font-family="var(--font-mono)" font-size="10.5" font-weight="700">git stash pop</text>
+        <text x="335" y="249" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5">restores stash@{0} AND removes it from the stack</text>
+
+        <!-- apply arrow: top of stack -> working dir, keeps entry -->
+        <path d="M486,138 C 350,290 280,300 205,222" stroke="var(--accent-3)" stroke-width="1.6" fill="none" stroke-dasharray="2 5"></path>
+        <polygon points="205,222 217,229 210,239" fill="var(--accent-3)"></polygon>
+        <text x="335" y="312" text-anchor="middle" fill="var(--accent-3)" font-family="var(--font-mono)" font-size="10.5" font-weight="700">git stash apply</text>
+        <text x="335" y="326" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5">restores stash@{0}, but LEAVES it on the stack</text>
+
+        <text x="380" y="358" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="9.5">Each entry is a real commit object under <tspan font-family="var(--font-mono)" fill="var(--ink)">refs/stash</tspan> &mdash; the stack itself is that ref's reflog (Ch. 9).</text>
+      </svg>
+      <figcaption>
+        <strong>A stack, popped or peeked.</strong> <code>push</code> adds
+        to the top; <code>pop</code> and <code>apply</code> both replay
+        <em>only</em> the top entry back into your working directory
+        &mdash; the difference is whether that entry survives the trip.
+        <code>pop</code> consumes it; <code>apply</code> leaves a copy
+        behind for later.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="stash-object-h">Under the Hood: A Stash Is Just a Commit</h2>
+    <p data-anchor="stash-object-p1">
+      Here's the payoff for having read Chapter 3 first: stashing isn't a
+      separate storage mechanism bolted onto Git. A stash <em>is</em> a
+      commit object &mdash; the exact same kind of object every
+      <code>git commit</code> in this book has created &mdash; just one
+      that lives under a different name, <code>refs/stash</code>, instead
+      of <code>refs/heads/&lt;branch&gt;</code>. Print it with the same
+      <code>git cat-file -p</code> plumbing Chapter 3 introduced, and it
+      looks almost like an ordinary commit, with one telling difference:
+    </p>
+    <pre class="code" data-anchor="stash-object-code1"><span class="cap">Terminal — the stash, pretty-printed as a commit</span><code><span class="cm">$</span> cat .git/refs/stash
+6853436<span class="num">4af04eb6e55353710af019e3672aa0ac9</span>
+<span class="cm">$</span> git cat-file -p 68534364af04eb6e55353710af019e3672aa0ac9
+tree 9fc66ff9e51835c758ceeeb1e090da681b9a7c1c
+parent 957bd8bce473171daa2810d5e9e830b379ae6ad5
+parent 921548a24c018d07be50162de520a6ddd58598dd
+author Ava &lt;ava@example.com&gt; <span class="num">1752400060</span> +0000
+committer Ava &lt;ava@example.com&gt; <span class="num">1752400060</span> +0000
+
+On main: WIP: sword inventory</code></pre>
+    <p data-anchor="stash-object-p2">
+      <strong>Two <code>parent</code> lines.</strong> Every commit you've
+      seen since Chapter 3 has had exactly one (or zero, for the first
+      commit ever) &mdash; a stash commit is a small merge commit with two:
+      the first parent is whatever <code>HEAD</code> pointed at the moment
+      you stashed, and the second is a commit built from your <em>index</em>
+      at that same instant. (Stash with <code>-u</code> and you'll get a
+      <em>third</em> parent, holding the untracked files too.) That's the
+      whole trick: <code>git stash push</code> packages "here's HEAD" and
+      "here's what was staged and unstaged" into one object, points
+      <code>refs/stash</code> at it, and only <em>then</em> resets your
+      working directory to look clean. Nothing new needed inventing &mdash;
+      it's blobs, trees, and commits, arranged in a slightly unusual shape.
+    </p>
+
+    <div class="callout key" data-anchor="stash-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        <code>git stash list</code> isn't reading some separate stash
+        database &mdash; it's printing the <strong>reflog of
+        <code>refs/stash</code></strong>, the exact mechanism Chapter 9
+        covered for <code>HEAD</code>. Every <code>push</code> appends a
+        line to <code>.git/logs/refs/stash</code> recording the old tip,
+        the new tip, and your <code>-m</code> message; that log <em>is</em>
+        the numbered <code>stash@{n}</code> stack. Run <code>git log -g
+        --oneline refs/stash</code> and you'll see the identical entries
+        <code>git stash list</code> shows you, just spelled the reflog way
+        &mdash; two chapters, one underlying idea.
+      </p>
+    </div>
+
+    <h2 data-anchor="stash-pop-h">git stash pop: Bring It Back, One Time</h2>
+    <p data-anchor="stash-pop-p1">
+      Back to the interruption. You stashed, switched context, and handled
+      the urgent thing &mdash; here, a one-line fix in a completely
+      different file, committed normally:
+    </p>
+    <pre class="code" data-anchor="stash-pop-code1"><span class="cap">Terminal — the urgent detour, unrelated to the stash</span><code><span class="cm">$</span> printf <span class="str">"URGENT: fix typo in intro\n"</span> &gt; bugfix.txt
+<span class="cm">$</span> git add bugfix.txt &amp;&amp; git commit -q -m <span class="str">"Fix urgent typo"</span>
+<span class="cm">$</span> git log --oneline
+<span class="num">1f3f99e</span> Fix urgent typo
+<span class="num">957bd8b</span> Start the story</code></pre>
+    <p data-anchor="stash-pop-p2">
+      Detour handled. Now reclaim the shelved work with <code>git stash
+      pop</code>, which reapplies <code>stash@{0}</code>'s changes on top
+      of your current working directory <em>and</em>, if that applies
+      cleanly, removes the entry from the stack &mdash; a bundled
+      "apply, then drop":
+    </p>
+    <pre class="code" data-anchor="stash-pop-code2"><span class="cap">Terminal — git stash pop, work resumes</span><code><span class="cm">$</span> git stash pop
+On branch main
+Changes not staged for commit:
+  (use <span class="str">"git add &lt;file&gt;..."</span> to update what will be committed)
+  (use <span class="str">"git restore &lt;file&gt;..."</span> to discard changes in working directory)
+	modified:   player.txt
+
+no changes added to commit (use <span class="str">"git add"</span> and/or <span class="str">"git commit -a"</span>)
+Dropped refs/stash@{0} (68534364af04eb6e55353710af019e3672aa0ac9)
+<span class="cm">$</span> cat player.txt
+Welcome to Staging Quest!
+HP: 100
+Inventory: sword
+<span class="cm">$</span> git stash list</code></pre>
+    <p data-anchor="stash-pop-p3">
+      The unstaged edit is back exactly as you left it, the "Dropped"
+      line confirms the commit object was removed from the stack, and
+      <code>git stash list</code> prints nothing &mdash; the pocket's
+      empty again. The commit itself isn't destroyed the instant it's
+      popped, by the way &mdash; same rule as Chapter 9's deleted branches
+      &mdash; it just becomes unreachable and eventually gets swept up by
+      <code>git gc</code>, so a <em>just</em>-popped stash is still
+      technically rescuable from the reflog for a little while if you
+      immediately realize you needed it.
+    </p>
+
+    <h2 data-anchor="stash-apply-h">git stash apply vs git stash pop: Keep or Remove</h2>
+    <p data-anchor="stash-apply-p1">
+      <code>pop</code> is the common case, but sometimes you want to try a
+      stash on <em>without</em> committing to giving it up &mdash; maybe
+      you're not sure this is even the right stash, or you want to apply
+      the same fix to two different branches. That's what
+      <code>git stash apply</code> is for: same restoration, but the entry
+      <strong>stays on the stack</strong> afterward, so you can apply it
+      again, or apply it somewhere else, or just decide later you're done
+      with it.
+    </p>
+    <pre class="code" data-anchor="stash-apply-code1"><span class="cap">Terminal — stash something new, then apply instead of pop</span><code><span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Add sword to inventory"</span>
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\nInventory: sword\nPotion: healing (WIP)\n"</span> &gt; player.txt
+<span class="cm">$</span> git stash push -m <span class="str">"WIP: healing potion"</span>
+Saved working directory and index state On main: WIP: healing potion
+<span class="cm">$</span> git stash apply
+On branch main
+Changes not staged for commit:
+  (use <span class="str">"git add &lt;file&gt;..."</span> to update what will be committed)
+  (use <span class="str">"git restore &lt;file&gt;..."</span> to discard changes in working directory)
+	modified:   player.txt
+
+no changes added to commit (use <span class="str">"git add"</span> and/or <span class="str">"git commit -a"</span>)
+<span class="cm">$</span> git stash list
+<span class="num">stash@{0}</span>: On main: WIP: healing potion</code></pre>
+    <p data-anchor="stash-apply-p2">
+      Look closely: the "Potion: healing (WIP)" line is back in
+      <code>player.txt</code>, exactly like <code>pop</code> would've done
+      &mdash; but <code>git stash list</code> still shows
+      <code>stash@{0}</code> sitting right there, untouched. Nothing was
+      dropped. Once you're actually done with an applied stash, remove it
+      explicitly with <code>git stash drop</code> (with no argument it
+      drops <code>stash@{0}</code>, same default as everything else):
+    </p>
+    <pre class="code" data-anchor="stash-apply-code2"><span class="cap">Terminal — done with it now, drop it for real</span><code><span class="cm">$</span> git stash drop
+Dropped refs/stash@{0} (8ba875f9f2c71ad54f1aa99a18531b0257b5b3a0)
+<span class="cm">$</span> git stash list</code></pre>
+    <p data-anchor="stash-apply-p3">
+      Put plainly: <code>pop</code> = <code>apply</code> +
+      <code>drop</code>, run as one step. Reach for <code>pop</code> when
+      you're confident you're done with the stash the moment it's back;
+      reach for <code>apply</code> (plus a manual <code>drop</code> later)
+      when you want a safety net while you check the result first.
+    </p>
+
+    <div class="callout tip" data-anchor="stash-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        Always name your stashes with <code>-m "&hellip;"</code>. A bare
+        <code>git stash push</code> labels the entry with just the branch
+        name and the last commit's subject &mdash; useless once you've got
+        three stashes and can't remember which is which. And if popping or
+        applying ever produces a merge conflict (it can, just like any
+        other merge), don't panic: Git leaves the stash entry
+        <strong>on the stack</strong> until you resolve it and either
+        commit or manually <code>git stash drop</code> it &mdash; a failed
+        pop never silently deletes your work.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="stash-warn-2">
+      <span class="co-tag">Warning</span>
+      <p>
+        Like Chapter 9's reflog, the stash stack is <strong>local
+        only</strong> &mdash; it lives under <code>refs/stash</code> and
+        <code>.git/logs/refs/stash</code> on <em>your</em> machine, and it
+        is never pushed, fetched, or cloned. A stash is not a backup you
+        can hand to a teammate or recover on a different computer; if this
+        laptop dies before you pop it, that work is gone with it. Treat
+        stashing as a same-session, "I'll be right back" tool &mdash; not
+        a substitute for actually committing (even to a scratch branch)
+        anything you want to survive past today.
+      </p>
+    </div>
+
+    <h2 data-anchor="stash-usecases-h">Where Stashing Actually Earns Its Keep</h2>
+    <ul data-anchor="stash-usecases-list">
+      <li><strong>The urgent interrupt.</strong> Mid-feature, a hotfix
+        request lands. Stash, switch, fix, push, switch back, pop &mdash;
+        five commands, zero lost context.</li>
+      <li><strong>A clean tree before pulling.</strong> <code>git pull</code>
+        (and especially a rebase-based pull) can refuse to run, or produce
+        confusing conflicts, with uncommitted local edits in the way.
+        Stash first, pull, pop after &mdash; a much cleaner story than a
+        tangled merge conflict mixing your WIP with incoming history.</li>
+      <li><strong>"Does this actually reproduce on a clean tree?"</strong>
+        Stash your in-progress debugging edits to check whether a bug
+        exists on plain <code>HEAD</code>, confirm it, then pop your
+        changes right back and keep working.</li>
+      <li><strong>Trying an idea without committing to it.</strong> Stash
+        gives you a free "undo everything since my last commit" you can
+        walk back from &mdash; safer than <code>reset --hard</code> because
+        nothing is discarded, just set aside.</li>
+    </ul>
+
+    <div class="callout lab" data-anchor="stash-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Live the whole interrupt-and-resume story yourself. Fresh throwaway
+        repo, one starting commit:
+      </p>
+      <pre class="code" data-anchor="stash-lab-code1"><span class="cap">Terminal — set the scene</span><code><span class="cm">$</span> mkdir stash-quest &amp;&amp; cd stash-quest &amp;&amp; git init -q -b main
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Start the story"</span></code></pre>
+      <p>
+        Start some in-progress work, mid-thought, then check the working
+        tree is genuinely dirty:
+      </p>
+      <pre class="code" data-anchor="stash-lab-code2"><span class="cap">Terminal — the WIP edit</span><code><span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\nInventory: sword\n"</span> &gt; player.txt
+<span class="cm">$</span> git status --short
+ M player.txt</code></pre>
+      <p>
+        Stash it with a real message, and confirm the working tree goes
+        fully clean &mdash; the edit isn't in the diff anymore, but it's
+        not gone either:
+      </p>
+      <pre class="code" data-anchor="stash-lab-code3"><span class="cap">Terminal — push, then verify a clean slate</span><code><span class="cm">$</span> git stash push -m <span class="str">"WIP: sword inventory"</span>
+Saved working directory and index state On main: WIP: sword inventory
+<span class="cm">$</span> git status
+On branch main
+nothing to commit, working tree clean
+<span class="cm">$</span> git stash list
+<span class="num">stash@{0}</span>: On main: WIP: sword inventory</code></pre>
+      <p>
+        Now go do something else entirely &mdash; the "urgent interrupt,"
+        touching a totally different file so there's no chance of overlap:
+      </p>
+      <pre class="code" data-anchor="stash-lab-code4"><span class="cap">Terminal — the interrupt, handled and committed</span><code><span class="cm">$</span> printf <span class="str">"URGENT: fix typo in intro\n"</span> &gt; bugfix.txt
+<span class="cm">$</span> git add bugfix.txt &amp;&amp; git commit -q -m <span class="str">"Fix urgent typo"</span>
+<span class="cm">$</span> git log --oneline
+<span class="num">1f3f99e</span> Fix urgent typo
+<span class="num">957bd8b</span> Start the story</code></pre>
+      <p>
+        Interrupt handled. Bring the original work back with
+        <code>pop</code>, and watch it disappear from the stack the moment
+        it lands:
+      </p>
+      <pre class="code" data-anchor="stash-lab-code5"><span class="cap">Terminal — pop, and the stack empties</span><code><span class="cm">$</span> git stash pop
+Dropped refs/stash@{0} (&hellip;)
+<span class="cm">$</span> cat player.txt
+Welcome to Staging Quest!
+HP: 100
+Inventory: sword
+<span class="cm">$</span> git stash list</code></pre>
+      <p>
+        Empty stack, and your sword edit is right back where you left off.
+        Last step &mdash; commit that, then create one more stash and this
+        time compare <code>apply</code> against <code>pop</code> directly:
+      </p>
+      <pre class="code" data-anchor="stash-lab-code6"><span class="cap">Terminal — apply keeps the entry, drop removes it explicitly</span><code><span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Add sword to inventory"</span>
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\nInventory: sword\nPotion: healing (WIP)\n"</span> &gt; player.txt
+<span class="cm">$</span> git stash push -m <span class="str">"WIP: healing potion"</span>
+<span class="cm">$</span> git stash apply
+<span class="cm">$</span> git stash list
+<span class="num">stash@{0}</span>: On main: WIP: healing potion
+<span class="cm">$</span> git stash drop
+Dropped refs/stash@{0} (&hellip;)
+<span class="cm">$</span> git stash list</code></pre>
+      <p>
+        Notice <code>apply</code> left the entry sitting in
+        <code>git stash list</code> right after restoring the file &mdash;
+        it took <code>drop</code>, run separately and on purpose, to
+        actually clear it. That's the whole difference between the two
+        commands, felt with your own hands instead of just read about.
+      </p>
+    </div>
+
+    <p data-anchor="stash-close-p1">
+      Zoom out and stashing turns out to be the least mysterious feature in
+      this book once you've read Chapter 3: no bespoke storage format, no
+      magic &mdash; just a two-parent commit under <code>refs/stash</code>,
+      a stack that's really the reflog Chapter 9 already explained, and two
+      familiar verbs, <code>apply</code> and <code>drop</code>, that
+      <code>pop</code> simply bundles together. It's the tool for pausing
+      work, not marking it &mdash; for that, Git has a different mechanism
+      entirely. Next chapter looks at how you plant a permanent flag on a
+      commit you actually want to remember forever: <strong>tags and
+      releases</strong>.
+    </p>
+
+    <p class="sources" data-anchor="stash-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/docs/git-stash" target="_blank" rel="noopener">git-scm.com &mdash; git-stash</a>
+      &middot;
+      <a href="https://git-scm.com/book/en/v2/Git-Tools-Stashing-and-Cleaning" target="_blank" rel="noopener">Pro Git, Ch. 7.3 &mdash; Stashing and Cleaning</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-reflog" target="_blank" rel="noopener">git-scm.com &mdash; git-reflog</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="10-reset-and-revert.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="12-tags-and-releases.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

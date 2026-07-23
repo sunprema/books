@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stack, Heap, and the Shape of Memory — Rust Lifetimes</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="book-title">Rust Lifetimes</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <h1><span class="ch-no">Chapter 02</span>Stack, Heap, and the Shape of Memory</h1>
+
+    <p class="lede">Before we can talk about how long data lives, we need to
+    know where it lives. This chapter is the memory-management foundation:
+    two regions, two sets of rules, and the question every language must
+    answer — <em>who cleans up?</em></p>
+
+    <h2>Two rooms in the workshop</h2>
+
+    <p>A running program gets (among other things) two regions of memory with
+    very different personalities.</p>
+
+    <p>The <strong>stack</strong> is the workbench: a strip of memory used in
+    strict last-in, first-out order. When a function is called, a
+    <em>frame</em> is pushed onto the bench — space for its parameters and
+    local variables. When the function returns, the whole frame is popped off
+    in one motion. Allocation is a single pointer bump; deallocation is free.
+    The price of that speed: everything on the stack must have a size known at
+    compile time, and nothing on the stack can outlive its frame.</p>
+
+    <p>The <strong>heap</strong> is the storeroom: a big, unordered space where
+    you can request a shelf of any size, at any time, and keep it as long as
+    you like. The allocator finds you a spot and hands back its address — a
+    <em>pointer</em>. Flexibility is the point; the price is that allocation
+    takes real work, and — crucially — <em>someone must remember to give the
+    shelf back.</em></p>
+
+    <figure>
+      <svg viewBox="0 0 760 330" role="img" aria-label="Diagram of a stack frame holding a pointer, length, and capacity, pointing into heap memory holding string bytes">
+        <style>
+          .t{ font:600 14px "Avenir Next","Helvetica Neue",sans-serif; fill:#2b2620; }
+          .s{ font:12px "Avenir Next","Helvetica Neue",sans-serif; fill:#5c5347; }
+          .m{ font:12.5px ui-monospace,Menlo,monospace; fill:#2b2620; }
+          .cell{ fill:#fbf8f1; stroke:#d9cdb8; stroke-width:1.5; }
+        </style>
+        <text x="80" y="34" class="t" fill="#1f6f6b">STACK (the workbench)</text>
+        <rect x="60" y="50" width="240" height="240" rx="10" fill="none" stroke="#1f6f6b" stroke-width="2"/>
+        <text x="76" y="76" class="m">let s: String</text>
+        <rect x="76" y="88" width="208" height="34" class="cell"/>
+        <text x="86" y="110" class="m">ptr   ●───────────</text>
+        <rect x="76" y="122" width="208" height="34" class="cell"/>
+        <text x="86" y="144" class="m">len   5</text>
+        <rect x="76" y="156" width="208" height="34" class="cell"/>
+        <text x="86" y="178" class="m">cap   8</text>
+        <text x="76" y="222" class="s">fixed size (3 words),</text>
+        <text x="76" y="240" class="s">freed automatically when</text>
+        <text x="76" y="258" class="s">the frame pops</text>
+
+        <text x="450" y="34" class="t" fill="#b7410e">HEAP (the storeroom)</text>
+        <rect x="430" y="50" width="270" height="240" rx="10" fill="none" stroke="#b7410e" stroke-width="2"/>
+        <g>
+          <rect x="450" y="96" width="30" height="34" class="cell"/><text x="459" y="118" class="m">h</text>
+          <rect x="480" y="96" width="30" height="34" class="cell"/><text x="489" y="118" class="m">e</text>
+          <rect x="510" y="96" width="30" height="34" class="cell"/><text x="519" y="118" class="m">l</text>
+          <rect x="540" y="96" width="30" height="34" class="cell"/><text x="549" y="118" class="m">l</text>
+          <rect x="570" y="96" width="30" height="34" class="cell"/><text x="579" y="118" class="m">o</text>
+          <rect x="600" y="96" width="30" height="34" fill="#efe7d8" stroke="#d9cdb8" stroke-dasharray="4 3"/>
+          <rect x="630" y="96" width="30" height="34" fill="#efe7d8" stroke="#d9cdb8" stroke-dasharray="4 3"/>
+          <rect x="660" y="96" width="30" height="34" fill="#efe7d8" stroke="#d9cdb8" stroke-dasharray="4 3"/>
+        </g>
+        <text x="450" y="160" class="s">any size, any order,</text>
+        <text x="450" y="178" class="s">lives until someone frees it —</text>
+        <text x="450" y="196" class="s">and someone MUST free it</text>
+        <path d="M 262 105 C 360 105 360 113 448 113" fill="none" stroke="#b7410e" stroke-width="2.2" marker-end="url(#arr)"/>
+        <defs>
+          <marker id="arr" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+            <polygon points="0,0 9,4 0,8" fill="#b7410e"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>A <code>String</code> is a small fixed-size handle on the stack (pointer, length, capacity) that owns a resizable buffer on the heap.</figcaption>
+    </figure>
+
+    <h2>The question every language must answer</h2>
+
+    <p>That storeroom shelf has to be returned eventually, or the program
+    slowly eats the machine. Returning it twice, or using it after returning
+    it, is worse — that's undefined behavior, the source of a large share of
+    the security bugs in systems software. So: <em>who cleans up, and when?</em>
+    Historically there have been two answers, and Rust adds a third.</p>
+
+    <table>
+      <thead>
+        <tr><th>Strategy</th><th>Who frees?</th><th>Cost</th><th>Failure mode</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Manual</strong> (C)</td>
+          <td>You, by calling <code>free</code></td>
+          <td>Your vigilance</td>
+          <td>Leaks, double-frees, use-after-free</td>
+        </tr>
+        <tr>
+          <td><strong>Garbage collection</strong> (Java, Go, Python)</td>
+          <td>A runtime, later</td>
+          <td>Memory overhead, pauses, a runtime</td>
+          <td>Unpredictable timing; leaks still possible via live references</td>
+        </tr>
+        <tr>
+          <td><strong>Ownership</strong> (Rust)</td>
+          <td>The compiler inserts the free at a known point</td>
+          <td>Thinking at compile time (this book!)</td>
+          <td>Programs that don't compile until the proof works</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Rust's answer is the interesting one: every heap allocation has exactly
+    one <em>owner</em>, and when the owner goes out of scope, the compiler
+    inserts the cleanup call right there — deterministically, at compile time,
+    with no runtime watching over your shoulder. It's as fast as the C answer
+    and as safe as the garbage-collected one. The mechanism that makes it work
+    is ownership, and it's the subject of the next chapter.</p>
+
+    <div class="callout key">
+      <span class="co-label">The Key Idea</span>
+      <p>Rust's memory management <em>is</em> its scoping rules. “When is this
+      freed?” always has a static answer: at the end of the owner's scope.
+      Lifetimes exist to extend that guarantee to <em>references</em> — pointers
+      that must never outlive the owned data they point into.</p>
+    </div>
+
+    <h2>Seeing it in Rust</h2>
+
+    <p>Let's make the picture concrete. Here's a function with both kinds of
+    data:</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">workbench</span>() {
+    <span class="kw">let</span> x = <span class="nm">42</span>;                          <span class="co">// i32: 4 bytes, lives on the stack</span>
+    <span class="kw">let</span> s = <span class="ty">String</span>::<span class="fn">from</span>(<span class="st">"hello"</span>);     <span class="co">// handle on the stack, bytes on the heap</span>
+    <span class="kw">let</span> y = x;                           <span class="co">// copy: two independent 42s</span>
+    <span class="fn">println!</span>(<span class="st">"{x} {y} {s}"</span>);
+}                                        <span class="co">// ← frame pops: x, y vanish; s's heap</span>
+                                         <span class="co">//   buffer is freed here, automatically</span></code></pre>
+
+    <p>Notice what happens at the closing brace. The stack frame pops — that
+    part is universal. But Rust also knows <code>s</code> owns a heap buffer, so
+    it inserts a call to <code>s</code>'s destructor (its <code>Drop</code>
+    implementation) right at that brace. No <code>free</code> to forget, no
+    collector to wait for. The brace <em>is</em> the memory management.</p>
+
+    <div class="callout note">
+      <span class="co-label">Note</span>
+      <p>Types like <code><span class="ty">i32</span></code>, <code><span class="ty">bool</span></code>,
+      <code><span class="ty">char</span></code>, and shared references implement
+      <code><span class="ty">Copy</span></code>: assignment duplicates them, because
+      copying a few bytes on the stack is trivially cheap and there's no heap
+      resource to double-free. Heap-owning types like
+      <code><span class="ty">String</span></code> and <code><span class="ty">Vec&lt;T&gt;</span></code>
+      are <em>not</em> <code>Copy</code> — and what assignment does to them
+      instead is the subject of chapter 3.</p>
+    </div>
+
+    <h2>Where do references fit?</h2>
+
+    <p>A reference — <code>&amp;s</code> — is just an address, a single machine
+    word on the stack pointing at data that lives somewhere else. It doesn't
+    own anything; dropping a reference frees nothing. That's exactly what makes
+    it dangerous in other systems languages: the address can outlive the thing
+    it points to. The workbench frame that held the data pops, or the storeroom
+    shelf is returned, and the address now points at ghosts. C calls this a
+    <em>dangling pointer</em> and lets it happen. Rust's entire lifetime
+    apparatus exists to make it impossible.</p>
+
+    <div class="callout workshop">
+      <span class="co-label">From the Bench</span>
+      <p>A good habit, starting now: whenever you see a variable, ask
+      <em>“stack or heap? owner or borrower?”</em> Every lifetime puzzle in this
+      book unravels once you can answer those two questions for each name in
+      the code.</p>
+    </div>
+
+    <h2>So what did we actually gain?</h2>
+
+    <p>We now know the terrain. Stack: fast, fixed-size, frame-scoped. Heap:
+    flexible, but someone must free it. Rust's answer to “who frees?” is
+    <em>the owner's closing brace</em> — a compile-time answer where other
+    languages give a runtime one. References are non-owning addresses into
+    either region, and keeping them honest is the borrow checker's whole job.
+    Next: ownership, the rule that makes the closing brace trustworthy.</p>
+
+    <div class="challenges">
+      <h3>Challenges</h3>
+      <ol>
+        <li>A <code><span class="ty">Vec&lt;i32&gt;</span></code> with 1,000
+        elements: how many bytes does it occupy <em>on the stack</em>? (Hint:
+        the same as an empty one.)</li>
+        <li>Why can't a value whose size is only known at run time — like the
+        string contents typed by a user — live directly on the stack?</li>
+        <li>In C, <code>free(p); free(p);</code> is catastrophic. Explain, in
+        workshop terms, why “exactly one owner” makes a double-free
+        structurally impossible rather than merely discouraged.</li>
+      </ol>
+    </div>
+
+    <div class="sources">
+      <ul>
+        <li>Source: <a href="https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html">The Rust Programming Language, ch. 4.1 — What Is Ownership?</a></li>
+      </ul>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="01-the-trouble-with-lifetimes.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="03-ownership-and-moves.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Distribution: Nodes Talking to Nodes — The BEAM Under the Hood</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">The BEAM<span class="dot">.</span></span>
+  <span class="chip">07 · Distribution</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 07 · Across the Wire</p>
+    <h1>Distribution: Nodes Talking to Nodes</h1>
+    <p class="dek">The same letters, now posted between buildings — and the network is not reliable.</p>
+
+    <p class="lead">Everything so far has happened inside one machine — one BEAM, many processes. But the same
+    idea stretches, rather magically, across machines. Start Erlang on two computers, connect them, and a process
+    here can send a message to a process there with <em>exactly the same</em> <code>send</code> it would use
+    locally. Distribution is the BEAM taking its message-passing model and running it over the network. It's a
+    lovely trick — and, being honest, it's the place where the tidy in-memory picture meets the messy real world,
+    so we'll spend equal time on what it gives you and where the edges are.</p>
+
+    <h2>Nodes, names, and a shared secret</h2>
+    <p>A running BEAM that can talk to others is a <strong>node</strong>, and it has a name like
+    <code>app@host</code>. Nodes find each other's ports through a little helper called <strong>epmd</strong>, the
+    Erlang Port Mapper Daemon, which runs on each host and answers the question "what TCP port is the node named
+    <code>app</code> listening on?" To connect at all, two nodes must share the same secret — the
+    <strong>magic cookie</strong>, an atom kept in <code>~/.erlang.cookie</code>. Same cookie, they may talk;
+    different cookie, they're refused. It's a coarse, all-or-nothing trust, so keep that cookie private.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p>Distributed send is <strong>location-transparent</strong>. Given a pid, <code>send(pid, msg)</code> works
+      the same whether that pid lives in your VM or on a node across the room — the BEAM copies the message and
+      ships it over a TCP link for you. The <em>syntax</em> and the <em>semantics</em> are identical to a local
+      send. What is <strong>not</strong> identical is the failure and latency profile — and forgetting that is how
+      distributed systems break hearts.</p>
+    </div>
+
+    <h2>The full mesh</h2>
+    <p>By default, distributed Erlang builds a <strong>fully connected mesh</strong>. The moment your node connects
+    to one visible node, it also connects to <em>every</em> node that one already knows about, until everybody has a
+    direct link to everybody. For a small cluster this is delightful: any node can reach any other in one hop, no
+    routing to think about. But look at the shape of it — with N nodes you have roughly N² connections, each with its
+    heartbeats and buffers. That cost grows fast.</p>
+
+    <figure class="svg-card">
+      <svg viewBox="0 0 700 220" role="img" aria-label="Five nodes each connected to every other node, forming a full mesh; one link is drawn dashed and sparking to show the network is unreliable.">
+        <g class="chalk-stroke" stroke-width="1.4">
+          <line x1="350" y1="40" x2="560" y2="110"/>
+          <line x1="350" y1="40" x2="480" y2="185"/>
+          <line x1="350" y1="40" x2="220" y2="185"/>
+          <line x1="350" y1="40" x2="140" y2="110"/>
+          <line x1="560" y1="110" x2="480" y2="185"/>
+          <line x1="560" y1="110" x2="140" y2="110"/>
+          <line x1="480" y1="185" x2="220" y2="185"/>
+          <line x1="220" y1="185" x2="140" y2="110"/>
+        </g>
+        <line x1="560" y1="110" x2="220" y2="185" class="chalk-accent" stroke-width="1.8" stroke-dasharray="5 5" style="stroke:var(--num)"/>
+        <text x="405" y="150" font-size="11" style="fill:var(--num)" font-family="var(--font-mono)">↯ flaky link</text>
+        <g font-family="var(--font-mono)" font-size="12">
+          <circle cx="350" cy="40" r="24" class="chalk-stroke" stroke-width="2" fill="var(--bg)"/><text x="350" y="45" text-anchor="middle" class="chalk-fill">n1</text>
+          <circle cx="560" cy="110" r="24" class="chalk-stroke" stroke-width="2" fill="var(--bg)"/><text x="560" y="115" text-anchor="middle" class="chalk-fill">n2</text>
+          <circle cx="480" cy="185" r="24" class="chalk-stroke" stroke-width="2" fill="var(--bg)"/><text x="480" y="190" text-anchor="middle" class="chalk-fill">n3</text>
+          <circle cx="220" cy="185" r="24" class="chalk-stroke" stroke-width="2" fill="var(--bg)"/><text x="220" y="190" text-anchor="middle" class="chalk-fill">n4</text>
+          <circle cx="140" cy="110" r="24" class="chalk-stroke" stroke-width="2" fill="var(--bg)"/><text x="140" y="115" text-anchor="middle" class="chalk-fill">n5</text>
+        </g>
+        <text x="350" y="212" text-anchor="middle" font-size="11" class="chalk-soft">everyone wired to everyone — lovely at 5 nodes, a problem at 500</text>
+      </svg>
+      <figcaption>The default topology: a full mesh. One hop to anywhere, but roughly N² connections — which is
+      exactly why these clusters are measured in tens of nodes, not thousands.</figcaption>
+    </figure>
+
+    <h2>How a node knows another has died</h2>
+    <p>Links across a network need a heartbeat, because a silent peer might be busy, or might be gone. So
+    <code>net_kernel</code> sends periodic <strong>ticks</strong> between connected nodes. If the ticks stop
+    arriving, the node is declared down. The interval is <code>net_ticktime</code>, defaulting to
+    <strong>60 seconds</strong>, and detection lands somewhere within roughly a quarter of that either way. Your
+    code can subscribe to these life-and-death events with <code>net_kernel:monitor_nodes/1</code> and receive
+    <code>nodeup</code> / <code>nodedown</code> messages — the same "tell me when it dies" pattern you use for
+    processes, lifted up to whole machines.</p>
+
+    <div class="callout warn">
+      <span class="tag">Sixty seconds is a long time</span>
+      <p>That default 60-second tick means a crashed node can look alive for up to a minute. For many systems that's
+      fine; for a chat or trading system it's an eternity. You can shorten <code>net_ticktime</code>, but tighten it
+      too far and a momentary network hiccup will falsely declare a healthy node dead, triggering needless failover.
+      Choosing this number <em>is</em> the design of your failure detector — there's no free lunch, only a dial
+      between "slow to notice" and "jumpy."</p>
+    </div>
+
+    <h2>Where the model strains</h2>
+    <p>There's one connection per pair of nodes, and historically a single big message could clog it — a 100&nbsp;MB
+    term in flight would make small, urgent messages wait behind it (<em>head-of-line blocking</em>). OTP 22 softened
+    this with <strong>message fragmentation</strong>: large terms are chopped into chunks and interleaved, so a
+    little message can slip between the pieces of a big one. But note what didn't change — it's still one connection
+    per pair. There is no built-in "many parallel links per node pair," even in recent OTP. When people genuinely need
+    to go past the full mesh — hundreds or thousands of nodes — they reach outside core distribution for it (libraries
+    like Partisan, or purpose-built topologies), rather than expecting the mesh to stretch that far.</p>
+
+    <div class="reflect">So what did distribution buy us? The whole programming model — spawn, send, monitor, let it
+    crash — extended across machines with the syntax unchanged. That transparency is a gift and a trap in one. A gift,
+    because you already know the API. A trap, because <b>the network is not reliable</b>, and a send that always
+    succeeded in memory can now vanish, arrive late, or arrive after the node you sent it to is already gone. The BEAM
+    hands you the same tools; it's on you to remember you're now using them over something that lies.</div>
+
+    <h3>Try it yourself</h3>
+    <ol class="challenges">
+      <li>Start two named nodes (<code>iex --sname a</code>, <code>iex --sname b</code>), connect with
+      <code>Node.connect/1</code>, and <code>Node.spawn/2</code> a process on the other. Same <code>send</code>,
+      different machine.</li>
+      <li>Subscribe with <code>:net_kernel.monitor_nodes(true)</code>, kill one node, and watch the
+      <code>:nodedown</code> arrive. Time how long it takes with the default tick.</li>
+      <li>Set <code>net_ticktime</code> low on both nodes, then pause one with Ctrl-Z for a few seconds. Watch a
+      healthy node get wrongly declared down — and feel the tradeoff in the dial.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Erlang/OTP System docs, "Distributed Erlang" · Kernel docs,
+    <code>net_kernel</code> (<code>net_ticktime</code>, <code>monitor_nodes</code>) · "Scaling Erlang distribution:
+    going beyond the fully connected mesh" (Erlang Workshop 2019). Links on the cheatsheet.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="06-dirty-schedulers.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="08-why-liveview-scales.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

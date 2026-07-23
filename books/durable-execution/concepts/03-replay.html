@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Checkpointing, Event Sourcing &amp; Deterministic Replay — Durable Execution</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Durable Execution<span class="dot">.</span></span>
+  <span class="chip">03 · Replay</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 03 · Rebuilding a Life</p>
+    <h1>Checkpointing, Event Sourcing &amp; Deterministic Replay</h1>
+    <p class="dek">How a program that died in the middle wakes up knowing exactly where it was.</p>
+
+    <p class="lead" data-anchor="rp-lead">Last chapter we made a durable log for <em>data</em>. Now we
+    do something bolder: we make a durable log for a <em>program's progress</em> — its place in the
+    story, the results it has gathered, the branch it took. This is the heart of durable execution.
+    When the machine dies mid-workflow, we do not restart from the beginning and hope; we
+    <strong>reconstruct</strong> the exact state the program was in and carry on from there. There are
+    two ways to do that reconstruction, and the good engines use both.</p>
+
+    <h2 data-anchor="rp-h-two">Two ways to remember: checkpoint and log</h2>
+    <p data-anchor="rp-p-checkpoint">A <strong>checkpoint</strong> is a snapshot: you periodically
+    write the whole current state to stable storage. To recover, load the latest snapshot. Simple, but
+    coarse — if you snapshot every minute and crash at 59 seconds, you lose 59 seconds of work, and
+    snapshotting a large state often is expensive.</p>
+
+    <p data-anchor="rp-p-eventsource"><strong>Event sourcing</strong> takes the other road, and it is
+    the ledger from Chapter 2 wearing new clothes. Instead of storing the current state, store the
+    ordered <em>sequence of events</em> that produced it. The current state is not a thing you keep —
+    it is a thing you <em>compute</em>, by folding the events from the start. Your bank balance is not
+    a stored number; it is the sum of every deposit and withdrawal, in order. Lose the balance and you
+    recompute it. The events are the truth; the state is derived.</p>
+
+    <div class="callout key" data-anchor="rp-callout-combo">
+      <span class="tag">In practice, both</span>
+      <p>Pure replay-from-zero gets slow as the history grows; pure checkpointing is coarse and heavy.
+      So real systems <strong>checkpoint occasionally and log the deltas continuously</strong>:
+      recover by loading the last checkpoint, then replaying only the events since. This is precisely
+      ARIES again — the checkpoint bounds how far back Redo must scan. The same idea, one layer up: a
+      snapshot to stand on, a log to finish the climb.</p>
+    </div>
+
+    <figure
+      class="img-slot"
+      data-img-slot="replay-ledger"
+      data-img-file="assets/img/replay-ledger.webp"
+      data-anchor="rp-fig-replay"
+      style="--img-aspect:16 / 9"
+    >
+      <img
+        class="img-real"
+        src="../assets/img/replay-ledger.webp"
+        alt="A hand re-reading a ledger to rebuild a scene of stacked blocks exactly as it stood before"
+        width="1280" height="720"
+        onerror="this.closest('.img-slot').classList.add('img-missing')"
+      />
+      <div class="img-drop">
+        <div class="img-drop-inner">
+          <strong>Illustration needed</strong>
+          <p class="img-prompt">A warm, scholarly engraved illustration in classic printed-book style on
+            aged paper (cream, sepia, single oxblood-red accent). A hand runs a finger down the ruled
+            lines of an open ledger; from each line, an action rises to rebuild a small tower of labelled
+            blocks on a table, reconstructed exactly as a faded 'ghost' outline shows it once stood. The
+            bottom lines are not yet read and the top blocks are still faint/half-formed — the rebuild in
+            progress. One block bears a small tick: a completed step whose result is remembered, not
+            redone. Fine cross-hatch engraving, restrained, no readable text baked in. ~1280×720px, 16:9
+            landscape, centred with safe margins.</p>
+          <button type="button" class="img-copy">Copy prompt</button>
+          <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+        </div>
+      </div>
+      <figcaption>Replay: read the recorded history from the top and the program's state rebuilds
+      itself, step for step — with finished work simply remembered, never repeated.</figcaption>
+    </figure>
+
+    <h2 data-anchor="rp-h-temporal">The trick: run the code, but honour the record</h2>
+    <p data-anchor="rp-p-temporal1">Here is the move that makes durable execution feel like magic, told
+    without the magic. An engine like <strong>Temporal</strong> writes your workflow as ordinary code —
+    a function that calls out to steps (it names them <em>activities</em>). Every meaningful thing that
+    happens is appended to a durable <strong>event history</strong> held on the server: the workflow
+    started, an activity was scheduled, an activity completed with <em>this</em> result, a timer fired.
+    That history is the log, and it is never lost.</p>
+
+    <p data-anchor="rp-p-temporal2">Now the machine running your workflow dies. A fresh worker picks it
+    up and does something that sounds absurd at first: it <strong>runs your workflow function again,
+    from the top.</strong> But it runs it against the history. When your code reaches the line that
+    charges the card, the engine does <em>not</em> charge the card again — it looks in the history,
+    finds "charge activity completed = ok," and hands that recorded result straight back to your code
+    as if the call had just returned. Your code doesn't know it's a rerun. It walks the same path,
+    making the same decisions, until it reaches the last recorded event — and there, at the frontier,
+    it continues live, doing genuinely new work. The state was rebuilt not by loading it, but by
+    <em>re-deriving</em> it from the log.</p>
+
+    <pre data-anchor="rp-pre-replay"><span class="cap">the same function, run twice — once live, once as replay</span><code><span class="k">def</span> <span class="fn">onboard</span>(user):
+    charge = <span class="fn">activity</span>(<span class="fn">charge_card</span>, user)   <span class="co"># history: completed = ok → NOT re-run on replay</span>
+    <span class="fn">sleep</span>(<span class="num">24</span> * <span class="num">3600</span>)                 <span class="co"># history: timer fired → already elapsed on replay</span>
+    ship  = <span class="fn">activity</span>(<span class="fn">ship_kit</span>, user)      <span class="co"># history: completed = ok → remembered, not repeated</span>
+    <span class="k">return</span> {<span class="str">"charged"</span>: charge, <span class="str">"shipped"</span>: ship}
+
+<span class="co"># Replay walks charge → sleep → ship using RECORDED results,</span>
+<span class="co"># then continues live from the first event the history doesn't have yet.</span></code></pre>
+
+    <h2 data-anchor="rp-h-determinism">The price of admission: determinism</h2>
+    <p data-anchor="rp-p-det1">This beautiful trick has one hard condition, and it is the thing people
+    stub their toe on. For replay to reconstruct the <em>same</em> state, the workflow code must be
+    <strong>deterministic</strong>: given the same history, it must take the same path and issue the
+    same commands in the same order. If, on the original run, your code branched on
+    <code>rand()</code> or on the wall clock or on some value it read directly from a database, then on
+    replay those would come out <em>different</em> — the code would take a different branch than the
+    history records, and the reconstruction would be nonsense.</p>
+
+    <div class="callout crash" data-anchor="rp-callout-nondeterm">
+      <span class="tag">The cardinal sin</span>
+      <p>Inside workflow code, do not read the clock, do not roll dice, do not reach out to the network
+      or the database directly. Every one of those is a value that differs between the first run and the
+      replay, and any of them will break the reconstruction — engines will even raise a
+      <em>non-determinism error</em> and refuse to continue. The discipline: push all of that outside,
+      into <strong>activities</strong> (whose results get recorded), or ask the <em>engine</em> for the
+      time and the random number so that <em>it</em> records them in the history. Then replay sees the
+      same values the original run did, because it is literally reading them back off the log.</p>
+    </div>
+
+    <p data-anchor="rp-p-det2">And what about the day you fix a bug in the workflow code, while old
+    executions are still out there mid-flight, carrying histories written by the <em>previous</em>
+    version? Change the shape of the code and replay may diverge from the history it is being replayed
+    against. This is a real operational hazard, and the engines answer it with
+    <strong>versioning</strong> (Temporal calls the mechanism <em>patching</em>): the code asks "am I
+    running an old history or a new one?" and takes the matching branch, so histories written under the
+    old logic keep replaying the old logic. It is exactly the discipline of a schema migration, applied
+    to control flow.</p>
+
+    <div class="reflect" data-anchor="rp-reflect">Strip away the vocabulary and it is Chapter 2's dance
+    once more: <b>repeat history to a known point, then continue.</b> ARIES redid log records against
+    pages; a workflow engine redoes your function against an event history. The genius is only in what
+    gets logged — not bytes on a page, but the <b>results of a program's decisions</b> — so that a
+    plain-looking function becomes something that can die and be reborn exactly where it stood.</div>
+
+    <div class="envelope" data-anchor="rp-env">
+      <span class="tag">Back of the envelope</span>
+      <p>Replay is cheap because it does no real work: activities aren't re-run, they're read from
+      history — so replaying a workflow with 200 events is a couple hundred hand-backs from a list,
+      microseconds each, not 200 network calls. That asymmetry is the whole economic argument: the
+      expensive things happen once and are remembered; the cheap re-derivation happens as often as
+      crashes demand.</p>
+    </div>
+
+    <h3 data-anchor="rp-try">Think it through</h3>
+    <ol class="challenges">
+      <li>Find one <code>Date.now()</code> or <code>rand()</code> hidden in orchestration code you own.
+      Ask: if I re-ran this function against a recorded history, would that line give the same answer?
+      If not, it belongs in an activity.</li>
+      <li>Take a small aggregate you keep as a stored number (a counter, a balance). Rewrite it, on
+      paper, as an event log plus a fold. Notice you can now audit <em>why</em> it holds any value.</li>
+      <li>Explain to a colleague why an engine re-runs the whole workflow function on recovery instead
+      of serialising and reloading local variables. (Hint: which is easier to keep correct across a
+      code change — a snapshot of raw memory, or a replay of decisions?)</li>
+    </ol>
+
+    <div class="sources" data-anchor="rp-sources"><b>Sources</b> · Temporal docs, <em>Workflows</em>
+    and <em>Events and Event History</em> · Learn Temporal, <em>Develop code that durably executes</em>
+    · Mohan et al., <em>ARIES</em> (1992) for the checkpoint-plus-log lineage. See the cheatsheet for
+    links.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="02-the-log.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="04-idempotency.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script>
+document.addEventListener('click',function(e){
+  var b=e.target.closest && e.target.closest('.img-copy'); if(!b) return;
+  var p=b.closest('.img-slot').querySelector('.img-prompt');
+  if(p&&navigator.clipboard){ navigator.clipboard.writeText(p.textContent.trim());
+    b.textContent='Copied ✓'; setTimeout(function(){b.textContent='Copy prompt';},1400);}
+});
+</script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

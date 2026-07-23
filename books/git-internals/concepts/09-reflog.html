@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reflog: Git's Time Travel Log — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 9 · Reflog</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="reflog-kicker">Chapter 9 of 17 &middot; The panic button</p>
+    <h1 data-anchor="reflog-h1">Reflog: Git's <span class="hl">Time Travel</span> Log</h1>
+
+    <p class="lede" data-anchor="reflog-lede">
+      "I deleted my branch. Can I get it back?" If you've never typed that
+      sentence into a search bar at 2am, heart sinking, you will one day
+      &mdash; and when you do, the answer is almost always yes. Chapter 8
+      ended with a promise: a second, quieter safety net has been recording
+      every move you've made in this book without you ever asking it to.
+      This chapter pulls back the curtain on the <strong>reflog</strong>,
+      and by the end you'll have deleted a branch on purpose, felt the
+      little jolt of "wait, is it actually gone?", and pulled it right back
+      out of the log where Git was keeping it the whole time.
+    </p>
+
+    <h2 data-anchor="reflog-story-h">The Panic, in Real Time</h2>
+    <p data-anchor="reflog-story-p1">
+      Here's the scenario, and it's not exaggerated &mdash; ask any
+      developer with a few years in and they'll have a version of this
+      story. You finish a feature on a branch, merge it (or think you did),
+      and clean up after yourself:
+    </p>
+    <pre class="code" data-anchor="reflog-story-code1"><span class="cap">Terminal — the moment of panic</span><code><span class="cm">$</span> git branch -D feature-boss-fight
+Deleted branch feature-boss-fight (was 28ce70b).
+<span class="cm">$</span> git branch -v
+<span class="str">*</span> main 2653c06 Start the story
+<span class="cm">$</span> git log --oneline --all
+2653c06 Start the story</code></pre>
+    <p data-anchor="reflog-story-p2">
+      And there it is &mdash; the sinking feeling. <code>git branch -v</code>
+      shows only <code>main</code>. <code>git log --all</code>, which walks
+      every ref Git knows about, shows exactly one commit. Two whole commits
+      of work &mdash; "Add boss room" and "Defeat the boss" &mdash; have
+      vanished from every command that lists history. Before you panic
+      further: <strong>they haven't gone anywhere.</strong> <code>git
+      branch -D</code> only ever deletes the 41-byte pointer file in
+      <code>refs/heads/</code> (Chapter 5's whole lesson). The commit
+      objects themselves are still sitting in <code>objects/</code>,
+      completely intact &mdash; they're just <em>unreachable</em> now,
+      because nothing points at them anymore. Or rather, nothing you've
+      checked <em>yet</em>.
+    </p>
+
+    <div class="callout key" data-anchor="reflog-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Deleting a branch never deletes commits &mdash; it deletes a
+        <em>pointer</em> to them. A commit only truly disappears once
+        nothing reachable references it <em>and</em> enough time passes for
+        Git's garbage collector to sweep it away. In between those two
+        moments, there's a window where the commit is "lost" from the normal
+        views but still fully recoverable &mdash; and the reflog is exactly
+        the map that tells you where to look.
+      </p>
+    </div>
+
+    <h2 data-anchor="reflog-what-h">What the Reflog Actually Is</h2>
+    <p data-anchor="reflog-what-p1">
+      Chapter 2 already showed you where it lives: <code>.git/logs/</code>.
+      The <strong>reflog</strong> (short for "reference log") is Git quietly
+      keeping a diary for every ref that matters, especially
+      <code>HEAD</code>. Every single time <code>HEAD</code> starts pointing
+      at a different commit &mdash; because you committed, checked out a
+      branch, merged, rebased, reset, or even just detached &mdash; Git
+      appends one line to <code>logs/HEAD</code>: the old hash, the new
+      hash, who did it, when, and a short note about which command moved
+      it. Individual branches get their own diary too:
+      <code>logs/refs/heads/main</code> tracks only <code>main</code>'s
+      journey, separately from <code>HEAD</code>'s.
+    </p>
+    <p data-anchor="reflog-what-p2">
+      You don't read those files directly &mdash; you ask for them with
+      <code>git reflog</code>, which (per its own docs) is shorthand for
+      <code>git reflog show HEAD</code>: it defaults to showing
+      <code>HEAD</code>'s log specifically, newest entry first. Each line
+      has an address of its own, <code>HEAD@{n}</code> &mdash; "where HEAD
+      was <code>n</code> moves ago" &mdash; and that address works
+      anywhere Git expects a commit: <code>git show HEAD@{2}</code>,
+      <code>git diff HEAD@{5} HEAD@{0}</code>, all of it.
+    </p>
+
+    <figure class="diagram" data-anchor="reflog-diagram">
+      <svg viewBox="0 0 760 460" role="img" aria-labelledby="reflog-svg-title">
+        <title id="reflog-svg-title">A chronological reflog timeline, newest entry at top: HEAD at zero, checkout moving from feature-boss-fight to main, at commit 2653c06. HEAD at one, commit Defeat the boss, at commit 28ce70b. HEAD at two, commit Add boss room, at commit ba4132c. HEAD at three, checkout moving from main to feature-boss-fight, at commit 2653c06. HEAD at four, commit initial Start the story, at commit 2653c06. A dashed arrow labeled git checkout dash b feature-boss-fight 28ce70b runs from a recovered-branch box back up to the HEAD at one entry, showing recovery pulls the lost tip back out of the log.</title>
+
+        <text x="380" y="26" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-mono)" font-size="11" letter-spacing=".08em">
+          logs/HEAD &mdash; newest at top, oldest at bottom
+        </text>
+
+        <!-- timeline spine -->
+        <line x1="70" y1="46" x2="70" y2="392" stroke="var(--rule)" stroke-width="2"></line>
+
+        <!-- row template: dot at x=70, box starting x=100 -->
+        <!-- HEAD@{0} checkout -->
+        <circle cx="70" cy="66" r="7" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="2.5"></circle>
+        <rect x="100" y="46" width="620" height="42" rx="8" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="1.5"></rect>
+        <text x="115" y="63" font-family="var(--font-mono)" font-size="11" font-weight="700" fill="var(--accent)">HEAD@{0}</text>
+        <text x="115" y="79" font-family="var(--font-body)" font-size="10.5" fill="var(--ink)">checkout: moving from feature-boss-fight to main</text>
+        <text x="700" y="71" text-anchor="end" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">2653c06</text>
+
+        <!-- HEAD@{1} commit Defeat the boss (the one we'll recover) -->
+        <circle cx="70" cy="140" r="7" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <rect x="100" y="120" width="620" height="42" rx="8" fill="var(--bg-2)" stroke="var(--obj-commit)" stroke-width="2.5"></rect>
+        <text x="115" y="137" font-family="var(--font-mono)" font-size="11" font-weight="700" fill="var(--obj-commit)">HEAD@{1}</text>
+        <text x="115" y="153" font-family="var(--font-body)" font-size="10.5" fill="var(--ink)">commit: Defeat the boss</text>
+        <text x="700" y="145" text-anchor="end" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">28ce70b</text>
+
+        <!-- HEAD@{2} commit Add boss room -->
+        <circle cx="70" cy="214" r="7" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <rect x="100" y="194" width="620" height="42" rx="8" fill="var(--bg-2)" stroke="var(--edge)"></rect>
+        <text x="115" y="211" font-family="var(--font-mono)" font-size="11" font-weight="700" fill="var(--obj-commit)">HEAD@{2}</text>
+        <text x="115" y="227" font-family="var(--font-body)" font-size="10.5" fill="var(--ink)">commit: Add boss room</text>
+        <text x="700" y="219" text-anchor="end" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">ba4132c</text>
+
+        <!-- HEAD@{3} checkout -->
+        <circle cx="70" cy="288" r="7" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="2.5"></circle>
+        <rect x="100" y="268" width="620" height="42" rx="8" fill="var(--bg-2)" stroke="var(--edge)"></rect>
+        <text x="115" y="285" font-family="var(--font-mono)" font-size="11" font-weight="700" fill="var(--accent)">HEAD@{3}</text>
+        <text x="115" y="301" font-family="var(--font-body)" font-size="10.5" fill="var(--ink)">checkout: moving from main to feature-boss-fight</text>
+        <text x="700" y="293" text-anchor="end" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">2653c06</text>
+
+        <!-- HEAD@{4} commit initial -->
+        <circle cx="70" cy="362" r="7" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <rect x="100" y="342" width="620" height="42" rx="8" fill="var(--bg-2)" stroke="var(--edge)"></rect>
+        <text x="115" y="359" font-family="var(--font-mono)" font-size="11" font-weight="700" fill="var(--obj-commit)">HEAD@{4}</text>
+        <text x="115" y="375" font-family="var(--font-body)" font-size="10.5" fill="var(--ink)">commit (initial): Start the story</text>
+        <text x="700" y="367" text-anchor="end" font-family="var(--font-mono)" font-size="11" fill="var(--ink-soft)">2653c06</text>
+
+        <!-- recovery arrow: from a "recovered branch" tag back to HEAD@{1} -->
+        <g stroke="var(--accent-2)" stroke-width="1.8" fill="none" stroke-dasharray="5 4">
+          <path d="M640,420 L640,141 L620,141"></path>
+        </g>
+        <polygon points="620,141 630,135 630,147" fill="var(--accent-2)"></polygon>
+        <rect x="470" y="404" width="250" height="34" rx="8" fill="var(--code-bg)" stroke="var(--accent-2)" stroke-width="1.5"></rect>
+        <text x="595" y="426" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" font-weight="700" fill="var(--accent-2)">git checkout -b feature-boss-fight 28ce70b</text>
+
+        <text x="380" y="450" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="10.5">
+          <tspan font-family="var(--font-mono)" fill="var(--ink)">git branch -D</tspan> deleted the pointer, not the commit &mdash; HEAD@{1} still remembers exactly where it was.
+        </text>
+      </svg>
+      <figcaption>
+        <strong>The reflog is a diary of HEAD, not a diary of branches.</strong>
+        Notice what's <em>missing</em>: there's no line that says "deleted
+        branch feature-boss-fight." Branch deletion doesn't move
+        <code>HEAD</code>, so it never gets an entry here &mdash; what
+        survives is the trail of commits and checkouts that led up to it,
+        which is more than enough to find the lost tip again.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="reflog-recover-h">Reading the Trail Back to the Lost Tip</h2>
+    <p data-anchor="reflog-recover-p1">
+      Back to the panic. Instead of despairing at <code>git log</code>, ask
+      the reflog what it remembers:
+    </p>
+    <pre class="code" data-anchor="reflog-recover-code1"><span class="cap">Terminal — git reflog, right after the delete</span><code><span class="cm">$</span> git reflog
+2653c06 <span class="num">HEAD@{0}</span>: checkout: moving from feature-boss-fight to main
+28ce70b <span class="num">HEAD@{1}</span>: commit: Defeat the boss
+ba4132c <span class="num">HEAD@{2}</span>: commit: Add boss room
+2653c06 <span class="num">HEAD@{3}</span>: checkout: moving from main to feature-boss-fight
+2653c06 <span class="num">HEAD@{4}</span>: commit (initial): Start the story</code></pre>
+    <p data-anchor="reflog-recover-p2">
+      Read it like a diary, top to bottom, newest to oldest: "HEAD just
+      checked out from <code>feature-boss-fight</code> back to
+      <code>main</code>. Before that, HEAD was at a commit called
+      'Defeat the boss.' Before that, 'Add boss room.'" That second line,
+      <code>HEAD@{1}</code>, is exactly the commit the deleted branch used
+      to point at &mdash; the tip of the work you thought you'd lost, sitting
+      right there with its hash spelled out: <code>28ce70b</code>. The
+      commit was never in danger. Only your <em>name</em> for it was gone.
+    </p>
+    <p data-anchor="reflog-recover-p3">
+      Recovery is one command &mdash; hand that hash to
+      <code>git checkout -b</code> (or the equivalent <code>git switch -c</code>)
+      to create a brand new branch pointing right at it, exactly the way
+      Chapter 5's hand-rolled <code>refs/heads/feature</code> trick worked:
+    </p>
+    <pre class="code" data-anchor="reflog-recover-code2"><span class="cap">Terminal — resurrecting the branch</span><code><span class="cm">$</span> git checkout -b feature-boss-fight 28ce70b
+Switched to a new branch <span class="str">'feature-boss-fight'</span>
+<span class="cm">$</span> git log --oneline
+28ce70b Defeat the boss
+ba4132c Add boss room
+2653c06 Start the story
+<span class="cm">$</span> git branch -v
+<span class="str">*</span> feature-boss-fight 28ce70b Defeat the boss
+  main               2653c06 Start the story</code></pre>
+    <p data-anchor="reflog-recover-p4">
+      Full history, same hash, same file contents, same branch name if you
+      want it back exactly &mdash; because you rebuilt the pointer that
+      pointed at real, never-deleted commit objects the whole time. This is
+      not a special trick reserved for reflog experts; it's the single most
+      common real-world use of the reflog, and Pro Git's own "Data
+      Recovery" chapter walks through this exact move.
+    </p>
+
+    <div class="callout tip" data-anchor="reflog-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        The reflog rescues more than deleted branches. A botched
+        <code>git rebase</code>, an over-eager <code>git reset --hard</code>,
+        even accidentally amending the wrong commit &mdash; all of them just
+        move where a ref points, and the reflog remembers every stop along
+        the way. <code>git reflog</code> (or its longer twin,
+        <code>git log -g</code>, which shows full commit messages per entry)
+        is worth trying <em>before</em> you conclude anything is really
+        gone. If you know roughly when, <code>git reflog</code> also accepts
+        time-based lookups like <code>HEAD@{2.hours.ago}</code> or
+        <code>HEAD@{yesterday}</code>.
+      </p>
+    </div>
+
+    <h2 data-anchor="reflog-limits-h">What the Reflog Won't Do</h2>
+    <p data-anchor="reflog-limits-p1">
+      Two limits worth knowing before you lean on it as a permanent
+      backup plan. First: the reflog only records history for refs
+      <em>this repository has actually seen move</em>. If a commit was
+      never checked out, committed, merged into, or otherwise made current
+      here, there's no reflog entry pointing at it &mdash; <code>git
+      fsck --full</code> (which scans every object directly) is the
+      fallback for that rarer case. Second, and this is the one that trips
+      people up the most:
+    </p>
+
+    <div class="callout warn" data-anchor="reflog-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        <strong>The reflog is local only &mdash; it is never pushed,
+        pulled, fetched, or cloned, and it doesn't live forever.</strong>
+        It's a file under <code>.git/logs/</code> on <em>your</em> machine,
+        describing what <em>your</em> HEAD and branches did on <em>your</em>
+        clone. Your teammate's reflog knows nothing about your deleted
+        branch, and pushing or cloning never transfers it &mdash; only
+        commits, trees, blobs, and refs travel over the network. It also
+        isn't permanent: Git's garbage collector (<code>git gc</code>,
+        which runs automatically in the background as
+        <code>git gc --auto</code>) expires old entries &mdash; by default,
+        reflog entries still reachable from a branch expire after
+        <strong>90 days</strong> (<code>gc.reflogExpire</code>), and entries
+        that have become <em>unreachable</em>, like our deleted branch's
+        old tip once nothing else points at it, expire after just
+        <strong>30 days</strong> (<code>gc.reflogExpireUnreachable</code>).
+        Delete a branch and mean to recover it &mdash; do it soon, on the
+        same machine, before gc has a chance to sweep the entry away.
+      </p>
+    </div>
+
+    <div class="callout lab" data-anchor="reflog-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Live the whole panic-and-rescue story yourself, start to finish.
+        Fresh throwaway repo:
+      </p>
+      <pre class="code" data-anchor="reflog-lab-code1"><span class="cap">Terminal — set the scene</span><code><span class="cm">$</span> mkdir reflog-quest &amp;&amp; cd reflog-quest &amp;&amp; git init -q -b main
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Start the story"</span>
+<span class="cm">$</span> git checkout -q -b feature-boss-fight
+<span class="cm">$</span> echo <span class="str">"Boss room unlocked"</span> &gt;&gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Add boss room"</span>
+<span class="cm">$</span> echo <span class="str">"Boss defeated"</span> &gt;&gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Defeat the boss"</span>
+<span class="cm">$</span> git checkout -q main</code></pre>
+      <p>
+        Now do the scary part on purpose &mdash; delete the branch you just
+        built, the way a real "cleanup" slip could actually happen:
+      </p>
+      <pre class="code" data-anchor="reflog-lab-code2"><span class="cap">Terminal — the delete, and the panic check</span><code><span class="cm">$</span> git branch -D feature-boss-fight
+Deleted branch feature-boss-fight (was 28ce70b).
+<span class="cm">$</span> git branch -v
+<span class="str">*</span> main 2653c06 Start the story
+<span class="cm">$</span> git log --oneline --all
+2653c06 Start the story</code></pre>
+      <p>
+        Two commits, gone from every listing command you know. This is the
+        exact moment to reach for the reflog instead of panicking:
+      </p>
+      <pre class="code" data-anchor="reflog-lab-code3"><span class="cap">Terminal — find it</span><code><span class="cm">$</span> git reflog
+2653c06 <span class="num">HEAD@{0}</span>: checkout: moving from feature-boss-fight to main
+28ce70b <span class="num">HEAD@{1}</span>: commit: Defeat the boss
+ba4132c <span class="num">HEAD@{2}</span>: commit: Add boss room
+2653c06 <span class="num">HEAD@{3}</span>: checkout: moving from main to feature-boss-fight
+2653c06 <span class="num">HEAD@{4}</span>: commit (initial): Start the story</code></pre>
+      <p>
+        Copy the hash next to <code>HEAD@{1}</code> &mdash; that's your
+        deleted branch's tip &mdash; and hand it straight to
+        <code>git checkout -b</code>:
+      </p>
+      <pre class="code" data-anchor="reflog-lab-code4"><span class="cap">Terminal — resurrection</span><code><span class="cm">$</span> git checkout -b feature-boss-fight 28ce70b
+Switched to a new branch <span class="str">'feature-boss-fight'</span>
+<span class="cm">$</span> cat player.txt
+Welcome to Staging Quest!
+HP: 100
+Boss room unlocked
+Boss defeated
+<span class="cm">$</span> git branch -v
+<span class="str">*</span> feature-boss-fight 28ce70b Defeat the boss
+  main               2653c06 Start the story</code></pre>
+      <p>
+        There it is &mdash; both commits, the exact same hashes, the file
+        exactly as you left it. You didn't restore a backup or undo
+        anything magical; you just told Git to point a new sticky note at a
+        commit it never actually threw away. That's the entire trick, and
+        now you've done it with your own hands instead of just reading
+        about it at 2am.
+      </p>
+    </div>
+
+    <p data-anchor="reflog-close-p1">
+      Zoom out and the reflog is really just Chapter 5's lesson turned into
+      a safety net: branches are cheap pointers, commits are the durable
+      thing underneath, and the reflog is the log of every place a pointer
+      has ever stood. It won't save you from a bad merge conflict or a
+      typo in your code &mdash; but "I deleted the wrong branch," "I reset
+      too hard," and "I rebased and now something's missing" are all, deep
+      down, the same problem: a pointer moved and you want to know where it
+      used to be. Next chapter takes that same idea and points it the other
+      direction &mdash; deliberately moving pointers on purpose, safely,
+      with <code>git reset</code> and <code>git revert</code>.
+    </p>
+
+    <p class="sources" data-anchor="reflog-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/docs/git-reflog" target="_blank" rel="noopener">git-scm.com &mdash; git-reflog</a>
+      &middot;
+      <a href="https://git-scm.com/book/en/v2/Git-Internals-Maintenance-and-Data-Recovery" target="_blank" rel="noopener">Pro Git, Ch. 10.6 &mdash; Maintenance and Data Recovery</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-gc" target="_blank" rel="noopener">git-scm.com &mdash; git-gc (reflog expiry defaults)</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="08-the-staging-area.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="10-reset-and-revert.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

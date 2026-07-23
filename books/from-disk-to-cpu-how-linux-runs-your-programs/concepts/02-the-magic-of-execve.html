@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Magic of execve · From Disk to CPU</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="bolt">&gt;_</span> From Disk to CPU</div>
+  <div class="spacer"></div>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapno">Chapter 02</div>
+    <div class="eyebrow">The syscall</div>
+    <h1 data-anchor="ch2-h1">The Magic of <code class="inl">execve</code></h1>
+
+    <p class="lead" data-anchor="ch2-p1">Here's the syscall that does the heavy lifting:</p>
+
+    <pre class="code" data-anchor="ch2-code1"><span class="ty">int</span> <span class="fn">execve</span>(<span class="kw">const</span> <span class="ty">char</span> *pathname,
+            <span class="ty">char</span> *<span class="kw">const</span> argv[],
+            <span class="ty">char</span> *<span class="kw">const</span> envp[]);</pre>
+
+    <p data-anchor="ch2-p2">Three arguments: which file to run, the argument list it should see as <code class="inl">argv</code>, and the environment variables it should see as <code class="inl">envp</code>. That's the whole interface. And yet the effect is total: on success, <code class="inl">execve()</code> does not return. Not "returns 0". Not "returns void". It <em>does not return</em> — because the process that called it no longer exists in any recognizable form. Its code, its heap, its stack, its memory mappings are gone, replaced wholesale by the new program.</p>
+
+    <div class="aside" data-anchor="ch2-aside1"><b>Here's the physical picture I like:</b> imagine you're driving a car down the highway, and — without stopping — you swap out the engine, the seats, the dashboard, and the entire body panel, keeping only the license plate and the fact that you're still "the car in lane two." The PID is the license plate. Everything else about the vehicle just got replaced, mid-motion, without you ever pulling over.</div>
+
+    <h2 data-anchor="ch2-h2a">What survives, what doesn't</h2>
+
+    <p data-anchor="ch2-p3">Because the process identity (PID) is preserved, a handful of things ride through <code class="inl">execve()</code> unchanged: the process ID and parent PID, open file descriptors (unless marked <code class="inl">close-on-exec</code>), the current working directory, and pending signals' disposition in some cases. But the address space — every byte of code, every global variable, every pointer you had — is thrown away and rebuilt from scratch out of the new file.</p>
+
+    <table class="grid" data-anchor="ch2-table1">
+      <tr><th>Survives exec</th><th>Replaced by exec</th></tr>
+      <tr><td>PID / PPID</td><td>Entire address space (code, data, heap)</td></tr>
+      <tr><td>Open file descriptors*</td><td>The stack (rebuilt with new argv/envp)</td></tr>
+      <tr><td>Current working directory</td><td>Registers, including the instruction pointer</td></tr>
+      <tr><td>Signal dispositions (mostly)</td><td>Any memory-mapped libraries</td></tr>
+    </table>
+    <p class="subtle" data-anchor="ch2-p3b">*Except descriptors opened with <code class="inl">O_CLOEXEC</code> — those close automatically on exec, a deliberate safety valve so a program doesn't accidentally hand its file handles to whatever it execs next.</p>
+
+    <h2 data-anchor="ch2-h2b">Two kinds of files execve understands</h2>
+
+    <p data-anchor="ch2-p4">The kernel doesn't just blindly trust that <code class="inl">pathname</code> is runnable. It peeks at the first few bytes to decide what kind of file it's holding. There are, broadly, two answers it can find:</p>
+
+    <ul data-anchor="ch2-list1">
+      <li><strong>An ELF binary.</strong> The bytes start with the magic sequence <code class="inl">0x7f 'E' 'L' 'F'</code>. The kernel's ELF loader takes over — this is the path our whole book follows.</li>
+      <li><strong>A script with a shebang line.</strong> The bytes start with <code class="inl">#!</code>, like <code class="inl">#!/bin/bash</code>. The kernel reads the interpreter path off that first line and effectively re-execs <em>that</em> interpreter, handing it your script's path as an argument.</li>
+    </ul>
+
+    <p data-anchor="ch2-p5">If the kernel doesn't recognize either shape — if the file isn't marked executable, or its first bytes are gibberish to every registered loader — <code class="inl">execve()</code> fails with <code class="inl">ENOEXEC</code>. That's the kernel's honest way of saying "I have no idea how to turn this into a running program."</p>
+
+    <div class="callout key" data-anchor="ch2-callout1">
+      <span class="tag">Key idea</span>
+      A shebang script is really just a note to the kernel saying "don't run me directly — go run <em>this other program</em> instead, and pass it my path." The real execution always bottoms out in an ELF binary somewhere.
+    </div>
+
+    <h2 data-anchor="ch2-h2c">Where ELF's own instructions come in</h2>
+
+    <p data-anchor="ch2-p6">Once the kernel recognizes the ELF magic bytes, it doesn't run the file the way you'd run a script — line by line. Instead, it reads a small structured header at the front of the file that tells it, precisely: how big is this file's header, where is the table describing which chunks of the file become which chunks of memory, and — critically — if this program needs help from another program (a dynamic linker) to finish loading, where is <em>that</em> program's path recorded?</p>
+
+    <p data-anchor="ch2-p7">That one detail — a field called <code class="inl">PT_INTERP</code> in the file, which we'll meet in Chapter 6 — is what lets a single system call, <code class="inl">execve()</code>, end up loading not one file but potentially two: your program, and the dynamic linker that finishes wiring it together. We'll trace that whole relay race in Chapter 9.</p>
+
+    <div class="tryit" data-anchor="ch2-tryit1">
+      <h4>Try this</h4>
+      <p>Watch <code class="inl">execve</code> fire, live, with <code class="inl">strace</code>:</p>
+      <pre class="code"><span class="prompt">$</span> strace -e trace=execve ./hello
+<span class="out">execve("./hello", ["./hello"], 0x7ffc... /* 40 vars */) = 0
+Hello, kernel!
++++ exited with 0 +++</span></pre>
+      <p>One line, one syscall, and everything we're about to spend the rest of this book unpacking happens inside that single <code class="inl">= 0</code>.</p>
+    </div>
+
+    <p class="subtle" data-anchor="ch2-sources">Sources: <a href="https://man7.org/linux/man-pages/man2/execve.2.html">execve(2) — Linux man-pages</a>.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-you-type-a-out-what-happens-next.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-what-is-an-elf-file.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

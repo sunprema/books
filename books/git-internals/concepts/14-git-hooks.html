@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git Hooks: Automating with Scripts — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 14 · Git Hooks</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="hooks-kicker">Chapter 14 of 17 &middot; Tripwires</p>
+    <h1 data-anchor="hooks-h1">Git Hooks: <span class="hl">Automating</span> with Scripts</h1>
+
+    <p class="lede" data-anchor="hooks-lede">
+      Chapter 13 ended on a warning: nothing stops a teammate &mdash; or you,
+      at 2am &mdash; from pushing something malformed, or forgetting to run
+      the test suite before committing. Git can't read your mind, but it can
+      run <em>your</em> code at exactly the right moment to catch that stuff
+      automatically. Those moments are called <strong>hooks</strong>, and
+      you've technically already met their home: Chapter 2's floor plan of
+      <code>.git</code> flagged a folder named <code>hooks/</code> and
+      promised we'd come back for it. We're back.
+    </p>
+
+    <h2 data-anchor="hooks-what-h">A Hook Is Just a Script With the Right Filename</h2>
+    <p data-anchor="hooks-what-p1">
+      Strip away the mystique and a Git hook is almost insultingly simple:
+      it's an <strong>executable script</strong>, dropped in
+      <code>.git/hooks/</code>, named <em>exactly</em> after the event that
+      should trigger it &mdash; no config file, no registration step, no
+      special syntax. Git checks that folder before and after nearly every
+      major operation, and if a file matching the event's name exists and is
+      executable, Git runs it. That's the entire mechanism.
+    </p>
+    <pre class="code" data-anchor="hooks-what-code1"><span class="cap">Terminal — a fresh repo already ships sample hooks, just disabled</span><code><span class="cm">$</span> git init -q quest &amp;&amp; cd quest
+<span class="cm">$</span> ls .git/hooks | head -5
+applypatch-msg.sample
+commit-msg.sample
+fsmonitor-watchman.sample
+post-update.sample
+pre-applypatch.sample</code></pre>
+    <p data-anchor="hooks-what-p2">
+      Every one of those ends in <code>.sample</code> &mdash; Git ships
+      example scripts for nearly every hook it supports, but ignores them
+      until you strip the <code>.sample</code> suffix <em>and</em> make the
+      file executable. Miss the <code>chmod +x</code> step and your hook
+      silently does nothing, which is, no exaggeration, the single most
+      common "why isn't my hook running?!" bug beginners hit.
+    </p>
+
+    <table data-anchor="hooks-table">
+      <thead>
+        <tr><th>Hook</th><th>Runs when</th><th>Can it block the operation?</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="mono">pre-commit</td><td>Before the commit message editor even opens</td>
+          <td>Yes &mdash; nonzero exit aborts the commit</td></tr>
+        <tr><td class="mono">prepare-commit-msg</td><td>Right after pre-commit, before the editor opens; can pre-fill the message</td>
+          <td>Rarely used to block, but nonzero exit does abort</td></tr>
+        <tr><td class="mono">commit-msg</td><td>After you've written a message, before the commit is finalized</td>
+          <td>Yes &mdash; nonzero exit aborts the commit</td></tr>
+        <tr><td class="mono">post-commit</td><td>Right after the commit object exists</td>
+          <td>No &mdash; informational only</td></tr>
+        <tr><td class="mono">post-merge</td><td>After a merge completes successfully</td>
+          <td>No &mdash; informational only</td></tr>
+        <tr><td class="mono">pre-push</td><td>Before objects upload to a remote</td>
+          <td>Yes &mdash; nonzero exit aborts the push</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="hooks-what-p3">
+      That's the short list of <strong>client-side</strong> hooks &mdash; the
+      ones that run on your machine, the only kind this chapter covers.
+      There's a parallel set of <strong>server-side</strong> hooks
+      (<code>pre-receive</code>, <code>update</code>,
+      <code>post-receive</code>) that fire on whatever machine hosts
+      <code>origin</code> when it <em>receives</em> your push &mdash; that's
+      how a company can reject a force-push to <code>main</code> before it
+      ever lands, a thread we'll pick back up in Chapter 16.
+    </p>
+
+    <div class="callout key" data-anchor="hooks-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Every blocking hook follows the same tiny contract: <strong>exit
+        <code>0</code> and Git proceeds; exit anything else and Git stops,
+        printing whatever your script wrote to <code>stderr</code></strong>.
+        You don't call any special Git API to "reject" a commit &mdash; you
+        just <code>exit 1</code> like any other broken shell script, and Git
+        treats that as a veto. It's the same convention as every Unix
+        command line tool you've ever run.
+      </p>
+    </div>
+
+    <h2 data-anchor="hooks-cycle-h">One <code>git commit</code>, Three Checkpoints</h2>
+    <p data-anchor="hooks-cycle-p1">
+      To see where these fire relative to each other, follow a single
+      <code>git commit</code> from start to finish. Two checkpoints can stop
+      it cold; a third only gets to watch after the fact:
+    </p>
+
+    <figure class="diagram" data-anchor="hooks-diagram">
+      <svg viewBox="0 0 780 390" role="img" aria-labelledby="hooks-diagram-title">
+        <title id="hooks-diagram-title">A timeline of one git commit. Step one, you run git commit, which triggers the pre-commit hook — if it exits nonzero the commit aborts right here, before any editor opens. Step two, the commit message editor opens (skipped if you passed -m). Step three, the commit-msg hook runs on the message you just wrote — if it exits nonzero the commit also aborts here. Step four, assuming both hooks passed, Git writes the actual commit object into objects/. Step five, the post-commit hook runs, but purely informationally — it cannot undo or block the commit that already happened.</title>
+
+        <text x="390" y="28" text-anchor="middle" fill="var(--ink)" font-family="var(--font-display)" font-size="13" font-weight="800" letter-spacing=".04em">ONE COMMIT, THREE HOOK CHECKPOINTS</text>
+        <text x="390" y="44" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="9">amber = can abort &middot; green = too late to abort, informational only</text>
+
+        <!-- Row 1: git commit -> pre-commit -> [editor] -->
+        <rect x="20" y="100" width="140" height="60" rx="10" fill="var(--bg-2)" stroke="var(--edge)" stroke-width="1.5"></rect>
+        <text x="90" y="126" text-anchor="middle" fill="var(--ink)" font-family="var(--font-mono)" font-size="12" font-weight="700">git commit</text>
+        <text x="90" y="142" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">you type this</text>
+
+        <path d="M160,130 L191,130" stroke="var(--ink-soft)" stroke-width="1.8" fill="none"></path>
+        <polygon points="191,130 181,125 181,135" fill="var(--ink-soft)"></polygon>
+
+        <rect x="195" y="95" width="170" height="70" rx="10" fill="var(--bg-2)" stroke="var(--accent-3)" stroke-width="2"></rect>
+        <text x="280" y="120" text-anchor="middle" fill="var(--accent-3)" font-family="var(--font-mono)" font-size="12.5" font-weight="700">pre-commit</text>
+        <text x="280" y="135" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">no args &middot; runs first</text>
+        <text x="280" y="147" text-anchor="middle" fill="var(--accent-3)" font-family="var(--font-body)" font-size="8" font-weight="700">exit &ne; 0 aborts here</text>
+
+        <path d="M365,130 L396,130" stroke="var(--ink-soft)" stroke-width="1.8" fill="none"></path>
+        <polygon points="396,130 386,125 386,135" fill="var(--ink-soft)"></polygon>
+
+        <rect x="400" y="100" width="200" height="60" rx="10" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1.5" stroke-dasharray="3 5"></rect>
+        <text x="500" y="126" text-anchor="middle" fill="var(--ink)" font-family="var(--font-mono)" font-size="11.5">[commit message editor]</text>
+        <text x="500" y="142" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">skipped if you passed -m</text>
+
+        <!-- wrap arrow down to row 2 -->
+        <path d="M500,160 C 500,210 180,210 110,258" stroke="var(--ink-soft)" stroke-width="1.8" fill="none"></path>
+        <polygon points="110,258 121,255 116,266" fill="var(--ink-soft)"></polygon>
+
+        <!-- Row 2: commit-msg -> [commit object created] -> post-commit -->
+        <rect x="20" y="262" width="190" height="70" rx="10" fill="var(--bg-2)" stroke="var(--accent-3)" stroke-width="2"></rect>
+        <text x="115" y="288" text-anchor="middle" fill="var(--accent-3)" font-family="var(--font-mono)" font-size="12.5" font-weight="700">commit-msg</text>
+        <text x="115" y="303" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">$1 = path to msg file</text>
+        <text x="115" y="315" text-anchor="middle" fill="var(--accent-3)" font-family="var(--font-body)" font-size="8" font-weight="700">exit &ne; 0 aborts here</text>
+
+        <path d="M210,297 L241,297" stroke="var(--ink-soft)" stroke-width="1.8" fill="none"></path>
+        <polygon points="241,297 231,292 231,302" fill="var(--ink-soft)"></polygon>
+
+        <rect x="245" y="262" width="245" height="70" rx="10" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1.5" stroke-dasharray="3 5"></rect>
+        <text x="367" y="288" text-anchor="middle" fill="var(--ink)" font-family="var(--font-mono)" font-size="11.5">[commit object created]</text>
+        <text x="367" y="303" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">written into objects/, Chapter 3's format</text>
+        <text x="367" y="315" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">refs/heads/&lt;branch&gt; moves to point at it</text>
+
+        <path d="M490,297 L521,297" stroke="var(--ink-soft)" stroke-width="1.8" fill="none"></path>
+        <polygon points="521,297 511,292 511,302" fill="var(--ink-soft)"></polygon>
+
+        <rect x="525" y="262" width="200" height="70" rx="10" fill="var(--bg-2)" stroke="var(--accent-2)" stroke-width="2"></rect>
+        <text x="625" y="288" text-anchor="middle" fill="var(--accent-2)" font-family="var(--font-mono)" font-size="12.5" font-weight="700">post-commit</text>
+        <text x="625" y="303" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">no args &middot; commit already exists</text>
+        <text x="625" y="315" text-anchor="middle" fill="var(--accent-2)" font-family="var(--font-body)" font-size="8" font-weight="700">informational only &mdash; can't abort</text>
+
+        <text x="390" y="360" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="10">
+          By the time <tspan fill="var(--accent-2)" font-weight="700">post-commit</tspan> runs, the commit already happened &mdash;
+        </text>
+        <text x="390" y="376" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="10">
+          it's for notifications and side effects, not gatekeeping. That's <tspan fill="var(--accent-3)" font-weight="700">pre-commit</tspan> and <tspan fill="var(--accent-3)" font-weight="700">commit-msg</tspan>'s job.
+        </text>
+      </svg>
+      <figcaption>
+        <strong>Two gates, one bystander.</strong> <code>pre-commit</code>
+        and <code>commit-msg</code> can each veto the commit with a nonzero
+        exit code; <code>post-commit</code> only finds out afterward, the
+        same way <code>post-merge</code> only finds out after a merge lands.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="hooks-msg-h">Writing a <code>commit-msg</code> Hook: Enforcing a Message Format</h2>
+    <p data-anchor="hooks-msg-p1">
+      <code>commit-msg</code> is the hook to reach for when you care about
+      <em>what the commit says</em>, not what it changes. Git calls it with
+      exactly one argument &mdash; <code>$1</code>, the path to a temporary
+      file already holding the message you just wrote &mdash; after the
+      editor closes (or immediately, if you used <code>-m</code>), but
+      before the commit is finalized. You can read that file to validate the
+      message, or even rewrite it in place; exit nonzero and Git throws the
+      whole commit back at you, message and all, so nothing is lost.
+    </p>
+    <p data-anchor="hooks-msg-p2">
+      Here's a hook that enforces a <strong>Conventional Commits</strong>
+      style prefix &mdash; <code>feat:</code>, <code>fix:</code>,
+      <code>docs:</code>, and a handful of others &mdash; the same
+      convention a lot of real teams use to auto-generate changelogs:
+    </p>
+    <pre class="code" data-anchor="hooks-msg-code1"><span class="cap">.git/hooks/commit-msg</span><code><span class="cm">#!/bin/sh</span>
+<span class="cm"># .git/hooks/commit-msg — reject commits that don't start with a</span>
+<span class="cm"># conventional-commit-style prefix (feat:, fix:, docs:, chore:, ...)</span>
+
+msg_file=<span class="str">"$1"</span>
+first_line=$(<span class="fn">head</span> -n1 <span class="str">"$msg_file"</span>)
+
+<span class="kw">if</span> ! <span class="fn">echo</span> <span class="str">"$first_line"</span> | <span class="fn">grep</span> -qE <span class="str">'^(feat|fix|docs|style|refactor|test|chore)(\(.+\))?: .+'</span>; <span class="kw">then</span>
+  <span class="fn">echo</span> <span class="str">"commit-msg: rejected — message must start with a type prefix,"</span> &gt;&amp;2
+  <span class="fn">echo</span> <span class="str">"  e.g. 'feat: add inventory system' or 'fix: correct HP bug'."</span> &gt;&amp;2
+  <span class="fn">echo</span> <span class="str">"  Got: \"$first_line\""</span> &gt;&amp;2
+  <span class="kw">exit</span> <span class="num">1</span>
+<span class="kw">fi</span>
+
+<span class="kw">exit</span> <span class="num">0</span></code></pre>
+    <p data-anchor="hooks-msg-p3">
+      Nothing exotic &mdash; a regular POSIX shell script, reading its one
+      argument, running <code>grep -qE</code> against a pattern, and exiting
+      <code>0</code> or <code>1</code>. That's genuinely the whole API
+      surface a hook has to learn.
+    </p>
+
+    <div class="callout lab" data-anchor="hooks-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Save that script as <code>.git/hooks/commit-msg</code> in any
+        throwaway repo (or reuse one from an earlier chapter's lab), make it
+        executable, and try to break the rule on purpose before following
+        it:
+      </p>
+      <pre class="code" data-anchor="hooks-lab-code1"><span class="cap">Terminal — chmod, then a bad message on purpose</span><code><span class="cm">$</span> chmod +x .git/hooks/commit-msg
+<span class="cm">$</span> printf <span class="str">"hello quest\n"</span> &gt; player.txt &amp;&amp; git add player.txt
+<span class="cm">$</span> git commit -m <span class="str">"started the game"</span>
+commit-msg: rejected — message must start with a type prefix,
+  e.g. <span class="str">'feat: add inventory system'</span> or <span class="str">'fix: correct HP bug'</span>.
+  Got: <span class="str">"started the game"</span>
+<span class="cm">$</span> echo $?
+<span class="num">1</span></code></pre>
+      <p>
+        Git left the staged file exactly as it was &mdash; nothing lost,
+        commit just refused to happen. Now give it a message the hook
+        actually accepts:
+      </p>
+      <pre class="code" data-anchor="hooks-lab-code2"><span class="cap">Terminal — a conventional-commit-style message gets through</span><code><span class="cm">$</span> git commit -m <span class="str">"feat: start the story"</span>
+[main (root-commit) 8f95cdc] feat: start the story
+ 1 file changed, 1 insertion(+)
+ create mode 100644 player.txt</code></pre>
+      <p>
+        Same staged content both times &mdash; the only thing that changed
+        was whether the first line of the message matched the pattern. That's
+        the entire job of a <code>commit-msg</code> hook: gatekeeping words,
+        not code.
+      </p>
+    </div>
+
+    <h2 data-anchor="hooks-pre-h">Writing a <code>pre-commit</code> Hook: Running Tests Before Every Commit</h2>
+    <p data-anchor="hooks-pre-p1">
+      <code>pre-commit</code> gets no arguments at all &mdash; it just runs,
+      with your staged changes sitting in the index, and Git waits to see
+      whether it exits <code>0</code>. That makes it the natural home for
+      anything that inspects <em>code</em> rather than the commit message:
+      linters, formatters, secret-scanners, or &mdash; the classic example
+      &mdash; your test suite. Nobody enjoys a "fix broken build" commit
+      three minutes after the one that broke it; a <code>pre-commit</code>
+      hook can make that commit simply never happen.
+    </p>
+    <p data-anchor="hooks-pre-p2">
+      Here's a deliberately tiny stand-in for a real test suite &mdash; it
+      just checks that a game character's HP never went negative &mdash;
+      plus the hook that wires it in:
+    </p>
+    <pre class="code" data-anchor="hooks-pre-code1"><span class="cap">run-tests.sh — a trivial "test suite"</span><code><span class="cm">#!/bin/sh</span>
+<span class="cm"># run-tests.sh — stand-in for a real test suite. Fails if hp.txt</span>
+<span class="cm"># contains a negative HP value, succeeds otherwise.</span>
+<span class="kw">if</span> <span class="fn">grep</span> -q <span class="str">'^HP: -'</span> hp.txt 2&gt;/dev/null; <span class="kw">then</span>
+  <span class="fn">echo</span> <span class="str">"FAIL: HP went negative — that's a bug."</span> &gt;&amp;2
+  <span class="kw">exit</span> <span class="num">1</span>
+<span class="kw">fi</span>
+<span class="fn">echo</span> <span class="str">"PASS: HP looks sane."</span>
+<span class="kw">exit</span> <span class="num">0</span></code></pre>
+    <pre class="code" data-anchor="hooks-pre-code2"><span class="cap">.git/hooks/pre-commit</span><code><span class="cm">#!/bin/sh</span>
+<span class="cm"># .git/hooks/pre-commit — block the commit if the test suite fails.</span>
+<span class="fn">echo</span> <span class="str">"Running tests before commit..."</span>
+./run-tests.sh
+status=$?
+<span class="kw">if</span> [ $status -ne <span class="num">0</span> ]; <span class="kw">then</span>
+  <span class="fn">echo</span> <span class="str">"pre-commit: tests failed, aborting commit."</span> &gt;&amp;2
+  <span class="kw">exit</span> <span class="num">1</span>
+<span class="kw">fi</span>
+<span class="kw">exit</span> <span class="num">0</span></code></pre>
+
+    <div class="callout lab" data-anchor="hooks-lab-2">
+      <span class="co-tag">Try It Yourself &middot; The Challenge</span>
+      <p>
+        This is the chapter's real challenge: wire up both files above,
+        <code>chmod +x</code> the hook (and the test script, since the hook
+        calls it directly), then try to commit a bug on purpose:
+      </p>
+      <pre class="code" data-anchor="hooks-lab-code3"><span class="cap">Terminal — a failing "test" blocks the commit</span><code><span class="cm">$</span> chmod +x .git/hooks/pre-commit run-tests.sh
+<span class="cm">$</span> echo <span class="str">"HP: -10"</span> &gt; hp.txt &amp;&amp; git add hp.txt
+<span class="cm">$</span> git commit -m <span class="str">"fix: update hp"</span>
+Running tests before commit...
+FAIL: HP went negative — that's a bug.
+pre-commit: tests failed, aborting commit.
+<span class="cm">$</span> echo $?
+<span class="num">1</span></code></pre>
+      <p>
+        Fix the actual bug &mdash; not the hook &mdash; and the same command
+        sails through:
+      </p>
+      <pre class="code" data-anchor="hooks-lab-code4"><span class="cap">Terminal — fix the bug, same command now succeeds</span><code><span class="cm">$</span> echo <span class="str">"HP: 90"</span> &gt; hp.txt &amp;&amp; git add hp.txt
+<span class="cm">$</span> git commit -m <span class="str">"fix: update hp"</span>
+Running tests before commit...
+PASS: HP looks sane.
+[main 0c38295] fix: update hp
+ 1 file changed, 1 insertion(+)</code></pre>
+      <p>
+        Swap <code>run-tests.sh</code> for whatever your actual project uses
+        &mdash; <code>npm test</code>, <code>pytest</code>,
+        <code>go test ./...</code> &mdash; and you've got a real,
+        working "no broken commits" tripwire, running in under a second
+        before anything ships.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="hooks-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        <code>.git/hooks/</code> lives <em>inside</em> <code>.git</code>
+        &mdash; and everything in <code>.git</code> is, by definition, the
+        one thing <code>git</code> itself never version-controls. Commit
+        your beautiful <code>pre-commit</code> hook, push it, and your
+        teammate's <code>git clone</code> gets none of it &mdash; hooks stay
+        purely local, forever, until someone writes them by hand. That's
+        exactly why real teams don't rely on raw <code>.git/hooks/</code>
+        files: tools like <strong>Husky</strong> (JavaScript ecosystem),
+        the <strong>pre-commit framework</strong> (Python, but
+        language-agnostic in practice), and <strong>Lefthook</strong> store
+        hook <em>config</em> in a tracked file inside the repo and install
+        the real scripts into <code>.git/hooks/</code> automatically after
+        every clone. Same underlying mechanism this chapter just showed you
+        &mdash; they're just solving the "how do I share this with my team"
+        problem on top of it.
+      </p>
+    </div>
+
+    <div class="callout tip" data-anchor="hooks-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        Genuinely stuck and need to get a commit through <em>right now</em>,
+        hook be damned? <code>git commit --no-verify</code> (short:
+        <code>-n</code>) skips <code>pre-commit</code> and
+        <code>commit-msg</code> entirely, and <code>git push
+        --no-verify</code> does the same for <code>pre-push</code>. It's a
+        legitimate escape hatch for a genuine emergency &mdash; just don't
+        make it a habit, or you've quietly rebuilt the world where nothing
+        ever got checked in the first place.
+      </p>
+    </div>
+
+    <p data-anchor="hooks-close-p1">
+      Zoom out and hooks are really just Git handing you the microphone at
+      specific moments: <em>about to commit</em>, <em>about to finalize this
+      message</em>, <em>just merged</em>, <em>about to push</em>. Two of
+      those moments &mdash; <code>pre-commit</code> and
+      <code>commit-msg</code> &mdash; happen early enough to say no; the rest
+      only get to react. None of it requires learning a plugin API: it's
+      executable files, an exit code, and a filename Git already knows to
+      look for. So far this book has been entirely about correctness &mdash;
+      what Git stores and how. Chapter 15 turns to something different:
+      what happens when a repository gets <em>big</em>, and the tricks Git
+      uses to stay fast anyway.
+    </p>
+
+    <p class="sources" data-anchor="hooks-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks" target="_blank" rel="noopener">Pro Git, Ch. 8.3 &mdash; Git Hooks</a>
+      &middot;
+      <a href="https://git-scm.com/docs/githooks" target="_blank" rel="noopener">git-scm.com &mdash; githooks</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-commit" target="_blank" rel="noopener">git-scm.com &mdash; git-commit</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="13-remote-repositories.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="15-performance-and-optimization.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

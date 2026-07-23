@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SHA-1 Hashes: Git's Fingerprint System — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 4 · SHA-1 Hashes</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="sha1-kicker">Chapter 4 of 17 &middot; Every object's fingerprint</p>
+    <h1 data-anchor="sha1-h1">SHA-1 Hashes: Git's <span class="hl">Fingerprint</span> System</h1>
+
+    <p class="lede" data-anchor="sha1-lede">
+      Chapter 3 left a thread dangling on purpose: every blob, tree, and
+      commit gets a forty-character hex name, and that name is somehow
+      squeezed out of the object's own content. No filename, no counter, no
+      central server handing out IDs &mdash; just math. Time to open up the
+      machine that makes those names and see exactly what it's chewing on.
+    </p>
+
+    <h2 data-anchor="sha1-recipe-h">The Recipe: What Actually Gets Hashed</h2>
+    <p data-anchor="sha1-recipe-p1">
+      It's tempting to assume Git just runs SHA-1 over the raw bytes of a
+      file. Close, but not quite &mdash; and the difference matters. Before
+      hashing, Git glues a small <strong>header</strong> onto the front of the
+      content: the object's type, a space, the content's length in decimal
+      bytes, and a single <code>NUL</code> byte (<code>\0</code>). Only
+      <em>then</em> does SHA-1 run over the whole thing:
+    </p>
+
+    <pre class="code" data-anchor="sha1-recipe-code"><span class="cap">The exact recipe (same shape for blob, tree, commit, tag)</span><code>sha1( "&lt;type&gt; &lt;byte-length&gt;\0" + &lt;content&gt; )
+
+<span class="cm"># worked example, straight from Chapter 3's lab:</span>
+<span class="cm">#   content: "Hello, Git objects!"  (19 bytes)</span>
+<span class="cm">#   header:  "blob 19\0"</span>
+<span class="cm">$</span> printf <span class="str">'blob 19\0Hello, Git objects!'</span> | sha1sum
+8331099cb7a9c6b8990e4af9f1db9ad2a69d5dd3  -</code></pre>
+
+    <p data-anchor="sha1-recipe-p2">
+      That's not a coincidence &mdash; it's the <em>exact</em> hash
+      <code>git hash-object --stdin</code> printed back in Chapter 3's lab for
+      that same string. This is the whole trick laid bare: pipe the header
+      plus the content into plain old SHA-1, and you get the object's name.
+      No secret sauce, no salt, no server round-trip &mdash; just a
+      well-known algorithm and a tiny, predictable prefix.
+    </p>
+
+    <div class="callout key" data-anchor="sha1-recipe-key">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        The header is <em>part of the content being hashed</em>, which is why
+        a blob and a tag can never accidentally collide even if their raw
+        bytes happen to match &mdash; one hashes as <code>"blob
+        &lt;n&gt;\0..."</code>, the other as <code>"tag &lt;n&gt;\0..."</code>,
+        so the inputs to SHA-1 are different strings even when the payload
+        looks identical. Type is baked into identity.
+      </p>
+    </div>
+
+    <h2 data-anchor="sha1-avalanche-h">The Avalanche Effect: One Byte, a Whole New Fingerprint</h2>
+    <p data-anchor="sha1-avalanche-p1">
+      Cryptographic hash functions have a property called the
+      <strong>avalanche effect</strong>: flip a single bit anywhere in the
+      input, and the output doesn't shift a little &mdash; it scrambles
+      completely, unrecognizably. That's by design. If similar inputs
+      produced similar-looking hashes, you could guess things about content
+      just by eyeballing its fingerprint, and content-addressing would leak
+      information it's supposed to hide. Here's the same 19-byte string from
+      the recipe above, changed by exactly one character &mdash; the closing
+      punctuation, <code>!</code> swapped for <code>?</code>:
+    </p>
+
+    <figure class="diagram" data-anchor="sha1-diagram">
+      <svg viewBox="0 0 760 300" role="img" aria-labelledby="sha1-svg-title">
+        <title id="sha1-svg-title">Two nineteen-byte strings differing only in their final character are each hashed with SHA-1. "Hello, Git objects!" produces 8331099cb7a9c6b8990e4af9f1db9ad2a69d5dd3. "Hello, Git objects?" produces 71bf49369b3f412ed4f63523afaca6df9581347d. The two output hashes share no visible pattern despite the tiny input change.</title>
+
+        <g stroke="var(--rule)" stroke-width="1.5" fill="none">
+          <path d="M232,51 L268,51"></path>
+          <path d="M382,51 L418,51"></path>
+          <path d="M232,196 L268,196"></path>
+          <path d="M382,196 L418,196"></path>
+        </g>
+
+        <!-- Pipeline A: input -->
+        <rect x="20" y="28" width="212" height="46" rx="8" fill="var(--code-bg)" stroke="var(--obj-blob)" stroke-width="2"></rect>
+        <text x="32" y="56" fill="var(--ink)" font-family="var(--font-mono)" font-size="13">Hello, Git objects<tspan fill="var(--accent-3)" font-weight="800">!</tspan></text>
+
+        <!-- Pipeline A: SHA-1 box -->
+        <rect x="268" y="24" width="114" height="54" rx="8" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="1.5"></rect>
+        <text x="325" y="46" text-anchor="middle" fill="var(--accent)" font-family="var(--font-display)" font-size="13" font-weight="800">SHA-1</text>
+        <text x="325" y="62" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-mono)" font-size="9">blob 19\0 + …</text>
+
+        <!-- Pipeline A: hash output -->
+        <rect x="418" y="28" width="322" height="46" rx="8" fill="var(--code-bg)" stroke="var(--obj-blob)" stroke-width="2"></rect>
+        <text x="434" y="56" fill="var(--obj-blob)" font-family="var(--font-mono)" font-size="11" font-weight="700">8331099cb7a9c6b8990e4af9f1db9ad2a69d5dd3</text>
+
+        <!-- Pipeline B: input -->
+        <rect x="20" y="173" width="212" height="46" rx="8" fill="var(--code-bg)" stroke="var(--obj-tree)" stroke-width="2"></rect>
+        <text x="32" y="201" fill="var(--ink)" font-family="var(--font-mono)" font-size="13">Hello, Git objects<tspan fill="var(--accent-3)" font-weight="800">?</tspan></text>
+
+        <!-- Pipeline B: SHA-1 box -->
+        <rect x="268" y="169" width="114" height="54" rx="8" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="1.5"></rect>
+        <text x="325" y="191" text-anchor="middle" fill="var(--accent)" font-family="var(--font-display)" font-size="13" font-weight="800">SHA-1</text>
+        <text x="325" y="207" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-mono)" font-size="9">blob 19\0 + …</text>
+
+        <!-- Pipeline B: hash output -->
+        <rect x="418" y="173" width="322" height="46" rx="8" fill="var(--code-bg)" stroke="var(--obj-tree)" stroke-width="2"></rect>
+        <text x="434" y="201" fill="var(--accent-2)" font-family="var(--font-mono)" font-size="11" font-weight="700">71bf49369b3f412ed4f63523afaca6df9581347d</text>
+
+        <text x="380" y="256" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="11">
+          One trailing character changed. Zero resemblance between the fingerprints.
+        </text>
+        <text x="380" y="276" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="11">
+          That unpredictability is what makes content-addressing trustworthy.
+        </text>
+      </svg>
+      <figcaption>
+        <strong>The avalanche effect, verified.</strong> Both strings are 19
+        bytes and differ in only their final character. Both get the same
+        <code>"blob 19\0"</code> header. The resulting SHA-1 digests share no
+        visible pattern &mdash; that's not a coincidence, it's the whole point
+        of a cryptographic hash function.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="sha1-avalanche-p2">
+      This is exactly why Git can trust a 40-character hash as a stand-in for
+      an entire file, folder tree, or commit history: two <em>meaningfully
+      different</em> objects essentially never end up with the same fingerprint
+      by accident, and the fingerprint gives no hint about how close two
+      objects' contents actually are. "Looks similar" and "hashes similarly"
+      have nothing to do with each other.
+    </p>
+
+    <div class="callout tip" data-anchor="sha1-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        You'll rarely type a full 40-character hash by hand &mdash; Git lets
+        you abbreviate one to the shortest prefix that's still unambiguous in
+        your repo (commonly 7&ndash;12 characters, controlled by
+        <code>core.abbrev</code>, which defaults to <code>auto</code> and
+        grows the prefix length automatically as the repo grows). Try
+        <code>git rev-parse --short &lt;hash&gt;</code> to see the shortest
+        safe abbreviation for any object you have locally.
+      </p>
+    </div>
+
+    <h2 data-anchor="sha1-why-h">Why Not Just Use a Counter?</h2>
+    <p data-anchor="sha1-why-p1">
+      A simple incrementing ID (<code>commit-1</code>, <code>commit-2</code>,
+      &hellip;) would be easier to read &mdash; so why didn't Git do that?
+      Because a counter needs a single authority to hand out the next number,
+      and Git has no central authority. Every clone is a full, independent
+      copy of the repository. Content-addressing sidesteps the whole problem:
+      any two people, on any two machines, with no network connection between
+      them, who create the exact same object will independently compute the
+      <em>exact same hash</em> for it. No coordination required, no
+      collisions between clones, and (as Chapter 3 showed) free deduplication
+      as a side effect.
+    </p>
+    <p data-anchor="sha1-why-p2">
+      It buys integrity checking too. An object's name is a hash of its own
+      content, so if a single bit flips &mdash; disk corruption, a bad
+      transfer, a tampered file &mdash; the content no longer matches its own
+      name. Git can detect that mismatch (that's part of what
+      <code>git fsck</code> checks), which is a property a plain filename or
+      counter could never give you.
+    </p>
+
+    <div class="callout warn" data-anchor="sha1-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        Abbreviated hashes are only unambiguous <em>within one repository at
+        one point in time</em> &mdash; the same short prefix can point at
+        completely different objects in someone else's fork, or even in your
+        own repo after enough new objects land. Never assume a 7-character
+        hash you copied from a chat message or a script means the same thing
+        on another machine; resolve it with <code>git rev-parse</code> or
+        paste the full hash when it actually matters.
+      </p>
+    </div>
+
+    <div class="callout tip" data-anchor="sha1-funfact">
+      <span class="co-tag">Fun Fact</span>
+      <p>
+        In February 2017, researchers at CWI Amsterdam and Google (the
+        "SHAttered" attack) published two different PDF files that hash to
+        the identical SHA-1 digest &mdash; proof that SHA-1 collisions had
+        gone from theoretical to practically achievable, at a cost of real
+        compute time. It wasn't an attack on any actual Git repository, but
+        Git took it seriously: since Git 2.13 (2017), Git ships with
+        <strong>collision-detecting SHA-1</strong> (<code>sha1dc</code>) on by
+        default, which recognizes the mathematical fingerprints of known
+        collision attacks and refuses to hash that content quietly. The
+        longer-term fix is a full migration to <strong>SHA-256</strong> object
+        names &mdash; you can already try it with <code>git init
+        --object-format=sha256</code> &mdash; but as of today it's still an
+        opt-in, early-stage transition: SHA-1 stays the default, SHA-1 and
+        SHA-256 repositories can't yet interoperate, and major hosts like
+        GitHub don't host SHA-256 repos yet. Slow and careful, exactly how you
+        want a change to your entire object model to go.
+      </p>
+    </div>
+
+    <div class="callout lab" data-anchor="sha1-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Reproduce the avalanche-effect diagram above yourself, with nothing
+        but a terminal. First, hash the original string exactly like
+        Chapter 3 did:
+      </p>
+      <p><code>printf 'Hello, Git objects!' | git hash-object --stdin</code></p>
+      <p>
+        You should get <code>8331099cb7a9c6b8990e4af9f1db9ad2a69d5dd3</code>
+        again. Now change one trailing character and hash it again:
+      </p>
+      <p><code>printf 'Hello, Git objects?' | git hash-object --stdin</code></p>
+      <p>
+        That prints <code>71bf49369b3f412ed4f63523afaca6df9581347d</code>
+        &mdash; a totally different fingerprint from a one-character edit.
+        Want to see the header trick with your own eyes, no Git involved at
+        all? Both strings are 19 bytes, so build the exact bytes Git hashes
+        and feed them straight to a generic SHA-1 tool:
+      </p>
+      <p><code>printf 'blob 19\0Hello, Git objects!' | sha1sum</code></p>
+      <p>
+        Same hash comes back &mdash; <code>8331099c&hellip;</code> &mdash;
+        proving there's no Git-specific magic in the algorithm itself, only in
+        the tiny header Git glues on first.
+      </p>
+    </div>
+
+    <p data-anchor="sha1-close-p1">
+      A fingerprint is precise, but nobody wants to type
+      <code>71bf49369b3f412ed4f63523afaca6df9581347d</code> to check out
+      yesterday's work, and Git itself needs some way to know which commit
+      hash is "current" without you telling it every single time. That's the
+      job of the next chapter's stars: branches and <code>HEAD</code> &mdash;
+      human-friendly pointers that ride on top of this hash graph instead of
+      replacing it.
+    </p>
+
+    <p class="sources" data-anchor="sha1-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/book/en/v2/Git-Internals-Git-Objects" target="_blank" rel="noopener">Pro Git, Ch. 10.2 &mdash; Git Objects</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-hash-object" target="_blank" rel="noopener">git-scm.com &mdash; git-hash-object</a>
+      &middot;
+      <a href="https://git-scm.com/docs/hash-function-transition" target="_blank" rel="noopener">git-scm.com &mdash; Git Hash Function Transition</a>
+      &middot;
+      <a href="https://shattered.io/" target="_blank" rel="noopener">shattered.io &mdash; the SHAttered SHA-1 collision</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="03-git-objects-blobs-trees-commits.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="05-branches-and-head.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

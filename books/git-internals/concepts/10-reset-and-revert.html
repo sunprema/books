@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset and Revert: Undoing Mistakes — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 10 · Reset and Revert</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="reset-kicker">Chapter 10 of 17 &middot; Moving pointers on purpose</p>
+    <h1 data-anchor="reset-h1">Reset and Revert: <span class="hl">Undoing Mistakes</span></h1>
+
+    <p class="lede" data-anchor="reset-lede">
+      Chapter 9 ended on a promise: this chapter takes the same idea &mdash;
+      "a pointer moved, and you want it to point somewhere else" &mdash; and
+      turns it around. Instead of recovering from an <em>accidental</em>
+      pointer move, you're about to make one <em>on purpose</em>. Two tools
+      do this: <code>git reset</code>, which rewinds your current branch to
+      an earlier commit, and <code>git revert</code>, which leaves history
+      alone and adds a brand-new commit that cancels one out. They solve the
+      same problem &mdash; "undo this" &mdash; in opposite ways, and picking
+      the wrong one on the wrong branch is how "undo my mistake" becomes a
+      bigger mistake. By the end of this chapter you'll know exactly which
+      one to reach for, and you'll have the reflog standing by in case you
+      don't.
+    </p>
+
+    <h2 data-anchor="reset-three-h">git reset: The Three-Tree Model, Rewound</h2>
+    <p data-anchor="reset-three-p1">
+      Chapter 8 gave you the mental model this whole chapter builds on:
+      Git is always juggling three trees at once &mdash; your
+      <strong>working directory</strong>, the <strong>index</strong>
+      (staging area), and <strong>HEAD</strong> (the tip of your current
+      branch, sealed history). <code>git add</code> moves content forward
+      from working directory into the index; <code>git commit</code> moves
+      it forward again from index into HEAD. <code>git reset</code> is the
+      command that moves things <em>backward</em> &mdash; and its three
+      flags, <code>--soft</code>, <code>--mixed</code>, and
+      <code>--hard</code>, are really just three answers to one question:
+      <strong>how far backward do you want the damage to reach?</strong>
+    </p>
+    <p data-anchor="reset-three-p2">
+      Per Git's own docs, <code>reset</code> always works in the same
+      order, and each flag just decides where it stops:
+    </p>
+    <ol data-anchor="reset-three-list">
+      <li><strong>Move HEAD</strong> (and the branch it points to) to the
+        target commit. Every mode does this.</li>
+      <li><strong>Update the index</strong> to match that target commit.
+        <code>--soft</code> stops <em>before</em> this step.</li>
+      <li><strong>Update the working directory</strong> to match the
+        index. Only <code>--hard</code> goes this far.</li>
+    </ol>
+
+    <figure class="diagram" data-anchor="reset-modes-diagram">
+      <svg viewBox="0 0 760 340" role="img" aria-labelledby="reset-modes-title">
+        <title id="reset-modes-title">A table-style diagram with three columns, Working Directory, Index, and HEAD, and three rows, soft, mixed, and hard. Soft touches only the HEAD column. Mixed touches the Index and HEAD columns. Hard touches all three columns and is flagged as dangerous in red, matching the danger color token.</title>
+
+        <text x="380" y="24" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-mono)" font-size="11" letter-spacing=".06em">git reset &lt;flag&gt; &mdash; how far back the rewind reaches</text>
+
+        <!-- column headers -->
+        <text x="245" y="56" text-anchor="middle" fill="var(--ink)" font-family="var(--font-display)" font-size="11" font-weight="800" letter-spacing=".03em">WORKING DIR</text>
+        <text x="440" y="56" text-anchor="middle" fill="var(--obj-blob)" font-family="var(--font-display)" font-size="11" font-weight="800" letter-spacing=".03em">INDEX</text>
+        <text x="635" y="56" text-anchor="middle" fill="var(--obj-commit)" font-family="var(--font-display)" font-size="11" font-weight="800" letter-spacing=".03em">HEAD</text>
+
+        <!-- row labels column -->
+        <text x="50" y="112" fill="var(--ink)" font-family="var(--font-mono)" font-size="12" font-weight="700">--soft</text>
+        <text x="50" y="178" fill="var(--ink)" font-family="var(--font-mono)" font-size="12" font-weight="700">--mixed</text>
+        <text x="50" y="244" fill="var(--danger)" font-family="var(--font-mono)" font-size="12" font-weight="700">--hard</text>
+        <text x="50" y="196" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8">(default)</text>
+
+        <!-- gridlines -->
+        <line x1="20" y1="70" x2="740" y2="70" stroke="var(--rule)" stroke-width="1.5"></line>
+        <line x1="20" y1="136" x2="740" y2="136" stroke="var(--rule)" stroke-width="1"></line>
+        <line x1="20" y1="202" x2="740" y2="202" stroke="var(--rule)" stroke-width="1"></line>
+        <line x1="20" y1="268" x2="740" y2="268" stroke="var(--rule)" stroke-width="1.5"></line>
+        <line x1="150" y1="70" x2="150" y2="268" stroke="var(--rule)" stroke-width="1"></line>
+        <line x1="340" y1="70" x2="340" y2="268" stroke="var(--rule)" stroke-width="1"></line>
+        <line x1="535" y1="70" x2="535" y2="268" stroke="var(--rule)" stroke-width="1"></line>
+
+        <!-- row: soft -->
+        <text x="245" y="112" text-anchor="middle" font-family="var(--font-body)" font-size="10.5" fill="var(--ink-soft)">untouched</text>
+        <text x="440" y="112" text-anchor="middle" font-family="var(--font-body)" font-size="10.5" fill="var(--ink-soft)">untouched</text>
+        <circle cx="635" cy="108" r="6" fill="var(--obj-commit)"></circle>
+        <text x="650" y="112" font-family="var(--font-body)" font-size="10.5" fill="var(--obj-commit)">moves</text>
+
+        <!-- row: mixed -->
+        <text x="245" y="178" text-anchor="middle" font-family="var(--font-body)" font-size="10.5" fill="var(--ink-soft)">untouched</text>
+        <circle cx="440" cy="174" r="6" fill="var(--obj-blob)"></circle>
+        <text x="455" y="178" font-family="var(--font-body)" font-size="10.5" fill="var(--obj-blob)">reset to HEAD</text>
+        <circle cx="635" cy="174" r="6" fill="var(--obj-commit)"></circle>
+        <text x="650" y="178" font-family="var(--font-body)" font-size="10.5" fill="var(--obj-commit)">moves</text>
+
+        <!-- row: hard -->
+        <circle cx="245" cy="240" r="6" fill="var(--danger)"></circle>
+        <text x="260" y="244" font-family="var(--font-body)" font-size="10.5" fill="var(--danger)" font-weight="700">overwritten</text>
+        <circle cx="440" cy="240" r="6" fill="var(--danger)"></circle>
+        <text x="455" y="244" font-family="var(--font-body)" font-size="10.5" fill="var(--danger)" font-weight="700">reset to HEAD</text>
+        <circle cx="635" cy="240" r="6" fill="var(--obj-commit)"></circle>
+        <text x="650" y="244" font-family="var(--font-body)" font-size="10.5" fill="var(--obj-commit)">moves</text>
+
+        <!-- danger flag box -->
+        <rect x="20" y="284" width="720" height="42" rx="8" fill="rgba(248,113,113,.10)" stroke="var(--danger)" stroke-width="1.5"></rect>
+        <text x="38" y="301" font-family="var(--font-display)" font-size="10" font-weight="800" letter-spacing=".1em" fill="var(--danger)">&#9888; --hard</text>
+        <text x="38" y="317" font-family="var(--font-body)" font-size="9.5" fill="var(--ink)">is the only mode that can destroy uncommitted work &mdash; it overwrites files on disk with no confirmation.</text>
+      </svg>
+      <figcaption>
+        <strong>Three flags, three stopping points.</strong>
+        <code>reset</code> always moves HEAD first; <code>--soft</code>
+        stops right there. <code>--mixed</code> &mdash; the default if you
+        type no flag at all &mdash; goes one step further and also resets
+        the index. Only <code>--hard</code> takes the third step and
+        overwrites your working directory too, which is exactly why it's
+        flagged in red here and everywhere else in this chapter.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="reset-three-p3">
+      Put in plain English: <code>--soft</code> just relabels which commit
+      your branch points to &mdash; everything you'd committed is now
+      sitting <em>staged</em>, ready to be re-committed differently.
+      <code>--mixed</code> does that and also unstages it, dumping it back
+      into your working directory as plain unstaged edits &mdash; nothing
+      is lost, it's just no longer queued for commit. <code>--hard</code>
+      does both of those <em>and</em> then overwrites the actual files on
+      disk to match &mdash; whatever your edits were, gone from view the
+      instant the command returns.
+    </p>
+
+    <div class="callout key" data-anchor="reset-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        A useful shortcut for remembering the order: <strong>soft moves the
+        least, hard moves the most</strong>, and each step is a superset of
+        the one before it. If you're ever unsure which flag you need, reach
+        for the gentler one first &mdash; you can always run
+        <code>git reset --hard</code> a second time to go further, but you
+        can't un-<code>--hard</code> your working directory back from
+        nothing.
+      </p>
+    </div>
+
+    <p data-anchor="reset-demo-p1">
+      Watching it happen makes the three stopping points click faster than
+      any description. Same starting point every time &mdash; two commits,
+      <code>c1</code> then <code>c2</code> &mdash; three different endings:
+    </p>
+    <pre class="code" data-anchor="reset-demo-code1"><span class="cap">Terminal — git reset --soft HEAD~1</span><code><span class="cm">$</span> git log --oneline
+ca1b9f4 c2
+cdb6f12 c1
+<span class="cm">$</span> git reset --soft HEAD~1
+<span class="cm">$</span> git log --oneline
+cdb6f12 c1
+<span class="cm">$</span> git status
+On branch main
+Changes to be committed:
+  (use <span class="str">"git restore --staged &lt;file&gt;..."</span> to unstage)
+	modified:   f.txt</code></pre>
+    <p data-anchor="reset-demo-p2">
+      HEAD moved back to <code>c1</code>, but <code>c2</code>'s content
+      didn't vanish &mdash; it's sitting in the index, staged, exactly as
+      if you'd just run <code>git add</code> a moment ago. Reset that same
+      starting point with <code>--mixed</code> (the default &mdash; no flag
+      needed) instead, and the difference from <code>--soft</code> shows up
+      immediately in <code>git status</code>:
+    </p>
+    <pre class="code" data-anchor="reset-demo-code2"><span class="cap">Terminal — git reset HEAD~1 (--mixed, the default)</span><code><span class="cm">$</span> git reset HEAD~1
+Unstaged changes after reset:
+M	f.txt
+<span class="cm">$</span> git status
+On branch main
+Changes not staged for commit:
+  (use <span class="str">"git add &lt;file&gt;..."</span> to update what will be committed)
+  (use <span class="str">"git restore &lt;file&gt;..."</span> to discard changes in working directory)
+	modified:   f.txt</code></pre>
+    <p data-anchor="reset-demo-p3">
+      "Changes to be committed" became "Changes not staged" &mdash; the
+      index snapped back to match the new HEAD, same as Chapter 8's
+      <code>git restore --staged</code>, except reset also dragged HEAD
+      itself backward. The file on disk still has <code>c2</code>'s
+      content either way; only the index's opinion of it changed. Now the
+      one that earns its warning color:
+    </p>
+    <pre class="code" data-anchor="reset-demo-code3"><span class="cap">Terminal — git reset --hard HEAD~1</span><code><span class="cm">$</span> git reset --hard HEAD~1
+HEAD is now at cdb6f12 c1
+<span class="cm">$</span> git status
+On branch main
+nothing to commit, working tree clean
+<span class="cm">$</span> cat f.txt
+line1</code></pre>
+    <p data-anchor="reset-demo-p4">
+      "Nothing to commit, working tree clean" &mdash; but that cleanliness
+      is the warning sign, not the reassurance. <code>c2</code>'s change to
+      <code>f.txt</code> is gone from the file entirely, with zero
+      confirmation prompt. The commit object for <code>c2</code> itself
+      still exists in <code>objects/</code> (nothing that was ever
+      committed is deleted this easily), and Chapter 9's reflog still
+      remembers HEAD's trip through it &mdash; but any edit that was only
+      ever on disk, never staged or committed, had no reflog entry to begin
+      with, and <code>--hard</code> just overwrote it with no way back.
+    </p>
+
+    <div class="callout warn" data-anchor="reset-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        <strong><code>git reset --hard</code> is the most dangerous common
+        command in this book.</strong> It overwrites your working directory
+        immediately, with no confirmation, no "are you sure?" &mdash; and
+        unlike almost every other mistake in Git, an uncommitted edit it
+        destroys was <em>never an object</em>, so there's no blob for the
+        reflog or <code>git fsck</code> to hand back to you. Two habits
+        keep this command safe: run <code>git status</code> first and
+        actually read it (anything under "Changes not staged" is about to
+        die), and if you only need to <em>look</em> at an old commit
+        without disturbing your branch, reach for <code>git checkout
+        &lt;commit&gt;</code> or <code>git stash</code> (Chapter 11) instead
+        of reset. If you do run it by accident on a commit that
+        <em>was</em> already committed, Chapter 9's reflog is exactly the
+        safety net you built there &mdash; <code>git reflog</code>, find
+        the hash, <code>git reset --hard &lt;hash&gt;</code> right back to
+        where you were.
+      </p>
+    </div>
+
+    <h2 data-anchor="reset-revert-h">git revert: Undo Without Rewriting History</h2>
+    <p data-anchor="reset-revert-p1">
+      Every reset mode does the same fundamental thing: it moves your
+      branch's pointer to point at an <em>older</em> commit. As far as
+      <code>git log</code> is concerned, the commits after that point stop
+      being part of the branch's history at all. That's exactly the
+      behavior you want on a branch only you have ever seen. It's exactly
+      the behavior you <strong>don't</strong> want on a branch you've
+      already pushed and a teammate has already pulled &mdash; because
+      their clone still has those commits, and the next time histories
+      meet, Git sees two branches that disagree about the past.
+    </p>
+    <p data-anchor="reset-revert-p2">
+      <code>git revert</code> solves the same problem &mdash; "undo what
+      this commit did" &mdash; without ever moving HEAD backward. Instead,
+      it looks at the target commit's changes, computes the exact opposite
+      diff, and commits <em>that</em> as a brand-new commit on top of your
+      history. Nothing is deleted, nothing is rewritten &mdash; the
+      mistake and its correction both stay on the record, forever, like a
+      ledger entry marked "reversed" instead of torn out of the book.
+    </p>
+
+    <figure class="diagram" data-anchor="reset-vs-revert-diagram">
+      <svg viewBox="0 0 760 210" role="img" aria-labelledby="reset-vs-revert-title">
+        <title id="reset-vs-revert-title">Two small timelines contrasting reset and revert. Top: reset moves the branch pointer backward from commit C3 to commit C2, leaving C3 behind and unreferenced. Bottom: revert keeps commits C1, C2, C3 in place and adds a new commit, revert of C3, on top, so the branch pointer moves forward.</title>
+
+        <text x="20" y="24" font-family="var(--font-display)" font-size="11" font-weight="800" fill="var(--danger)" letter-spacing=".05em">RESET &mdash; moves history backward</text>
+        <line x1="60" y1="60" x2="480" y2="60" stroke="var(--rule)" stroke-width="1.5"></line>
+        <circle cx="90" cy="60" r="9" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <text x="90" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">C1</text>
+        <circle cx="220" cy="60" r="9" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <text x="220" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">C2</text>
+        <circle cx="350" cy="60" r="9" fill="var(--code-bg)" stroke="var(--danger)" stroke-width="2.5" stroke-dasharray="3 2"></circle>
+        <text x="350" y="82" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--danger)">C3</text>
+        <text x="350" y="40" text-anchor="middle" font-family="var(--font-body)" font-size="8.5" fill="var(--danger)">unreferenced</text>
+        <path d="M350,-4 L350,-4" fill="none"></path>
+        <path d="M300,100 L220,100 L220,72" stroke="var(--danger)" stroke-width="1.6" fill="none" stroke-dasharray="4 3"></path>
+        <polygon points="220,72 214,84 226,84" fill="var(--danger)"></polygon>
+        <text x="300" y="113" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" font-weight="700" fill="var(--danger)">branch ptr &larr; here</text>
+
+        <text x="20" y="146" font-family="var(--font-display)" font-size="11" font-weight="800" fill="var(--accent-2)" letter-spacing=".05em">REVERT &mdash; adds history forward</text>
+        <line x1="60" y1="182" x2="620" y2="182" stroke="var(--rule)" stroke-width="1.5"></line>
+        <circle cx="90" cy="182" r="9" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <text x="90" y="204" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">C1</text>
+        <circle cx="220" cy="182" r="9" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <text x="220" y="204" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">C2</text>
+        <circle cx="350" cy="182" r="9" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></circle>
+        <text x="350" y="204" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">C3</text>
+        <circle cx="500" cy="182" r="9" fill="var(--code-bg)" stroke="var(--accent-2)" stroke-width="2.5"></circle>
+        <text x="500" y="204" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--accent-2)">revert C3</text>
+        <text x="500" y="160" text-anchor="middle" font-family="var(--font-body)" font-size="8.5" fill="var(--accent-2)">new commit, inverse diff</text>
+        <path d="M350,182 L500,182" stroke="var(--accent-2)" stroke-width="1.5" fill="none"></path>
+      </svg>
+      <figcaption>
+        <strong>Same goal, opposite mechanics.</strong> Reset makes your
+        branch pointer point at an earlier commit &mdash; anything after
+        it becomes unreferenced (recoverable via reflog, but gone from
+        <code>git log</code>). Revert never moves the pointer backward at
+        all; it adds a new commit whose diff is the mirror image of the
+        one you're undoing, so the pointer only ever moves <em>forward</em>.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="reset-revert-p3">
+      Mechanically, <code>git revert &lt;commit&gt;</code> figures out what
+      that commit changed, applies the reverse of that change to your
+      working directory and index, and opens a commit message for you
+      &mdash; pre-filled as <code>Revert "&lt;original subject&gt;"</code>
+      with a body noting <code>This reverts commit &lt;hash&gt;.</code> so
+      the link back to the original is permanent and searchable. Pass
+      <code>--no-edit</code> to accept that message as-is instead of
+      opening an editor:
+    </p>
+    <pre class="code" data-anchor="reset-revert-code1"><span class="cap">Terminal — reverting a commit already on main</span><code><span class="cm">$</span> git log --oneline
+525a5c6 Equip cursed amulet (oops, shared with team)
+c237a45 Add potion slot
+70b6d77 Start the story
+<span class="cm">$</span> git revert --no-edit HEAD
+[main cddb29d] Revert <span class="str">"Equip cursed amulet (oops, shared with team)"</span>
+ <span class="num">1</span> file changed, <span class="num">1</span> deletion(-)
+<span class="cm">$</span> git log --oneline
+cddb29d Revert <span class="str">"Equip cursed amulet (oops, shared with team)"</span>
+525a5c6 Equip cursed amulet (oops, shared with team)
+c237a45 Add potion slot
+70b6d77 Start the story</code></pre>
+    <p data-anchor="reset-revert-p4">
+      Four commits now, not three &mdash; the "mistake" commit is still
+      right there in the log, permanently, with a new commit directly
+      above it canceling its effect out. Anyone who already pulled
+      <code>525a5c6</code> loses nothing when they pull again: they just
+      receive one new commit, same as any other change, no history
+      conflict possible.
+    </p>
+
+    <div class="callout tip" data-anchor="reset-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        The rule of thumb every team eventually adopts: <strong>if it's
+        only ever been on your machine, reset is fine; the moment it's
+        been pushed anywhere someone else might have pulled from, revert
+        instead.</strong> Reset a commit that a teammate already has, and
+        the next <code>git push</code> gets rejected as a
+        non-fast-forward &mdash; the only way past that is
+        <code>git push --force</code>, which can silently drop your
+        teammate's work if they'd built anything on top of the commit you
+        erased. Revert never has this problem, because it never removes
+        anything the remote already saw.
+      </p>
+    </div>
+
+    <h2 data-anchor="reset-wrongbranch-h">Scenario: You Committed to the Wrong Branch</h2>
+    <p data-anchor="reset-wrongbranch-p1">
+      Here's the situation that makes <code>reset --soft</code> genuinely
+      useful day to day, not just a trivia answer. You meant to be on a
+      feature branch. You weren't &mdash; maybe you forgot to
+      <code>git switch</code> after your last merge, maybe a terminal tab
+      lied to you about where you were. Either way, you just committed
+      real work directly onto <code>main</code>:
+    </p>
+    <pre class="code" data-anchor="reset-wrongbranch-code1"><span class="cap">Terminal — the mistake, made in good faith</span><code><span class="cm">$</span> git branch
+<span class="str">*</span> main
+<span class="cm">$</span> git add player.txt
+<span class="cm">$</span> git commit -q -m <span class="str">"Add inventory system"</span>
+<span class="cm">$</span> git log --oneline
+1bdc88c Add inventory system
+f0b337f Start the story</code></pre>
+    <p data-anchor="reset-wrongbranch-p2">
+      Whatever you do next, <em>don't</em> reach for <code>--hard</code>
+      &mdash; that would throw the inventory-system work away entirely,
+      and it's good work, it's just committed to the wrong pointer. What
+      you actually want is to un-commit it while keeping every byte
+      exactly as it is, so you can hand it to the <em>right</em> branch
+      instead. That's precisely what <code>--soft</code> is for:
+    </p>
+    <pre class="code" data-anchor="reset-wrongbranch-code2"><span class="cap">Terminal — back it out with reset --soft</span><code><span class="cm">$</span> git reset --soft HEAD~1
+<span class="cm">$</span> git log --oneline
+f0b337f Start the story
+<span class="cm">$</span> git status
+On branch main
+Changes to be committed:
+  (use <span class="str">"git restore --staged &lt;file&gt;..."</span> to unstage)
+	modified:   player.txt</code></pre>
+    <p data-anchor="reset-wrongbranch-p3">
+      <code>main</code> is back to a clean state &mdash; the commit never
+      happened, as far as history is concerned &mdash; but the change
+      itself is still fully staged, sitting in the index exactly as it
+      was a second before you typed <code>commit</code>. Now switch to
+      where it actually belongs. A staged change travels with you across
+      <code>git switch</code>, so nothing needs re-adding:
+    </p>
+    <pre class="code" data-anchor="reset-wrongbranch-code3"><span class="cap">Terminal — switch branches, staged change comes along</span><code><span class="cm">$</span> git switch -c feature-inventory
+Switched to a new branch <span class="str">'feature-inventory'</span>
+<span class="cm">$</span> git status
+On branch feature-inventory
+Changes to be committed:
+  (use <span class="str">"git restore --staged &lt;file&gt;..."</span> to unstage)
+	modified:   player.txt
+<span class="cm">$</span> git commit -q -m <span class="str">"Add inventory system"</span>
+<span class="cm">$</span> git log --oneline
+3696ff3 Add inventory system
+f0b337f Start the story
+<span class="cm">$</span> git switch main
+<span class="cm">$</span> git log --oneline
+f0b337f Start the story</code></pre>
+    <p data-anchor="reset-wrongbranch-p4">
+      Same commit message, same file content, brand-new hash &mdash;
+      because it's a genuinely new commit object, just built on the
+      branch you meant all along. <code>main</code> never saw it. This is
+      the move worth memorizing: <strong>reset --soft, switch, commit
+      again.</strong> Three commands, zero lost work, and it fixes the
+      single most common "wait, what branch am I on?!" moment you'll hit
+      in real projects.
+    </p>
+
+    <div class="callout lab" data-anchor="reset-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Live the wrong-branch rescue yourself, start to finish. Fresh
+        throwaway repo:
+      </p>
+      <pre class="code" data-anchor="reset-lab-code1"><span class="cap">Terminal — set the scene</span><code><span class="cm">$</span> mkdir reset-quest &amp;&amp; cd reset-quest &amp;&amp; git init -q -b main
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Start the story"</span></code></pre>
+      <p>
+        Now make the mistake on purpose &mdash; stay on <code>main</code>
+        and commit feature work that should have gone on its own branch:
+      </p>
+      <pre class="code" data-anchor="reset-lab-code2"><span class="cap">Terminal — commit to the wrong branch</span><code><span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\nInventory: sword, shield\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Add inventory system"</span>
+<span class="cm">$</span> git branch -v
+<span class="str">*</span> main 1bdc88c Add inventory system</code></pre>
+      <p>
+        Caught it. Back the commit out with <code>--soft</code> so the
+        work stays staged instead of vanishing:
+      </p>
+      <pre class="code" data-anchor="reset-lab-code3"><span class="cap">Terminal — reset --soft, then check the index</span><code><span class="cm">$</span> git reset --soft HEAD~1
+<span class="cm">$</span> git log --oneline
+f0b337f Start the story
+<span class="cm">$</span> git diff --staged --stat
+ player.txt | 1 +
+ 1 file changed, 1 insertion(+)</code></pre>
+      <p>
+        <code>main</code> is clean, and the change is still right there,
+        staged. Move it to a proper branch and finish the commit:
+      </p>
+      <pre class="code" data-anchor="reset-lab-code4"><span class="cap">Terminal — the rescue, completed</span><code><span class="cm">$</span> git switch -c feature-inventory
+Switched to a new branch <span class="str">'feature-inventory'</span>
+<span class="cm">$</span> git commit -q -m <span class="str">"Add inventory system"</span>
+<span class="cm">$</span> git log --oneline
+3696ff3 Add inventory system
+f0b337f Start the story
+<span class="cm">$</span> git switch -q main &amp;&amp; git log --oneline
+f0b337f Start the story</code></pre>
+      <p>
+        <code>main</code> never carried the extra commit; the work now
+        lives cleanly on <code>feature-inventory</code>, right where it
+        belonged from the start. That's the entire fix &mdash; no force
+        push, no drama, no lost inventory system.
+      </p>
+    </div>
+
+    <div class="callout lab" data-anchor="reset-lab-2">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Now the other side &mdash; undoing a commit that's already
+        <em>shared</em>, where reset is off the table. Same repo, keep
+        going, or start fresh with a couple more commits:
+      </p>
+      <pre class="code" data-anchor="reset-lab-code5"><span class="cap">Terminal — build a small history, including a bad idea</span><code><span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\nPotion: none\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Add potion slot"</span>
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\nPotion: none\nCursed amulet: equipped\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Equip cursed amulet (oops, shared with team)"</span>
+<span class="cm">$</span> git log --oneline
+525a5c6 Equip cursed amulet (oops, shared with team)
+c237a45 Add potion slot
+f0b337f Start the story</code></pre>
+      <p>
+        Pretend that last commit already went out in a <code>git push</code>
+        &mdash; a teammate may already have it. Resetting it away would
+        set up a rejected push later; revert it instead:
+      </p>
+      <pre class="code" data-anchor="reset-lab-code6"><span class="cap">Terminal — revert, not reset</span><code><span class="cm">$</span> git revert --no-edit HEAD
+[main cddb29d] Revert <span class="str">"Equip cursed amulet (oops, shared with team)"</span>
+ <span class="num">1</span> file changed, <span class="num">1</span> deletion(-)
+<span class="cm">$</span> cat player.txt
+Welcome to Staging Quest!
+HP: 100
+Potion: none
+<span class="cm">$</span> git log --oneline
+cddb29d Revert <span class="str">"Equip cursed amulet (oops, shared with team)"</span>
+525a5c6 Equip cursed amulet (oops, shared with team)
+c237a45 Add potion slot
+f0b337f Start the story</code></pre>
+      <p>
+        The cursed amulet is gone from <code>player.txt</code> again
+        &mdash; same practical result as a hard reset &mdash; but
+        <code>525a5c6</code> is still sitting in the log, untouched,
+        with a new commit on top explaining exactly what got undone and
+        why. A teammate pulling right now gets one new commit and no
+        conflict, no force push, no confusion about where their local
+        copy diverged.
+      </p>
+    </div>
+
+    <p data-anchor="reset-close-p1">
+      Zoom out and reset and revert are two tools built for the same
+      job &mdash; "make Git forget this happened" &mdash; aimed at two
+      different audiences. Reset rewrites <em>your</em> branch's story,
+      which is perfectly safe as long as you're the only reader of that
+      story so far; it's the right call for the wrong-branch fumble, the
+      "let me try that commit message again" cleanup, the local
+      experiment that didn't pan out. Revert writes a correction into the
+      <em>public</em> record instead of erasing a page, which is the only
+      safe move once other people have already turned to that page. Keep
+      Chapter 9's reflog running underneath either one as your net, and
+      there's genuinely no "undo" mistake left in Git that can't be
+      walked back. Next chapter is about the opposite problem &mdash; not
+      undoing work, but <em>pausing</em> it mid-flight, with
+      <code>git stash</code>.
+    </p>
+
+    <p class="sources" data-anchor="reset-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/docs/git-reset" target="_blank" rel="noopener">git-scm.com &mdash; git-reset</a>
+      &middot;
+      <a href="https://git-scm.com/book/en/v2/Git-Tools-Reset-Demystified" target="_blank" rel="noopener">Pro Git, Ch. 7.7 &mdash; Reset Demystified</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-revert" target="_blank" rel="noopener">git-scm.com &mdash; git-revert</a>
+      &middot;
+      <a href="https://git-scm.com/book/en/v2/Git-Basics-Undoing-Things" target="_blank" rel="noopener">Pro Git, Ch. 2.5 &mdash; Undoing Things</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="09-reflog.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="11-stashing.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

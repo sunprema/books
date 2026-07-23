@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Durable Timers &amp; the Passage of Time — Durable Execution</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Durable Execution<span class="dot">.</span></span>
+  <span class="chip">05 · Durable Timers</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 05 · Time, Made Durable</p>
+    <h1>Durable Timers &amp; the Passage of Time</h1>
+    <p class="dek">A workflow that says "wait 30 days" must survive 30 days of crashes, deploys, and reboots.</p>
+
+    <p class="lead" data-anchor="tm-lead">Real business does not happen in a millisecond. "Charge the
+    card, then wait three days, then send a reminder if they haven't paid." "Start the trial; in
+    fourteen days, downgrade." Ordinary programs express a wait with <code>sleep()</code> — a thread
+    parked in memory. But memory is the first thing a crash destroys. A workflow that must wait a month
+    cannot hold a thread for a month; the machine will be redeployed a dozen times before then. So we
+    need time itself to be durable, and the way we get it is the same way we got everything else: we
+    write it down.</p>
+
+    <h2 data-anchor="tm-h-durable">A wait is a fact on the log, not a parked thread</h2>
+    <p data-anchor="tm-p-durable">A <strong>durable timer</strong> is recorded in the log as an event:
+    "a timer for workflow&nbsp;X should fire at 14:00 on the 30th." Having written that, the worker is
+    <em>free</em> — it holds no thread, consumes no memory, and can crash, be replaced, or be
+    redeployed a hundred times. The wait does not live in a process; it lives in the store. When the
+    appointed moment arrives, the engine appends a "timer fired" event and wakes the workflow to
+    continue. The passage of a month costs you exactly one row and one wake-up, not a month of held
+    resources.</p>
+
+    <div class="ledger" data-anchor="tm-ledger" role="img" aria-label="A log showing a timer scheduled to fire in the future and, later, the fired event that wakes the workflow.">
+      <div class="row done"><span class="lsn">e12</span><span class="ev">ActivityCompleted &nbsp;charge = ok</span></div>
+      <div class="row done"><span class="lsn">e13</span><span class="ev">TimerStarted &nbsp;fire_at = +30d</span></div>
+      <div class="row"><span class="lsn">⋯</span><span class="ev">worker may crash / redeploy freely here</span></div>
+      <div class="row new"><span class="lsn">e14</span><span class="ev">TimerFired &nbsp;→ wake &amp; continue</span></div>
+    </div>
+
+    <h2 data-anchor="tm-h-nondeterm">Time is the sneakiest non-determinism of all</h2>
+    <p data-anchor="tm-p-nondeterm">Chapter 3 warned you never to read the wall clock inside workflow
+    code, and the durable timer is <em>why</em> the engine can afford that rule. Think about replay. If
+    your code said <code>if now() &gt; deadline</code>, then the first run and a replay six days later
+    would read two different clocks and could take two different branches — the reconstruction breaks.
+    So the engine forbids the raw clock and offers durable timers instead: you say "sleep until the
+    deadline," the engine records the <em>firing</em> as an event, and on replay your code sees that
+    same recorded firing, not a fresh reading. Time stops being a live, ever-changing input and becomes
+    just another fact on the log — which is exactly what makes it safe to replay.</p>
+
+    <div class="callout key" data-anchor="tm-callout-time">
+      <span class="tag">The reframing</span>
+      <p>In a durable workflow, the current time is not something you <em>read</em> — it is something
+      the engine <em>records</em> for you. "Has enough time passed?" is answered by a timer event in the
+      history, not by a clock in the CPU. Once you see time as logged fact rather than live input, the
+      whole determinism rule of Chapter 3 stops feeling like a restriction and starts feeling like the
+      only sane way to build something that can be reborn from its record.</p>
+    </div>
+
+    <h2 data-anchor="tm-h-heartbeat">Telling a slow worker from a dead one</h2>
+    <p data-anchor="tm-p-heartbeat">Timers point the other way too. Suppose an activity is genuinely
+    long — transcoding a video, crunching a report — and takes twenty minutes. How does the engine tell
+    "still working, be patient" from "the worker died ten minutes ago"? It cannot, unless the worker
+    speaks up. So long activities send periodic <strong>heartbeats</strong>: little "still alive"
+    signals. The engine sets a <em>heartbeat timeout</em>; as long as beats keep arriving inside it, the
+    activity is presumed healthy. If the beats stop, the engine declares the attempt failed and — being
+    an at-least-once system — reschedules it. (Which is precisely why Chapter 4 insisted that activity
+    be idempotent: a heartbeat timeout is one of the ordinary ways an activity runs twice.)</p>
+
+    <div class="callout note" data-anchor="tm-note-heartbeat">
+      <span class="tag">A timeout is a bet, not a fact</span>
+      <p>Every timeout is a wager: "if I haven't heard back in <em>this</em> long, I'll assume the worst
+      and retry." Set it too tight and you abandon healthy-but-slow work — and double it up. Set it too
+      loose and a truly dead worker stalls the workflow for ages before anyone notices. There is no
+      universally right value; there is only a value chosen deliberately for <em>this</em> task's honest
+      distribution of durations. Guessing is how you get mysterious duplicate work at the tail.</p>
+    </div>
+
+    <h2 data-anchor="tm-h-queue">The queue-shaped version of the same idea</h2>
+    <p data-anchor="tm-p-queue">Not every durable timer lives inside a replay engine. In a job queue
+    like <strong>Oban</strong>, the very same idea appears as a <em>scheduled job</em>: a row in the
+    database with a <code>scheduled_at</code> timestamp, invisible to workers until its time comes, at
+    which point the queue makes it available to run. "Remind them in three days" is a job scheduled for
+    three days hence; "reconcile accounts nightly" is a cron entry the queue enqueues on the hour. The
+    mechanism is humbler — a timestamped row, not an event in a replayed history — but the principle is
+    identical: the wait is durable because it is <em>written down in a store that survives the crash</em>,
+    not held in a thread that doesn't.</p>
+
+    <pre data-anchor="tm-pre-oban"><span class="cap">a durable wait as a scheduled row (Oban, Elixir)</span><code><span class="co"># "remind in 3 days" — the wait lives in Postgres, not in a process</span>
+%{user_id: id}
+|&gt; <span class="mod">ReminderWorker</span>.<span class="fn">new</span>(<span class="at">schedule_in:</span> <span class="num">3</span> * <span class="num">24</span> * <span class="num">3600</span>)
+|&gt; <span class="mod">Oban</span>.<span class="fn">insert</span>()
+
+<span class="co"># The app can restart a hundred times before it fires; the row waits patiently.</span></code></pre>
+
+    <div class="reflect" data-anchor="tm-reflect">Notice the pattern holding across every layer.
+    Whenever durable execution needs to remember something across a crash — a result, a decision, a
+    debt, and now the <b>passage of time</b> — its answer is the same four words: <b>write it down
+    first.</b> A wait is not an absence of work the process must sit through; it is a small durable fact
+    the process is free to forget, trusting the log to remind it.</div>
+
+    <div class="envelope" data-anchor="tm-env">
+      <span class="tag">Back of the envelope</span>
+      <p>A held thread costs perhaps a megabyte of stack plus a scheduler slot, for the entire duration
+      of the wait. A durable timer costs one row — call it a hundred bytes — and zero running threads.
+      For a one-second wait the difference is academic; for a thirty-day wait across a million workflows
+      it is the difference between a rack of idle machines and a single quiet table. Durability and
+      efficiency, for once, pull the same direction.</p>
+    </div>
+
+    <h3 data-anchor="tm-try">Think it through</h3>
+    <ol class="challenges">
+      <li>Find a <code>sleep</code> or a scheduled thread in your system that waits more than a few
+      seconds. Ask what happens to that wait if the process is redeployed. If the answer is "it's lost,"
+      it wanted to be a durable timer.</li>
+      <li>Pick a long-running job you own and decide its honest heartbeat timeout from its real duration
+      distribution — not a round number. Then say what happens on a timeout, and confirm the job is
+      idempotent enough to survive it.</li>
+      <li>Re-read Chapter 3's determinism rule with time in mind. Explain, in one sentence, why a durable
+      timer is what <em>permits</em> that rule rather than what fights it.</li>
+    </ol>
+
+    <div class="sources" data-anchor="tm-sources"><b>Sources</b> · Temporal docs, <em>Workflows</em>
+    and <em>Events and Event History</em> (timers, heartbeats) · Learn Temporal, <em>Develop code that
+    durably executes</em> · Oban hexdocs (scheduled and cron jobs). See the cheatsheet for links.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="04-idempotency.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="06-sagas.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

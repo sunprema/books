@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Your Own Agent DSL — Spark DSL</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">✦</span> Spark <b>·</b> DSLs in Elixir</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 08 · Capstone</p>
+      <h1>Design Your Own Agent DSL</h1>
+      <p class="lede">Let's earn the whole book in one example. We'll invent a tiny <code>agent</code> language: a way to declare an LLM agent — its model, its system prompt, and the tools it may call — that the runtime can introspect and hand to a model.</p>
+
+      <p class="serif-drop">We want users to write the block on the right and get, for free, a validated agent definition plus a function that emits standard tool schemas for any LLM API. Nothing here is exotic — it's Chapters 2–5 aimed at a new domain. That's the point: once you own the pattern, every new DSL is a weekend, not a quarter.</p>
+
+      <h2>The target syntax</h2>
+      <pre><span class="cap">what a user will write</span><code><span class="kw">defmodule</span> <span class="ty">MyApp.SupportAgent</span> <span class="kw">do</span>
+  <span class="kw">use</span> <span class="ty">Agentic</span>
+
+  <span class="fn">agent</span> <span class="kw">do</span>
+    <span class="fn">model</span> <span class="str">"claude-opus-4-8"</span>
+    <span class="fn">system_prompt</span> <span class="str">"You are a calm support agent."</span>
+  <span class="kw">end</span>
+
+  <span class="fn">tools</span> <span class="kw">do</span>
+    <span class="fn">tool</span> <span class="at">:lookup_order</span> <span class="kw">do</span>
+      <span class="fn">description</span> <span class="str">"Find an order by its id"</span>
+      <span class="fn">param</span> <span class="at">:order_id</span>, <span class="at">:string</span>, required: <span class="kw">true</span>
+      <span class="fn">handler</span> &amp;<span class="ty">Orders</span>.<span class="fn">lookup/1</span>
+    <span class="kw">end</span>
+
+    <span class="fn">tool</span> <span class="at">:issue_refund</span> <span class="kw">do</span>
+      <span class="fn">description</span> <span class="str">"Refund an order"</span>
+      <span class="fn">param</span> <span class="at">:order_id</span>, <span class="at">:string</span>, required: <span class="kw">true</span>
+      <span class="fn">destructive?</span> <span class="kw">true</span>
+      <span class="fn">handler</span> &amp;<span class="ty">Orders</span>.<span class="fn">refund/1</span>
+    <span class="kw">end</span>
+  <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+      <span class="folio">19 ·</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>The extension</h2>
+      <p>Two entities (<code>param</code> nested in <code>tool</code>), two sections (<code>agent</code>, <code>tools</code>):</p>
+      <pre><span class="cap">lib/agentic/dsl.ex</span><code><span class="kw">defmodule</span> <span class="ty">Agentic.Dsl</span> <span class="kw">do</span>
+  <span class="kw">alias</span> <span class="ty">Spark.Builder.{Entity, Field, Section}</span>
+
+  <span class="kw">defmodule</span> <span class="ty">Param</span> <span class="kw">do</span>
+    <span class="bi">defstruct</span> [<span class="at">:name</span>, <span class="at">:type</span>, <span class="at">:required</span>, <span class="at">:__spark_metadata__</span>]
+  <span class="kw">end</span>
+  <span class="kw">defmodule</span> <span class="ty">Tool</span> <span class="kw">do</span>
+    <span class="bi">defstruct</span> [<span class="at">:name</span>, <span class="at">:description</span>, <span class="at">:handler</span>,
+               destructive?: <span class="kw">false</span>, params: [],
+               __spark_metadata__: <span class="kw">nil</span>]
+  <span class="kw">end</span>
+
+  @param <span class="ty">Entity</span>.<span class="fn">new</span>(<span class="at">:param</span>, <span class="ty">Param</span>,
+    args: [<span class="at">:name</span>, <span class="at">:type</span>],
+    schema: [
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:name</span>, <span class="at">:atom</span>, required: <span class="kw">true</span>),
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:type</span>, {<span class="at">:one_of</span>, [<span class="at">:string</span>, <span class="at">:integer</span>, <span class="at">:boolean</span>]},
+        required: <span class="kw">true</span>),
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:required</span>, <span class="at">:boolean</span>, default: <span class="kw">false</span>)
+    ]) |&gt; <span class="ty">Entity</span>.<span class="fn">build!</span>()
+
+  @tool <span class="ty">Entity</span>.<span class="fn">new</span>(<span class="at">:tool</span>, <span class="ty">Tool</span>,
+    args: [<span class="at">:name</span>],
+    entities: [params: [@param]],
+    schema: [
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:name</span>, <span class="at">:atom</span>, required: <span class="kw">true</span>),
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:description</span>, <span class="at">:string</span>, required: <span class="kw">true</span>),
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:destructive?</span>, <span class="at">:boolean</span>, default: <span class="kw">false</span>),
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:handler</span>, {<span class="at">:fun</span>, <span class="num">1</span>}, required: <span class="kw">true</span>)
+    ]) |&gt; <span class="ty">Entity</span>.<span class="fn">build!</span>()
+
+  @tools <span class="ty">Section</span>.<span class="fn">new</span>(<span class="at">:tools</span>, entities: [@tool])
+         |&gt; <span class="ty">Section</span>.<span class="fn">build!</span>()
+
+  @agent <span class="ty">Section</span>.<span class="fn">new</span>(<span class="at">:agent</span>,
+    schema: [
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:model</span>, <span class="at">:string</span>, required: <span class="kw">true</span>),
+      <span class="ty">Field</span>.<span class="fn">new</span>(<span class="at">:system_prompt</span>, <span class="at">:string</span>)
+    ]) |&gt; <span class="ty">Section</span>.<span class="fn">build!</span>()
+
+  <span class="kw">use</span> <span class="ty">Spark.Dsl.Extension</span>,
+    sections: [@agent, @tools],
+    verifiers: [<span class="ty">Agentic.Verifiers.UniqueTools</span>]
+<span class="kw">end</span></code></pre>
+      <span class="folio">· 20</span>
+    </div>
+  </section>
+
+  <section class="spread" style="margin-top:1.4rem">
+    <div class="leaf leaf-left">
+      <h2>Info + a guardrail verifier</h2>
+      <pre><span class="cap">lib/agentic/info.ex</span><code><span class="kw">defmodule</span> <span class="ty">Agentic.Info</span> <span class="kw">do</span>
+  <span class="kw">use</span> <span class="ty">Spark.InfoGenerator</span>,
+    extension: <span class="ty">Agentic.Dsl</span>, sections: [<span class="at">:agent</span>, <span class="at">:tools</span>]
+<span class="kw">end</span></code></pre>
+      <pre><span class="cap">unique tool names — at compile time</span><code><span class="kw">defmodule</span> <span class="ty">Agentic.Verifiers.UniqueTools</span> <span class="kw">do</span>
+  <span class="kw">use</span> <span class="ty">Spark.Dsl.Verifier</span>
+
+  <span class="kw">def</span> <span class="fn">verify</span>(dsl) <span class="kw">do</span>
+    names = <span class="ty">Enum</span>.<span class="fn">map</span>(<span class="ty">Agentic.Info</span>.<span class="fn">tools</span>(dsl), &amp; &amp;1.name)
+
+    <span class="kw">if</span> names == <span class="ty">Enum</span>.<span class="fn">uniq</span>(names),
+      <span class="kw">do</span>: <span class="at">:ok</span>,
+      <span class="kw">else</span>: {<span class="at">:error</span>, <span class="ty">Spark.Error.DslError</span>.<span class="fn">exception</span>(
+        message: <span class="str">"tool names must be unique"</span>,
+        path: [<span class="at">:tools</span>],
+        module: <span class="ty">Spark.Dsl.Verifier</span>.<span class="fn">get_persisted</span>(dsl, <span class="at">:module</span>))}
+  <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+      <div class="callout note">
+        <span class="ic">🧱</span>
+        <div><span class="lab">Guardrails as code</span>
+        <p>Want "no agent may declare more than 3 destructive tools"? It's three more lines in a verifier: count <code>&amp;1.destructive?</code> and error past the threshold. Policy that used to live in a wiki now fails the build.</p>
+        </div>
+      </div>
+      <span class="folio">21 ·</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>The payoff: introspection → tool schema</h2>
+      <p>Now turn the declared tools into the JSON tool definitions any LLM API expects — purely by reading the DSL back out:</p>
+      <pre><span class="cap">lib/agentic.ex</span><code><span class="kw">defmodule</span> <span class="ty">Agentic</span> <span class="kw">do</span>
+  <span class="kw">use</span> <span class="ty">Spark.Dsl</span>,
+    default_extensions: [extensions: [<span class="ty">Agentic.Dsl</span>]]
+
+  <span class="cm"># Build provider-ready tool specs from the DSL.</span>
+  <span class="kw">def</span> <span class="fn">tool_specs</span>(agent) <span class="kw">do</span>
+    <span class="ty">Agentic.Info</span>.<span class="fn">tools</span>(agent)
+    |&gt; <span class="ty">Enum</span>.<span class="fn">map</span>(<span class="kw">fn</span> tool -&gt;
+      %{
+        name: tool.name,
+        description: tool.description,
+        input_schema: %{
+          type: <span class="str">"object"</span>,
+          properties:
+            <span class="ty">Map</span>.<span class="fn">new</span>(tool.params, <span class="kw">fn</span> p -&gt;
+              {p.name, %{type: <span class="ty">Atom</span>.<span class="fn">to_string</span>(p.type)}}
+            <span class="kw">end</span>),
+          required:
+            <span class="kw">for</span> p &lt;- tool.params, p.required, <span class="kw">do</span>: p.name
+        }
+      }
+    <span class="kw">end</span>)
+  <span class="kw">end</span>
+
+  <span class="cm"># Dispatch a model's chosen call to the right handler.</span>
+  <span class="kw">def</span> <span class="fn">dispatch</span>(agent, name, args) <span class="kw">do</span>
+    tool = <span class="ty">Enum</span>.<span class="fn">find</span>(<span class="ty">Agentic.Info</span>.<span class="fn">tools</span>(agent),
+                    &amp;(&amp;1.name == name))
+    tool.handler.(args)
+  <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+      <pre><span class="cap">iex</span><code><span class="pr">iex&gt;</span> <span class="ty">Agentic</span>.<span class="fn">tool_specs</span>(<span class="ty">MyApp.SupportAgent</span>)
+[%{name: <span class="at">:lookup_order</span>, description: <span class="str">"Find an order…"</span>,
+   input_schema: %{type: <span class="str">"object"</span>,
+     properties: %{order_id: %{type: <span class="str">"string"</span>}},
+     required: [<span class="at">:order_id</span>]}}, …]</code></pre>
+
+      <div class="callout key">
+        <span class="ic">🎯</span>
+        <div><span class="lab">Look what we built</span>
+        <p>A human declares an agent in readable Elixir; a verifier enforces safety at compile time; <code>tool_specs/1</code> emits exactly what an LLM tool-calling API wants; <code>dispatch/3</code> routes the model's answer back to real code. The DSL is the single source of truth for both the human <em>and</em> the machine. That's the whole promise of this book, standing on its own two feet.</p>
+        </div>
+      </div>
+
+      <div class="callout why">
+        <span class="ic">🍎</span>
+        <div><span class="lab">Where to go next</span>
+        <p>Study how Ash AI and Jido do this at production scale, wire <code>tool_specs/1</code> to a real client like <em>LangChain</em> or <em>ReqLLM</em>, and read the official <em>Writing Extensions</em> guide. You now have the map; the territory is wide and surprisingly friendly.</p>
+        </div>
+      </div>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p>Pattern synthesized from Spark's <code>usage-rules.md</code> (entities, verifiers, InfoGenerator) and the Ash AI / Jido tool-DSL designs. Illustrative code; APIs per Spark 2.7.2.</p>
+      </div>
+      <span class="folio">· 22</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="07-agentic-world.html"><span class="dir">← Prev</span><span class="ttl">Spark in the Agentic World</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>✦</a>
+      <a class="next" rel="next" href="../cheatsheet.html"><span class="dir">Next →</span><span class="ttl">Cheatsheet</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

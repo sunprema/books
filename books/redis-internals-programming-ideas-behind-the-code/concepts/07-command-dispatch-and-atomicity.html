@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command Dispatch and Atomicity Without Locks &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 7 &middot; Command Execution</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch7-kicker">Chapter 7 of 12 &middot; Command execution</p>
+    <h1 data-anchor="ch7-h1">Command Dispatch and Atomicity <span class="hl">Without Locks</span></h1>
+
+    <p class="lede" data-anchor="ch7-lede">
+      Fire the same increment at Redis from fifty concurrent clients and
+      count the result:
+    </p>
+
+    <pre class="code" data-anchor="ch7-code1"><span class="cap">Terminal &mdash; 50 clients racing to INCR the same key</span><code><span class="cm">$</span> redis-cli SET counter 0
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-benchmark -c 50 -n 5000 -t incr -q -r 0
+<span class="cm">INCR: ... requests per second</span>
+<span class="cm">$</span> redis-cli GET counter
+<span class="str">"5000"</span></code></pre>
+
+    <p data-anchor="ch7-p1">
+      Exactly 5000, every time, no matter how many concurrent clients raced to
+      get there. In a database with real internal concurrency, that would
+      need a lock around the counter to avoid a classic read-modify-write
+      race. Redis has no such lock &mdash; and doesn't need one, because of a
+      guarantee this chapter makes precise: exactly one command's execution
+      step ever runs at a time, start to finish, with nothing else touching
+      the dataset in between.
+    </p>
+
+    <h2 data-anchor="ch7-h2-table">The Command Table</h2>
+    <p data-anchor="ch7-p2">
+      Every command Redis understands is registered once, in a table keyed by
+      name, as a <code>struct redisCommand</code>: the command's name, a
+      function pointer to its handler, its <strong>arity</strong> (the exact
+      argument count, or a negative number meaning "at least N"), a set of
+      <strong>flags</strong> (is it a write command? read-only? does it
+      require enough free memory, <code>deny-oom</code>? is it an admin-only
+      command?), and metadata describing which of its arguments are actual
+      keys (so cluster routing and <code>MULTI</code> conflict-checking can
+      find them generically). <code>lookupCommand()</code> resolves the
+      first word of a request against this table with a single dictionary
+      lookup &mdash; the same <code>dict</code> structure from Chapter 6, put
+      to a different use.
+    </p>
+
+    <div class="callout tip" data-anchor="ch7-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        Run <code>COMMAND INFO get set expire</code> from any live server to
+        see this metadata firsthand &mdash; arity, flags, and first/last/step
+        key positions, exactly as the dispatcher reads it. It's the same
+        introspection Redis Cluster clients use to figure out which key(s) a
+        command touches without hardcoding a list per command.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch7-h2-call">From Lookup to <span class="term">call()</span></h2>
+    <p data-anchor="ch7-p3">
+      Once the handler is found, the dispatcher's <code>call()</code>
+      function invokes it directly: <code>cmd-&gt;proc(c)</code>. There is no
+      task queue, no scheduling decision, no yield point in the middle
+      &mdash; it's an ordinary, synchronous C function call, and the function
+      doesn't return until the command is completely finished mutating the
+      keyspace and has queued its reply. That's the whole mechanism. Atomicity
+      isn't implemented &mdash; it falls out for free from "the event loop
+      only ever does one thing at a time" (Chapter 2) plus "executing a
+      command is one uninterrupted function call" (Chapter 3).
+    </p>
+
+    <figure class="diagram" data-anchor="ch7-diagram">
+      <svg viewBox="0 0 700 220" role="img" aria-labelledby="ch7-svg-title">
+        <title id="ch7-svg-title">Many clients queue for the same single execution lane. Only one command's handler ever runs against the dataset at a time, so operations that touch the same key never interleave.</title>
+        <g font-family="var(--font-mono)" font-size="10.5">
+          <g fill="var(--bg-2)" stroke="var(--ty)" stroke-width="1.3">
+            <rect x="20" y="20" width="110" height="30" rx="6"></rect>
+            <rect x="20" y="60" width="110" height="30" rx="6"></rect>
+            <rect x="20" y="100" width="110" height="30" rx="6"></rect>
+            <rect x="20" y="140" width="110" height="30" rx="6"></rect>
+            <rect x="20" y="180" width="110" height="30" rx="6"></rect>
+          </g>
+          <text x="75" y="39"  text-anchor="middle" fill="var(--ty)" font-size="9.5">client 1: INCR c</text>
+          <text x="75" y="79"  text-anchor="middle" fill="var(--ty)" font-size="9.5">client 2: INCR c</text>
+          <text x="75" y="119" text-anchor="middle" fill="var(--ty)" font-size="9.5">client 3: INCR c</text>
+          <text x="75" y="159" text-anchor="middle" fill="var(--ty)" font-size="9.5">client 4: INCR c</text>
+          <text x="75" y="199" text-anchor="middle" fill="var(--ty)" font-size="9.5">client 5: INCR c</text>
+
+          <g stroke="var(--rule)" stroke-width="1.2" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow7)">
+            <path d="M130,35  C230,35 250,95 320,100"></path>
+            <path d="M130,75  C230,75 260,98 320,105"></path>
+            <path d="M130,115 C260,115 290,110 320,110"></path>
+            <path d="M130,155 C260,155 290,120 320,115"></path>
+            <path d="M130,195 C260,195 290,130 320,120"></path>
+          </g>
+
+          <rect x="330" y="60" width="170" height="100" rx="10" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="2"></rect>
+          <text x="415" y="98" text-anchor="middle" fill="var(--accent)" font-weight="700">call()</text>
+          <text x="415" y="116" text-anchor="middle" fill="var(--ink-soft)" font-size="9">one lane</text>
+          <text x="415" y="132" text-anchor="middle" fill="var(--ink-soft)" font-size="9">no interleaving</text>
+
+          <path d="M500,110 L570,110" stroke="var(--fn)" stroke-width="1.6" fill="none" marker-end="url(#arrow7f)"></path>
+          <rect x="580" y="82" width="100" height="56" rx="8" fill="var(--bg-2)" stroke="var(--fn)" stroke-width="1.4"></rect>
+          <text x="630" y="106" text-anchor="middle" fill="var(--fn)" font-size="9.5">counter</text>
+          <text x="630" y="122" text-anchor="middle" fill="var(--fn)" font-size="9.5">= 5</text>
+        </g>
+        <defs>
+          <marker id="arrow7" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--rule)"></path></marker>
+          <marker id="arrow7f" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--fn)"></path></marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>No lock, because there's no race to guard against.</strong>
+        Five clients funnel into one execution lane; each <code>INCR</code>
+        completes entirely before the next one starts. Correctness comes from
+        architecture, not from a mutex any handler has to remember to take.
+      </figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch7-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Almost every single Redis command is atomic simply by virtue of being
+        one command &mdash; <code>INCR</code>, <code>LPUSH</code>,
+        <code>HSET</code>, even compound-sounding ones like
+        <code>SETNX</code> (set-if-not-exists) or <code>GETSET</code>. What
+        needs actual thought is when your application logic spans
+        <em>multiple</em> commands and the state in between matters &mdash;
+        that's what <code>MULTI</code>/<code>EXEC</code> and Lua scripting
+        exist for.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch7-h2-multi">Transactions: MULTI/EXEC</h2>
+    <p data-anchor="ch7-p4">
+      <code>MULTI</code> switches a connection into queuing mode: every
+      command after it is parsed and validated but not executed, just
+      appended to a per-client queue. <code>EXEC</code> then runs every
+      queued command back-to-back, as one atomic block &mdash; no other
+      client's command can be interleaved in the middle, because, again,
+      there's only one execution lane and this block has claimed it entirely
+      for its duration. The catch: <code>MULTI</code>/<code>EXEC</code>
+      queues commands blindly. It can't look at the result of the second
+      queued command to decide what the third one should be &mdash; there's
+      no branching once you're inside the block.
+    </p>
+
+    <pre class="code" data-anchor="ch7-code2"><span class="cap">Terminal &mdash; a queued, atomic transaction</span><code><span class="cm">$</span> redis-cli
+127.0.0.1:6379&gt; <span class="fn">MULTI</span>
+<span class="fn">OK</span>
+127.0.0.1:6379&gt; <span class="fn">INCR</span> visits
+<span class="fn">QUEUED</span>
+127.0.0.1:6379&gt; <span class="fn">EXPIRE</span> visits 60
+<span class="fn">QUEUED</span>
+127.0.0.1:6379&gt; <span class="fn">EXEC</span>
+<span class="num">1) (integer) 1</span>
+<span class="num">2) (integer) 1</span></code></pre>
+
+    <h2 data-anchor="ch7-h2-lua">Scripting: Lua and Determinism</h2>
+    <p data-anchor="ch7-p5">
+      Lua scripting (<code>EVAL</code>, and its cousin <code>FUNCTION</code>)
+      solves exactly the limitation <code>MULTI</code>/<code>EXEC</code>
+      has: a script can read a value, branch on it, and decide what to write
+      next, all inside one atomic unit, because the whole script runs to
+      completion as a single unit of execution &mdash; no other command can
+      run in the middle. That power comes with a rule: scripts must be
+      <strong>deterministic</strong>, because their effects are replicated to
+      replicas and persisted to the AOF (Chapter 8) as if they were the
+      commands the script itself ran. Redis actively blocks a script from
+      calling a random or clock-dependent command (like <code>SPOP</code> or
+      <code>TIME</code>) and then following it with a write, specifically to
+      keep every replica's data path deterministic.
+    </p>
+
+    <div class="callout warn" data-anchor="ch7-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        A script that runs long doesn't get preempted &mdash; the same
+        "one uninterrupted execution" guarantee that makes it atomic also
+        means a runaway loop inside a script stalls the entire server exactly
+        like the dangerous commands from Chapter 3. The <code>busy-reply-threshold</code>
+        (formerly <code>lua-time-limit</code>) exists to let you notice a
+        stuck script and intervene &mdash; not to make the script safe to run
+        unbounded in the first place.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch7-h2-modules">Modules: Extending Redis Without Breaking the Contract</h2>
+    <p data-anchor="ch7-p6">
+      Modules (loaded via <code>MODULE LOAD</code>) let you register whole new
+      commands, written in C or any language with a native binding, using
+      <code>RedisModule_CreateCommand()</code>. The API is layered
+      deliberately: a high-level layer that looks like calling any other
+      Redis command, and a low-level layer with near-native access to core
+      data structures for performance-critical modules. Either way, a module
+      command is expected to respect the same execution contract every
+      built-in command does &mdash; run to completion without silently
+      blocking the loop &mdash; because the module boundary is a place to add
+      new capability, not a place to opt out of the guarantees the rest of
+      the engine depends on.
+    </p>
+
+    <p data-anchor="ch7-close-p1">
+      Atomic execution is what makes the data path trustworthy moment to
+      moment. But none of it survives a restart unless it's written
+      somewhere durable &mdash; and writing to disk is exactly the kind of
+      slow operation Chapter 1 said the main thread must never wait on.
+      How Redis squares that circle is next.
+    </p>
+
+    <p class="sources" data-anchor="ch7-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://redis.io/docs/latest/develop/programmability/eval-intro/" target="_blank" rel="noopener">redis.io &mdash; Scripting with Lua</a>
+      &middot;
+      <a href="https://redis.io/docs/latest/develop/reference/modules/" target="_blank" rel="noopener">redis.io &mdash; Modules API</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="06-dictionaries-and-incremental-rehashing.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="08-persistence-rdb-and-aof.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

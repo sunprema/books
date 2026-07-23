@@ -1,0 +1,134 @@
+name: Place approved image
+
+# Fires when a MAINTAINER adds the `art-approved` label to an `image-request`
+# issue. The label is the trigger AND the security boundary: an issue author
+# cannot self-assign a label (that needs triage/write), so a random user's
+# attached image is inert until a maintainer approves it. See AUTOMATION.md.
+#
+# Art is placed ONTO THE BOOK'S OWN PR BRANCH (from the issue marker), so it
+# accumulates on the still-unmerged book PR. The book is never live with
+# prompt placeholders — it goes to Pages complete, only when that PR merges.
+on:
+  issues:
+    types: [labeled]
+
+# Serialize ALL placements so two approvals can't race-push the same branch.
+concurrency:
+  group: place-image
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  place:
+    if: github.event.label.name == 'art-approved'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ github.event.issue.number }}
+      SENDER: ${{ github.event.sender.login }}
+    steps:
+      # 1. SECURITY GATE — belt-and-suspenders. Only triage+ can label, but
+      #    verify the labeler really has write/admin before touching the repo.
+      #    exit 0 (not 1) on failure: a spoof attempt leaves a green no-op run.
+      - name: Verify labeler is a maintainer
+        run: |
+          perm=$(gh api "repos/${{ github.repository }}/collaborators/$SENDER/permission" -q .permission 2>/dev/null || echo none)
+          echo "permission=$perm"
+          if [[ "$perm" != "admin" && "$perm" != "write" ]]; then
+            echo "::notice::$SENDER lacks write access — ignoring."
+            exit 0
+          fi
+          echo "ok=1" >> "$GITHUB_ENV"
+
+      # 2. Resolve book/slot/branch from the marker + newest attached image.
+      #    Checkout happens AFTER we know the branch, so do a light checkout of
+      #    default first only to read nothing — we clone the branch in step 4.
+      - name: Resolve slot, branch, image URL
+        if: env.ok == '1'
+        id: resolve
+        run: |
+          blob=$(gh issue view "$ISSUE" --repo "${{ github.repository }}" --json body,comments \
+                   -q '.body + "\n" + ([.comments[].body] | join("\n"))')
+          book=$(grep -oP 'bookbank-img:\s*book=\K[^\s]+'      <<<"$blob" | head -1)
+          slot=$(grep -oP 'bookbank-img:.*\bslot=\K[^\s>]+'    <<<"$blob" | head -1)
+          branch=$(grep -oP 'bookbank-img:.*\bbranch=\K[^\s>]+' <<<"$blob" | head -1)
+          url=$(grep -oP '(https://github\.com/user-attachments/assets/[^\s)"]+|https://user-images\.githubusercontent\.com/[^\s)"]+)' <<<"$blob" | tail -1)
+          echo "book=$book slot=$slot branch=$branch"
+          fail() { gh issue comment "$ISSUE" --repo "${{ github.repository }}" --body "$1"; gh issue edit "$ISSUE" --repo "${{ github.repository }}" --remove-label art-approved; exit 1; }
+          [[ -n "$book" && -n "$slot" ]] || fail "⚠️ Missing \`book\`/\`slot\` in the bookbank-img marker. Re-add **art-approved** after fixing."
+          [[ -n "$branch" ]] || fail "⚠️ Missing \`branch\` in the marker — can't tell which book PR to place onto."
+          [[ -n "$url" ]]    || fail "⚠️ No attached image found on this issue or its comments. Attach one, then re-add **art-approved**."
+          echo "book=$book"     >> "$GITHUB_OUTPUT"
+          echo "slot=$slot"     >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "url=$url"       >> "$GITHUB_OUTPUT"
+
+      # 3. Checkout the BOOK PR BRANCH (that's where books/<book>/ actually lives;
+      #    it isn't on main until the book PR merges).
+      - name: Checkout book PR branch
+        if: env.ok == '1'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.branch }}
+
+      - name: Guard — book exists on this branch
+        if: env.ok == '1'
+        run: |
+          if [[ ! -f "books/${{ steps.resolve.outputs.book }}/book.json" ]]; then
+            gh issue comment "$ISSUE" --repo "${{ github.repository }}" --body "⚠️ \`books/${{ steps.resolve.outputs.book }}\` not found on branch \`${{ steps.resolve.outputs.branch }}\`. Not placing."
+            gh issue edit "$ISSUE" --repo "${{ github.repository }}" --remove-label art-approved
+            exit 1
+          fi
+
+      # 4. Fetch placement tool from the pinned kit plugin, and the image.
+      - name: Fetch bookbank library (pinned)
+        if: env.ok == '1'
+        run: |
+          git clone --filter=blob:none --sparse https://github.com/sunprema/kit /tmp/kit
+          git -C /tmp/kit sparse-checkout set bookbank/library
+          git -C /tmp/kit checkout d7c63ab7a5b774912499931238ade41d8935efc7
+      - uses: actions/setup-python@v5
+        if: env.ok == '1'
+        with:
+          python-version: '3.12'
+      - name: Install Pillow & fetch image
+        if: env.ok == '1'
+        run: |
+          pip install --quiet Pillow
+          curl -sL --retry 3 --retry-all-errors "${{ steps.resolve.outputs.url }}" -o /tmp/incoming.img
+          echo "bytes=$(wc -c < /tmp/incoming.img)"
+
+      # 5. Place into the slot (validates slot exists, re-encodes, checks aspect).
+      - name: Place image into slot
+        if: env.ok == '1'
+        run: |
+          python3 /tmp/kit/bookbank/library/place_image.py \
+            "books/${{ steps.resolve.outputs.book }}" \
+            "${{ steps.resolve.outputs.slot }}" \
+            /tmp/incoming.img --force
+
+      # 6. Commit back to the SAME book PR branch — updates the open book PR.
+      - name: Commit to book PR branch
+        if: env.ok == '1'
+        env:
+          BOOK: ${{ steps.resolve.outputs.book }}
+          SLOT: ${{ steps.resolve.outputs.slot }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        run: |
+          git config user.name  "bookbank-bot"
+          git config user.email "bookbank-bot@users.noreply.github.com"
+          git add "books/$BOOK"
+          if git diff --cached --quiet; then
+            echo "::notice::No change — image identical to what's already placed."
+          else
+            git commit -m "art($BOOK): add $SLOT (closes #$ISSUE)"
+            git push origin "HEAD:$BRANCH"
+          fi
+          pr_url=$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --json url -q '.[0].url' 2>/dev/null || true)
+          gh issue comment "$ISSUE" --repo "${{ github.repository }}" \
+            --body "✅ Placed \`$SLOT\` onto \`$BRANCH\`${pr_url:+ ($pr_url)}. It'll publish when the book PR merges."
+          gh issue close "$ISSUE" --repo "${{ github.repository }}" --reason completed

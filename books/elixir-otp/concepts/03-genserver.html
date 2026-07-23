@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · GenServer — Elixir OTP</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Elixir OTP<span class="dot">.</span></span>
+  <span class="chip">03 · GenServer</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 03 · The Generic Server</p>
+    <h1>GenServer</h1>
+    <p class="dek">The loop from Chapter 01, written once, correctly, forever.</p>
+
+    <p class="lead">Remember the hand-rolled <code>Counter</code> loop — spawn, receive, recurse with
+    new state? Every stateful process wants that skeleton, plus a dozen fiddly details: replying to
+    the right caller, timeouts, clean shutdown, code upgrades, debugging hooks. Writing that by hand
+    every time is how bugs are born. <code>GenServer</code> is that skeleton, written once by people
+    who ran telecoms on it, leaving you to fill in only the interesting clauses.</p>
+
+    <p>The deal is a clean split. <strong>You</strong> write two kinds of code: a <em>client API</em>
+    (plain functions your callers use) and a set of <em>callbacks</em> (how the server reacts).
+    <strong>GenServer</strong> owns the loop, the mailbox, and the message plumbing between them.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p>A GenServer is a process whose loop is provided for you. You implement callbacks —
+      <code>init/1</code> sets the starting state, <code>handle_call/3</code> answers synchronous
+      requests, <code>handle_cast/2</code> takes fire-and-forget ones, <code>handle_info/2</code>
+      catches everything else — and each returns a tuple telling GenServer the new state and what to
+      do next.</p>
+    </div>
+
+    <h2>call vs. cast, on the wire</h2>
+    <figure class="svg-card">
+      <svg viewBox="0 0 640 250" role="img" aria-label="Sequence diagram: a call sends a request and blocks for a reply; a cast sends a request and returns immediately.">
+        <!-- lifelines -->
+        <text x="120" y="24" text-anchor="middle" font-family="monospace" font-size="13" fill="#6b3fa0" font-weight="700">Client</text>
+        <text x="470" y="24" text-anchor="middle" font-family="monospace" font-size="13" fill="#4a2a72" font-weight="700">GenServer</text>
+        <line x1="120" y1="34" x2="120" y2="230" stroke="#cdbb9c" stroke-width="1.5"/>
+        <line x1="470" y1="34" x2="470" y2="230" stroke="#cdbb9c" stroke-width="1.5"/>
+
+        <!-- CALL -->
+        <text x="60" y="58" font-family="monospace" font-size="12" fill="#6b3fa0" font-weight="700">call</text>
+        <line x1="120" y1="70" x2="470" y2="70" stroke="#6b3fa0" stroke-width="2.5"/>
+        <polygon points="470,70 458,65 458,75" fill="#6b3fa0"/>
+        <text x="290" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5c5164">{:pop} · caller blocks ⏳</text>
+        <rect x="463" y="70" width="14" height="34" fill="#e6d8f5" stroke="#6b3fa0"/>
+        <text x="520" y="92" font-family="sans-serif" font-size="10" fill="#5c5164">handle_call/3</text>
+        <line x1="470" y1="110" x2="120" y2="110" stroke="#6b3fa0" stroke-width="2.5" stroke-dasharray="5 3"/>
+        <polygon points="120,110 132,105 132,115" fill="#6b3fa0"/>
+        <text x="290" y="103" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5c5164">{:reply, value, state} → unblocks</text>
+
+        <!-- CAST -->
+        <text x="60" y="168" font-family="monospace" font-size="12" fill="#c8781f" font-weight="700">cast</text>
+        <line x1="120" y1="180" x2="470" y2="180" stroke="#c8781f" stroke-width="2.5"/>
+        <polygon points="470,180 458,175 458,185" fill="#c8781f"/>
+        <text x="290" y="173" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5c5164">{:push, x} · returns :ok at once ⚡</text>
+        <rect x="463" y="180" width="14" height="30" fill="#f6e6cf" stroke="#c8781f"/>
+        <text x="520" y="200" font-family="sans-serif" font-size="10" fill="#5c5164">handle_cast/2</text>
+        <text x="120" y="205" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#167f6c">(client already moved on)</text>
+      </svg>
+      <figcaption>A <em>call</em> is a round trip: the client sends and waits for
+      <code>handle_call/3</code> to reply (default timeout 5&nbsp;s). A <em>cast</em> is one-way: the
+      client gets <code>:ok</code> immediately and <code>handle_cast/2</code> runs whenever the server
+      gets to it. Prefer <code>call</code> when you need the answer <em>or</em> the back-pressure.</figcaption>
+    </figure>
+
+    <h2>Implementation: a Stack, end to end</h2>
+    <p>Let's build the canonical example. Read it top to bottom: the client API is what the outside
+    world calls; the callbacks are how the server responds. The two halves talk only through
+    <code>GenServer.call</code> and <code>cast</code>.</p>
+
+    <pre><span class="cap">lib/stack.ex</span><code><span class="k">defmodule</span> <span class="mod">Stack</span> <span class="k">do</span>
+  <span class="k">use</span> <span class="mod">GenServer</span>
+
+  <span class="co"># ---------- Client API (runs in the CALLER's process) ----------</span>
+  <span class="k">def</span> <span class="fn">start_link</span>(initial \\ []) <span class="k">do</span>
+    <span class="mod">GenServer</span>.<span class="fn">start_link</span>(<span class="mod">__MODULE__</span>, initial, name: <span class="mod">__MODULE__</span>)
+  <span class="k">end</span>
+
+  <span class="k">def</span> <span class="fn">push</span>(value), <span class="k">do</span>: <span class="mod">GenServer</span>.<span class="fn">cast</span>(<span class="mod">__MODULE__</span>, {<span class="at">:push</span>, value})
+  <span class="k">def</span> <span class="fn">pop</span>,         <span class="k">do</span>: <span class="mod">GenServer</span>.<span class="fn">call</span>(<span class="mod">__MODULE__</span>, <span class="at">:pop</span>)
+
+  <span class="co"># ---------- Server callbacks (run in the SERVER's process) ----------</span>
+  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">init</span>(initial), <span class="k">do</span>: {<span class="at">:ok</span>, initial}   <span class="co"># state starts as `initial`</span>
+
+  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">handle_call</span>(<span class="at">:pop</span>, _from, [top | rest]) <span class="k">do</span>
+    {<span class="at">:reply</span>, top, rest}                    <span class="co"># reply `top`, new state `rest`</span>
+  <span class="k">end</span>
+  <span class="k">def</span> <span class="fn">handle_call</span>(<span class="at">:pop</span>, _from, []) <span class="k">do</span>
+    {<span class="at">:reply</span>, {<span class="at">:error</span>, <span class="at">:empty</span>}, []}
+  <span class="k">end</span>
+
+  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">handle_cast</span>({<span class="at">:push</span>, value}, state) <span class="k">do</span>
+    {<span class="at">:noreply</span>, [value | state]}            <span class="co"># no reply, just new state</span>
+  <span class="k">end</span>
+<span class="k">end</span></code></pre>
+
+    <pre><span class="cap">iex — using it</span><code>{<span class="at">:ok</span>, _pid} = <span class="mod">Stack</span>.<span class="fn">start_link</span>([<span class="str">"a"</span>, <span class="str">"b"</span>])
+<span class="mod">Stack</span>.<span class="fn">push</span>(<span class="str">"c"</span>)   <span class="co">#=&gt; :ok        (async, returns instantly)</span>
+<span class="mod">Stack</span>.<span class="fn">pop</span>()        <span class="co">#=&gt; "c"        (blocks for the reply)</span>
+<span class="mod">Stack</span>.<span class="fn">pop</span>()        <span class="co">#=&gt; "a"</span></code></pre>
+
+    <div class="callout note">
+      <span class="tag">Read the return tuples</span>
+      <p>The whole callback contract is in the tuples. <code>{:reply, value, new_state}</code> answers
+      a call. <code>{:noreply, new_state}</code> updates state silently. <code>{:stop, reason,
+      new_state}</code> ends the server. There's even <code>{:noreply, state,
+      {:continue, arg}}</code> to hand off heavy work to <code>handle_continue/2</code> right after —
+      handy for doing slow setup <em>after</em> <code>init/1</code> returns so startup stays snappy.</p>
+    </div>
+
+    <h3>handle_info and handle_continue</h3>
+    <p>Two more callbacks earn their keep. <code>handle_info/2</code> catches messages that didn't
+    come through <code>call</code>/<code>cast</code> — raw <code>send/2</code> messages, monitor
+    <code>:DOWN</code> notices, and timer ticks from <code>Process.send_after/3</code>. It's how a
+    GenServer runs periodic work. <code>handle_continue/2</code> lets <code>init/1</code> return fast
+    and then finish expensive initialization as the very next thing the server does — so a slow
+    dependency doesn't block your whole supervision tree from booting.</p>
+
+    <pre><span class="cap">a self-ticking server</span><code>  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">init</span>(state) <span class="k">do</span>
+    <span class="mod">Process</span>.<span class="fn">send_after</span>(<span class="fn">self</span>(), <span class="at">:tick</span>, <span class="num">1_000</span>)
+    {<span class="at">:ok</span>, state}
+  <span class="k">end</span>
+
+  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">handle_info</span>(<span class="at">:tick</span>, state) <span class="k">do</span>
+    <span class="mod">IO</span>.<span class="fn">puts</span>(<span class="str">"tick"</span>)
+    <span class="mod">Process</span>.<span class="fn">send_after</span>(<span class="fn">self</span>(), <span class="at">:tick</span>, <span class="num">1_000</span>)  <span class="co"># schedule the next one</span>
+    {<span class="at">:noreply</span>, state}
+  <span class="k">end</span></code></pre>
+
+    <div class="callout warn">
+      <span class="tag">The server is single-threaded — respect it</span>
+      <p>A GenServer handles one message at a time. That's the gift (no locks) and the trap: a slow
+      <code>handle_call</code> blocks <em>every</em> other caller behind it. Keep callbacks fast; push
+      heavy or slow work to a <code>Task</code> (Chapter 07) so the server stays responsive. And
+      prefer <code>call</code> over <code>cast</code> when senders could outpace the server — the
+      caller waiting <em>is</em> your back-pressure.</p>
+    </div>
+
+    <div class="reflect">So what did we actually gain? We stopped writing loops and started writing
+    <b>behaviour</b>. The <code>use GenServer</code> line quietly gave us a correct receive loop, a
+    <code>child_spec/1</code> so a supervisor can start us (Chapter 04), timeout handling, and debug
+    tooling. All we supplied were the clauses that make <em>this</em> server different from every
+    other. That's the OTP bargain in miniature.</div>
+
+    <h3>Challenges</h3>
+    <ol class="challenges">
+      <li>Add a <code>peek/0</code> that returns the top without removing it. Which callback — call or
+      cast — and why?</li>
+      <li>Make <code>push/1</code> a <code>call</code> instead of a <code>cast</code>. When would that
+      actually be the better choice? (Think about a fast producer and a slow disk.)</li>
+      <li>Add <code>handle_call(:pop, _from, [])</code> that instead returns <code>{:stop, :empty,
+      {:error, :empty}, []}</code>. Watch the server terminate. Now put it under a supervisor and
+      watch it come back.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Elixir hexdocs, <code>GenServer</code> — callbacks &amp;
+    return values, "Client / Server APIs," <code>handle_continue/2</code> · Elixir Getting Started,
+    "GenServer."</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="02-let-it-crash.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="04-supervisors.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

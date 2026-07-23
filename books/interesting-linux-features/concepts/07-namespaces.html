@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Namespaces: Your Own Private Linux — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 07 &middot; A Different Universe, Same Kernel</p>
+    <h1>Namespaces: Your Own Private Linux</h1>
+    <p class="lead">Every "container" you've ever run is a completely ordinary Linux process. What
+    makes it feel like a separate machine isn't virtualization &mdash; it's that the kernel can
+    give a process its own private <em>view</em> of shared global state: its own set of visible
+    PIDs, its own filesystem tree, its own network stack. That view is a
+    <strong>namespace</strong>.</p>
+
+    <p class="dropcap">There are several kinds of namespace (network, user, IPC, UTS, cgroup,
+    time), but two of them do most of the work of making a process feel like it's alone on its
+    own machine: the PID namespace, which controls which processes you can even see, and the
+    mount namespace, which controls which filesystem tree you see at all.</p>
+
+    <h2>PID namespaces: your own process tree</h2>
+    <p>Create a new PID namespace &mdash; via <code class="inl">clone(CLONE_NEWPID, ...)</code>
+    or <code class="inl">unshare(CLONE_NEWPID)</code> followed by a fork &mdash; and the very
+    first process born inside it is assigned <strong>PID 1</strong>, exactly like the real
+    <code class="inl">init</code> on a freshly booted machine. That process can only see, signal,
+    and interact with other processes inside the same namespace (and its descendant namespaces);
+    everything outside is invisible to it, as if it simply doesn't exist.</p>
+    <pre class="tab"><span class="cap">shell &middot; a process that thinks it's PID 1</span><code><span class="pr">#</span> unshare --pid --fork --mount-proc bash
+<span class="pr">#</span> ps aux
+<span class="out">USER  PID  ...  COMMAND
+root    1  ...  bash
+root    9  ...  ps aux</span>
+<span class="cm"># from the host's point of view, this bash has some large, ordinary host PID</span></code></pre>
+    <p>PID namespaces nest: each one (other than the very first, the "root" namespace the whole
+    system boots into) has a parent, and a process actually holds one PID <em>per namespace it's
+    a member of</em> &mdash; the same task might be PID 4931 as seen from the host and PID 1 as
+    seen from inside its own container, simultaneously true, depending on who's asking.</p>
+    <div class="callout warn" data-anchor="pid1-warn">
+      <span class="tag">The PID 1 catch</span>
+      If the namespace's PID 1 dies, the kernel treats it like a real init crashing: every other
+      process left in that namespace is sent <code class="inl">SIGKILL</code>. This is why
+      container images so often need a tiny, deliberate init process (<code class="inl">tini</code>,
+      <code class="inl">dumb-init</code>) instead of running the application directly as PID 1 &mdash;
+      a naive app usually doesn't reap zombie children or forward signals the way a real init
+      would.
+    </div>
+
+    <h2>Mount namespaces: your own filesystem tree</h2>
+    <p><code class="inl">CLONE_NEWNS</code> gives a process its own private copy of the system's
+    mount table. Mounting or unmounting something afterward, inside that namespace, is invisible
+    to every other namespace &mdash; and combined with <strong>bind mounts</strong>
+    (<code class="inl">mount --bind</code>, which grafts one part of the filesystem tree onto
+    another path, no new filesystem required), a process can be given a completely custom view of
+    "the filesystem" built entirely out of pieces borrowed from the real one.</p>
+    <pre class="tab"><span class="cap">shell &middot; a container root, built from bind mounts</span><code><span class="pr">#</span> mount --bind /var/lib/containers/myapp /mnt/newroot
+<span class="pr">#</span> mount --bind /var/lib/containers/myapp/etc-resolv /mnt/newroot/etc/resolv.conf
+<span class="cm"># each bind mount grafts one tree onto another location -- no chroot needed yet</span></code></pre>
+    <p>This is more flexible &mdash; and much more secure &mdash; than the old
+    <code class="inl">chroot(2)</code>, which only ever changed where <code class="inl">/</code>
+    points and famously does nothing to stop a privileged process from escaping. A mount
+    namespace is a first-class kernel object with its own lifecycle, and it's what lets a
+    container runtime assemble an entire root filesystem for a container out of read-only image
+    layers, writable overlays, and selectively bind-mounted host directories &mdash; without
+    touching the real host filesystem at all.</p>
+
+    <div class="callout why" data-anchor="proc-why">
+      <span class="tag">Why /proc needs its own mount too</span>
+      A <code class="inl">/proc</code> filesystem reflects whichever PID namespace mounted it, not
+      whichever PID namespace is currently looking at it. Which is why creating a new PID
+      namespace almost always goes hand-in-hand with creating a new mount namespace and mounting
+      a fresh <code class="inl">/proc</code> inside it &mdash; otherwise <code class="inl">ps</code>
+      run inside your shiny new "container" would show every process on the whole host.
+    </div>
+
+    <div class="usecase" data-anchor="ns-use">
+      <span class="tag">Real-world use</span>
+      This is, quite literally, what Docker, Podman, and Kubernetes' <code class="inl">containerd</code>/<code class="inl">runc</code>
+      are built from: a bundle of namespaces (PID, mount, network, UTS, IPC, and usually user)
+      created together via <code class="inl">clone()</code>/<code class="inl">unshare()</code>, plus
+      cgroups for resource limits. "Container" is a userspace word; the kernel only knows
+      namespaces and cgroups.
+    </div>
+
+    <div class="callout funny" data-anchor="ns-funny">
+      <span class="tag">A small delight</span>
+      A process inside a fresh PID namespace looking at <code class="inl">ps aux</code> and
+      seeing only itself as PID 1 is not being lied to by some virtualization layer &mdash; it is
+      getting the kernel's honest, complete answer to "what processes exist," because as far as
+      that namespace's bookkeeping goes, it really is the only process that exists. The isolation
+      isn't a mask over the truth; it <em>is</em> the truth, from where it's standing.
+    </div>
+
+    <svg viewBox="0 0 640 220" class="figure-svg" role="img" aria-label="A large box labeled host PID namespace containing PID 1 real init and two smaller nested boxes, container A and container B, each with their own PID 1 that is a different real PID as seen from the host.">
+      <rect x="20" y="20" width="600" height="180" rx="10" fill="#fdf8ee" stroke="#8a2f22" stroke-width="1.8"/>
+      <text x="40" y="42" font-family="monospace" font-size="10" fill="#8a2f22" font-weight="bold">host PID namespace</text>
+      <text x="40" y="58" font-family="monospace" font-size="8" fill="#6f5c3e">PID 1 = real init &middot; sees every process below, too</text>
+
+      <rect x="60" y="80" width="230" height="100" rx="8" fill="#eef3ea" stroke="#3f6d3a" stroke-width="1.6"/>
+      <text x="175" y="100" text-anchor="middle" font-family="monospace" font-size="9" fill="#3f6d3a" font-weight="bold">container A's namespace</text>
+      <text x="175" y="120" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">PID 1 (inside)</text>
+      <text x="175" y="136" text-anchor="middle" font-family="monospace" font-size="8" fill="#6f5c3e">= host PID 4931 (outside)</text>
+      <text x="175" y="160" text-anchor="middle" font-family="monospace" font-size="8" fill="#6f5c3e">sees only its own tree</text>
+
+      <rect x="340" y="80" width="230" height="100" rx="8" fill="#f3ecf5" stroke="#7a3b8a" stroke-width="1.6"/>
+      <text x="455" y="100" text-anchor="middle" font-family="monospace" font-size="9" fill="#7a3b8a" font-weight="bold">container B's namespace</text>
+      <text x="455" y="120" text-anchor="middle" font-family="monospace" font-size="9" fill="#2b2114">PID 1 (inside)</text>
+      <text x="455" y="136" text-anchor="middle" font-family="monospace" font-size="8" fill="#6f5c3e">= host PID 5820 (outside)</text>
+      <text x="455" y="160" text-anchor="middle" font-family="monospace" font-size="8" fill="#6f5c3e">cannot see container A at all</text>
+    </svg>
+    <p class="figure-cap">Two "PID 1"s, two entirely different process trees, one kernel keeping honest, separate books for each.</p>
+
+    <div class="sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html">pid_namespaces(7)</a>,
+      <a href="https://man7.org/linux/man-pages/man7/mount_namespaces.7.html">mount_namespaces(7)</a>,
+      <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html">namespaces(7)</a> &mdash; man7.org Linux man-pages.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-io-uring.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-kernel-tuning-secrets.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Study: a CLI Tool — LLMs, Go Code!</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="gopher-mark">
+      <svg width="20" height="16" viewBox="0 0 20 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <ellipse cx="10" cy="9" rx="9" ry="6.5" fill="#00add8"/>
+        <circle cx="10" cy="3.6" r="3.4" fill="#00add8"/>
+        <circle cx="6.6" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="13.4" cy="2.6" r="1.7" fill="#fff"/>
+        <circle cx="6.9" cy="2.7" r=".7" fill="#142229"/>
+        <circle cx="13.1" cy="2.7" r=".7" fill="#142229"/>
+      </svg>
+    </span>
+    LLMs, Go Code! <span class="pick">&mdash; a BookBank field guide</span>
+  </span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Part III &middot; Built With an Agent</p>
+    <p class="chapno">Chapter 10</p>
+    <h1>Case Study: Prompting a CLI Tool Into Existence</h1>
+
+    <p class="lead">A CLI tool sounds like the easiest thing you could ask an agent to build.
+    No database, no HTTP handlers, no auth middleware &mdash; just flags in, text out. That
+    simplicity is exactly why it's a good closing case study: with the moving parts stripped
+    down this far, the mistakes an agent makes aren't hidden under architectural noise. They're
+    sitting right there in forty lines of <code class="inl">main.go</code>, and once you know
+    where to look, you'll spot them in about the time it takes to read the diff.</p>
+
+    <h2>The Brief We Hand the Agent</h2>
+    <p>Let's build <code class="inl">statusck</code>, a small utility that checks the HTTP
+    status of a list of URLs and reports which ones are failing &mdash; the kind of tool you'd
+    reach for in a deploy script or a cron job. The prompt we give the agent is short, but it's
+    doing real work as an executable specification (Chapter 7's idea, back in action):</p>
+
+    <div class="callout key">
+      <span class="tag">The prompt</span>
+      &ldquo;Write a Go CLI called <code class="inl">statusck</code>. It takes one or more URLs
+      as arguments, or reads them from stdin if none are given. Flags: <code class="inl">-timeout</code>
+      (duration, default 5s), <code class="inl">-quiet</code> (bool, only print failures),
+      <code class="inl">-o</code> (string, write the report to a file instead of stdout).
+      Support <code class="inl">-h</code> with a clear usage message. Exit 0 if every URL
+      returns a status under 400, exit 1 if any fail, exit 2 on a bad invocation. Put the real
+      logic in a <code class="inl">run</code> function separate from <code class="inl">main</code>
+      so it's unit-testable without touching the real network or the real stdout.&rdquo;
+    </div>
+
+    <p>Notice how much of that paragraph is really about the <em>shell</em> of the program
+    &mdash; flags, streams, exit codes &mdash; and how little is about checking an HTTP status,
+    which is three lines of <code class="inl">net/http</code>. That ratio is not an accident.
+    It's also exactly backwards from where most engineers, and most agents, focus their
+    attention. The status check is the part everyone gets right on the first try. The shell is
+    where the bugs live.</p>
+
+    <h2>Flags, the Standard Way</h2>
+    <p>Go's standard library ships flag parsing in the box &mdash; <code class="inl">flag</code>
+    &mdash; and as of Go 1.26 it's still the right default choice for a tool this size; reach
+    for a third-party flag library only once you need subcommands or POSIX-style short-flag
+    clustering. The package-level functions like <code class="inl">flag.String</code> and
+    <code class="inl">flag.Parse()</code> are the ones every tutorial shows first, and they work
+    &mdash; but they parse into a global, process-wide <code class="inl">FlagSet</code> that
+    exits the process on a bad flag. That's fine for a five-line script. It's a trap for
+    anything you want to unit test, which is exactly what our brief asked for. So we build our
+    own <code class="inl">FlagSet</code> instead:</p>
+
+    <pre class="tab"><code><span class="kw">type</span> config <span class="kw">struct</span> {
+    timeout time.Duration
+    quiet   <span class="ty">bool</span>
+    outFile <span class="ty">string</span>
+}
+
+<span class="kw">func</span> <span class="fn">newFlagSet</span>(stderr io.Writer) (*flag.FlagSet, *config) {
+    fs := flag.<span class="fn">NewFlagSet</span>(<span class="str">"statusck"</span>, flag.ContinueOnError)
+    fs.<span class="fn">SetOutput</span>(stderr)
+
+    cfg := &amp;config{}
+    fs.<span class="fn">DurationVar</span>(&amp;cfg.timeout, <span class="str">"timeout"</span>, 5*time.Second, <span class="str">"per-request timeout"</span>)
+    fs.<span class="fn">BoolVar</span>(&amp;cfg.quiet, <span class="str">"quiet"</span>, <span class="kw">false</span>, <span class="str">"only print failing URLs"</span>)
+    fs.<span class="fn">StringVar</span>(&amp;cfg.outFile, <span class="str">"o"</span>, <span class="str">""</span>, <span class="str">"write the report here instead of stdout"</span>)
+
+    fs.Usage = <span class="kw">func</span>() {
+        fmt.<span class="fn">Fprintf</span>(stderr, <span class="str">"Usage: statusck [flags] &lt;url&gt; [url...]\n\n"</span>+
+            <span class="str">"Checks the HTTP status of one or more URLs.\n"</span>+
+            <span class="str">"Reads URLs from stdin if none are given as arguments.\n\nFlags:\n"</span>)
+        fs.<span class="fn">PrintDefaults</span>()
+    }
+    <span class="kw">return</span> fs, cfg
+}</code></pre>
+
+    <p><code class="inl">flag.ContinueOnError</code> is the quiet hero of this snippet.
+    With it, <code class="inl">fs.Parse</code> <em>returns</em> an error instead of calling
+    <code class="inl">os.Exit</code> on your behalf &mdash; which matters twice over. First, it
+    means a test can feed <code class="inl">run</code> a bad flag and assert on the returned
+    error instead of watching the test binary vanish. Second, it keeps every call to
+    <code class="inl">os.Exit</code> in exactly one place in the program, which is the whole
+    point of the next section. The package also wires up <code class="inl">-h</code> and
+    <code class="inl">-help</code> for you automatically: if either is passed, <code class="inl">Parse</code>
+    calls your <code class="inl">Usage</code> function and returns the sentinel error
+    <code class="inl">flag.ErrHelp</code>. You don't have to special-case <code class="inl">-h</code>
+    yourself &mdash; you just have to <em>not swallow</em> the error it hands back, which,
+    as we'll see, is precisely the step an agent likes to skip.</p>
+
+    <h2>Splitting the Shell from the Engine</h2>
+    <p>Here's the design idea that makes the rest of the file testable: <code class="inl">main</code>
+    should do almost nothing. All it does is gather the real operating-system inputs &mdash;
+    <code class="inl">os.Args</code>, <code class="inl">os.Stdin</code>, <code class="inl">os.Stdout</code>,
+    <code class="inl">os.Stderr</code> &mdash; hand them to a plain function, and translate
+    whatever comes back into an exit code. That plain function, <code class="inl">run</code>,
+    takes its inputs and outputs as ordinary parameters instead of reaching into global state,
+    which means a test can call it with a fake stdin and a <code class="inl">bytes.Buffer</code>
+    standing in for stdout, with no process boundary anywhere in sight. This isn't a
+    Go-specific trick &mdash; it's the same shell-versus-engine split good CLI writers in every
+    language reach for &mdash; but Go's small, explicit function signatures make it almost free
+    to set up.</p>
+
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 640 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="fig10title fig10desc">
+        <title id="fig10title">A thin main() shell wrapping a testable run() core</title>
+        <desc id="fig10desc">os.Args and os.Stdin feed into main, which calls run with explicit stdin, stdout, and stderr parameters. run writes results directly to stdout and returns an error. main alone decides the process exit code and writes any error message to stderr.</desc>
+
+        <defs>
+          <marker id="c10arrN" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--ink-soft)"/>
+          </marker>
+          <marker id="c10arrOK" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--en)"/>
+          </marker>
+          <marker id="c10arrErr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--fuchsia)"/>
+          </marker>
+        </defs>
+
+        <rect x="8" y="70" width="108" height="30" rx="15" fill="var(--bg-2)" stroke="var(--edge-2)"/>
+        <text x="62" y="89" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" fill="var(--ink)">os.Args[1:]</text>
+        <rect x="8" y="150" width="108" height="30" rx="15" fill="var(--bg-2)" stroke="var(--edge-2)"/>
+        <text x="62" y="169" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" fill="var(--ink)">os.Stdin</text>
+
+        <rect x="140" y="30" width="410" height="230" rx="16" fill="none" stroke="var(--edge-2)" stroke-width="1.5"/>
+        <text x="158" y="52" font-family="var(--font-mono)" font-size="11" letter-spacing=".04em" fill="var(--ink-soft)">func main()</text>
+
+        <rect x="220" y="95" width="250" height="80" rx="10" fill="var(--bg-2)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="345" y="130" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" fill="var(--accent-deep)">run(args, stdin,</text>
+        <text x="345" y="146" text-anchor="middle" font-family="var(--font-mono)" font-size="10.5" fill="var(--accent-deep)">stdout, stderr) error</text>
+
+        <line x1="116" y1="85" x2="222" y2="120" stroke="var(--ink-soft)" stroke-width="1.3" marker-end="url(#c10arrN)"/>
+        <line x1="116" y1="165" x2="222" y2="150" stroke="var(--ink-soft)" stroke-width="1.3" marker-end="url(#c10arrN)"/>
+
+        <line x1="470" y1="115" x2="598" y2="78" stroke="var(--en)" stroke-width="1.5" marker-end="url(#c10arrOK)"/>
+        <rect x="558" y="53" width="72" height="28" rx="14" fill="var(--bg-2)" stroke="var(--en)"/>
+        <text x="594" y="71" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink)">stdout</text>
+        <text x="470" y="90" font-family="var(--font-body)" font-size="9" fill="var(--ink-soft)">results, written directly</text>
+
+        <line x1="345" y1="175" x2="345" y2="212" stroke="var(--ink-soft)" stroke-width="1.3" marker-end="url(#c10arrN)"/>
+        <text x="352" y="198" font-family="var(--font-body)" font-size="9" fill="var(--ink-soft)">returns error</text>
+
+        <text x="345" y="232" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">err == nil ?</text>
+
+        <line x1="300" y1="238" x2="202" y2="238" stroke="var(--fuchsia)" stroke-width="1.5" marker-end="url(#c10arrErr)"/>
+        <text x="250" y="230" text-anchor="middle" font-family="var(--font-body)" font-size="9" fill="var(--fuchsia)">no</text>
+        <rect x="122" y="223" width="80" height="28" rx="14" fill="var(--bg-2)" stroke="var(--fuchsia)"/>
+        <text x="162" y="241" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--ink)">stderr</text>
+
+        <line x1="162" y1="251" x2="162" y2="284" stroke="var(--fuchsia)" stroke-width="1.5" marker-end="url(#c10arrErr)"/>
+        <rect x="102" y="284" width="120" height="28" rx="14" fill="var(--fuchsia)"/>
+        <text x="162" y="302" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--bg-2)">os.Exit(1)</text>
+
+        <line x1="390" y1="238" x2="468" y2="238" stroke="var(--en)" stroke-width="1.5" marker-end="url(#c10arrOK)"/>
+        <text x="430" y="230" text-anchor="middle" font-family="var(--font-body)" font-size="9" fill="var(--en)">yes</text>
+
+        <line x1="468" y1="238" x2="468" y2="284" stroke="var(--en)" stroke-width="1.5" marker-end="url(#c10arrOK)"/>
+        <rect x="408" y="284" width="120" height="28" rx="14" fill="var(--accent)"/>
+        <text x="468" y="302" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--bg-2)">os.Exit(0)</text>
+      </svg>
+      <figcaption>run() owns the logic and writes results straight to the stdout it was
+      handed; main() owns nothing but the exit decision. Only one box in this whole diagram
+      is allowed to call os.Exit.</figcaption>
+    </figure>
+
+    <h2>Reading Input, Writing a Report</h2>
+    <p>The rest of <code class="inl">run</code> is where the brief's remaining requirements
+    live: fall back to stdin when no URLs are given on the command line, and optionally send
+    the report to a file instead of stdout. Both are small, and both are places an agent's
+    error handling tends to get sloppy, so let's write them carefully.</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">run</span>(args []<span class="ty">string</span>, stdin io.Reader, stdout, stderr io.Writer) (err <span class="ty">error</span>) {
+    fs, cfg := <span class="fn">newFlagSet</span>(stderr)
+    <span class="kw">if</span> perr := fs.<span class="fn">Parse</span>(args); perr != <span class="kw">nil</span> {
+        <span class="kw">return</span> perr <span class="cm">// ErrHelp on -h; fs.Usage already printed to stderr</span>
+    }
+
+    urls := fs.<span class="fn">Args</span>()
+    <span class="kw">if</span> <span class="fn">len</span>(urls) == 0 {
+        <span class="kw">if</span> urls, err = <span class="fn">readLines</span>(stdin); err != <span class="kw">nil</span> {
+            <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"reading stdin: %w"</span>, err)
+        }
+    }
+    <span class="kw">if</span> <span class="fn">len</span>(urls) == 0 {
+        fs.<span class="fn">Usage</span>()
+        <span class="kw">return</span> errors.<span class="fn">New</span>(<span class="str">"no URLs given"</span>)
+    }
+
+    out := stdout
+    <span class="kw">if</span> cfg.outFile != <span class="str">""</span> {
+        f, ferr := os.<span class="fn">Create</span>(cfg.outFile)
+        <span class="kw">if</span> ferr != <span class="kw">nil</span> {
+            <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"opening report file: %w"</span>, ferr)
+        }
+        <span class="kw">defer</span> <span class="kw">func</span>() {
+            <span class="kw">if</span> cerr := f.<span class="fn">Close</span>(); err == <span class="kw">nil</span> {
+                err = cerr <span class="cm">// surface a failed flush/close, don't swallow it</span>
+            }
+        }()
+        out = f
+    }
+
+    client := &amp;http.Client{Timeout: cfg.timeout}
+    failures := 0
+    <span class="kw">for</span> _, u := <span class="kw">range</span> urls {
+        code, cerr := <span class="fn">check</span>(client, u)
+        <span class="kw">switch</span> {
+        <span class="kw">case</span> cerr != <span class="kw">nil</span>:
+            failures++
+            fmt.<span class="fn">Fprintf</span>(out, <span class="str">"FAIL  %s  (%v)\n"</span>, u, cerr)
+        <span class="kw">case</span> code &gt;= 400:
+            failures++
+            fmt.<span class="fn">Fprintf</span>(out, <span class="str">"FAIL  %s  %d\n"</span>, u, code)
+        <span class="kw">case</span> !cfg.quiet:
+            fmt.<span class="fn">Fprintf</span>(out, <span class="str">"OK    %s  %d\n"</span>, u, code)
+        }
+    }
+    <span class="kw">if</span> failures &gt; 0 {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="str">"%d of %d checks failed"</span>, failures, <span class="fn">len</span>(urls))
+    }
+    <span class="kw">return</span> <span class="kw">nil</span>
+}
+
+<span class="kw">func</span> <span class="fn">check</span>(client *http.Client, url <span class="ty">string</span>) (<span class="ty">int</span>, <span class="ty">error</span>) {
+    resp, err := client.<span class="fn">Get</span>(url)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="kw">return</span> 0, err
+    }
+    <span class="kw">defer</span> resp.Body.<span class="fn">Close</span>()
+    <span class="kw">return</span> resp.StatusCode, <span class="kw">nil</span>
+}
+
+<span class="kw">func</span> <span class="fn">readLines</span>(r io.Reader) ([]<span class="ty">string</span>, <span class="ty">error</span>) {
+    <span class="kw">var</span> lines []<span class="ty">string</span>
+    sc := bufio.<span class="fn">NewScanner</span>(r)
+    <span class="kw">for</span> sc.<span class="fn">Scan</span>() {
+        <span class="kw">if</span> line := sc.<span class="fn">Text</span>(); line != <span class="str">""</span> {
+            lines = <span class="fn">append</span>(lines, line)
+        }
+    }
+    <span class="kw">return</span> lines, sc.<span class="fn">Err</span>()
+}</code></pre>
+
+    <p>Two small things in there are worth calling out because they're easy to miss and even
+    easier for an agent to skip. First, <code class="inl">run</code> uses a <em>named</em>
+    return value, <code class="inl">err</code>, purely so the deferred close can report its own
+    failure. <code class="inl">f.Close()</code> can fail &mdash; a full disk won't necessarily
+    surface until the final flush &mdash; and if you throw that error away, you've told the
+    caller a report was written successfully when it might be truncated garbage. Second,
+    <code class="inl">check</code> defers <code class="inl">resp.Body.Close()</code>
+    immediately after confirming the request succeeded, which is the single most common
+    resource leak in AI-generated Go HTTP code (it came up back in the book's very first
+    audit checklist, and it'll keep coming up &mdash; that's how you know it's a real pattern
+    and not a one-off tip).</p>
+
+    <p>The thin shell that ties it together is almost anticlimactic after all that, and that's
+    exactly the point:</p>
+
+    <pre class="tab"><code><span class="kw">func</span> <span class="fn">main</span>() {
+    err := <span class="fn">run</span>(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+    <span class="kw">if</span> errors.<span class="fn">Is</span>(err, flag.ErrHelp) {
+        os.<span class="fn">Exit</span>(0) <span class="cm">// -h is not a failure</span>
+    }
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        fmt.<span class="fn">Fprintln</span>(os.Stderr, <span class="str">"statusck:"</span>, err)
+        os.<span class="fn">Exit</span>(1)
+    }
+}</code></pre>
+
+    <p>Eight lines, one call to <code class="inl">run</code>, and every <code class="inl">os.Exit</code>
+    in the entire program. That last part is the load-bearing detail.</p>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      <code class="inl">os.Exit</code> terminates the process immediately &mdash; the Go
+      documentation is explicit that deferred functions do not run. Every <code class="inl">defer</code>
+      in this file, including the one closing the report file and the one closing each response
+      body, depends on nothing ever calling <code class="inl">os.Exit</code> before it has a
+      chance to unwind back through <code class="inl">main</code>. An agent that reaches for
+      <code class="inl">log.Fatal</code> inside <code class="inl">check</code> or
+      <code class="inl">readLines</code> &mdash; a very natural-looking shortcut, since
+      <code class="inl">log.Fatal</code> is one line and reads like a normal error return &mdash;
+      is quietly calling <code class="inl">os.Exit(1)</code> from three stack frames deep,
+      skipping every deferred cleanup between there and the top. The fix costs nothing:
+      <code class="inl">return err</code> instead of <code class="inl">log.Fatal(err)</code>,
+      everywhere except inside <code class="inl">main</code> itself.
+    </div>
+
+    <h2>Where Agents Go Wrong in Exactly This Scenario</h2>
+    <p>Once you've reviewed a few dozen agent-written CLIs, the mistakes stop being surprising
+    &mdash; they cluster into the same handful of shapes every time.</p>
+
+    <p><strong>Swallowing the error <code class="inl">Parse</code> hands back.</strong> The
+    single most common bug is code that calls <code class="inl">fs.Parse(args)</code> and
+    ignores the return value, or worse, uses the package-level <code class="inl">flag.Parse()</code>
+    inside a function that isn't <code class="inl">main</code>. The package-level flag set
+    defaults to <code class="inl">flag.ExitOnError</code>, which calls <code class="inl">os.Exit(2)</code>
+    for a bad flag and <code class="inl">os.Exit(0)</code> for <code class="inl">-h</code> &mdash;
+    <em>from inside the flag package itself</em>. That's an exit call buried two layers below
+    your own code, invisible in a diff, and it turns your carefully separated
+    <code class="inl">run</code> function untestable the moment a test passes it a flag it
+    doesn't recognize.</p>
+
+    <p><strong>Writing to the wrong stream.</strong> The Unix convention, older than most
+    languages in active use today, is that normal output goes to stdout and diagnostics go to
+    stderr &mdash; standard file descriptors 1 and 2, respectively, kept separate precisely so a
+    shell pipeline can redirect the data (<code class="inl">statusck url... &gt; report.txt</code>)
+    while error messages still land on the terminal instead of corrupting the file. An agent
+    that reaches for a bare <code class="inl">fmt.Println("error:", err)</code> sends that
+    message to stdout by default, where it silently pollutes whatever's consuming your output.
+    Our <code class="inl">main</code> is careful to route the error message through
+    <code class="inl">os.Stderr</code> explicitly; it's one keystroke of discipline that a
+    generated-in-a-hurry version is prone to drop.</p>
+
+    <p><strong>Skipping usage discovery.</strong> Users reach for <code class="inl">-h</code>
+    reflexively, before they read anything you wrote. If an agent leaves
+    <code class="inl">fs.Usage</code> unset, they get the flag package's generic default
+    &mdash; a bare list of flag names with no explanation of what the tool does or what a
+    &ldquo;URL&rdquo; argument even means here. Setting <code class="inl">Usage</code>
+    explicitly, as we did above, costs four lines and turns <code class="inl">-h</code> into
+    actual documentation instead of a shrug.</p>
+
+    <p><strong>Treating exit codes as an afterthought.</strong> The brief asked for three
+    distinct codes &mdash; 0 for success, 1 for &ldquo;ran fine but found failures,&rdquo; 2 for
+    &ldquo;you used the tool wrong.&rdquo; An agent that returns a plain <code class="inl">error</code>
+    for both cases and lets <code class="inl">main</code> flatten everything to
+    <code class="inl">os.Exit(1)</code> has thrown away information a caller in a script needs
+    &mdash; &ldquo;retry this&rdquo; and &ldquo;fix your invocation&rdquo; are very different
+    responses. Here it falls out almost for free: a bad flag returns before we ever reach the
+    URL loop, and <code class="inl">flag.ExitOnError</code>'s own convention of reserving 2 for
+    usage errors is worth matching rather than fighting.</p>
+
+    <div class="callout warn">
+      <span class="tag">Watch for this</span>
+      Grep any agent-generated <code class="inl">main.go</code> for <code class="inl">log.Fatal</code>,
+      <code class="inl">log.Panic</code>, and bare <code class="inl">os.Exit</code> calls outside
+      <code class="inl">func main</code>. Every hit is a deferred cleanup that silently never runs,
+      and a function that looked testable on the page but exits the whole test binary the moment
+      you call it.
+    </div>
+
+    <h2>Reflection</h2>
+    <p>None of what we just built is exotic. A <code class="inl">FlagSet</code>, a
+    <code class="inl">run</code> function with explicit parameters instead of ambient globals,
+    a <code class="inl">main</code> that does nothing but translate an error into an exit code
+    &mdash; every piece is ordinary standard-library Go. That's exactly why a CLI tool is such a
+    good closing case study for this book. There's no framework to hide behind and no clever
+    abstraction to distract from the fundamentals: explicit errors, one owner for
+    <code class="inl">os.Exit</code>, deferred cleanup that only works if nothing short-circuits
+    it, and streams used for what they're for. Every concept from the earlier chapters &mdash;
+    errors as values, small explicit surfaces, the toolchain as a feedback loop &mdash; shows up
+    here in miniature, which makes this exactly the shape of program worth handing to an agent
+    first, before you trust it with something bigger.</p>
+
+    <h3>Challenges</h3>
+    <ol>
+      <li>Write a table-driven test for <code class="inl">run</code> that feeds it a fake stdin
+      via <code class="inl">strings.NewReader</code>, captures stdout in a
+      <code class="inl">bytes.Buffer</code>, and asserts on both the printed report and the
+      returned error &mdash; no real HTTP request required once you inject a fake
+      <code class="inl">http.Client</code>.</li>
+      <li>Prompt an agent to add a <code class="inl">-json</code> flag that switches the report
+      to newline-delimited JSON. Check whether it threads the new flag through
+      <code class="inl">config</code> and <code class="inl">newFlagSet</code>, or bolts a second,
+      parallel parsing path onto the side.</li>
+      <li>Delete the <code class="inl">defer</code> that reports <code class="inl">f.Close()</code>'s
+      error, force a write failure in a test, and confirm the bug you just reintroduced is
+      exactly the one this chapter warned about.</li>
+    </ol>
+
+    <div class="callout agent">
+      <span class="tag">The Agent Angle</span>
+      When you hand off a CLI spec, state the shell/engine split as a hard constraint, not a
+      suggestion: &ldquo;all logic lives in <code class="inl">run(args, stdin, stdout, stderr)
+      error</code>; <code class="inl">main</code> contains only the call to <code class="inl">run</code>
+      and the exit-code translation.&rdquo; It's one sentence, it's easy for an agent to satisfy,
+      and it gives you a single, obvious place to check for the exact class of bug this chapter
+      is about &mdash; if <code class="inl">os.Exit</code> or <code class="inl">log.Fatal</code>
+      shows up anywhere else in the diff, that's the whole review, right there.
+    </div>
+
+    <div class="audit">
+      <h4>Audit Checklist</h4>
+      <ul>
+        <li><b>Every <code class="inl">os.Exit</code>, <code class="inl">log.Fatal</code>, and
+        <code class="inl">log.Panic</code> lives in <code class="inl">main</code>.</b> Grep the
+        rest of the package for all three; any hit outside <code class="inl">main</code> is a
+        skipped <code class="inl">defer</code> waiting to happen.</li>
+        <li><b>Flag parsing uses <code class="inl">ContinueOnError</code>, not the package-level
+        <code class="inl">flag.Parse()</code>.</b> The latter's default <code class="inl">ExitOnError</code>
+        makes the parsing path untestable and hides an <code class="inl">os.Exit</code> call
+        inside the standard library itself.</li>
+        <li><b><code class="inl">fs.Usage</code> is set explicitly and <code class="inl">-h</code>
+        actually explains the tool.</b> Run it and read what a first-time user would see.</li>
+        <li><b>Normal output goes to stdout; diagnostics and errors go to stderr.</b> Redirect
+        stdout to <code class="inl">/dev/null</code> and confirm error messages still show up on
+        the terminal.</li>
+        <li><b>Every opened file and response body has a checked <code class="inl">defer ...Close()</code>.</b>
+        For files you write to, the close error is surfaced, not discarded &mdash; a full disk
+        should be a reported failure, not a silent one.</li>
+        <li><b>Exit codes are distinct and documented.</b> 0 for success, a non-zero code for
+        &ldquo;ran correctly but found a problem,&rdquo; and a different one for &ldquo;you
+        called this wrong&rdquo; &mdash; verify the tool's own <code class="inl">-h</code>
+        text says which is which.</li>
+      </ul>
+    </div>
+
+    <p>That's the last worked example in the book. The <a href="../cheatsheet.html">cheatsheet</a>
+    that follows distills every audit checklist from all ten chapters &mdash; the zen of small
+    surfaces, structs before methods, implicit interfaces as sandboxes, errors as values,
+    concurrency hygiene, the toolchain loop, executable specs, test-driven agent development,
+    and the two case studies &mdash; onto one page you can keep open in a tab while you review
+    an agent's next pull request.</p>
+
+    <div class="sources">Sources:
+      <a href="https://pkg.go.dev/flag">flag &mdash; Go standard library documentation, pkg.go.dev</a>,
+      <a href="https://pkg.go.dev/os#Exit">os.Exit &mdash; Go standard library documentation, pkg.go.dev</a>,
+      <a href="https://clig.dev/">Command Line Interface Guidelines &mdash; clig.dev</a>,
+      <a href="https://blog.carlana.net/post/2020/go-cli-how-to-and-advice/">Writing Go CLIs With Just Enough Architecture &mdash; Carlana Johnson</a>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-case-study-api-service.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

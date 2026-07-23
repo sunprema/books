@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · The Memory Mountain — How GPUs Work</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">HOW <span class="zap">GPUs</span> WORK</a>
+  <span class="bb-chapter">05 · The Memory Mountain</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker">Chapter 05 · Where The Time Actually Goes</p>
+    <h1>The <span class="hl">Memory Mountain</span></h1>
+
+    <p class="lede">Here's the secret that separates people who <em>use</em> GPUs from
+    people who <em>understand</em> them: on a modern GPU, arithmetic is nearly free.
+    The chip can do hundreds of trillions of operations per second. What it
+    <em>can't</em> do is feed itself. Getting a number from memory to a core costs more
+    time — often 100× more — than the math you do with it. Every serious GPU
+    optimization is really a memory optimization wearing a disguise.</p>
+
+    <h2>The pyramid</h2>
+    <p>GPU memory is a pyramid: tiny-and-instant at the top, huge-and-far at the bottom.
+    Learn the four levels and the rough costs — these numbers explain almost everything
+    about GPU performance:</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 760 290" role="img" aria-label="Memory pyramid: registers, shared memory/L1, L2, HBM with sizes and latencies">
+        <g font-family="-apple-system,Arial" font-size="12" fill="#241f18">
+          <!-- pyramid trapezoids -->
+          <polygon points="310,30 450,30 470,85 290,85" fill="#76b900" stroke="#241f18" stroke-width="2"/>
+          <polygon points="270,95 490,95 515,150 245,150" fill="#9fd44a" stroke="#241f18" stroke-width="2"/>
+          <polygon points="225,160 535,160 560,215 200,215" fill="#e9d9a8" stroke="#241f18" stroke-width="2"/>
+          <polygon points="180,225 580,225 600,278 160,278" fill="#ddd2ba" stroke="#241f18" stroke-width="2"/>
+          <g text-anchor="middle" font-weight="800">
+            <text x="380" y="63">Registers</text>
+            <text x="380" y="128">Shared memory / L1</text>
+            <text x="380" y="193">L2 cache</text>
+            <text x="380" y="257">Global memory (HBM / GDDR)</text>
+          </g>
+          <!-- left labels: size -->
+          <g text-anchor="end" font-size="11" fill="#46760a" font-family="ui-monospace,Menlo,monospace">
+            <text x="285" y="63">~256 KB / SM</text>
+            <text x="240" y="128">~228 KB / SM</text>
+            <text x="195" y="193">50–96 MB / chip</text>
+            <text x="152" y="257">24–192 GB</text>
+          </g>
+          <!-- right labels: latency -->
+          <g text-anchor="start" font-size="11" fill="#d6407a" font-family="ui-monospace,Menlo,monospace">
+            <text x="478" y="63">~1 cycle</text>
+            <text x="522" y="128">~20–30 cycles</text>
+            <text x="568" y="193">~200 cycles</text>
+            <text x="608" y="257">~400–800 cycles</text>
+          </g>
+          <text x="380" y="20" text-anchor="middle" font-size="11" fill="#6f6654">per-thread · per-block · per-GPU · per-GPU</text>
+        </g>
+      </svg>
+      <figcaption><strong>The four floors.</strong> Sizes/latencies are H100-generation
+      ballparks — exact values vary by chip, the <em>ratios</em> don't. Top two floors
+      live <em>inside</em> each SM; bottom two are shared by the whole chip.</figcaption>
+    </figure>
+
+    <ul>
+      <li><strong>Registers</strong> — each thread's private variables. Effectively
+      instant. This is where <code>int i</code> and <code>sum</code> from Chapter 4
+      live. (A warp's registers never leave the SM — that's what makes zero-cost warp
+      switching possible.)</li>
+      <li><strong>Shared memory / L1</strong> — a ~228 KB scratchpad <em>you program
+      explicitly</em>, shared by the threads of one block. Think "the team's whiteboard."</li>
+      <li><strong>L2 cache</strong> — an automatic, chip-wide cache. You don't control
+      it; you just benefit when data gets reused.</li>
+      <li><strong>Global memory</strong> — the "80 GB" on the spec sheet. Data-center
+      GPUs use <span class="term">HBM</span> (High Bandwidth Memory: DRAM dies stacked
+      vertically right next to the GPU die — H100: 3.35 TB/s); gaming cards use
+      <span class="term">GDDR</span> chips around the board (RTX 5090: 1.79 TB/s of
+      GDDR7). Huge, and hundreds of cycles away.</li>
+    </ul>
+
+    <div class="callout key">
+      <span class="co-tag">Key Idea</span>
+      <p>3.35 TB/s sounds infinite. It isn't — divide by the compute. An H100 can do
+      ~989 <em>trillion</em> FP16 operations/sec but read only ~3.35 trillion bytes/sec.
+      That's <strong>~300 math ops per byte</strong> just to break even. Read a number,
+      add 1, write it back? The cores spend 99% of their time idling. The ratio of
+      math-per-byte is called <span class="term">arithmetic intensity</span>, and it
+      decides everything (Chapter 8 uses it to explain LLM speed).</p>
+    </div>
+
+    <h2>Coalescing: the bus, not the taxi</h2>
+    <p>Global memory has a quirk that every GPU programmer learns in week one. The
+    hardware can't fetch one byte at a time — it fetches in chunks (32–128 byte
+    transactions). When a warp's 32 threads each ask for 4 bytes, the memory system
+    looks at the 32 addresses and asks: <em>can I serve these with few chunks?</em></p>
+    <p>If thread <code>i</code> reads <code>data[i]</code> — 32 neighbors, consecutive
+    addresses — the whole warp is served by <strong>a handful of transactions</strong>.
+    That's a <span class="term">coalesced</span> access: everyone rides one bus. But if
+    thread <code>i</code> reads <code>data[i * 1000]</code> — addresses scattered across
+    memory — the hardware needs <strong>32 separate transactions</strong>. Same
+    instruction, up to 32× slower. Everyone took a private taxi.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 760 210" role="img" aria-label="Coalesced consecutive access served by one transaction vs scattered access needing many">
+        <g font-family="ui-monospace,Menlo,monospace" font-size="11" fill="#241f18">
+          <text x="190" y="22" text-anchor="middle" font-family="-apple-system,Arial" font-weight="800" font-size="13">Coalesced: data[i] ✓</text>
+          <g>
+            <g fill="#76b900" stroke="#241f18" stroke-width=".8">
+              <circle cx="60" cy="45" r="8"/><circle cx="95" cy="45" r="8"/><circle cx="130" cy="45" r="8"/><circle cx="165" cy="45" r="8"/><circle cx="200" cy="45" r="8"/><circle cx="235" cy="45" r="8"/><circle cx="270" cy="45" r="8"/><circle cx="305" cy="45" r="8"/>
+            </g>
+            <g stroke="#46760a" stroke-width="1.4">
+              <line x1="60" y1="53" x2="80" y2="95"/><line x1="95" y1="53" x2="110" y2="95"/><line x1="130" y1="53" x2="140" y2="95"/><line x1="165" y1="53" x2="170" y2="95"/><line x1="200" y1="53" x2="200" y2="95"/><line x1="235" y1="53" x2="230" y2="95"/><line x1="270" y1="53" x2="260" y2="95"/><line x1="305" y1="53" x2="290" y2="95"/>
+            </g>
+            <rect x="60" y="95" width="250" height="26" rx="5" fill="#e9f3d3" stroke="#241f18" stroke-width="1.5"/>
+            <text x="185" y="112" text-anchor="middle" font-size="10">one 128-byte chunk serves all 8</text>
+            <rect x="60" y="140" width="250" height="22" rx="5" fill="#76b900" stroke="#241f18"/>
+            <text x="185" y="155" text-anchor="middle" fill="#fff" font-weight="700" font-size="10">1 transaction 🚌</text>
+          </g>
+          <text x="565" y="22" text-anchor="middle" font-family="-apple-system,Arial" font-weight="800" font-size="13">Scattered: data[i*1000] ✗</text>
+          <g>
+            <g fill="#d6407a" stroke="#241f18" stroke-width=".8">
+              <circle cx="435" cy="45" r="8"/><circle cx="470" cy="45" r="8"/><circle cx="505" cy="45" r="8"/><circle cx="540" cy="45" r="8"/><circle cx="575" cy="45" r="8"/><circle cx="610" cy="45" r="8"/><circle cx="645" cy="45" r="8"/><circle cx="680" cy="45" r="8"/>
+            </g>
+            <g stroke="#d6407a" stroke-width="1.4">
+              <line x1="435" y1="53" x2="425" y2="95"/><line x1="470" y1="53" x2="497" y2="95"/><line x1="505" y1="53" x2="568" y2="95"/><line x1="540" y1="53" x2="454" y2="95"/><line x1="575" y1="53" x2="640" y2="95"/><line x1="610" y1="53" x2="525" y2="95"/><line x1="645" y1="53" x2="710" y2="95"/><line x1="680" y1="53" x2="597" y2="95"/>
+            </g>
+            <g fill="#f7dbe6" stroke="#241f18" stroke-width="1.2">
+              <rect x="415" y="95" width="24" height="26" rx="4"/><rect x="444" y="95" width="24" height="26" rx="4"/><rect x="487" y="95" width="24" height="26" rx="4"/><rect x="515" y="95" width="24" height="26" rx="4"/><rect x="558" y="95" width="24" height="26" rx="4"/><rect x="587" y="95" width="24" height="26" rx="4"/><rect x="630" y="95" width="24" height="26" rx="4"/><rect x="700" y="95" width="24" height="26" rx="4"/>
+            </g>
+            <rect x="435" y="140" width="250" height="22" rx="5" fill="#d6407a" stroke="#241f18"/>
+            <text x="560" y="155" text-anchor="middle" fill="#fff" font-weight="700" font-size="10">8 transactions 🚕🚕🚕…</text>
+          </g>
+          <text x="380" y="195" text-anchor="middle" font-family="-apple-system,Arial" font-size="11" fill="#6f6654">Same instruction, same data size — up to 32× difference in memory traffic (shown with 8 threads for space).</text>
+        </g>
+      </svg>
+      <figcaption><strong>The bus vs the taxi fleet.</strong> The #1 performance rule of
+      GPU code: <em>neighboring threads should touch neighboring memory.</em></figcaption>
+    </figure>
+
+    <h2>Shared memory: the team whiteboard</h2>
+    <p>Now the fun tool: that ~228 KB scratchpad each block gets. The pattern that uses
+    it appears in virtually every fast GPU program, so let's spell it out with matrix
+    multiplication — the operation AI spends its life doing.</p>
+    <p>Multiplying two 4096×4096 matrices naively means every output element re-reads an
+    entire row and column from global memory — each input value gets fetched
+    <em>4096 times</em>. Horrifying. The fix is <span class="term">tiling</span>:</p>
+    <ol>
+      <li>Each block claims a small output tile (say 32×32).</li>
+      <li>Its threads <strong>cooperatively</strong> load the needed slices of A and B
+      into shared memory — coalesced, each value fetched from HBM <em>once</em>.</li>
+      <li><code>__syncthreads()</code> — everyone waits at the barrier until the tile
+      is fully loaded (this sync is exactly what blocks exist to provide).</li>
+      <li>Everyone computes on the whiteboard at ~20-cycle speed, reusing every loaded
+      value 32 times. Slide to the next tile; repeat.</li>
+    </ol>
+    <pre class="code"><span class="cap">the tiling idiom (sketch)</span><code><span class="k">__shared__</span> <span class="t">float</span> tileA[<span class="n">32</span>][<span class="n">32</span>], tileB[<span class="n">32</span>][<span class="n">32</span>];
+<span class="k">for</span> (<span class="t">int</span> t = <span class="n">0</span>; t &lt; numTiles; t++) {
+    tileA[ty][tx] = A[…];  tileB[ty][tx] = B[…];  <span class="c">// everyone grabs one value</span>
+    <span class="f">__syncthreads</span>();                             <span class="c">// wait for the whiteboard</span>
+    <span class="k">for</span> (<span class="t">int</span> k = <span class="n">0</span>; k &lt; <span class="n">32</span>; k++)
+        sum += tileA[ty][k] * tileB[k][tx];          <span class="c">// 32 reuses per load!</span>
+    <span class="f">__syncthreads</span>();
+}</code></pre>
+    <p>This one idea — <em>stage data in shared memory, reuse it many times</em> — is
+    the backbone of cuBLAS, FlashAttention, and every fast kernel you've ever benefited
+    from. (Tensor Cores, next chapter, are this idea cast directly into silicon.)</p>
+
+    <figure class="img-slot" data-img-slot="memory-commute"
+            data-img-file="assets/img/memory-commute.webp" style="--img-aspect:16 / 9">
+      <img class="img-real" src="../assets/img/memory-commute.webp"
+           alt="Cartoon city map: desk drawer, office whiteboard, downtown warehouse showing memory distances"
+           width="1280" height="720"
+           onerror="this.closest('.img-slot').classList.add('img-missing')">
+      <div class="img-drop"><div class="img-drop-inner">
+        <strong>Image needed</strong>
+        <p class="img-prompt">A funny zine-style cartoon map, hand-drawn ink with flat colors
+        (electric green, violet, pink on cream paper): a cute robot worker at a desk. Its
+        pencil is right in its hand (labeled "REGISTERS"), a whiteboard is one step away
+        (labeled "SHARED"), a supply closet is down the hall (labeled "L2"), and a gigantic
+        warehouse ("HBM") sits across town connected by a long winding highway with a tiny
+        delivery truck on it. The robot checks a watch impatiently while a second robot
+        happily juggles work at the whiteboard. Distances hilariously exaggerated: the
+        warehouse drawn tiny on the horizon. No other small text. Target size ~1280×720px,
+        16:9 landscape; composed for a small on-page figure, subject centred with safe
+        margins — it is letterboxed into a 16:9 box, so keep nothing important near the
+        edges.</p>
+        <button type="button" class="img-copy">Copy prompt</button>
+        <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+      </div></div>
+      <figcaption><strong>Memory as a commute.</strong> If registers are your hand and
+      shared memory the whiteboard, HBM is a warehouse across town. Plan your trips.</figcaption>
+    </figure>
+
+    <div class="callout warn">
+      <span class="co-tag">Gotcha</span>
+      <p>"My GPU has 3 TB/s, memory can't be my problem." It's <em>always</em> your
+      problem. Profile any real workload — the profiler will almost always show memory
+      throughput pinned at 100% while the shiny compute units nap. The spec-sheet FLOPS
+      are a <em>prize</em> you unlock with data reuse, not a default you're owed.</p>
+    </div>
+
+    <p>We now have the full general-purpose machine: cores, warps, kernels, memory.
+    Before we race off to AI, let's pay respects to the GPU's first love — and see what
+    graphics hardware actually does with all this — because the pipeline that draws
+    your games still explains half the chip's design.</p>
+
+    <p class="sources"><span class="src-tag">Sources</span>
+      NVIDIA CUDA C++ Best Practices Guide, "Memory Optimizations" (docs.nvidia.com) ·
+      NVIDIA H100 Architecture Whitepaper (nvidia.com) ·
+      "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking" (arxiv.org/abs/2501.12084)
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="04-programming-model.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="06-graphics-pipeline.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

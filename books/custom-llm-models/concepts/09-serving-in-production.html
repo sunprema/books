@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serving in Production — Custom LLM Models</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="chip">◧</span> Custom <b>·</b> LLMs</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <section class="spread">
+    <div class="leaf leaf-left">
+      <p class="kicker">Concept 09 · Production</p>
+      <h1>Serving in Production</h1>
+      <p class="lede">A server that runs is not a server that's tuned. The last mile is spending your GPU deliberately — trading latency for throughput on purpose, and knowing what to do when the model won't fit on one card.</p>
+
+      <p class="serif-drop">Every production decision comes back to the budget from Chapter 5: weights + KV cache + overhead. Weights are fixed once you've chosen precision. Overhead is small. So the game is the KV-cache pool — and that pool is governed by two settings and one trade-off.</p>
+
+      <h2>The trade-off: throughput vs. latency</h2>
+      <p>Bigger batches amortize the weight-load across more users, so <strong>total tokens/sec climbs</strong>. But a bigger batch can also mean any single request waits a touch longer for its turn in each step. That's the whole tension:</p>
+      <ul class="spec">
+        <li><span class="k">Latency</span><span class="v">TTFT + per-token, one user</span></li>
+        <li><span class="k">Throughput</span><span class="v">tokens/sec, everyone</span></li>
+      </ul>
+      <p>Continuous batching + PagedAttention are what let modern servers push throughput hard <em>without</em> wrecking latency — together they run roughly 2–4× the throughput of the 2023 baselines the vLLM paper measured, and far more than a naive PyTorch loop.</p>
+
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">Pick your target first</span>
+        <p>Interactive chat wants low TTFT (tune for latency). A nightly batch job wants maximum tokens/sec (tune for throughput). You can't max both — decide which one the product needs, then turn the knobs toward it.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 1</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>The two knobs that set concurrency</h2>
+      <table>
+        <thead><tr><th>Flag</th><th>Controls</th></tr></thead>
+        <tbody>
+          <tr><td><code>--max-model-len</code></td><td>context length (prompt + output) per request — the <code>seq_len</code> in the KV formula</td></tr>
+          <tr><td><code>--max-num-seqs</code></td><td>how many sequences run in one iteration — the <code>batch</code></td></tr>
+          <tr><td><code>--gpu-memory-utilization</code></td><td>fraction of VRAM given to the KV-cache pool (default 0.9)</td></tr>
+        </tbody>
+      </table>
+
+      <p>These aren't independent — they multiply. The KV formula says <code>cache ∝ seq_len × batch</code>. Give every request 32K of context and you can hold far fewer of them at once than at 8K. Right-size <code>--max-model-len</code> to what your workload <em>actually</em> needs; padding it to a huge number silently slashes concurrency.</p>
+
+      <div class="callout warn">
+        <span class="ic">⚠️</span>
+        <div><span class="lab">The classic self-own</span>
+        <p>Setting <code>--max-model-len 128000</code> "just in case" reserves cache for 128K-token conversations you never have — and you'll wonder why only two requests fit. Match context length to reality.</p>
+        </div>
+      </div>
+
+      <div class="callout note">
+        <span class="ic">🗜️</span>
+        <div><span class="lab">More seats, same card</span>
+        <p>Two moves buy concurrency: <strong>quantize the weights</strong> (Ch. 5) to shrink the first budget term and free VRAM for cache, and <strong>quantize the KV cache</strong> itself (fp8) to halve <code>dtype_bytes</code> in the formula. Both trade a little quality for a lot of throughput.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 2</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="08-inference-servers.html"><span class="dir">← Prev</span><span class="ttl">Inference Servers</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="10-ship-it.html"><span class="dir">Next →</span><span class="ttl">Ship It, End to End</span></a>
+    </nav>
+  </section>
+
+  <section class="spread" style="margin-top:1.4rem">
+    <div class="leaf leaf-left">
+      <h2>When the model won't fit on one GPU</h2>
+      <p>A 70B model in 16-bit is ~140 GB — more than any single card. Two ways to split it across GPUs:</p>
+      <div class="cols">
+        <div class="card good">
+          <h4>Tensor parallelism</h4>
+          <p>Shard each layer's weight matrices <em>across</em> GPUs; every layer needs cross-GPU communication. Heavy chatter → best <strong>within one node</strong> over NVLink. <code>--tensor-parallel-size N</code>.</p>
+        </div>
+        <div class="card good">
+          <h4>Pipeline parallelism</h4>
+          <p>Split the model <em>by layers</em> into stages on different GPUs. Less communication, but "pipeline bubbles" → good <strong>across nodes</strong>. <code>--pipeline-parallel-size N</code>.</p>
+        </div>
+      </div>
+      <p>They compose: tensor-parallel within a node, pipeline-parallel across nodes. Start with tensor parallelism on a single multi-GPU box — it's simpler and usually enough.</p>
+
+      <div class="callout key">
+        <span class="ic">🔑</span>
+        <div><span class="lab">Cheapest fix first</span>
+        <p>Before you reach for multiple GPUs, ask whether <em>quantization</em> lets the model fit on one. A 70B in 4-bit is ~35 GB — one 48 GB card. Splitting across GPUs adds communication cost and complexity; often a smaller footprint is the better trade.</p>
+        </div>
+      </div>
+
+      <span class="folio">· 3</span>
+    </div>
+
+    <div class="leaf leaf-right">
+      <h2>Calling your endpoint</h2>
+      <p>Because the server is OpenAI-compatible, your application code is boring — which is the point. The official OpenAI client, pointed at localhost:</p>
+
+      <pre><span class="cap">python · call the Acme Copilot</span><code><span class="kw">from</span> openai <span class="kw">import</span> OpenAI
+
+client = <span class="ty">OpenAI</span>(base_url=<span class="str">"http://localhost:8000/v1"</span>,
+                api_key=<span class="str">"EMPTY"</span>)  <span class="cm"># ignored unless --api-key set</span>
+
+resp = client.chat.completions.<span class="fn">create</span>(
+    model=<span class="str">"acme-copilot-merged"</span>,
+    messages=[
+      {<span class="at">"role"</span>: <span class="str">"system"</span>, <span class="at">"content"</span>: <span class="str">"You are Acme's support assistant."</span>},
+      {<span class="at">"role"</span>: <span class="str">"user"</span>,   <span class="at">"content"</span>: <span class="str">"My invoice looks wrong."</span>},
+    ],
+)
+<span class="fn">print</span>(resp.choices[<span class="num">0</span>].message.content)</code></pre>
+
+      <div class="callout note">
+        <span class="ic">📊</span>
+        <div><span class="lab">Watch the right numbers</span>
+        <p>In production, track TTFT and per-token latency at your <em>peak</em> concurrency, not on an idle box — that's where the KV-cache pool gets tight and requests start queuing. If TTFT spikes under load, you're cache-bound: shrink context, quantize, or add a GPU.</p>
+        </div>
+      </div>
+
+      <div class="callout bot">
+        <span class="ic">🧪</span>
+        <div><span class="lab">Acme is live</span>
+        <p>Qwen, fine-tuned to Acme's voice, quantized to fit, served by vLLM behind <code>/v1/chat/completions</code>, tuned so the whole ticket queue can hit it at once. Every idea in this book now points at one running endpoint.</p>
+        </div>
+      </div>
+
+      <div class="sources">
+        <h3>Sources</h3>
+        <p><a href="https://docs.vllm.ai/en/stable/serving/parallelism_scaling/">vLLM · parallelism &amp; scaling</a> · <a href="https://docs.vllm.ai/en/stable/serving/openai_compatible_server.html">vLLM · OpenAI-compatible server</a> · <a href="https://arxiv.org/abs/2309.06180">vLLM paper</a> (throughput figures).</p>
+      </div>
+
+      <span class="folio">· 4</span>
+    </div>
+
+    <nav class="pager">
+      <a class="prev" rel="prev" href="08-inference-servers.html"><span class="dir">← Prev</span><span class="ttl">Inference Servers</span></a>
+      <a class="contents" rel="home" href="../index.html"><span class="dir">Contents</span>◧</a>
+      <a class="next" rel="next" href="10-ship-it.html"><span class="dir">Next →</span><span class="ttl">Ship It, End to End</span></a>
+    </nav>
+  </section>
+</main>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

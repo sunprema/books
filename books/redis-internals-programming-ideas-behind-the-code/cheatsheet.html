@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheatsheet &mdash; Redis Internals</title>
+<link rel="stylesheet" href="assets/book.css">
+<style>
+  /* ---------- cheatsheet-only layout ----------
+     A cheatsheet is meant to be scanned and printed, not paginated as a
+     two-page spread — so this page opts out of the book-leaf/columns pager
+     mechanics and lays out as a normal scrolling document instead. It still
+     reuses every theme token, callout, table, and code-block style from
+     assets/book.css verbatim. */
+  html, body { height:auto; overflow:visible; }
+  .cheat-wrap {
+    max-width:1180px; margin:0 auto;
+    padding:6.5rem 5vw 5rem;
+  }
+  .cheat-hero { margin-bottom:1.6rem; }
+  .cheat-grid {
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr));
+    gap:1rem; margin:0 0 1.6rem;
+  }
+  .cheat-grid .cheat-card { margin:0; }
+  .cheat-grid.wide { grid-template-columns:repeat(auto-fit, minmax(420px, 1fr)); }
+  .cheat-full { grid-column:1 / -1; }
+  .cheat-card table { width:100%; }
+  .cheat-card code { white-space:nowrap; }
+  .summary-card {
+    background:var(--bg-2); border:2px dashed var(--accent); border-left-width:5px; border-left-style:solid;
+    border-radius:10px; padding:1rem 1.2rem; margin:0 0 1.6rem;
+  }
+  .summary-card .co-tag {
+    display:inline-flex; align-items:center; gap:.35em;
+    font-family:var(--font-display); font-size:.78rem; font-weight:700;
+    padding:.1em .6em; border-radius:99px; margin-bottom:.5rem;
+    background:rgba(242,208,107,.16); color:var(--accent);
+  }
+  .summary-card .co-tag::before { content:"\261E "; }
+  .gotcha-list { list-style:none; margin:0; }
+  .gotcha-list li {
+    display:flex; gap:.6rem; align-items:flex-start;
+    padding:.5rem 0; border-top:1px dashed var(--rule);
+  }
+  .gotcha-list li:first-child { border-top:0; }
+  .gotcha-list .gx { color:var(--kw); font-weight:700; flex:0 0 auto; }
+  .gotcha-list code { flex:0 0 auto; }
+  .cheat-foot {
+    text-align:center; margin-top:2rem; display:flex; gap:1.4rem;
+    justify-content:center; align-items:center; flex-wrap:wrap;
+  }
+  .cheat-foot a {
+    font-family:var(--font-display); font-size:.85rem; font-weight:700;
+    text-decoration:none;
+  }
+
+  /* ---------- print stylesheet ---------- */
+  @media print {
+    .book-topbar, .cheat-foot { display:none !important; }
+    html, body { background:#fff !important; overflow:visible !important; }
+    body {
+      color:#111; background-image:none !important;
+      font-size:11px; line-height:1.35;
+    }
+    .cheat-wrap { max-width:100%; padding:0.4in 0.3in; }
+    .cheat-hero .kicker, .cheat-hero .lede { color:#333 !important; }
+    h1 { color:#000 !important; }
+    h1 .hl { color:#000 !important; }
+    h1::after { display:none !important; }
+    h2 { color:#000 !important; }
+    .kicker::before { color:#555 !important; }
+    .cheat-grid, .cheat-grid.wide { grid-template-columns:repeat(2, 1fr); gap:.35in .3in; }
+    .cheat-card, .summary-card {
+      background:#fff !important; border:1px solid #999 !important;
+      box-shadow:none !important; break-inside:avoid; page-break-inside:avoid;
+      padding:.15in .2in;
+    }
+    .cheat-card h2 { font-size:10px; }
+    table { background:#fff !important; border-color:#999 !important; width:100%; }
+    th { background:#eee !important; color:#000 !important; }
+    td { color:#000 !important; border-color:#ccc !important; }
+    tr:nth-child(even) td { background:#f6f6f6 !important; }
+    code { background:#f0f0f0 !important; color:#000 !important; border-color:#ccc !important; }
+    a { color:#000 !important; text-decoration:underline; }
+    .summary-card { border-color:#333 !important; }
+    .gotcha-list li { border-color:#ccc !important; }
+    .gotcha-list .gx { color:#000 !important; }
+  }
+</style>
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Cheatsheet</span>
+  <a href="index.html">Contents</a>
+  <a href="cheatsheet.html">Cheatsheet</a>
+</header>
+
+<main class="cheat-wrap">
+
+  <div class="cheat-hero">
+    <p class="kicker">Encodings, Tradeoffs &amp; Glossary, One Page</p>
+    <h1>The <span class="hl">Cheatsheet</span></h1>
+    <p class="lede">
+      Twelve chapters, boiled down to what you'd actually want open in a tab
+      while you're debugging a real server. This page doesn't teach &mdash;
+      it reminds.
+    </p>
+  </div>
+
+  <div class="summary-card">
+    <span class="co-tag">The 30-Second Summary</span>
+    <p>
+      Redis runs <strong>one command at a time</strong> on a single thread
+      (Ch. 2, 3, 7) &mdash; which is why it needs no locks and every single
+      command is naturally atomic. Every value is a generic
+      <code>robj</code> wrapper (Ch. 4) that picks the <strong>cheapest
+      physical encoding</strong> that fits &mdash; <code>int</code>/<code>embstr</code>/<code>raw</code>
+      strings, <code>listpack</code>/<code>intset</code> for small
+      collections, converting one-way to <code>quicklist</code>/<code>hashtable</code>/<code>skiplist</code>
+      once they grow (Ch. 5). The keyspace itself is a <code>dict</code> that
+      grows by <strong>incremental rehashing</strong> &mdash; a few buckets
+      at a time, never all at once (Ch. 6). Durability comes from two
+      cooperating mechanisms: <strong>RDB</strong> snapshots via
+      <code>fork()</code> + copy-on-write, and the <strong>AOF</strong>
+      write-ahead log with a tunable <code>fsync</code> policy (Ch. 8).
+      Scale comes from asynchronous <strong>replication</strong> (full/partial
+      resync via a backlog ring buffer) and <strong>Cluster</strong> sharding
+      across 16384 hash slots (Ch. 9). Keys clean themselves up via
+      <strong>passive + active expiration</strong>, and memory pressure
+      triggers <strong>approximated LRU/LFU eviction</strong> &mdash; both
+      sampling-based, never an exhaustive scan (Ch. 10). The one idea behind
+      all of it: never do a big, unpredictable chunk of work when a small,
+      bounded, repeatable one will do.
+    </p>
+  </div>
+
+  <h2>String &amp; Collection Encodings</h2>
+  <div class="cheat-grid wide">
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th>Type</th><th>Compact encoding</th><th>Scaled encoding</th></tr></thead>
+        <tbody>
+          <tr><td>String</td><td class="mono">int / embstr (&le;44B)</td><td class="mono">raw (&gt;44B)</td></tr>
+          <tr><td>List</td><td class="mono">listpack</td><td class="mono">quicklist</td></tr>
+          <tr><td>Hash</td><td class="mono">listpack</td><td class="mono">hashtable</td></tr>
+          <tr><td>Set (all-int)</td><td class="mono">intset</td><td class="mono">listpack / hashtable</td></tr>
+          <tr><td>Set (strings)</td><td class="mono">listpack</td><td class="mono">hashtable</td></tr>
+          <tr><td>Sorted set</td><td class="mono">listpack</td><td class="mono">skiplist + dict</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="cheat-card">
+      <h2>Check It Live</h2>
+      <table>
+        <tbody>
+          <tr><td><code>OBJECT ENCODING key</code></td><td>Show a key's current physical encoding</td></tr>
+          <tr><td><code>OBJECT REFCOUNT key</code></td><td>Shared small-int objects show an unusually high count</td></tr>
+          <tr><td><code>OBJECT FREQ key</code></td><td>Approximated LFU counter (needs an LFU maxmemory-policy)</td></tr>
+          <tr><td><code>OBJECT IDLETIME key</code></td><td>Seconds since last access (needs an LRU policy)</td></tr>
+          <tr><td><code>MEMORY USAGE key</code></td><td>Bytes this key actually costs, encoding included</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:.78rem;color:var(--ink-soft);margin-top:.4rem">
+        Conversion is a one-way ratchet &mdash; a collection never converts
+        back to a compact encoding after shrinking.
+      </p>
+    </div>
+  </div>
+
+  <h2>Persistence: RDB vs. AOF</h2>
+  <div class="cheat-grid wide">
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th></th><th>RDB</th><th>AOF</th></tr></thead>
+        <tbody>
+          <tr><td>What it stores</td><td>Point-in-time binary snapshot</td><td>A log of write commands to replay</td></tr>
+          <tr><td>Recovery speed</td><td class="good">Fast &mdash; load the final state directly</td><td>Slower &mdash; replay every logged write</td></tr>
+          <tr><td>Worst-case data loss</td><td class="bad">Since the last snapshot</td><td>~1s with <code>everysec</code>, ~0 with <code>always</code></td></tr>
+          <tr><td>File size</td><td class="good">Compact (final values only)</td><td>Larger (a history of operations, rewrite-compacted)</td></tr>
+          <tr><td>Mechanism</td><td><code>fork()</code> + copy-on-write</td><td>Append + periodic <code>fsync</code> + background rewrite</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="cheat-card">
+      <h2>appendfsync Policies</h2>
+      <table>
+        <thead><tr><th>Policy</th><th>Cost</th><th>Loses on crash</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">always</td><td class="bad">Highest (fsync every write)</td><td class="good">~none</td></tr>
+          <tr><td class="mono">everysec</td><td>Low (default)</td><td class="bad">up to ~1s</td></tr>
+          <tr><td class="mono">no</td><td class="good">Lowest</td><td class="bad">OS-dependent</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:.78rem;color:var(--ink-soft);margin-top:.4rem">
+        Most production setups run both RDB (fast recovery, backups) and AOF
+        (tight durability window) together.
+      </p>
+    </div>
+  </div>
+
+  <h2>Eviction Policies (maxmemory-policy)</h2>
+  <div class="cheat-grid">
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th>Policy</th><th>Evicts from</th><th>By</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">noeviction</td><td>&mdash;</td><td class="bad">rejects writes with OOM (the default!)</td></tr>
+          <tr><td class="mono">allkeys-lru</td><td>any key</td><td>approximated least-recently-used</td></tr>
+          <tr><td class="mono">volatile-lru</td><td>keys with a TTL</td><td>approximated least-recently-used</td></tr>
+          <tr><td class="mono">allkeys-lfu</td><td>any key</td><td>approximated least-frequently-used</td></tr>
+          <tr><td class="mono">volatile-lfu</td><td>keys with a TTL</td><td>approximated least-frequently-used</td></tr>
+          <tr><td class="mono">allkeys-random</td><td>any key</td><td>random</td></tr>
+          <tr><td class="mono">volatile-random</td><td>keys with a TTL</td><td>random</td></tr>
+          <tr><td class="mono">volatile-ttl</td><td>keys with a TTL</td><td>soonest expiry first</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="cheat-card">
+      <h2>Expiration, Quick Reference</h2>
+      <table>
+        <tbody>
+          <tr><td>Passive</td><td>Checked &amp; deleted on access, via <code>expireIfNeeded()</code></td></tr>
+          <tr><td>Active</td><td>Background cron samples ~20 random TTL keys; repeats immediately if &gt;10% were expired</td></tr>
+          <tr><td><code>maxmemory-samples</code></td><td>Keys sampled per eviction decision (default 5)</td></tr>
+          <tr><td><code>TTL</code> / <code>PTTL key</code></td><td>Seconds / ms until expiry, <code>-1</code> no TTL, <code>-2</code> no key</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>Atomicity &amp; Multi-Command Operations</h2>
+  <div class="cheat-grid wide">
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th>Mechanism</th><th>Atomic unit</th><th>Can branch on results?</th></tr></thead>
+        <tbody>
+          <tr><td>A single command</td><td>That one command</td><td>&mdash;</td></tr>
+          <tr><td><code>MULTI</code> / <code>EXEC</code></td><td>All queued commands</td><td class="bad">No &mdash; queued blind</td></tr>
+          <tr><td>Lua (<code>EVAL</code>) / Functions</td><td>The whole script</td><td class="good">Yes</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="cheat-card">
+      <h2>Command Table Fields</h2>
+      <table>
+        <tbody>
+          <tr><td class="mono">arity</td><td>Exact arg count, or <code>-N</code> for "at least N"</td></tr>
+          <tr><td class="mono">flags</td><td>write / readonly / admin / deny-oom&hellip;</td></tr>
+          <tr><td class="mono">key specs</td><td>Which arguments are key names (drives cluster routing)</td></tr>
+          <tr><td><code>COMMAND INFO &lt;cmd&gt;</code></td><td>Inspect all of the above on a live server</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>Replication &amp; Cluster</h2>
+  <div class="cheat-grid wide">
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">PSYNC</td><td>Handshake command: replid + offset the replica already has</td></tr>
+          <tr><td>Full resync</td><td>Unrecognized replid/offset &mdash; fork, send a fresh RDB</td></tr>
+          <tr><td>Partial resync</td><td>Offset still inside the backlog &mdash; replay just the gap</td></tr>
+          <tr><td>Replication backlog</td><td>Fixed-size ring buffer of the recent write stream</td></tr>
+          <tr><td class="mono">replid2</td><td>Old primary's identity, kept after a failover for partial resyncs</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>Hash slots</td><td>16384 fixed slots; <code>CRC16(key) mod 16384</code></td></tr>
+          <tr><td>Hash tag <code>{...}</code></td><td>Only the braced substring is hashed &mdash; co-locate related keys</td></tr>
+          <tr><td class="mono">-MOVED</td><td>Permanent redirect &mdash; slot lives on a different node now</td></tr>
+          <tr><td class="mono">-ASK</td><td>Temporary redirect &mdash; slot mid-migration, try target once</td></tr>
+          <tr><td>Consistency</td><td>Async replication &mdash; a failover can lose the last unreplicated writes</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>Observability</h2>
+  <div class="cheat-grid wide">
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th>Command</th><th>What it shows</th></tr></thead>
+        <tbody>
+          <tr><td><code>SLOWLOG GET [n]</code></td><td>Recent commands over <code>slowlog-log-slower-than</code> &micro;s</td></tr>
+          <tr><td><code>SLOWLOG RESET</code></td><td>Clear the slowlog</td></tr>
+          <tr><td><code>LATENCY HISTORY &lt;event&gt;</code></td><td>Time series for one latency-sensitive internal event</td></tr>
+          <tr><td><code>LATENCY DOCTOR</code></td><td>Plain-English diagnosis from the latency monitor's samples</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="cheat-card">
+      <table>
+        <thead><tr><th>Command</th><th>What it shows</th></tr></thead>
+        <tbody>
+          <tr><td><code>INFO stats</code></td><td>Throughput, hit-rate, connection counters</td></tr>
+          <tr><td><code>INFO commandstats</code></td><td>Per-command call count &amp; total time</td></tr>
+          <tr><td><code>INFO latencystats</code></td><td>Per-command latency percentiles (p50/p99/p999)</td></tr>
+          <tr><td><code>MONITOR</code></td><td>Live command stream &mdash; five-second debugging only, never leave it on</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="cheat-card cheat-full">
+    <h2>Glossary &amp; Source Map</h2>
+    <div class="cheat-grid wide" style="margin-bottom:0">
+      <table>
+        <tbody>
+          <tr><td class="mono">robj</td><td>The generic object wrapper: type, encoding, refcount, LRU/LFU field, data pointer (<code>object.c</code>)</td></tr>
+          <tr><td class="mono">SDS</td><td>Simple Dynamic String &mdash; binary-safe, O(1) length, variable header size</td></tr>
+          <tr><td class="mono">dict</td><td>The two-table, incrementally-rehashing hash table backing the keyspace (<code>dict.c</code>)</td></tr>
+          <tr><td class="mono">ae</td><td>Redis's own tiny event library: file events + time events (<code>ae.c</code>)</td></tr>
+          <tr><td class="mono">serverCron</td><td>The recurring time event driving all background housekeeping</td></tr>
+        </tbody>
+      </table>
+      <table>
+        <tbody>
+          <tr><td class="mono">server.c / server.h</td><td>Main loop wiring &amp; the global server state</td></tr>
+          <tr><td class="mono">networking.c</td><td>Reading requests, writing replies, client buffers</td></tr>
+          <tr><td class="mono">t_string.c / t_list.c / t_hash.c / t_set.c / t_zset.c</td><td>One file per data type</td></tr>
+          <tr><td class="mono">rdb.c / aof.c</td><td>The two persistence formats</td></tr>
+          <tr><td class="mono">replication.c / cluster.c</td><td>Master/replica sync &amp; sharded clustering</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="cheat-card cheat-full">
+    <h2>&#9888; Gotchas &mdash; Know These Before Production</h2>
+    <ul class="gotcha-list">
+      <li><span class="gx">&#9888;</span><code>KEYS *</code><span>O(N) over the whole keyspace, done in one blocking command (Ch. 2&ndash;3). Use <code>SCAN</code> instead &mdash; same traversal, incremental cursor.</span></li>
+      <li><span class="gx">&#9888;</span><code>noeviction</code> is the default<span>With <code>maxmemory</code> set and no explicit eviction policy, Redis starts <strong>rejecting writes</strong> at capacity instead of evicting anything (Ch. 10).</span></li>
+      <li><span class="gx">&#9888;</span>Encoding conversion is one-way<span>A collection that grows past its compact-encoding threshold never converts back, even after you delete most of its elements (Ch. 5).</span></li>
+      <li><span class="gx">&#9888;</span>A stuck Lua script or long command stalls everyone<span>Single-threaded execution means there's no other thread to pick up the slack (Ch. 2, 3, 7). Keep any one command's work bounded.</span></li>
+      <li><span class="gx">&#9888;</span>Cluster has no cross-slot transactions<span>A command touching keys in two different hash slots is rejected unless you've forced them together with a <code>{hash tag}</code> (Ch. 9).</span></li>
+      <li><span class="gx">&#9888;</span>Async replication can lose the newest writes on failover<span>Redis trades the strongest consistency guarantee for simplicity and speed &mdash; a deliberate choice, not an oversight (Ch. 9).</span></li>
+    </ul>
+  </div>
+
+  <p class="sources" style="margin:0 0 1rem">
+    <span class="src-tag">Where To Look It Up</span>
+    <a href="https://redis.io/docs/latest/operate/oss_and_stack/" target="_blank" rel="noopener">redis.io &mdash; Open Source docs</a>
+    &middot;
+    <a href="https://github.com/redis/redis" target="_blank" rel="noopener">github.com/redis/redis</a>
+    &middot;
+    <a href="https://github.com/redis/redis-doc" target="_blank" rel="noopener">github.com/redis/redis-doc</a>
+  </p>
+
+  <nav class="cheat-foot">
+    <a class="nav-prev" rel="prev" href="concepts/12-thinking-like-a-redis-engineer.html">&lsaquo; Back to Chapter 12</a>
+    <a class="nav-home" rel="home" href="index.html">Contents</a>
+  </nav>
+
+</main>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

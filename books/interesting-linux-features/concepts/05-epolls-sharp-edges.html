@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Epoll's Sharp Edges — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 05 &middot; A Trap With Excellent Documentation</p>
+    <h1>Epoll's Sharp Edges</h1>
+    <p class="lead"><code class="inl">epoll(7)</code> is the workhorse behind nearly every
+    high-performance Linux network daemon, and its default mode is friendly and forgiving. Its
+    <em>optional</em> mode is faster, sharper, and will silently stall your server the first
+    time you get it slightly wrong.</p>
+
+    <p class="dropcap">Every registered file descriptor in an epoll instance can be watched one
+    of two ways, and the choice changes what "ready" means so fundamentally that code correct
+    under one mode will hang forever under the other.</p>
+
+    <h2>Level-triggered: "still ready" (the default)</h2>
+    <p>In level-triggered mode &mdash; what you get if you don't pass <code class="inl">EPOLLET</code>
+    &mdash; <code class="inl">epoll_wait()</code> reports a file descriptor as ready every single
+    time you call it, for as long as the underlying condition holds. If a socket has 4&nbsp;KB of
+    unread data and you only <code class="inl">read()</code> 1&nbsp;KB of it, the next
+    <code class="inl">epoll_wait()</code> will immediately tell you it's still readable. This is
+    exactly how <code class="inl">poll(2)</code> and <code class="inl">select(2)</code> already
+    behave &mdash; epoll's level-triggered mode is simply a much faster version of the same
+    mental model. You can read a little, do other work, come back, and epoll will keep reminding
+    you there's more.</p>
+
+    <h2>Edge-triggered: "just changed" (EPOLLET)</h2>
+    <p>Edge-triggered mode notifies you exactly once, at the moment a file descriptor's state
+    <em>transitions</em> &mdash; empty buffer becomes non-empty, a socket becomes writable again.
+    It does <strong>not</strong> keep reminding you. If you read only part of the available data
+    and stop, the rest sits in the kernel buffer, epoll stays silent about it, and unless
+    something else nudges the socket again, that data may never get processed.</p>
+
+    <div class="callout danger" data-anchor="epollet-danger">
+      <span class="tag">The trap</span>
+      The man page's rule is absolute: with <code class="inl">EPOLLET</code>, always use
+      non-blocking file descriptors, and always drain a ready fd in a loop &mdash;
+      <code class="inl">read()</code> or <code class="inl">write()</code> repeatedly until you get
+      <code class="inl">EAGAIN</code> &mdash; before waiting on the next
+      <code class="inl">epoll_wait()</code>. Stop one read early and you leave data stranded with
+      no notification ever coming to tell you it's there.
+    </div>
+
+    <pre class="tab"><span class="cap">c &middot; correct edge-triggered drain loop</span><code>ev.events = <span class="mac">EPOLLIN</span> | <span class="mac">EPOLLET</span>;   <span class="cm">// edge-triggered, from man7's own example</span>
+<span class="fn">epoll_ctl</span>(epfd, <span class="en">EPOLL_CTL_ADD</span>, conn_fd, &amp;ev);
+
+<span class="cm">// on notification:</span>
+<span class="kw">for</span> (;;) {
+  <span class="ty">ssize_t</span> n = <span class="fn">read</span>(conn_fd, buf, <span class="kw">sizeof</span> buf);
+  <span class="kw">if</span> (n &gt; <span class="num">0</span>)  { <span class="fn">handle</span>(buf, n); <span class="kw">continue</span>; }
+  <span class="kw">if</span> (n == -<span class="num">1</span> &amp;&amp; errno == <span class="en">EAGAIN</span>) <span class="kw">break</span>;  <span class="cm">// truly drained</span>
+  <span class="kw">if</span> (n == <span class="num">0</span>) { <span class="fn">close_connection</span>(); <span class="kw">break</span>; }
+}</code></pre>
+
+    <p>Why bother with the sharp edge at all? Fewer wasted wakeups. A busy, mostly-idle-between-bursts
+    server spends less time being told "still readable" over and over when it already knows.
+    Under real load, edge-triggered epoll is measurably cheaper &mdash; which is why nginx and
+    other high-throughput servers default to it, accepting the drain-loop discipline in exchange.</p>
+
+    <h2>EPOLLONESHOT: one event, then silence until re-armed</h2>
+    <p>Both modes have a shared problem in a multi-threaded server: if two worker threads share
+    one epoll instance, the same ready fd can be handed to two threads simultaneously &mdash; a
+    race where both try to read the same connection at once. <code class="inl">EPOLLONESHOT</code>
+    fixes this by disabling further notifications for a file descriptor the instant one event is
+    delivered for it. No other thread will be told about it again until you explicitly re-arm it:</p>
+    <pre class="tab"><span class="cap">c &middot; hand each ready fd to exactly one worker</span><code>ev.events = <span class="mac">EPOLLIN</span> | <span class="mac">EPOLLONESHOT</span>;
+<span class="fn">epoll_ctl</span>(epfd, <span class="en">EPOLL_CTL_ADD</span>, conn_fd, &amp;ev);
+
+<span class="cm">// a worker thread handles the event, then re-arms explicitly when done:</span>
+ev.events = <span class="mac">EPOLLIN</span> | <span class="mac">EPOLLONESHOT</span>;
+<span class="fn">epoll_ctl</span>(epfd, <span class="en">EPOLL_CTL_MOD</span>, conn_fd, &amp;ev);</code></pre>
+    <p>Only one thread ever "owns" a given connection at a time, and ownership is handed back
+    explicitly &mdash; a clean, race-free way to fan an epoll instance's events out across a
+    thread pool.</p>
+
+    <div class="usecase" data-anchor="epoll-use">
+      <span class="tag">Real-world use</span>
+      Thread-pool-based servers (many production HTTP and RPC servers) use
+      <code class="inl">EPOLLONESHOT</code> exactly for this reason &mdash; without it, sharing
+      one epoll fd across worker threads invites double-processing races on the same connection.
+    </div>
+
+    <div class="callout funny" data-anchor="epoll-funny">
+      <span class="tag">A small delight</span>
+      "Edge-triggered" is a genuinely good pun disguised as jargon: it means the notification
+      fires only at the <em>edge</em> of a state change, like a doorbell that only rings the
+      instant someone arrives &mdash; and stays completely silent no matter how long they
+      continue standing on your porch afterward.
+    </div>
+
+    <svg viewBox="0 0 640 220" class="figure-svg" role="img" aria-label="Two timelines showing a socket buffer receiving three chunks of data with a partial read between chunks two and three. Level-triggered epoll fires on every call while data remains. Edge-triggered epoll fires only once per transition from empty to non-empty, and stays silent if data is left unread.">
+      <text x="10" y="20" font-family="monospace" font-size="10" fill="#2b2114" font-weight="bold">buffer state:</text>
+      <rect x="140" y="8" width="60" height="16" fill="#efe3c6" stroke="#a5561a"/><text x="170" y="20" text-anchor="middle" font-family="monospace" font-size="8">chunk 1</text>
+      <rect x="260" y="8" width="60" height="16" fill="#efe3c6" stroke="#a5561a"/><text x="290" y="20" text-anchor="middle" font-family="monospace" font-size="8">partial read</text>
+      <rect x="400" y="8" width="60" height="16" fill="#efe3c6" stroke="#a5561a"/><text x="430" y="20" text-anchor="middle" font-family="monospace" font-size="8">chunk 2</text>
+
+      <text x="10" y="70" font-family="monospace" font-size="10" fill="#3f6d3a" font-weight="bold">level-triggered:</text>
+      <circle cx="170" cy="90" r="5" fill="#3f6d3a"/><text x="170" y="108" text-anchor="middle" font-family="monospace" font-size="8">fires</text>
+      <circle cx="290" cy="90" r="5" fill="#3f6d3a"/><text x="290" y="108" text-anchor="middle" font-family="monospace" font-size="8">fires again (still data left!)</text>
+      <circle cx="430" cy="90" r="5" fill="#3f6d3a"/><text x="430" y="108" text-anchor="middle" font-family="monospace" font-size="8">fires</text>
+
+      <text x="10" y="150" font-family="monospace" font-size="10" fill="#8a2f22" font-weight="bold">edge-triggered:</text>
+      <circle cx="170" cy="170" r="5" fill="#8a2f22"/><text x="170" y="188" text-anchor="middle" font-family="monospace" font-size="8">fires (empty&#8594;data)</text>
+      <circle cx="290" cy="170" r="5" fill="#d8c49c" stroke="#8a2f22" stroke-dasharray="2 2"/><text x="290" y="188" text-anchor="middle" font-family="monospace" font-size="8" fill="#8a2f22">silent &mdash; still had data!</text>
+      <circle cx="430" cy="170" r="5" fill="#8a2f22"/><text x="430" y="188" text-anchor="middle" font-family="monospace" font-size="8">fires (new bytes arrived)</text>
+    </svg>
+    <p class="figure-cap">The same three-event stream, two very different notification counts &mdash; and one of them (edge-triggered, undrained) is a live bug.</p>
+
+    <div class="sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man7/epoll.7.html">epoll(7)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/epoll_ctl.2.html">epoll_ctl(2)</a> &mdash; man7.org Linux man-pages.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-anonymous-memory-files.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-io-uring.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

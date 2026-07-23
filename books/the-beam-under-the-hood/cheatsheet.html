@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheatsheet — The BEAM Under the Hood</title>
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">The BEAM<span class="dot">.</span></span>
+  <span class="chip">★ Cheatsheet</span>
+  <span class="spacer"></span>
+  <a href="index.html">Contents</a>
+  <a href="cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">The whole machine on one board</p>
+    <h1>Cheatsheet</h1>
+    <p class="dek">The numbers, the flags, the symptoms — chalked up where you can grab them.</p>
+
+    <div class="sheet-grid">
+
+      <div class="sheet-card">
+        <h3>Key numbers</h3>
+        <table>
+          <tr><th>Thing</th><th>Value</th></tr>
+          <tr><td>Reduction budget (<code>CONTEXT_REDS</code>)</td><td>4000 (was 2000 pre-OTP-20)</td></tr>
+          <tr><td>Normal schedulers</td><td>1 per logical core (<code>+S</code>)</td></tr>
+          <tr><td>Fresh process heap</td><td>~233 words</td></tr>
+          <tr><td>Heap vs refc binary line</td><td>64 bytes</td></tr>
+          <tr><td>Dirty-CPU schedulers</td><td>= normal count (<code>+SDcpu</code>)</td></tr>
+          <tr><td>Dirty-I/O schedulers</td><td>10 (<code>+SDio</code>)</td></tr>
+          <tr><td><code>net_ticktime</code></td><td>60 s</td></tr>
+          <tr><td><code>fullsweep_after</code> default</td><td>65535</td></tr>
+          <tr><td>NIF budget on a normal scheduler</td><td>&lt; ~1 ms</td></tr>
+        </table>
+      </div>
+
+      <div class="sheet-card">
+        <h3>Symptom → cause → fix</h3>
+        <table>
+          <tr><th>Symptom</th><th>Cause / fix</th></tr>
+          <tr><td>Memory up, heaps tiny</td><td>Binary leak → <code>:recon.bin_leak/1</code>, <code>:binary.copy/1</code>, hibernate (Ch 5)</td></tr>
+          <tr><td>One process slow + fat</td><td>Mailbox bloat, O(n) receive → back-pressure, <code>call</code> over <code>cast</code> (Ch 4)</td></tr>
+          <tr><td>Cores idle, latency spikes</td><td>Scheduler collapse/busy-wait → <code>+sbwt</code> (Ch 2)</td></tr>
+          <tr><td>Node stutters on native call</td><td>Long NIF → dirty scheduler / yield (Ch 6)</td></tr>
+          <tr><td>Dead node noticed slowly</td><td><code>net_ticktime</code> too high (Ch 7)</td></tr>
+        </table>
+      </div>
+
+      <div class="sheet-card">
+        <h3>The primitives</h3>
+        <pre><code>pid = <span class="fn">spawn</span>(<span class="k">fn</span> -&gt; <span class="fn">loop</span>() <span class="k">end</span>)
+<span class="fn">send</span>(pid, {<span class="at">:msg</span>, <span class="fn">self</span>()})
+<span class="k">receive</span> <span class="k">do</span>
+  <span class="at">:reply</span> -&gt; <span class="at">:ok</span>
+<span class="k">after</span> <span class="num">1_000</span> -&gt; <span class="at">:timeout</span>
+<span class="k">end</span></code></pre>
+      </div>
+
+      <div class="sheet-card">
+        <h3>Inspect a live system</h3>
+        <pre><code><span class="mod">Process</span>.<span class="fn">info</span>(pid, <span class="at">:message_queue_len</span>)
+<span class="mod">Process</span>.<span class="fn">info</span>(pid, <span class="at">:memory</span>)
+<span class="mod">Process</span>.<span class="fn">info</span>(pid, <span class="at">:binary</span>)
+<span class="mod">:erlang</span>.<span class="fn">system_info</span>(<span class="at">:schedulers_online</span>)
+<span class="mod">:erlang</span>.<span class="fn">system_info</span>(<span class="at">:dirty_cpu_schedulers</span>)
+<span class="mod">:erlang</span>.<span class="fn">garbage_collect</span>(pid)
+<span class="mod">:observer</span>.<span class="fn">start</span>()          <span class="co"># the live dashboard</span>
+<span class="mod">:recon</span>.<span class="fn">bin_leak</span>(<span class="num">10</span>)        <span class="co"># top binary hoarders</span>
+<span class="mod">:recon</span>.<span class="fn">proc_count</span>(<span class="at">:memory</span>, <span class="num">5</span>)</code></pre>
+      </div>
+
+      <div class="sheet-card">
+        <h3>Tuning knobs (measure first!)</h3>
+        <pre><code><span class="fn">spawn_opt</span>(fun, [
+  <span class="op">{</span><span class="at">:min_heap_size</span>, <span class="num">4_000</span><span class="op">}</span>,
+  <span class="op">{</span><span class="at">:fullsweep_after</span>, <span class="num">10</span><span class="op">}</span>,
+  <span class="op">{</span><span class="at">:message_queue_data</span>, <span class="at">:off_heap</span><span class="op">}</span>
+])</code></pre>
+        <p style="font-size:.82rem" class="chalk-soft">Boot flags: <code>+S</code> schedulers · <code>+SDcpu</code>/<code>+SDio</code> dirty pools · <code>+sbwt</code> busy-wait.</p>
+      </div>
+
+      <div class="sheet-card">
+        <h3>The 30-second summary</h3>
+        <p style="font-size:.9rem">Millions of <b>cheap isolated processes</b>, each with a <b>private heap</b> and
+        <b>mailbox</b>. Fair <b>reduction-counted preemption</b> at 4000, one scheduler per core. <b>Copying</b>
+        message passing (big binaries shared off-heap). <b>Per-process generational GC</b> — no stop-the-world.
+        Long native calls go to <b>dirty schedulers</b>. Machines cluster in a <b>full mesh</b>. Stack it all up and
+        one box holds a huge crowd of live connections.</p>
+      </div>
+
+      <div class="sheet-card">
+        <h3>Sources &amp; further reading</h3>
+        <p style="font-size:.8rem;line-height:1.7">
+          <a href="https://github.com/happi/theBeamBook">The BEAM Book</a> (Erik Stenman) — scheduling, memory ·
+          <a href="https://www.erlang.org/doc/apps/erts/garbagecollection.html">ERTS: Erlang Garbage Collector</a> ·
+          <a href="https://www.erlang.org/blog/message-passing/">OTP blog: A few notes on message passing</a> ·
+          <a href="https://www.erlang.org/doc/apps/erts/erl_nif.html">ERTS: erl_nif</a> (dirty schedulers) ·
+          <a href="https://www.erlang.org/doc/system/binaryhandling.html">Efficiency Guide: Binaries</a> ·
+          <a href="https://www.erlang.org/doc/system/eff_guide_processes.html">Efficiency Guide: Processes</a> ·
+          <a href="https://www.erlang.org/doc/system/distributed.html">Distributed Erlang</a> ·
+          <a href="https://www.erlang.org/doc/apps/kernel/net_kernel.html">net_kernel</a> ·
+          <a href="https://github.com/heroku/erlang-in-anger">Erlang in Anger</a> (Fred Hébert) ·
+          <a href="https://www.phoenixframework.org/blog/the-road-to-2-million-websocket-connections">The Road to 2M Websockets</a>.
+        </p>
+      </div>
+
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="concepts/08-why-liveview-scales.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a href="index.html">Back to cover</a>
+</nav>
+
+<script src="assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

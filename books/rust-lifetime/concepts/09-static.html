@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>'static: The Most Misunderstood Lifetime — Rust Lifetimes</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="book-title">Rust Lifetimes</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <h1><span class="ch-no">Chapter 09</span><code class="lt">'static</code>: The Most Misunderstood Lifetime</h1>
+
+    <p class="lede">One lifetime has a keyword all to itself, shows up in
+    compiler suggestions, and gets pasted into signatures by desperate
+    programmers at 2 a.m. It means two related but different things, and
+    telling them apart dissolves a whole family of confusing errors.</p>
+
+    <h2>Meaning one: <code class="lt">'static</code> as a lifetime</h2>
+
+    <p><code>&amp;<span class="lt">'static</span> T</code> is a reference valid
+    for the <em>entire remaining run of the program</em> — the region that
+    covers all other regions. The classic inhabitant is the string literal:</p>
+
+<pre><code><span class="kw">let</span> s: &amp;<span class="lt">'static</span> <span class="ty">str</span> = <span class="st">"I have a static lifetime."</span>;</code></pre>
+
+    <p>Why does a humble literal earn the maximal lifetime? Because its bytes
+    are baked into the executable itself — they're in the program's read-only
+    data section, mapped into memory from the moment the process starts to the
+    moment it exits. Nothing to allocate, nothing to drop, no owner to outlive.
+    The same goes for <code><span class="kw">static</span></code> items, and for
+    memory you deliberately never free
+    (<code><span class="ty">Box</span>::<span class="fn">leak</span></code> turns a
+    <code><span class="ty">Box</span>&lt;T&gt;</code> into a
+    <code>&amp;<span class="lt">'static</span> <span class="kw">mut</span> T</code>
+    by promising the allocator will never get it back).</p>
+
+    <p>Because <code><span class="lt">'static</span></code> covers every region,
+    a <code>&amp;<span class="lt">'static</span> str</code> can go anywhere a
+    <code>&amp;<span class="lt">'a</span> str</code> is expected, for any
+    <code><span class="lt">'a</span></code>. Longer loans substitute for shorter
+    ones — that's the “subtyping” corner of the lifetime system, and it's why
+    <code>first_or_default</code> in chapter 6 could return the literal
+    <code><span class="st">"default"</span></code> where a caller-tied
+    <code>&amp;<span class="lt">'a</span> str</code> was promised.</p>
+
+    <h2>Meaning two: <code>T: <span class="lt">'static</span></code> as a bound</h2>
+
+    <p>Now the trickier sibling. When you see
+    <code>T: <span class="lt">'static</span></code> — in thread APIs, async
+    runtimes, anywhere data escapes the current stack — it does <em>not</em>
+    mean “<code>T</code> is a reference that lives forever,” and it definitely
+    doesn't mean “<code>T</code> lives forever.” It means:
+    <strong><code>T</code> contains no borrows shorter than
+    <code><span class="lt">'static</span></code></strong>. In practice: owned
+    types pass; types holding temporary references don't.</p>
+
+<pre><code><span class="ty">String</span>: <span class="lt">'static</span>            <span class="co">// ✓ owns its data, borrows nothing</span>
+<span class="ty">Vec</span>&lt;<span class="ty">u8</span>&gt;: <span class="lt">'static</span>           <span class="co">// ✓ same</span>
+<span class="ty">i32</span>: <span class="lt">'static</span>               <span class="co">// ✓ no references at all</span>
+&amp;<span class="lt">'static</span> <span class="ty">str</span>: <span class="lt">'static</span>      <span class="co">// ✓ its one borrow is forever</span>
+&amp;<span class="lt">'a</span> <span class="ty">str</span>: <span class="lt">'static</span>           <span class="co">// ✗ carries a shorter loan</span>
+<span class="ty">Excerpt</span>&lt;<span class="lt">'a</span>&gt;: <span class="lt">'static</span>       <span class="co">// ✗ struct-holding-a-borrow IS a borrow (ch. 8)</span></code></pre>
+
+    <p>A <code><span class="ty">String</span></code> satisfying
+    <code>: <span class="lt">'static</span></code> can still be dropped two lines
+    from now. The bound isn't about how long the value <em>will</em> live; it's
+    about whether the value is <em>tethered</em> to somebody else's scope. Untethered
+    values may be kept as long as the holder pleases — which is exactly the
+    property a spawned thread needs.</p>
+
+    <div class="callout key">
+      <span class="co-label">The Key Idea</span>
+      <p><code>&amp;<span class="lt">'static</span> T</code>: “this reference is
+      good forever.” <code>T: <span class="lt">'static</span></code>: “this value
+      is <em>self-contained</em> — no expiring loans inside.” The first is
+      about a pointer; the second is about freedom from other people's
+      scopes.</p>
+    </div>
+
+    <h2>Why <code>thread::spawn</code> demands it</h2>
+
+<pre><code><span class="kw">fn</span> <span class="fn">spawn</span>&lt;F, T&gt;(f: F) -&gt; <span class="ty">JoinHandle</span>&lt;T&gt;
+<span class="kw">where</span>
+    F: <span class="ty">FnOnce</span>() -&gt; T + <span class="ty">Send</span> + <span class="lt">'static</span>,
+    T: <span class="ty">Send</span> + <span class="lt">'static</span>,</code></pre>
+
+    <p>A spawned thread may outlive the function that spawned it — maybe the
+    whole rest of the program. If the closure captured
+    <code>&amp;local_variable</code>, the thread could be reading that variable
+    long after its frame popped. So the API refuses tethered closures
+    outright. The fix is almost never to make the data
+    <code><span class="lt">'static</span></code>; it's to <strong>move ownership
+    into the closure</strong> (<code><span class="kw">move</span> ||</code>), or to
+    share with <code><span class="ty">Arc</span></code>, or to use
+    <a href="https://doc.rust-lang.org/std/thread/fn.scope.html">scoped
+    threads</a> (<code>std::thread::scope</code>, stable since Rust 1.63),
+    which promise to join before the borrowed scope ends — letting you borrow
+    locals across threads safely.</p>
+
+    <h2>The 2 a.m. anti-pattern</h2>
+
+    <p>Now the myth-busting the Rust Book itself insists on. The compiler will
+    sometimes <em>suggest</em> <code><span class="lt">'static</span></code>:</p>
+
+<pre class="term"><code>help: consider using the `'static` lifetime
+  |
+1 | fn dangle() -&gt; &amp;'static String {
+  |                 ~~~~~~~~</code></pre>
+
+    <p>Following that suggestion is like fixing a fire alarm by removing the
+    battery. The error says <em>your data doesn't live long enough for how
+    you're using it</em>. Claiming the data lives forever doesn't stretch a
+    single byte's life — annotations describe, remember? — it just relocates
+    the error, or worse, contorts your design into leaking memory to keep the
+    claim true. The Book's advice: error messages that suggest
+    <code><span class="lt">'static</span></code> usually mean you're trying to
+    create a dangling reference or mismatching available lifetimes — <em>fix
+    that</em>, don't reach for the biggest hammer.</p>
+
+    <div class="callout warn">
+      <span class="co-label">Common Trap</span>
+      <p>When tempted to write <code><span class="lt">'static</span></code>, run
+      this checklist: (1) Is the data truly baked into the binary or
+      deliberately leaked? Then yes, it's honest. (2) Am I sending data to a
+      thread/async task? Then <code><span class="kw">move</span></code> ownership
+      or use <code>Arc</code>/scoped threads. (3) Anything else? The design
+      wants restructuring — usually returning owned data instead of a
+      reference.</p>
+    </div>
+
+    <h2>Where <code class="lt">'static</code> hides in plain sight</h2>
+
+    <p>Recall from chapter 7 that some positions <em>default</em> to
+    <code><span class="lt">'static</span></code>: <code>const</code>/<code>static</code>
+    reference types, and boxed trait objects —
+    <code><span class="ty">Box</span>&lt;<span class="kw">dyn</span> <span class="ty">Handler</span>&gt;</code>
+    means <code><span class="ty">Box</span>&lt;<span class="kw">dyn</span> <span class="ty">Handler</span> + <span class="lt">'static</span>&gt;</code>.
+    So when you stuff a borrowing closure into a
+    <code>Box&lt;dyn Fn()&gt;</code> and the compiler objects about lifetimes you
+    never wrote, you've met the default object bound. If the trait object
+    genuinely borrows, say so:
+    <code><span class="ty">Box</span>&lt;<span class="kw">dyn</span> <span class="ty">Handler</span> + <span class="lt">'a</span>&gt;</code>.</p>
+
+    <figure>
+      <svg viewBox="0 0 760 240" role="img" aria-label="Region containment: 'static covers the whole program; smaller regions nest inside">
+        <style>
+          .t9{ font:600 13px "Avenir Next","Helvetica Neue",sans-serif; fill:#2b2620; }
+          .s9{ font:12px "Avenir Next","Helvetica Neue",sans-serif; fill:#5c5347; }
+          .m9{ font:12.5px ui-monospace,Menlo,monospace; }
+        </style>
+        <rect x="40" y="30" width="680" height="180" rx="12" fill="none" stroke="#b7410e" stroke-width="2.5"/>
+        <text x="56" y="56" class="m9" fill="#b7410e">'static — the whole run of the program</text>
+        <rect x="80" y="76" width="480" height="110" rx="10" fill="none" stroke="#1f6f6b" stroke-width="2"/>
+        <text x="96" y="100" class="m9" fill="#1f6f6b">'a — some function's region</text>
+        <rect x="120" y="116" width="280" height="52" rx="8" fill="none" stroke="#a07d2a" stroke-width="2"/>
+        <text x="136" y="140" class="m9" fill="#a07d2a">'b — an inner block</text>
+        <text x="420" y="150" class="s9">'static: 'a  and  'a: 'b —</text>
+        <text x="420" y="168" class="s9">bigger regions substitute for smaller</text>
+      </svg>
+      <figcaption><code class="lt">'static</code> is just the outermost box. Every “outlives” fact is containment of one box in another.</figcaption>
+    </figure>
+
+    <h2>So what did we actually gain?</h2>
+
+    <p>Two meanings, now cleanly separated.
+    <code>&amp;<span class="lt">'static</span> T</code> is a forever-valid
+    reference — rare, honest only for binary-baked or leaked data.
+    <code>T: <span class="lt">'static</span></code> is a self-containment bound —
+    common, satisfied by any owned type, demanded wherever data outruns its
+    birth scope. And one reflex retired: pasting
+    <code><span class="lt">'static</span></code> over a lifetime error treats the
+    alarm, not the fire. Last stop: the machine that's been judging us all
+    book long — the borrow checker itself, and how it got so much smarter.</p>
+
+    <div class="challenges">
+      <h3>Challenges</h3>
+      <ol>
+        <li>Does <code>Vec&lt;&amp;<span class="lt">'a</span> str&gt;</code>
+        satisfy <code>: <span class="lt">'static</span></code>? Does
+        <code>Vec&lt;String&gt;</code>? Explain via “does it carry someone
+        else's loan?”</li>
+        <li>Make this compile two ways — with <code><span class="kw">move</span></code>,
+        and with <code>std::thread::scope</code>:
+        <code>let v = vec![1,2,3]; thread::spawn(|| println!("{v:?}"));</code></li>
+        <li><code>Box::leak</code> really does produce
+        <code>&amp;<span class="lt">'static</span> mut T</code>. When is that a
+        legitimate tool rather than a leak-shaped bug? (Think: one-time
+        startup configuration.)</li>
+      </ol>
+    </div>
+
+    <div class="sources">
+      <ul>
+        <li>Sources: <a href="https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html">The Rust Book — the static lifetime</a> ·
+        <a href="https://doc.rust-lang.org/rust-by-example/scope/lifetime/static_lifetime.html">Rust by Example — 'static</a> ·
+        <a href="https://doc.rust-lang.org/std/thread/fn.scope.html">std::thread::scope</a></li>
+      </ul>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="08-structs-and-methods.html">‹ Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="10-borrow-checker.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Staging Area (Index): Git's Waiting Room — Git Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">GIT <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 8 · The Staging Area</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="stage-kicker">Chapter 8 of 17 &middot; Before the snapshot</p>
+    <h1 data-anchor="stage-h1">The Staging Area (Index): Git's <span class="hl">Waiting Room</span></h1>
+
+    <p class="lede" data-anchor="stage-lede">
+      Chapter 2 pointed at one line in the <code>.git</code> floor plan and told
+      you to come back later: <code>index</code>, "the staging area, as a binary
+      snapshot &mdash; what <code>git add</code> actually edits." Chapter 7
+      leaned on it too, quietly, every time it told you to <code>git add</code>
+      a resolved conflict before committing. Later is now. Every commit you've
+      made since Chapter 1 secretly passed through this one file first &mdash;
+      it's time to open it up and watch it work.
+    </p>
+
+    <h2 data-anchor="stage-three-h">Three Copies of Your Project, Live at Once</h2>
+    <p data-anchor="stage-three-p1">
+      Here's the idea that makes the rest of this chapter click: at any moment,
+      Git is tracking <strong>three different versions</strong> of your project
+      simultaneously, and they can all disagree with each other. Your
+      <strong>working directory</strong> is whatever's on disk right now &mdash;
+      the file you're mid-edit in your editor. Your <strong>staging area</strong>
+      (also called the <strong>index</strong>) is the version you've
+      deliberately marked as "this is what I want in the <em>next</em> commit."
+      And <strong>HEAD</strong> &mdash; the tip of your current branch &mdash;
+      is the last version you actually committed, already sealed into history.
+      <code>git add</code> and <code>git commit</code> are just the two moves
+      that shuffle content between these three, one step at a time.
+    </p>
+    <p data-anchor="stage-three-p2">
+      That's why the index deserves the nickname "waiting room": nothing
+      reaches the repository directly from your editor. Every change queues up
+      in the index first, and <code>git commit</code> only ever looks at
+      <em>what's staged</em> &mdash; never at whatever unstaged edits happen to
+      be sitting in your working directory at the time. Forget to
+      <code>git add</code> a change, and <code>git commit</code> will happily
+      commit without it, no warning given.
+    </p>
+
+    <figure class="diagram" data-anchor="stage-diagram">
+      <svg viewBox="0 0 760 300" role="img" aria-labelledby="stage-diagram-title">
+        <title id="stage-diagram-title">Three boxes left to right: Working Directory, Staging Area (Index), and Repository (HEAD). A solid arrow labeled git add runs from Working Directory to Staging Area. A solid arrow labeled git commit runs from Staging Area to Repository. Below, a dashed arrow labeled git restore --staged runs backward from Repository into Staging Area, undoing an add. A second dashed arrow labeled git restore file, marked as discarding edits, runs backward from Staging Area into Working Directory.</title>
+
+        <!-- forward flow -->
+        <g stroke="var(--rule)" stroke-width="1.5" fill="none">
+          <path d="M210,77 L279,77"></path>
+          <path d="M475,77 L544,77"></path>
+        </g>
+        <polygon points="285,77 271,71 271,83" fill="var(--rule)"></polygon>
+        <polygon points="550,77 536,71 536,83" fill="var(--rule)"></polygon>
+
+        <text x="247" y="62" text-anchor="middle" fill="var(--obj-blob)" font-family="var(--font-mono)" font-size="11" font-weight="700">git add</text>
+        <text x="247" y="98" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5">writes a blob, updates the index</text>
+
+        <text x="512" y="62" text-anchor="middle" fill="var(--obj-commit)" font-family="var(--font-mono)" font-size="11" font-weight="700">git commit</text>
+        <text x="512" y="98" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5">writes a tree + commit object</text>
+
+        <!-- box 1: working directory -->
+        <rect x="20" y="40" width="190" height="74" rx="10" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="2"></rect>
+        <text x="115" y="66" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-display)" font-size="11" font-weight="800" letter-spacing=".03em">WORKING DIRECTORY</text>
+        <text x="115" y="84" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">the files you're actually editing</text>
+        <text x="115" y="100" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">plain files, not yet objects</text>
+
+        <!-- box 2: staging area / index -->
+        <rect x="285" y="40" width="190" height="74" rx="10" fill="var(--code-bg)" stroke="var(--obj-blob)" stroke-width="2.5"></rect>
+        <text x="380" y="66" text-anchor="middle" fill="var(--obj-blob)" font-family="var(--font-display)" font-size="11" font-weight="800" letter-spacing=".03em">STAGING AREA (INDEX)</text>
+        <text x="380" y="84" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">.git/index &mdash; the next commit,</text>
+        <text x="380" y="100" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">assembling one file at a time</text>
+
+        <!-- box 3: repository / HEAD -->
+        <rect x="550" y="40" width="190" height="74" rx="10" fill="var(--code-bg)" stroke="var(--obj-commit)" stroke-width="2.5"></rect>
+        <text x="645" y="66" text-anchor="middle" fill="var(--obj-commit)" font-family="var(--font-display)" font-size="11" font-weight="800" letter-spacing=".03em">REPOSITORY (HEAD)</text>
+        <text x="645" y="84" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">committed history &mdash;</text>
+        <text x="645" y="100" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="8.5">objects/ + refs/, sealed</text>
+
+        <!-- return arrow: git restore, staged flag (Repository -> Index) -->
+        <path d="M645,114 L645,150 L420,150 L420,114" stroke="var(--accent)" stroke-width="1.5" fill="none" stroke-dasharray="4 4"></path>
+        <polygon points="420,114 414,126 426,126" fill="var(--accent)"></polygon>
+        <text x="530" y="146" text-anchor="middle" fill="var(--accent)" font-family="var(--font-mono)" font-size="10" font-weight="700">git restore --staged</text>
+        <text x="530" y="163" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="7.5">safe: unstages, index goes back to matching HEAD</text>
+
+        <!-- return arrow: git restore <file> (Index -> Working Directory), dangerous -->
+        <path d="M340,114 L340,190 L140,190 L140,114" stroke="var(--danger)" stroke-width="1.5" fill="none" stroke-dasharray="4 4"></path>
+        <polygon points="140,114 134,126 146,126" fill="var(--danger)"></polygon>
+        <text x="240" y="203" text-anchor="middle" fill="var(--danger)" font-family="var(--font-mono)" font-size="10" font-weight="700">git restore &lt;file&gt;</text>
+        <text x="240" y="220" text-anchor="middle" fill="var(--danger)" font-family="var(--font-body)" font-size="7.5" font-weight="600">no --staged: overwrites the working file &mdash; edits gone</text>
+
+        <text x="380" y="260" text-anchor="middle" fill="var(--ink-soft)" font-family="var(--font-body)" font-size="10">Working Directory, Staging Area, and HEAD can all hold a different version of the same file &mdash; at the same time.</text>
+      </svg>
+      <figcaption>
+        <strong>The three-tree model.</strong> <code>git add</code> moves a
+        change from your working directory into the index; <code>git
+        commit</code> seals whatever's in the index into a new commit. The two
+        dashed arrows are the undo moves &mdash; and they are <em>not</em> the
+        same command with an optional flag. Mixing them up is the single most
+        common way people accidentally lose an edit.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="stage-index-h">Meet .git/index: A Snapshot Under Construction</h2>
+    <p data-anchor="stage-index-p1">
+      The staging area isn't a metaphor or a UI concept &mdash; it's one real
+      file, <code>.git/index</code>, sitting right there among the entries
+      Chapter 2 mapped out. It's binary, not text, so <code>cat</code> just
+      prints garbage at you (same rule as <code>objects/</code>). Structurally
+      it's a flat list of entries, one per tracked file, and each entry holds
+      the file's path, its file mode, and &mdash; this is the important part
+      &mdash; the <strong>SHA-1 hash of a blob object</strong>, exactly the kind
+      of object Chapter 3 introduced. <code>git add</code> doesn't just make a
+      note that "this file changed." It immediately computes the file's blob
+      hash, writes that blob into <code>objects/</code> if it isn't already
+      there, and points the index entry at it. The object exists the moment
+      you stage it &mdash; long before you ever type <code>git commit</code>.
+    </p>
+    <p data-anchor="stage-index-p2">
+      You can read the index yourself with the plumbing command
+      <code>git ls-files --stage</code>, which prints exactly those fields:
+    </p>
+    <pre class="code" data-anchor="stage-index-code1"><span class="cap">Terminal — reading the index directly</span><code><span class="cm">$</span> git ls-files --stage
+<span class="num">100644</span> e360e42923f59636bba0ec059c74701ce6a7f2f0 <span class="num">0</span>	player.txt</code></pre>
+    <p data-anchor="stage-index-p3">
+      Left to right: <code>100644</code> is the file mode (a normal,
+      non-executable file), the long hex string is the staged blob's SHA-1
+      &mdash; the exact hash <code>git add</code> just computed &mdash; the
+      <code>0</code> is the <strong>stage number</strong>, and
+      <code>player.txt</code> is the path. Stage <code>0</code> means "normal,
+      no conflict." That number only becomes interesting during an unresolved
+      merge, and this is where Chapter 7's conflicts stop being spooky: while
+      <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code> markers sit in your file, the
+      index is quietly holding <em>three</em> versions of it at once &mdash;
+      stage <code>1</code> for the common ancestor, stage <code>2</code> for
+      your side (<code>HEAD</code>), stage <code>3</code> for theirs:
+    </p>
+    <pre class="code" data-anchor="stage-index-code2"><span class="cap">Terminal — the index mid-conflict, real output</span><code><span class="cm">$</span> git ls-files --stage
+<span class="num">100644</span> e5c5c5583f49a34e86ce622b59363df99e09d4c6 <span class="num">1</span>	f.txt
+<span class="num">100644</span> c3f770ebb024c04d4c7909c55d8aefd6d6e1b4a5 <span class="num">2</span>	f.txt
+<span class="num">100644</span> c90e8dae6fb411bcbf6105d0ea4e8bd558715963 <span class="num">3</span>	f.txt</code></pre>
+    <p data-anchor="stage-index-p4">
+      That's not three files &mdash; it's one path, <code>f.txt</code>, listed
+      three times because Git can't collapse it to a single answer yet. The
+      moment you edit the file, delete the markers, and run plain
+      <code>git add f.txt</code>, all three stage entries collapse back down
+      to a single stage <code>0</code> &mdash; your resolution &mdash; and
+      that's precisely the signal Git uses to know the conflict is settled.
+    </p>
+
+    <div class="callout key" data-anchor="stage-index-key">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        <code>git diff</code> with no arguments compares your working
+        directory against the index &mdash; "what have I changed that isn't
+        staged yet?" <code>git diff --staged</code> (or its older spelling,
+        <code>git diff --cached</code>) compares the index against
+        <code>HEAD</code> &mdash; "what will actually go into the next commit?"
+        Two different questions, two different diffs, and mixing them up is a
+        classic way to be baffled by an empty <code>git diff</code> right
+        before committing something you swore you hadn't reviewed yet.
+      </p>
+    </div>
+
+    <h2 data-anchor="stage-add-h">git commit Only Ever Reads the Index</h2>
+    <p data-anchor="stage-add-p1">
+      This is the payoff of everything above: when you finally run
+      <code>git commit</code>, Git does not look at your working directory at
+      all. It takes whatever is currently sitting in the index, converts that
+      flat list of path&rarr;blob entries into a tree object (nesting
+      sub-trees for sub-directories, exactly as Chapter 3 described), and
+      wraps that tree in a new commit object pointing at your current
+      <code>HEAD</code> as its parent. The index, at the instant you commit,
+      <em>becomes</em> the new snapshot &mdash; word for word the mechanism
+      Chapter 6 called "commits are snapshots, not diffs." The staging area is
+      where that snapshot gets built, one <code>git add</code> at a time,
+      before it's sealed.
+    </p>
+    <p data-anchor="stage-add-p2">
+      That's also why staging is selective by design, not all-or-nothing.
+      You're free to edit five files and <code>git add</code> only two of
+      them &mdash; the other three stay unstaged, excluded from the next
+      commit, still sitting untouched in your working directory for later.
+      Go finer still with <code>git add -p</code>, which walks you through a
+      file change hunk by hunk and lets you stage half a file's edits and
+      leave the rest for a separate commit. The index doesn't care whether a
+      change came from one file or one line &mdash; it just holds whatever you
+      told it to hold.
+    </p>
+
+    <div class="callout tip" data-anchor="stage-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        <code>git restore --staged &lt;file&gt;</code> is the modern (Git 2.23+)
+        way to unstage &mdash; it copies the file's entry back out of
+        <code>HEAD</code> into the index and leaves your working directory
+        completely alone. If you're reading an older script or a Stack
+        Overflow answer from before 2019, you'll see the equivalent written as
+        <code>git reset HEAD -- &lt;file&gt;</code>. Same effect, older
+        spelling &mdash; both just move content backward one step, from
+        repository to index.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="stage-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        <code>git restore --staged &lt;file&gt;</code> and plain
+        <code>git restore &lt;file&gt;</code> look like the same command with
+        an optional flag. They are not. <strong>Without</strong>
+        <code>--staged</code>, <code>git restore</code> overwrites your
+        <em>working directory</em> file with whatever's in the index &mdash;
+        which means any edit you haven't staged yet is gone, no confirmation
+        asked, no reflog entry to rescue it (working-directory changes were
+        never committed anywhere for the reflog to remember). Read the flag
+        before you hit enter. If in doubt, <code>git status</code> already
+        tells you the exact right command to type &mdash; it's printed right
+        there under "Changes to be committed" and "Changes not staged."
+      </p>
+    </div>
+
+    <div class="callout lab" data-anchor="stage-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Time to watch the index change with your own eyes instead of taking
+        the book's word for it. Fresh throwaway repo, one starting file:
+      </p>
+      <pre class="code" data-anchor="stage-lab-code1"><span class="cap">Terminal — set the scene</span><code><span class="cm">$</span> mkdir staging-quest &amp;&amp; cd staging-quest &amp;&amp; git init -q -b main
+<span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 100\n"</span> &gt; player.txt
+<span class="cm">$</span> git add player.txt &amp;&amp; git commit -q -m <span class="str">"Start the story"</span></code></pre>
+      <p>
+        Now take some damage &mdash; edit the file, and check
+        <code>git status</code> <em>before</em> touching the index at all:
+      </p>
+      <pre class="code" data-anchor="stage-lab-code2"><span class="cap">Terminal — a working-directory edit, unstaged</span><code><span class="cm">$</span> printf <span class="str">"Welcome to Staging Quest!\nHP: 80\n"</span> &gt; player.txt
+<span class="cm">$</span> git status
+On branch main
+Changes not staged for commit:
+  (use <span class="str">"git add &lt;file&gt;..."</span> to update what will be committed)
+  (use <span class="str">"git restore &lt;file&gt;..."</span> to discard changes in working directory)
+	modified:   player.txt
+
+no changes added to commit (use <span class="str">"git add"</span> and/or <span class="str">"git commit -a"</span>)</code></pre>
+      <p>
+        Git already sees the change &mdash; it's just not queued up yet.
+        Stage it, and watch the same command change its story completely:
+      </p>
+      <pre class="code" data-anchor="stage-lab-code3"><span class="cap">Terminal — git add, then git status again</span><code><span class="cm">$</span> git add player.txt
+<span class="cm">$</span> git status
+On branch main
+Changes to be committed:
+  (use <span class="str">"git restore --staged &lt;file&gt;..."</span> to unstage)
+	modified:   player.txt</code></pre>
+      <p>
+        Same one-line edit, completely different section of the output
+        &mdash; "not staged" became "to be committed." Now look at what
+        <code>git add</code> actually did to the index:
+      </p>
+      <pre class="code" data-anchor="stage-lab-code4"><span class="cap">Terminal — the staged blob, in the index</span><code><span class="cm">$</span> git ls-files --stage
+<span class="num">100644</span> e360e42923f59636bba0ec059c74701ce6a7f2f0 <span class="num">0</span>	player.txt
+<span class="cm">$</span> git hash-object player.txt
+e360e42923f59636bba0ec059c74701ce6a7f2f0</code></pre>
+      <p>
+        That's not a coincidence &mdash; <code>git hash-object</code> just
+        recomputes the same SHA-1 <code>git add</code> already wrote into the
+        index a moment ago. The blob for "HP: 80" genuinely exists in
+        <code>objects/</code> right now, staged and ready, even though you
+        haven't committed anything. Change your mind and back it out:
+      </p>
+      <pre class="code" data-anchor="stage-lab-code5"><span class="cap">Terminal — unstage with git restore --staged</span><code><span class="cm">$</span> git restore --staged player.txt
+<span class="cm">$</span> git status
+On branch main
+Changes not staged for commit:
+  (use <span class="str">"git add &lt;file&gt;..."</span> to update what will be committed)
+  (use <span class="str">"git restore &lt;file&gt;..."</span> to discard changes in working directory)
+	modified:   player.txt
+
+no changes added to commit (use <span class="str">"git add"</span> and/or <span class="str">"git commit -a"</span>)
+<span class="cm">$</span> git ls-files --stage
+<span class="num">100644</span> af0893a73b352784c1f208d5d40a79016c12769c <span class="num">0</span>	player.txt
+<span class="cm">$</span> cat player.txt
+Welcome to Staging Quest!
+HP: 80</code></pre>
+      <p>
+        Read that last block closely &mdash; it's the whole chapter in one
+        screenful. <code>git status</code> is back to "not staged," exactly
+        where it started. <code>git ls-files --stage</code> now shows a
+        <em>different</em> hash than before &mdash; <code>af0893a7&hellip;</code>,
+        the original "HP: 100" blob from your first commit &mdash; because the
+        index snapped back to matching <code>HEAD</code>. And
+        <code>player.txt</code> on disk still says "HP: 80," untouched,
+        because you used <code>--staged</code>. Three areas, three different
+        contents, all live at once, precisely as promised.
+      </p>
+    </div>
+
+    <p data-anchor="stage-close-p1">
+      You've now watched a single edit travel every stop on the line: working
+      directory, staged in the index as a real blob, unstaged again with the
+      working copy left intact. That's the whole mechanism behind every
+      <code>git add</code> you've typed since Chapter 1 &mdash; and behind
+      every conflict resolution in Chapter 7, which was really just you
+      manually collapsing three index stages back down to one. There's a
+      second, quieter safety net running underneath everything you've done in
+      this book, one that's been recording every move without your ever
+      needing to ask &mdash; every commit, every reset, every branch switch.
+      Chapter 9 pulls the curtain back on the <strong>reflog</strong>, Git's
+      built-in time machine.
+    </p>
+
+    <p class="sources" data-anchor="stage-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://git-scm.com/book/en/v2/Git-Basics-Recording-Changes-to-the-Repository" target="_blank" rel="noopener">Pro Git, Ch. 2.2 &mdash; Recording Changes to the Repository</a>
+      &middot;
+      <a href="https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain" target="_blank" rel="noopener">Pro Git, Ch. 10.1 &mdash; Plumbing and Porcelain</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-add" target="_blank" rel="noopener">git-scm.com &mdash; git-add</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-ls-files" target="_blank" rel="noopener">git-scm.com &mdash; git-ls-files</a>
+      &middot;
+      <a href="https://git-scm.com/docs/git-restore" target="_blank" rel="noopener">git-scm.com &mdash; git-restore</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-merging-and-rebasing.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="09-reflog.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

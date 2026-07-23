@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doing It By Hand — Where Does the Memory Go?</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<nav class="topbar">
+  <a class="brand" href="../index.html"><span class="gly">▤</span> Where Does the <b>Memory</b> Go?</a>
+  <span class="spacer"></span>
+  <a class="nav" href="../index.html#contents">Contents</a>
+  <a class="nav" href="../cheatsheet.html">Cheatsheet</a>
+</nav>
+
+<main class="book">
+  <div class="spread">
+    <section class="leaf left">
+      <p class="kicker">Concept 04 · Core</p>
+      <h1>Doing It By Hand — and the Bugs It Breeds</h1>
+      <p class="lede">For decades the deal was simple: you call <code>malloc</code>, you call <code>free</code>, and you'd better match them up perfectly. It sounds easy. It is, for ten lines. Across a million lines and twenty programmers, it has caused more security holes than any other single idea in computing.</p>
+
+      <p>The trouble is that "when is this object dead?" is genuinely hard to answer. A pointer gets copied, passed into a function, stored in a list, handed to another thread. Now five places might be looking at the same shelf. Who frees it? If everyone assumes someone else will, it leaks. If two of them free it, the warehouse's records get corrupted. There's no local rule — you have to reason about the whole program at once.</p>
+
+      <p>Let's meet the four horsemen. These exact bugs are <em>why</em> Rust, Java, Python, and Go exist.</p>
+
+      <h2>① The leak — forgot to free</h2>
+      <pre><span class="cap">C — memory you can never get back</span><code><span class="kw">void</span> <span class="fn">handle</span>(<span class="ty">void</span>) {
+    <span class="ty">char</span>* buf = <span class="fn">malloc</span>(<span class="num">1</span> &lt;&lt; <span class="num">20</span>);  <span class="cm">// 1 MB</span>
+    <span class="kw">if</span> (<span class="fn">early_error</span>()) <span class="kw">return</span>;     <span class="cm">// ✗ buf leaked!</span>
+    <span class="fn">use</span>(buf);
+    <span class="fn">free</span>(buf);
+}</code></pre>
+      <p>One forgotten path and a megabyte vanishes every call. A server doing this slowly swells until the OS kills it. Not a crash you can catch — a slow, creeping death.</p>
+
+      <h2>② Use-after-free — freed, then touched</h2>
+      <pre><span class="cap">C — the shelf was given away</span><code><span class="fn">free</span>(p);
+<span class="fn">printf</span>(<span class="str">"%d"</span>, p-&gt;value);  <span class="cm">// ✗ reading a returned shelf</span></code></pre>
+      <p>The instant you <code>free(p)</code>, the allocator may hand that exact space to the next request. Your <code>p</code> still points there — but now it's someone else's data. This is the bug attackers <em>love</em>: control what lands on the reused shelf and you can hijack the program.</p>
+    </section>
+
+    <section class="leaf right">
+      <h2>③ Double-free — freed twice</h2>
+      <pre><span class="cap">C — corrupting the allocator's books</span><code><span class="fn">free</span>(p);
+<span class="cm">// … later, a different code path …</span>
+<span class="fn">free</span>(p);   <span class="cm">// ✗ second free scrambles the heap</span></code></pre>
+      <p>The allocator keeps its free-list <em>inside</em> the heap itself. Free the same block twice and you tangle that list — a corruption that often crashes much later, somewhere innocent, making it maddening to trace.</p>
+
+      <h2>④ Dangling &amp; the null deref</h2>
+      <p>A pointer that outlives what it points to is <em>dangling</em>. Reading through one — or through an uninitialized or <code>NULL</code> pointer — is undefined behavior: maybe a crash, maybe silent garbage, maybe a security hole.</p>
+
+      <div class="diagram">
+        <svg viewBox="0 0 320 150" role="img" aria-label="A dangling pointer after free">
+          <rect x="20" y="55" width="90" height="45" rx="4" fill="#fbf2e0" stroke="#b9701a"/>
+          <text x="65" y="80" text-anchor="middle" font-size="11" fill="#243140" font-family="monospace">p</text>
+          <rect x="210" y="35" width="95" height="85" rx="4" fill="#f9e8ea" stroke="#b23b4e" stroke-dasharray="5 4"/>
+          <text x="257" y="62" text-anchor="middle" font-size="10" fill="#b23b4e" font-family="monospace">freed</text>
+          <text x="257" y="82" text-anchor="middle" font-size="9" fill="#8c97a4" font-family="monospace">reused by</text>
+          <text x="257" y="96" text-anchor="middle" font-size="9" fill="#8c97a4" font-family="monospace">someone else</text>
+          <line x1="110" y1="77" x2="210" y2="77" stroke="#b23b4e" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#x)"/>
+          <text x="160" y="68" text-anchor="middle" font-size="9" fill="#b23b4e" font-family="monospace">still points!</text>
+          <defs><marker id="x" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#b23b4e"/></marker></defs>
+        </svg>
+        <span class="cap">After free, p dangles — aimed at a shelf now owned by other data.</span>
+      </div>
+
+      <div class="callout danger">
+        <span class="ic">▲</span>
+        <div><span class="lab">This is not a small problem</span>
+        <p>Microsoft and Google have each reported that roughly <strong>70% of their serious security vulnerabilities</strong> are memory-safety bugs — overwhelmingly these four. That number is the entire reason the industry has spent decades inventing ways to take the job away from the programmer.</p>
+        </div>
+      </div>
+
+      <h2>So what do we do about it?</h2>
+      <p>Three escapes from manual misery, and the rest of this book is a tour of each:</p>
+      <ul class="tick">
+        <li><strong>Make the compiler prove it.</strong> Track ownership at compile time and insert the <code>free</code> for you, exactly once, exactly on time. <span class="pill">Rust</span> <span class="pill">C++ RAII</span></li>
+        <li><strong>Keep it manual but make the bugs loud.</strong> Pass allocators explicitly, and ship a debug allocator that catches leaks and double-frees in testing. <span class="pill">Zig</span></li>
+        <li><strong>Hire a robot janitor.</strong> A <em>garbage collector</em> runs alongside your program, finds memory nothing can reach, and reclaims it. <span class="pill">Java</span> <span class="pill">Python</span> <span class="pill">Go</span></li>
+      </ul>
+
+      <p>That robot janitor sounds like cheating — how can a program tell, while running, which memory is truly dead? It's one of the prettiest ideas in computer science. Let's go see how it works.</p>
+    </section>
+  </div>
+</main>
+
+<nav class="pager">
+  <a class="prev" href="03-the-heap.html">‹ <span class="dir">Prev</span><span class="ttl">The Heap</span></a>
+  <a class="contents" href="../index.html">▤ Contents</a>
+  <a class="next" href="05-garbage-collection.html"><span class="dir">Next ›</span><span class="ttl">Garbage Collection</span></a>
+</nav>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

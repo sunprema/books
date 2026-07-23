@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Registry — Elixir OTP</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Elixir OTP<span class="dot">.</span></span>
+  <span class="chip">06 · Registry</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 06 · Finding a Process</p>
+    <h1>Registry &amp; Naming</h1>
+    <p class="dek">A PID is a phone number. A Registry is the phone book.</p>
+
+    <p class="lead">A PID identifies a process, but it's opaque and — worse — it <em>changes</em>. When
+    a supervisor restarts a crashed worker, the replacement has a brand-new PID. So any PID you
+    stashed away is now pointing at a corpse. We need to refer to a process by a stable
+    <em>name</em> — something meaningful like <code>"room:lobby"</code> or <code>{:user, 42}</code> —
+    and have the lookup always resolve to the currently-alive process behind that name.</p>
+
+    <p>For a single, always-there process, you already saw the simplest answer in Chapter 03:
+    <code>name: __MODULE__</code>. But that only works for <em>one</em> process per name, known at
+    compile time. For the fluctuating populations of Chapter 05 — one process per user, keyed by a
+    runtime value — we need <code>Registry</code>.</p>
+
+    <div class="callout key">
+      <span class="tag">The one idea</span>
+      <p><code>Registry</code> is a fast, concurrent, in-memory key→PID map that lives right in the
+      BEAM. Register a process under any term as a key; look it up later to get the live PID. Best of
+      all, entries are <strong>automatically removed when the process dies</strong> — the phone book
+      never lists a disconnected number.</p>
+    </div>
+
+    <h2>The :via tuple — self-registering GenServers</h2>
+    <p>The cleanest pattern is to let each GenServer register <em>itself</em> under a business key as
+    it starts, using a <code>:via</code> tuple as its name. Then <code>call</code> and
+    <code>cast</code> can address the process by that key directly — no PID bookkeeping anywhere.</p>
+
+    <pre><span class="cap">lib/my_app/session.ex</span><code><span class="k">defmodule</span> <span class="mod">MyApp.Session</span> <span class="k">do</span>
+  <span class="k">use</span> <span class="mod">GenServer</span>
+
+  <span class="k">def</span> <span class="fn">start_link</span>(user_id) <span class="k">do</span>
+    <span class="mod">GenServer</span>.<span class="fn">start_link</span>(<span class="mod">__MODULE__</span>, user_id, name: <span class="fn">via</span>(user_id))
+  <span class="k">end</span>
+
+  <span class="co"># the :via tuple: "register me in MyApp.Registry under this key"</span>
+  <span class="k">defp</span> <span class="fn">via</span>(user_id), <span class="k">do</span>: {<span class="at">:via</span>, <span class="mod">Registry</span>, {<span class="mod">MyApp.Registry</span>, {<span class="at">:session</span>, user_id}}}
+
+  <span class="co"># address the process by user_id — resolves to the live PID for you</span>
+  <span class="k">def</span> <span class="fn">whoami</span>(user_id), <span class="k">do</span>: <span class="mod">GenServer</span>.<span class="fn">call</span>(<span class="fn">via</span>(user_id), <span class="at">:whoami</span>)
+
+  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">init</span>(user_id), <span class="k">do</span>: {<span class="at">:ok</span>, user_id}
+
+  <span class="at">@impl</span> <span class="k">true</span>
+  <span class="k">def</span> <span class="fn">handle_call</span>(<span class="at">:whoami</span>, _from, user_id), <span class="k">do</span>: {<span class="at">:reply</span>, user_id, user_id}
+<span class="k">end</span></code></pre>
+
+    <h2>Wire the Registry into the tree</h2>
+    <p>A <code>Registry</code> is itself a process, so it goes in your supervision tree, and it pairs
+    naturally with the DynamicSupervisor from last chapter:</p>
+
+    <pre><span class="cap">application children</span><code>children = [
+  {<span class="mod">Registry</span>, keys: <span class="at">:unique</span>, name: <span class="mod">MyApp.Registry</span>},
+  {<span class="mod">DynamicSupervisor</span>, name: <span class="mod">MyApp.WorkerSup</span>, strategy: <span class="at">:one_for_one</span>}
+]</code></pre>
+
+    <pre><span class="cap">start on demand, then reach by key</span><code><span class="mod">DynamicSupervisor</span>.<span class="fn">start_child</span>(<span class="mod">MyApp.WorkerSup</span>, {<span class="mod">MyApp.Session</span>, <span class="num">42</span>})
+
+<span class="mod">MyApp.Session</span>.<span class="fn">whoami</span>(<span class="num">42</span>)   <span class="co">#=&gt; 42   (found the live PID via the key)</span>
+
+<span class="co"># or look the PID up yourself:</span>
+<span class="mod">Registry</span>.<span class="fn">lookup</span>(<span class="mod">MyApp.Registry</span>, {<span class="at">:session</span>, <span class="num">42</span>})
+<span class="co">#=&gt; [{#PID&lt;0.312.0&gt;, nil}]   (empty list [] if nobody's registered)</span></code></pre>
+
+    <div class="callout note">
+      <span class="tag">:unique vs :duplicate</span>
+      <p>A <code>:unique</code> registry allows one process per key — perfect for "the session for user
+      42." A <code>:duplicate</code> registry allows many processes under one key — perfect for
+      pub/sub, where every subscriber to <code>"topic:news"</code> registers under that key and you
+      <code>dispatch</code> to all of them at once. Same tool, two shapes of problem.</p>
+    </div>
+
+    <div class="callout warn">
+      <span class="tag">Why not just keep the PID?</span>
+      <p>Because restarts. The instant a supervised process crashes and is replaced, its PID is stale.
+      The Registry entry, by contrast, is cleaned up on death and re-created when the fresh process
+      registers itself on start — so a lookup by key always yields the <em>current</em> process, or
+      an honest empty list. Name things by what they <em>mean</em>, never by their current PID.</p>
+    </div>
+
+    <div class="reflect">So what did we actually gain? <b>Stable identity</b> in a world of
+    disposable processes. DynamicSupervisor lets processes come and go; Registry lets the rest of the
+    system keep talking to "user 42's session" without ever caring which incarnation is currently
+    answering. Crash-and-restart becomes invisible to callers — which is the entire promise of
+    fault tolerance, delivered.</div>
+
+    <h3>Challenges</h3>
+    <ol class="challenges">
+      <li>Call <code>whoami/1</code> for a user who was never started. What error do you get, and why
+      is failing loudly the right behaviour here?</li>
+      <li>Start a session, crash it, and (with a supervisor restarting it) confirm a later lookup
+      still resolves. Inspect the PID before and after.</li>
+      <li>Build a tiny pub/sub with a <code>:duplicate</code> registry: subscribers register under a
+      topic, a publisher uses <code>Registry.dispatch/3</code> to message them all.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Elixir hexdocs, <code>Registry</code> — <code>:via</code>
+    tuples, <code>lookup/2</code>, <code>register/3</code>, <code>dispatch/3</code>, unique vs
+    duplicate keys; "Using in a supervision tree."</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="05-dynamic-supervisor.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="07-task-agent.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

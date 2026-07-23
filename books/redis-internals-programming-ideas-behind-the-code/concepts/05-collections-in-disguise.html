@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Collections in Disguise &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 5 &middot; Objects &amp; Memory</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch5-kicker">Chapter 5 of 12 &middot; Core objects and memory</p>
+    <h1 data-anchor="ch5-h1">Collections in Disguise: Lists, Hashes, Sets, <span class="hl">Sorted Sets</span></h1>
+
+    <p class="lede" data-anchor="ch5-lede">
+      Build a tiny hash, then keep growing it, and watch its encoding change
+      underneath you without a single command changing shape:
+    </p>
+
+    <pre class="code" data-anchor="ch5-code1"><span class="cap">Terminal &mdash; a hash that outgrows its compact encoding</span><code><span class="cm">$</span> redis-cli HSET user:1 name <span class="str">"Ava"</span> age 29
+<span class="num">(integer) 2</span>
+<span class="cm">$</span> redis-cli OBJECT ENCODING user:1
+<span class="str">"listpack"</span>
+<span class="cm">$</span> <span class="cm"># now push past hash-max-listpack-entries (default 128)</span>
+<span class="cm">$</span> for i in $(seq 1 200); do redis-cli HSET user:1 f$i v$i > /dev/null; done
+<span class="cm">$</span> redis-cli OBJECT ENCODING user:1
+<span class="str">"hashtable"</span></code></pre>
+
+    <p data-anchor="ch5-p1">
+      <code>HSET</code>, <code>HGET</code>, <code>HGETALL</code> all still
+      work exactly the same. What changed is invisible from the API and
+      significant in memory: a small hash is packed tight; a big one gets a
+      real hash table underneath. Every collection type makes this same
+      trade, with its own thresholds and its own compact format.
+    </p>
+
+    <h2 data-anchor="ch5-h2-compact">The Compact Formats: listpack and intset</h2>
+    <p data-anchor="ch5-p2">
+      For small collections, Redis avoids per-element pointers entirely and
+      instead packs every entry &mdash; length-prefixed, back-to-back &mdash;
+      into one contiguous block of memory:
+    </p>
+    <ul data-anchor="ch5-list-compact">
+      <li><strong><code class="mono">listpack</code></strong> &mdash; the
+      modern, general-purpose compact encoding (introduced for Streams in
+      Redis 5, and since Redis 7 the default small-collection encoding for
+      hashes, sets, sorted sets, and lists, replacing the older
+      <code>ziplist</code>). A flat sequence of length-prefixed entries with
+      no next/prev pointers at all &mdash; you walk it by reading each
+      entry's own length header.</li>
+      <li><strong><code class="mono">intset</code></strong> &mdash; used only
+      for a set made entirely of integers. It's a plain sorted array of
+      integers, deduplicated, so membership tests binary-search in O(log n)
+      instead of hashing, and the whole set is about as memory-dense as a C
+      array can be.</li>
+    </ul>
+    <p data-anchor="ch5-p3">
+      A contiguous, pointer-free block is small and cache-friendly to scan
+      linearly &mdash; but it's still O(n) to scan. That's fine as long as
+      "n" stays small; the whole strategy depends on collections
+      <em>usually</em> being small enough that the difference between O(1)
+      hashing and O(n) linear scan doesn't matter, while the memory savings
+      always do.
+    </p>
+
+    <h2 data-anchor="ch5-h2-scale-up">When a Collection Grows: quicklist and skiplist</h2>
+    <p data-anchor="ch5-p4">
+      Past a size or element-length threshold, each type converts to a
+      structure built for scale instead of density:
+    </p>
+    <table data-anchor="ch5-table-encodings">
+      <thead><tr><th>Type</th><th>Compact (small)</th><th>Scaled (large)</th><th>Config knob</th></tr></thead>
+      <tbody>
+        <tr><td>List</td><td class="mono">listpack</td><td class="mono">quicklist</td><td class="mono">list-max-listpack-size</td></tr>
+        <tr><td>Hash</td><td class="mono">listpack</td><td class="mono">hashtable</td><td class="mono">hash-max-listpack-entries / -value</td></tr>
+        <tr><td>Set (ints)</td><td class="mono">intset</td><td class="mono">listpack / hashtable</td><td class="mono">set-max-intset-entries</td></tr>
+        <tr><td>Set (strings)</td><td class="mono">listpack</td><td class="mono">hashtable</td><td class="mono">set-max-listpack-entries</td></tr>
+        <tr><td>Sorted set</td><td class="mono">listpack</td><td class="mono">skiplist</td><td class="mono">zset-max-listpack-entries / -value</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="ch5-p5">
+      A <strong>quicklist</strong> is a doubly linked list of nodes, where
+      each node is itself a small listpack &mdash; the best of both shapes:
+      cheap inserts/removals at either end like a linked list, but each node
+      still packs several elements densely instead of one pointer-heavy node
+      per element. A <strong>skiplist</strong> is the classic probabilistic
+      structure with multiple forward-pointer "levels" per node, giving
+      sorted sets O(log n) insert, remove, and range queries by score
+      &mdash; something no flat array could do efficiently once the set gets
+      large. Redis pairs the skiplist with a plain dictionary for O(1)
+      score lookups by member, so a big sorted set actually keeps
+      <em>two</em> structures over the same data, each optimized for a
+      different access pattern.
+    </p>
+
+    <figure class="diagram" data-anchor="ch5-diagram">
+      <svg viewBox="0 0 700 210" role="img" aria-labelledby="ch5-svg-title">
+        <title id="ch5-svg-title">A one-way ratchet: a small collection starts in a compact listpack or intset; once it crosses a configured size or value-length threshold it converts to a scaled structure like quicklist, hashtable, or skiplist, and never converts back.</title>
+        <g font-family="var(--font-mono)" font-size="10.5">
+          <rect x="30" y="70" width="190" height="70" rx="9" fill="var(--code-bg)" stroke="var(--fn)" stroke-width="1.6"></rect>
+          <text x="125" y="98" text-anchor="middle" fill="var(--fn)" font-weight="700">listpack / intset</text>
+          <text x="125" y="116" text-anchor="middle" fill="var(--ink-soft)" font-size="9">flat, packed, cache-friendly</text>
+          <text x="125" y="130" text-anchor="middle" fill="var(--ink-soft)" font-size="9">good while n is small</text>
+
+          <path d="M220,105 L470,105" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#arrow5)"></path>
+          <text x="345" y="90" text-anchor="middle" fill="var(--accent)" font-size="10">crosses threshold &mdash; one-way</text>
+
+          <rect x="480" y="70" width="190" height="70" rx="9" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.6"></rect>
+          <text x="575" y="93" text-anchor="middle" fill="var(--kw)" font-weight="700">quicklist / hashtable /</text>
+          <text x="575" y="109" text-anchor="middle" fill="var(--kw)" font-weight="700">skiplist</text>
+          <text x="575" y="127" text-anchor="middle" fill="var(--ink-soft)" font-size="9">built for scale, not density</text>
+        </g>
+        <defs>
+          <marker id="arrow5" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--accent)"></path>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>The ratchet only turns one way.</strong> Once a collection
+        converts to its scaled encoding, deleting elements back down below
+        the threshold does not convert it back &mdash; converting is a
+        one-time cost Redis is willing to pay to grow, not something worth
+        re-paying on every shrink.
+      </figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch5-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Every collection type separates its <strong>abstract API</strong>
+        (push, pop, add, range, score) from its <strong>physical
+        encoding</strong>, and every one of them defaults to the cheapest
+        encoding that fits the data, converting up as it grows. This is the
+        same move Chapter 4 made for strings, applied independently, type by
+        type, all the way through the codebase &mdash; a pattern worth
+        noticing now because Chapter 12 will ask you to go looking for it
+        elsewhere too.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="ch5-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        Conversion is triggered by <em>either</em> the element count
+        <em>or</em> the size of any individual value &mdash; a hash with
+        only three fields still becomes a <code>hashtable</code> if one of
+        those values is a 10&nbsp;KB blob, because
+        <code>hash-max-listpack-value</code> caps individual entry size, not
+        just entry count. If your memory usage jumps unexpectedly on a
+        collection you assumed was "small," check the value sizes, not just
+        the length.
+      </p>
+    </div>
+
+    <div class="callout lab" data-anchor="ch5-lab-1">
+      <span class="co-tag">Try It Yourself</span>
+      <p>
+        Compare the two set encodings directly: <code>SADD ints 1 2 3</code>
+        then <code>OBJECT ENCODING ints</code> (expect <code>intset</code>),
+        versus <code>SADD words a b c</code> then <code>OBJECT ENCODING
+        words</code> (expect <code>listpack</code>, since strings can't use
+        the integer-only <code>intset</code>). Then run <code>SADD ints
+        hello</code> &mdash; adding one non-integer member to an
+        <code>intset</code> &mdash; and check the encoding again. One
+        non-numeric member is enough to convert the whole set away from
+        <code>intset</code>.
+      </p>
+    </div>
+
+    <p data-anchor="ch5-close-p1">
+      Encodings solve memory density for individual values and small
+      collections. But the keyspace itself &mdash; the mapping from every key
+      name to its value &mdash; is one giant hash table, and it has its own
+      much more interesting scaling story: how do you resize a hash table
+      holding millions of entries without ever pausing to do it all at once?
+      That's next.
+    </p>
+
+    <p class="sources" data-anchor="ch5-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://github.com/antirez/listpack/blob/master/listpack.md" target="_blank" rel="noopener">antirez/listpack &mdash; format spec</a>
+      &middot;
+      <a href="https://redis.io/docs/latest/commands/object-encoding/" target="_blank" rel="noopener">redis.io &mdash; OBJECT ENCODING</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="04-the-object-model-and-strings.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="06-dictionaries-and-incremental-rehashing.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

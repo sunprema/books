@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Reason Like a Redis Engineer &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 12 &middot; Closing</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch12-kicker">Chapter 12 of 12 &middot; How to reason like a Redis engineer</p>
+    <h1 data-anchor="ch12-h1">How to Reason Like a <span class="hl">Redis Engineer</span></h1>
+
+    <p class="lede" data-anchor="ch12-lede">
+      Here's a small case study in the method this closing chapter is really
+      about. Pick one command you haven't looked at yet &mdash;
+      <code>EXPIRE</code> &mdash; and trace it, cold, using only the map from
+      Chapter 1:
+    </p>
+
+    <pre class="code" data-anchor="ch12-code1"><span class="cap">Terminal &mdash; a five-minute trace of EXPIRE, start to finish</span><code><span class="cm">$</span> grep -n <span class="str">"expireCommand"</span> src/expire.c   <span class="cm"># find the handler (Ch. 1's naming convention)</span>
+<span class="cm">$</span> <span class="cm"># read it: it looks up the key, computes an absolute expiry time,</span>
+<span class="cm">$</span> <span class="cm"># stores it in the expires dict (Ch. 10), and propagates the command</span>
+<span class="cm">$</span> <span class="cm"># to replicas as an absolute PEXPIREAT, not a relative EXPIRE &mdash;</span>
+<span class="cm">$</span> <span class="cm"># so every replica expires the key at the same wall-clock instant,</span>
+<span class="cm">$</span> <span class="cm"># regardless of replication lag (Ch. 9's determinism concern, again)</span></code></pre>
+
+    <p data-anchor="ch12-p1">
+      Ten minutes with <code>grep</code> and a text editor, and a command you
+      "knew" turns into a small worked example of two ideas from earlier
+      chapters &mdash; the compact expires dict, and deterministic
+      replication &mdash; showing up together in one unglamorous 40-line
+      function. That's the whole method: pick a feature, find its handler by
+      name, read outward, and notice which of the book's recurring ideas it's
+      quietly reusing.
+    </p>
+
+    <h2 data-anchor="ch12-h2-recipe">A Repeatable Recipe for Reading Any Subsystem</h2>
+    <ol data-anchor="ch12-list-recipe">
+      <li><strong>Choose a feature</strong>, not a file &mdash; "how does
+      <code>LPOS</code> work" is a better starting question than "what's in
+      <code>t_list.c</code>."</li>
+      <li><strong>Find the entry point</strong> by naming convention
+      (<code>&lt;command&gt;Command</code>, Chapter 1) or by grepping the
+      command table (Chapter 7) for the command's string name.</li>
+      <li><strong>Trace control flow outward</strong>, not exhaustively
+      &mdash; note every data structure it touches and every subsystem it
+      calls into (does it check the expires dict? does it need to propagate
+      to replicas or the AOF?).</li>
+      <li><strong>Ask what happens under load</strong> &mdash; is this
+      command's cost bounded, or does it scale with data size? If it scales,
+      does it do its work incrementally, the way Chapters 6 and 10 do, or all
+      at once, the way <code>KEYS</code> does?</li>
+      <li><strong>Name the trade-off</strong> the implementation makes.
+      There's almost always one: memory versus CPU, latency versus
+      throughput, simplicity versus a stronger guarantee it chose not to
+      offer.</li>
+    </ol>
+
+    <h2 data-anchor="ch12-h2-patterns">Four Patterns, Repeated Everywhere</h2>
+    <p data-anchor="ch12-p2">
+      Look back across this whole book and the same four moves keep
+      reappearing, applied to completely different problems:
+    </p>
+
+    <figure class="diagram" data-anchor="ch12-diagram">
+      <svg viewBox="0 0 700 300" role="img" aria-labelledby="ch12-svg-title">
+        <title id="ch12-svg-title">Four recurring design patterns arranged around a compass: small fast paths with generic fallbacks, approximation over precision, background and incremental work instead of blocking, and a single writer avoiding locks &mdash; each labeled with the chapters where it appeared.</title>
+        <g font-family="var(--font-mono)" font-size="10">
+          <circle cx="350" cy="150" r="46" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="2"></circle>
+          <text x="350" y="146" text-anchor="middle" fill="var(--accent)" font-weight="700" font-size="11">four patterns,</text>
+          <text x="350" y="162" text-anchor="middle" fill="var(--accent)" font-weight="700" font-size="11">one codebase</text>
+
+          <rect x="30" y="20" width="220" height="66" rx="8" fill="var(--bg-2)" stroke="var(--ty)" stroke-width="1.5"></rect>
+          <text x="140" y="42" text-anchor="middle" fill="var(--ty)" font-weight="700">small fast path,</text>
+          <text x="140" y="58" text-anchor="middle" fill="var(--ty)" font-weight="700">generic fallback</text>
+          <text x="140" y="74" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">int/embstr/raw &middot; listpack/skiplist (Ch. 4&ndash;5)</text>
+          <path d="M180,86 C230,110 280,125 305,133" stroke="var(--ty)" stroke-width="1.3" fill="none" stroke-dasharray="3,3"></path>
+
+          <rect x="450" y="20" width="220" height="66" rx="8" fill="var(--bg-2)" stroke="var(--kw)" stroke-width="1.5"></rect>
+          <text x="560" y="42" text-anchor="middle" fill="var(--kw)" font-weight="700">approximation</text>
+          <text x="560" y="58" text-anchor="middle" fill="var(--kw)" font-weight="700">over precision</text>
+          <text x="560" y="74" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">sampled LRU/LFU &middot; expire sampling (Ch. 10)</text>
+          <path d="M520,86 C470,110 420,125 395,133" stroke="var(--kw)" stroke-width="1.3" fill="none" stroke-dasharray="3,3"></path>
+
+          <rect x="30" y="215" width="220" height="66" rx="8" fill="var(--bg-2)" stroke="var(--fn)" stroke-width="1.5"></rect>
+          <text x="140" y="237" text-anchor="middle" fill="var(--fn)" font-weight="700">background &amp;</text>
+          <text x="140" y="253" text-anchor="middle" fill="var(--fn)" font-weight="700">incremental work</text>
+          <text x="140" y="269" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">rehashing &middot; expire cron &middot; fork+COW (Ch. 6, 8, 10)</text>
+          <path d="M180,215 C230,190 280,175 305,167" stroke="var(--fn)" stroke-width="1.3" fill="none" stroke-dasharray="3,3"></path>
+
+          <rect x="450" y="215" width="220" height="66" rx="8" fill="var(--bg-2)" stroke="var(--mac)" stroke-width="1.5"></rect>
+          <text x="560" y="237" text-anchor="middle" fill="var(--mac)" font-weight="700">single writer,</text>
+          <text x="560" y="253" text-anchor="middle" fill="var(--mac)" font-weight="700">no locks</text>
+          <text x="560" y="269" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">the event loop &amp; call() (Ch. 2, 3, 7)</text>
+          <path d="M520,215 C470,190 420,175 395,167" stroke="var(--mac)" stroke-width="1.3" fill="none" stroke-dasharray="3,3"></path>
+        </g>
+      </svg>
+      <figcaption>
+        <strong>Four ideas, endlessly reapplied.</strong> Once you can name
+        these, you'll start spotting them in codebases that have nothing to
+        do with Redis &mdash; they're general engineering moves, not
+        Redis-specific tricks.
+      </figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch12-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Redis isn't fast because of one clever trick. It's fast because a
+        small number of genuinely general ideas &mdash; cheap-path-first,
+        approximate-when-exact-is-too-costly, incremental-over-blocking,
+        single-writer-over-locking &mdash; got applied consistently,
+        everywhere they fit, by people who kept asking "does this have to be
+        exact / all-at-once / locked?" and kept finding the answer was no.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch12-h2-lessons">Lessons for Your Own Systems</h2>
+    <p data-anchor="ch12-p3">
+      None of this requires you to build a database. These are decisions
+      worth making deliberately in far more ordinary software:
+    </p>
+    <ul data-anchor="ch12-list-lessons">
+      <li><strong>A single-threaded core is a legitimate architecture</strong>,
+      not a fallback &mdash; when your per-operation cost is genuinely small
+      and bounded, one thread with no locks can beat a concurrent design that
+      spends more of its budget coordinating than working.</li>
+      <li><strong>Compact representations compound.</strong> A data structure
+      that's twice as small isn't just cheaper to store &mdash; it's faster
+      to scan, faster to copy, and kinder to every cache level between your
+      CPU and RAM.</li>
+      <li><strong>Incremental maintenance beats a big pause</strong>, even if
+      the total work done is slightly higher. Users forgive "a little slower,
+      always" far more readily than "instant, except for that one alarming
+      freeze."</li>
+      <li><strong>Simplicity is a deliverable, not a compromise.</strong> Every
+      "no" in this book &mdash; no cross-slot transactions, no exact LRU, no
+      preemptible scripts &mdash; bought back engineering clarity and
+      operational predictability. Decide, on purpose, which guarantees your
+      own system actually needs, and refuse the rest.</li>
+    </ul>
+
+    <div class="callout lab" data-anchor="ch12-lab-1">
+      <span class="co-tag">Exercises for the Reader</span>
+      <p>Pick any one of these and actually do it &mdash; reading about a
+      trick and tracing it yourself are very different experiences:</p>
+      <ul>
+        <li>Trace one command end to end, from its handler to every
+        subsystem it touches, the way this chapter traced <code>EXPIRE</code>.</li>
+        <li>Explain incremental rehashing to a colleague, out loud, without
+        looking back at Chapter 6.</li>
+        <li>Compare RDB and AOF for a specific app you know well &mdash;
+        which durability profile would you actually pick, and why?</li>
+        <li>Follow one data structure (pick a sorted set) across its full
+        life: small and packed, then converted, then grown. What triggers
+        each step?</li>
+        <li>Find every place in this book a background task runs, and list
+        what would go wrong if each one ran synchronously instead.</li>
+      </ul>
+    </div>
+
+    <p data-anchor="ch12-close-p1">
+      That's the book. Redis earns its reputation for cleverness the
+      unglamorous way &mdash; not with one dazzling trick, but with a long
+      series of small, disciplined decisions, applied consistently, in
+      service of a goal it never wavered from: stay fast, stay predictable,
+      stay simple enough that one engineer can hold the whole system in
+      their head. That's a good goal for your own next project, too. The
+      cheatsheet that follows is a dense, single-page reference &mdash; keep
+      it open while you go build something.
+    </p>
+
+    <p class="sources" data-anchor="ch12-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://github.com/redis/redis" target="_blank" rel="noopener">github.com/redis/redis</a>
+      &middot;
+      <a href="https://github.com/zpoint/Redis-Internals" target="_blank" rel="noopener">zpoint/Redis-Internals</a>
+      &middot;
+      <a href="https://wangziqi2013.github.io/article/2023/02/12/redis-notes.html" target="_blank" rel="noopener">Understanding Redis Source Code</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="11-why-redis-is-fast.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="../cheatsheet.html">Cheatsheet &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

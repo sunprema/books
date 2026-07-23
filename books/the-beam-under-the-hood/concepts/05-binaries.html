@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Binaries &amp; the Large-Binary Trap — The BEAM Under the Hood</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">The BEAM<span class="dot">.</span></span>
+  <span class="chip">05 · Binaries</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="chapter-num">Chapter 05 · The Sharp Edge</p>
+    <h1>Binaries &amp; the Large-Binary Trap</h1>
+    <p class="dek">The one thing we share — and the tidy little disaster it can cause.</p>
+
+    <p class="lead">Everything so far has been about <em>not</em> sharing. Private heaps, copied messages,
+    isolated deaths. Now meet the deliberate exception. Binaries — the blobs of bytes behind your strings,
+    your JSON payloads, your file contents — are big and get passed around a lot, and copying a megabyte on
+    every send would be silly. So the BEAM shares them. That sharing is a wonderful optimisation, and it is
+    also the source of the single most famous "why won't my memory come down?" mystery in all of Erlang.
+    Let's understand both halves.</p>
+
+    <h2>Two kinds of binary</h2>
+    <p>The BEAM splits binaries at a threshold: <strong>64 bytes</strong>. A binary of 64 bytes or fewer is a
+    <strong>heap binary</strong> — it lives right on the process heap and is copied like any ordinary term.
+    Small, cheap, unremarkable. A binary <em>larger</em> than 64 bytes is a <strong>refc binary</strong>
+    (reference-counted): its bytes live off in a separate, shared, global binary area, and on the process
+    heap sits only a small structure called a <strong>ProcBin</strong> that points at the blob and counts as
+    one reference to it.</p>
+
+    <figure class="svg-card">
+      <svg viewBox="0 0 700 200" role="img" aria-label="Two processes each hold a small ProcBin on their heap, both pointing at one shared off-heap binary with a reference count of 2.">
+        <rect x="30" y="40" width="150" height="70" rx="10" class="chalk-stroke" stroke-width="2"/>
+        <text x="105" y="33" text-anchor="middle" class="chalk-label" font-size="12">process A heap</text>
+        <text x="105" y="82" text-anchor="middle" font-size="12" font-family="var(--font-mono)" style="fill:var(--ty)">ProcBin →</text>
+        <rect x="30" y="130" width="150" height="60" rx="10" class="chalk-stroke" stroke-width="2"/>
+        <text x="105" y="123" text-anchor="middle" class="chalk-label" font-size="12">process B heap</text>
+        <text x="105" y="166" text-anchor="middle" font-size="12" font-family="var(--font-mono)" style="fill:var(--ty)">ProcBin →</text>
+
+        <rect x="420" y="70" width="230" height="80" rx="10" class="chalk-accent" stroke-width="2" fill="rgba(242,208,107,.10)"/>
+        <text x="535" y="63" text-anchor="middle" class="chalk-label" font-size="12" style="fill:var(--accent)">shared off-heap binary area</text>
+        <text x="535" y="105" text-anchor="middle" font-size="13" font-family="var(--font-mono)" style="fill:var(--str)">the 5 MB blob</text>
+        <text x="535" y="128" text-anchor="middle" font-size="12" font-family="var(--font-mono)" class="chalk-fill">refcount = 2</text>
+        <line x1="180" y1="80" x2="420" y2="100" class="chalk-stroke" stroke-width="1.6" marker-end="url(#a5)"/>
+        <line x1="180" y1="160" x2="420" y2="120" class="chalk-stroke" stroke-width="1.6" marker-end="url(#a5)"/>
+        <text x="300" y="185" text-anchor="middle" font-size="11" class="chalk-soft">freed only when BOTH ProcBins are collected</text>
+        <defs><marker id="a5" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="var(--ink)"/></marker></defs>
+      </svg>
+      <figcaption>A big binary exists once; every holder keeps a tiny ProcBin pointing at it and counts as one
+      reference. The blob dies only when the last ProcBin is garbage-collected.</figcaption>
+    </figure>
+
+    <h2>The trap, told as a story</h2>
+    <p>Now watch how the good idea turns into the famous bug. That off-heap blob is freed only when its
+    reference count hits zero — that is, only when <em>every</em> process holding a ProcBin to it has
+    garbage-collected and dropped its pointer. And here's the collision: a ProcBin is <em>tiny</em>. From the
+    garbage collector's point of view, a process holding a hundred ProcBins looks nearly empty — a hundred
+    little pointers, a few kilobytes of heap. The GC sees no pressure, so it doesn't run. But each of those
+    "tiny" pointers may be pinning a multi-megabyte blob alive off-heap.</p>
+
+    <p>So picture a process that reads big payloads, keeps a reference to each, and is otherwise quiet — it
+    rarely allocates, so it rarely collects, so it rarely drops its ProcBins, so the blobs never get freed.
+    Your <code>:observer</code> shows the process using a few KB of heap while the machine's total memory
+    climbs and climbs into the gigabytes. That gap — small heap, huge real footprint — is the tell-tale
+    fingerprint of a <strong>binary leak</strong>.</p>
+
+    <div class="callout crash">
+      <span class="tag">The classic leak</span>
+      <p>Off-heap binary memory is invisible to a process's ordinary heap size, and it will not come down until
+      the holding process garbage-collects. A busy system with a few idle-but-reference-holding processes can
+      bleed memory for hours with nothing in the "process heap" numbers to explain it. Every seasoned Erlang
+      operator has been bitten by this exactly once, and never forgotten it.</p>
+    </div>
+
+    <h2>The sub-binary twist</h2>
+    <p>It gets one turn more subtle. When you match a piece out of a binary — a header, a field, a single
+    line — the BEAM often doesn't copy those bytes. It hands you a <strong>sub-binary</strong>: a tiny
+    reference that says "bytes 40 through 60 of that big blob." Efficient! But that little slice still holds a
+    reference to the <em>whole</em> original binary. Parse a 10&nbsp;MB file, keep one 20-byte field from it,
+    and you may be keeping all 10&nbsp;MB alive to hold that one field. The small thing pins the big thing.</p>
+
+    <h2>How to break the leak</h2>
+    <p>Once you can see it, the cures are direct:</p>
+    <pre><span class="cap">iex — detach a slice, and force a stubborn holder to let go</span><code><span class="co"># A tiny slice you want to KEEP but that pins a huge parent:</span>
+field = <span class="mod">:binary</span>.<span class="fn">copy</span>(<span class="mod">:binary</span>.<span class="fn">part</span>(big, <span class="num">40</span>, <span class="num">20</span>))
+<span class="co"># copy/1 makes a fresh, standalone binary → the 10 MB parent can now be freed.</span>
+
+<span class="co"># A quiet process pinning blobs: make it hibernate between jobs.</span>
+<span class="co"># hibernate does a full sweep and shrinks the heap, dropping stale ProcBins:</span>
+<span class="op">{</span><span class="at">:noreply</span>, state, <span class="at">:hibernate</span><span class="op">}</span>   <span class="co"># a GenServer callback can return this</span>
+
+<span class="co"># Or force the issue when you must:</span>
+<span class="mod">:erlang</span>.<span class="fn">garbage_collect</span>(pid)</code></pre>
+
+    <div class="callout note">
+      <span class="tag">Find it with recon</span>
+      <p>The tool built for exactly this is <code>recon</code>. <code>:recon.bin_leak(10)</code> forces GC
+      across processes and reports the ten that freed the most binary memory — i.e. the ten that were hoarding
+      it. It's the fastest way to turn "memory is climbing and I don't know why" into "these three processes,
+      right here."</p>
+    </div>
+
+    <div class="reflect">So what did shared binaries buy us? The freedom to pass big blobs around a huge system
+    almost for free — no megabyte copies on every send, exactly what a web server shuffling payloads needs. The
+    bill is subtle and it's the honest kind: memory that hides off-heap, freed on a schedule the garbage
+    collector — not you — decides. Know the 64-byte line, know that <b>a small reference can pin a large blob</b>,
+    and the scariest memory graph in Erlang becomes a five-minute fix.</div>
+
+    <h3>Try it yourself</h3>
+    <ol class="challenges">
+      <li>Build a 1&nbsp;MB binary and check <code>Process.info(self(), :binary)</code> — the list of refc
+      binaries this process holds. Watch it grow as you keep references.</li>
+      <li>Match a 10-byte sub-binary out of a big one, drop the big one, and confirm memory <em>doesn't</em>
+      fall. Now wrap the slice in <code>:binary.copy/1</code> and confirm it does.</li>
+      <li>Add <code>:recon</code> to a project and run <code>:recon.bin_leak(5)</code> under load. Meet your
+      hoarders.</li>
+    </ol>
+
+    <div class="sources"><b>Sources</b> · Efficiency Guide, "Constructing and Matching Binaries" · Erlang in
+    Anger, ch. 7 "Memory leaks" (Fred Hébert) · ERTS "Erlang Garbage Collector." Links on the cheatsheet.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <a class="nav-prev" rel="prev" href="04-message-passing.html">‹ Prev</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="06-dirty-schedulers.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

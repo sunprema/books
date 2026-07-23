@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Object Model and Strings &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 4 &middot; Objects &amp; Memory</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch4-kicker">Chapter 4 of 12 &middot; Core objects and memory</p>
+    <h1 data-anchor="ch4-h1">The Object Model: One Struct, <span class="hl">Many Encodings</span></h1>
+
+    <p class="lede" data-anchor="ch4-lede">
+      Store three strings that look similar to you and ask Redis how it
+      actually stored them:
+    </p>
+
+    <pre class="code" data-anchor="ch4-code1"><span class="cap">Terminal &mdash; the same command, three different encodings</span><code><span class="cm">$</span> redis-cli SET n 42
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli OBJECT ENCODING n
+<span class="str">"int"</span>
+<span class="cm">$</span> redis-cli SET short <span class="str">"hello there"</span>
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli OBJECT ENCODING short
+<span class="str">"embstr"</span>
+<span class="cm">$</span> redis-cli SET long <span class="str">"a string that runs well past forty-four bytes long"</span>
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli OBJECT ENCODING long
+<span class="str">"raw"</span></code></pre>
+
+    <p data-anchor="ch4-p1">
+      Same command, same declared type (a Redis string), three completely
+      different memory layouts. That's the theme of this whole chapter and
+      the next: Redis draws a hard line between a value's <strong>logical
+      type</strong> (what your client sees &mdash; a string, a list, a hash)
+      and its <strong>physical encoding</strong> (how it's actually laid out
+      in RAM). Every value picks the cheapest encoding that fits, silently,
+      with no change to the API you use.
+    </p>
+
+    <h2 data-anchor="ch4-h2-robj">The Generic Object: <span class="term">robj</span></h2>
+    <p data-anchor="ch4-p2">
+      Every value in the keyspace is wrapped in the same small struct,
+      <code>robj</code> ("Redis object"). It carries a <code>type</code>
+      (string, list, hash, set, zset&hellip;), an <code>encoding</code> (which
+      physical representation is in use right now), a reference count for
+      sharing, an LRU/LFU field used by eviction (Chapter 10), and a raw
+      pointer to the actual data. The command handlers in <code>t_string.c</code>,
+      <code>t_list.c</code>, and friends mostly work against this generic
+      wrapper and dispatch internally based on <code>encoding</code> &mdash;
+      which is exactly what lets the physical layout change without the
+      command surface changing at all.
+    </p>
+
+    <div class="callout key" data-anchor="ch4-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Separating "what type is this" from "how is it physically stored"
+        is what lets Redis quietly swap in a more compact representation
+        when a value is small, and a more capable one when it grows &mdash;
+        without ever changing the command you call. You'll see this same
+        move made independently for every collection type in Chapter 5.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch4-h2-strings">Strings: int, embstr, raw</h2>
+    <p data-anchor="ch4-p3">
+      A string picks one of three encodings, cheapest first:
+    </p>
+    <ul data-anchor="ch4-list-string-enc">
+      <li><strong><code class="mono">int</code></strong> &mdash; the value
+      parses cleanly as a 64-bit signed integer, so Redis stores the
+      <em>integer itself</em>, no character data at all, directly in the
+      <code>robj</code>'s pointer field.</li>
+      <li><strong><code class="mono">embstr</code></strong> ("embedded
+      string") &mdash; short strings, up to 44 bytes, get the
+      <code>robj</code> header and the string data allocated together in a
+      single memory chunk.</li>
+      <li><strong><code class="mono">raw</code></strong> &mdash; anything
+      longer than 44 bytes gets its own separate allocation for the string
+      data, referenced by pointer from the <code>robj</code>.</li>
+    </ul>
+    <p data-anchor="ch4-p4">
+      That 44-byte line isn't arbitrary. It's chosen so that an
+      <code>embstr</code>'s combined allocation &mdash; object header plus
+      string header plus content &mdash; still fits inside a single 64-byte
+      allocator bucket in jemalloc, the memory allocator Redis uses. One
+      allocation instead of two also means one cache line to touch instead
+      of two, and one <code>free()</code> instead of two when the key is
+      deleted &mdash; a small win multiplied across millions of keys.
+    </p>
+
+    <figure class="diagram" data-anchor="ch4-diagram">
+      <svg viewBox="0 0 700 220" role="img" aria-labelledby="ch4-svg-title">
+        <title id="ch4-svg-title">A decision path for a stored string: parses as a 64-bit integer becomes int encoding; otherwise 44 bytes or fewer becomes embstr, one allocation; longer becomes raw, two allocations.</title>
+        <g font-family="var(--font-mono)" font-size="10.5">
+          <rect x="10" y="90" width="140" height="46" rx="8" fill="var(--bg-2)" stroke="var(--ink-soft)" stroke-width="1.4"></rect>
+          <text x="80" y="118" text-anchor="middle" fill="var(--ink)">new string value</text>
+
+          <path d="M150,100 L230,60" stroke="var(--rule)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow4)"></path>
+          <text x="185" y="70" fill="var(--ink-soft)" font-size="9">parses as int64?</text>
+          <rect x="230" y="34" width="150" height="46" rx="8" fill="var(--code-bg)" stroke="var(--num)" stroke-width="1.6"></rect>
+          <text x="305" y="54" text-anchor="middle" fill="var(--num)" font-weight="700">int</text>
+          <text x="305" y="70" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">value stored inline</text>
+
+          <path d="M150,120 L230,120" stroke="var(--rule)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow4)"></path>
+          <text x="190" y="112" fill="var(--ink-soft)" font-size="9">&le; 44 bytes?</text>
+          <rect x="230" y="97" width="150" height="46" rx="8" fill="var(--code-bg)" stroke="var(--fn)" stroke-width="1.6"></rect>
+          <text x="305" y="117" text-anchor="middle" fill="var(--fn)" font-weight="700">embstr</text>
+          <text x="305" y="133" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">1 allocation</text>
+
+          <path d="M150,132 L230,178" stroke="var(--rule)" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow4)"></path>
+          <text x="188" y="168" fill="var(--ink-soft)" font-size="9">&gt; 44 bytes</text>
+          <rect x="230" y="160" width="150" height="46" rx="8" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="1.6"></rect>
+          <text x="305" y="180" text-anchor="middle" fill="var(--kw)" font-weight="700">raw</text>
+          <text x="305" y="196" text-anchor="middle" fill="var(--ink-soft)" font-size="8.5">2 allocations (header + SDS)</text>
+
+          <rect x="440" y="80" width="240" height="80" rx="8" fill="var(--bg-2)" stroke="var(--rule)" stroke-width="1.3" stroke-dasharray="4,3"></rect>
+          <text x="560" y="102" text-anchor="middle" fill="var(--ink-soft)" font-size="10">robj{type,encoding,refcount,</text>
+          <text x="560" y="117" text-anchor="middle" fill="var(--ink-soft)" font-size="10">lru,*ptr} &mdash; same wrapper,</text>
+          <text x="560" y="132" text-anchor="middle" fill="var(--ink-soft)" font-size="10">every encoding, same commands</text>
+        </g>
+        <defs>
+          <marker id="arrow4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--rule)"></path>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>Cheapest representation wins.</strong> Redis checks, in order,
+        whether it can get away with the cheapest layout before falling back
+        to a more general one &mdash; the same ratchet you'll meet again for
+        every collection type in Chapter 5.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ch4-h2-shared">Shared Objects and the Small-Int Cache</h2>
+    <p data-anchor="ch4-p5">
+      Integers between 0 and 9999 are special-cased even further: Redis
+      pre-allocates one shared <code>robj</code> for each of these small
+      integers at startup and hands out a reference to the shared object
+      (bumping its reference count) instead of allocating a fresh one every
+      time a key happens to hold, say, the number <code>7</code>. Counters,
+      small IDs, and flags are extremely common values in real workloads, so
+      this one cache quietly avoids an enormous number of tiny allocations.
+    </p>
+
+    <div class="callout tip" data-anchor="ch4-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        <code>OBJECT REFCOUNT key</code> on a small shared integer will
+        report an unusually large number &mdash; that's not a bug, it's you
+        observing the shared-integer pool directly. Reference counting only
+        <em>looks</em> unusual here because sharing is normally rare in
+        Redis; once a value is mutated in place, sharing stops (see the
+        warning below).
+      </p>
+    </div>
+
+    <h2 data-anchor="ch4-h2-sds">Under raw and embstr: Simple Dynamic Strings</h2>
+    <p data-anchor="ch4-p6">
+      The actual bytes behind <code>embstr</code> and <code>raw</code> are
+      stored as an <strong>SDS</strong> (simple dynamic string) rather than a
+      plain C string. An SDS keeps a small header in front of the character
+      data recording the current length and the allocated capacity, which
+      buys two things a C string can't: <code>strlen()</code>-free O(1)
+      length lookups, and safe storage of binary data containing embedded
+      NUL bytes (a plain C string would silently truncate at the first
+      <code>\0</code>). Redis even varies the header's own size
+      (<code>sdshdr5/8/16/32/64</code>) based on how big the string is, so a
+      short string doesn't pay for a header sized for gigabyte-scale content.
+    </p>
+
+    <div class="callout warn" data-anchor="ch4-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        Encoding is a memory optimization Redis picks <em>for you</em>, not a
+        promise about how a value behaves. <code>APPEND</code>ing to a short
+        string converts it away from <code>embstr</code> to <code>raw</code>
+        (an embedded string's single allocation isn't resizable in place);
+        once a value moves off a shared small-integer object because you ran
+        <code>INCR</code> or <code>APPEND</code> on it, it gets its own
+        private allocation and stops being shared. None of this changes
+        correctness &mdash; only the memory footprint &mdash; but it's worth
+        knowing if you're chasing memory numbers with <code>MEMORY USAGE</code>.
+      </p>
+    </div>
+
+    <p data-anchor="ch4-close-p1">
+      Strings are the simplest case: one value, three possible shapes. The
+      collection types &mdash; lists, hashes, sets, sorted sets &mdash; play
+      the exact same game, just with more encodings and more interesting
+      trade-offs. That's next.
+    </p>
+
+    <p class="sources" data-anchor="ch4-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://redis.io/docs/latest/commands/object-encoding/" target="_blank" rel="noopener">redis.io &mdash; OBJECT ENCODING</a>
+      &middot;
+      <a href="https://github.com/redis/redis/issues/14438" target="_blank" rel="noopener">redis/redis &mdash; embstr size-limit discussion</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="03-anatomy-of-a-request.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="05-collections-in-disguise.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

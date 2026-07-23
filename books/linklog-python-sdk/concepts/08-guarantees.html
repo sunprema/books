@@ -1,0 +1,174 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Guarantees: Zero-Panic, Bounded, Fast — Integrating LinkLog</title>
+<link rel="stylesheet" href="../assets/book.css">
+
+<header class="topbar">
+  <span class="brand"><span class="tick">//</span> Integrating LinkLog</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="gu-eyebrow">Chapter 08</p>
+    <h1 data-anchor="gu-title">The Guarantees: Zero-Panic, Bounded, Fast</h1>
+    <p class="lede" data-anchor="gu-lede">You are about to wrap production code paths in a recording library and leave it on forever. That is only reasonable if the library makes a few hard promises: it will <strong>never crash your app</strong>, never leak state back into it, never grow without bound, and never cost enough to notice. LinkLog is built around exactly those promises — here they are, and here is what each one means for how you integrate and verify.</p>
+
+    <h2 data-anchor="gu-h-panic">1. Zero-panic: it cannot take your app down</h2>
+    <p data-anchor="gu-p-panic1">This is the load-bearing guarantee (invariant #7). An observability tool that crashes the thing it observes is worse than no tool at all. So every public entry point in the SDK is wrapped: on any internal error — <code>/dev/shm</code> full, a serialization failure, a syscall that returns the wrong thing — LinkLog <strong>fails silently and stops recording</strong> rather than raising into your code. If there is no active session, every call is a counted no-op.</p>
+
+    <pre data-anchor="gu-pre-panic"><code><span class="cap">tracker.py — the shape of every write path</span><span class="kw">def</span> <span class="fn">snapshot</span>(name, value):
+    s = _session.<span class="fn">get</span>()
+    <span class="kw">if</span> s <span class="kw">is</span> <span class="kw">None</span>:
+        stats.dropped_no_buffer += <span class="num">1</span>   <span class="cm"># no trace to attach to → counted no-op</span>
+        <span class="kw">return</span>
+    <span class="kw">try</span>:
+        s.<span class="fn">emit</span>(...)
+    <span class="kw">except</span> <span class="ty">Exception</span>:
+        <span class="kw">pass</span>                        <span class="cm"># never raises into your app</span></code></pre>
+
+    <div class="callout key" data-anchor="gu-key-verify">
+      <span class="ct">The habit this forces on you</span>
+      <p>Because the SDK swallows its own errors, a <em>broken</em> capture looks identical to a working one from the outside — there is no exception and no falsy return to tip you off. So when you verify your instrumentation, <strong>assert the artifact exists on disk</strong> (<code>/dev/shm/llog/events/</code>), never trust a return value or the absence of an exception. This is the single most important debugging habit with LinkLog. The project's own reference PoC returned <code>False</code> from a broken commit for weeks and no test noticed — because nothing was checking the disk.</p>
+    </div>
+
+    <h2 data-anchor="gu-h-writeonly">2. Write-only: nothing flows back</h2>
+    <p data-anchor="gu-p-writeonly">Recapping invariant #6 from Chapter 6: the SDK is a one-way street. Snapshots go <em>into</em> the buffer and there is no public API that hands captured execution state back to your application. Your instrumentation can never become an accidental read-back or exfiltration surface inside your own process.</p>
+
+    <h2 data-anchor="gu-h-bounded">3. Bounded snapshots: capture anything safely</h2>
+    <p data-anchor="gu-p-bounded1">You should be able to <code>snapshot()</code> almost any value without first checking whether it's huge, cyclic, or serializable. LinkLog makes that safe by bounding every snapshot on three axes — <strong>depth</strong> (about 3 levels), <strong>byte size</strong>, and <strong>item count</strong> — inside the walk itself. A deeply nested or self-referential object simply stops being descended; it can't blow up your memory or hang the walk.</p>
+    <p data-anchor="gu-p-bounded2">Values it can't serialize don't throw — they're recorded as a marker so the shape survives:</p>
+    <pre data-anchor="gu-pre-bounded"><code><span class="cap">what LinkLog records for the awkward cases</span>llog.<span class="fn">snapshot</span>(<span class="str">"ctx"</span>, {
+    <span class="str">"order_id"</span>: <span class="str">"ord_88"</span>,        <span class="cm"># → captured normally</span>
+    <span class="str">"db"</span>: connection,             <span class="cm"># → "&lt;Unserializable: Connection at 0x10f3a20&gt;"</span>
+    <span class="str">"blob"</span>: huge_bytes,            <span class="cm"># → truncated at the byte cap, with a marker</span>
+})</code></pre>
+    <p data-anchor="gu-p-bounded3">An unserializable object becomes <code>&lt;Unserializable: TypeName at 0x...&gt;</code>; an over-long <code>str</code>/<code>bytes</code> is truncated with a trailing <code>...</code>. The rule of thumb: <em>capture is defensive, so you don't have to be.</em></p>
+
+    <h2 data-anchor="gu-h-fast">4. Fast: the success path is effectively free</h2>
+    <p data-anchor="gu-p-fast1">"Record everything and discard on success" only works if recording is cheap enough to always leave on. The budget is <strong>under 1ms per request</strong> (under 0.5ms for a 20-step path), and the measured reality on Linux is far under it:</p>
+
+    <table data-anchor="gu-tbl-perf">
+      <tr><th>Operation</th><th>Measured (Linux, p50)</th></tr>
+      <tr><td>10-snapshot request, end to end</td><td><code>~0.040 ms</code></td></tr>
+      <tr><td><code>O_TMPFILE</code> discard on success</td><td><code>~5 µs</code></td></tr>
+      <tr><td>6,400 successful requests</td><td><code>0</code> artifacts left on disk</td></tr>
+    </table>
+    <p data-anchor="gu-p-fast2">The point isn't the exact numbers — it's the ratio. The overhead sits an order of magnitude below the budget, which is what makes generous recording affordable. You are not trading latency for context here.</p>
+
+    <div class="callout warn" data-anchor="gu-warn-bench">
+      <span class="ct">Benchmark only on Linux</span>
+      <p>These figures come from the real mechanism (<code>O_TMPFILE</code> in <code>/dev/shm</code>). On macOS/Windows the SDK runs its hidden-temp-file fallback, so any number you measure there describes the fallback, not the product. If you're going to quote a success-path cost, measure it on Linux.</p>
+    </div>
+
+    <h2 data-anchor="gu-h-resource">5. Resource-safe: it won't fill your pod</h2>
+    <p data-anchor="gu-p-resource">Buffers live in tmpfs, and tmpfs pages count against your container's cgroup memory limit — so an unbounded recorder could OOM the very pod it's protecting. LinkLog caps the buffer size and event count per request, and caps concurrent buffers and total buffer bytes across the process. It will stop recording before it fills <code>/dev/shm</code>, not after.</p>
+
+    <h2 data-anchor="gu-h-introspect">6. Introspection: check that it's actually working</h2>
+    <p data-anchor="gu-p-introspect">Because failures are swallowed, you'll want a way to confirm the SDK is doing what you expect. <code>llog.stats</code> is a live set of counters you can read at any time (for a health endpoint, a test assertion, or a quick REPL check):</p>
+
+    <pre data-anchor="gu-pre-stats"><code><span class="cap">a health check on your instrumentation</span><span class="kw">import</span> llog
+
+<span class="cm"># ... after some traffic ...</span>
+<span class="fn">print</span>(llog.stats.buffers_created, llog.stats.commits, llog.stats.discards)
+<span class="kw">assert</span> llog.stats.write_errors == <span class="num">0</span>      <span class="cm"># capture is healthy</span></code></pre>
+
+    <table data-anchor="gu-tbl-stats">
+      <tr><th>Counter</th><th>What it tells you</th></tr>
+      <tr><td><code>buffers_created</code></td><td>Sessions opened — one per instrumented request/intent.</td></tr>
+      <tr><td><code>commits</code></td><td>Checkpoints written to disk (i.e. failures kept).</td></tr>
+      <tr><td><code>discards</code></td><td>Buffers thrown away on success — should dwarf commits.</td></tr>
+      <tr><td><code>write_errors</code></td><td>Internal write failures. Non-zero means capture is degraded.</td></tr>
+      <tr><td><code>commit_errors</code></td><td>Failures while committing an artifact. Investigate if non-zero.</td></tr>
+      <tr><td><code>cap_truncations</code></td><td>Buffers that hit the size cap and stopped recording early.</td></tr>
+      <tr><td><code>dropped_no_buffer</code></td><td>Calls made with no active session (e.g. <code>snapshot()</code> outside an intent).</td></tr>
+      <tr><td><code>suppressed</code></td><td>Commits dropped by the storm rate limiter (Chapter 7).</td></tr>
+    </table>
+    <p data-anchor="gu-p-introspect2">Alongside the counters, <code>llog.config</code> reflects the effective configuration and <code>llog.current_session()</code> returns the active session (or <code>None</code>) if you need to check whether you're inside a captured context.</p>
+
+    <h2 data-anchor="gu-h-summary">The promises, at a glance</h2>
+    <table data-anchor="gu-tbl-summary">
+      <tr><th>Guarantee</th><th>What it means when you integrate</th></tr>
+      <tr><td>Zero-panic</td><td>Wrap anything; it can't crash your app. Verify by checking disk, not return values.</td></tr>
+      <tr><td>Write-only</td><td>Instrumentation can't read state back into your process.</td></tr>
+      <tr><td>Bounded snapshots</td><td><code>snapshot()</code> any object — huge, cyclic, or unserializable — without a pre-check.</td></tr>
+      <tr><td>Fast</td><td>Leave it on in production; the success path is sub-budget.</td></tr>
+      <tr><td>Resource-safe</td><td>It self-caps before filling tmpfs / your cgroup limit.</td></tr>
+      <tr><td>Introspectable</td><td><code>llog.stats</code> lets you prove capture is healthy.</td></tr>
+    </table>
+
+    <p class="soft" data-anchor="gu-p-next">Those guarantees are why the checkpoint gets written safely. Next, we follow it out of your process: what the sidecar does with it, and the one flag you set that turns a checkpoint into a runnable failing test.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-storms.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-downstream.html">Next: Downstream ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->

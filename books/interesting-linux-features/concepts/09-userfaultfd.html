@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>userfaultfd — Interesting Linux</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" rel="home" href="../index.html"><span class="mark">&#9776;</span> Interesting Linux</a>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 09 &middot; The Kernel Asks You What To Do</p>
+    <h1>userfaultfd</h1>
+    <p class="lead" data-anchor="uffd-lead">A page fault is normally a conversation your program isn't invited to.
+    You touch an address, the CPU traps, the kernel quietly finds a page &mdash; from the file, from swap,
+    from the zero page &mdash; maps it in, and resumes you. You never knew it happened.
+    <code class="inl">userfaultfd</code> inverts that: it lets a process register a range of its own memory
+    and say <em>when someone touches this and there's nothing there, don't guess &mdash; stop the thread
+    and ask me.</em></p>
+
+    <h2>What actually happens on a fault</h2>
+    <p data-anchor="uffd-normal">When a thread touches an unmapped-but-valid address, the hardware raises a fault and the
+    kernel takes over. It decides what the page should contain: read it from a file, pull it from swap,
+    hand out a shared zero page, or allocate a fresh anonymous one. The faulting thread is parked
+    for the duration and then resumed as if nothing happened. The policy &mdash; <em>where does this page
+    come from?</em> &mdash; has always been the kernel's to decide.</p>
+    <p data-anchor="uffd-invert"><code class="inl">userfaultfd</code> hands that decision to a userspace <em class="term">manager</em>.
+    You get a file descriptor. The kernel writes fault notifications to it. The faulting thread stays
+    blocked until you supply the page's contents. The kernel has stopped guessing, because you told it
+    you know better &mdash; and, importantly, you might know something the kernel physically cannot:
+    that the page's contents are still on another machine.</p>
+
+    <div class="callout key" data-anchor="uffd-key">
+      <span class="tag">The key idea</span>
+      Every other chapter in this book asks the kernel to do something. This one is the kernel
+      asking <em>you</em>. The fd runs backwards: you read requests from it, not data.
+    </div>
+
+    <h2>Getting the descriptor</h2>
+    <p data-anchor="uffd-nowrapper">There is no glibc wrapper &mdash; you call it through
+    <code class="inl">syscall(2)</code> directly. It has been in the kernel since <strong>Linux 4.3</strong>.</p>
+
+    <pre class="tab" data-anchor="uffd-create"><span class="cap">c &middot; create the userfault descriptor</span><code><span class="mac">#define _GNU_SOURCE</span>
+<span class="mac">#include</span> <span class="str">&lt;fcntl.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;linux/userfaultfd.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;sys/ioctl.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;sys/syscall.h&gt;</span>
+<span class="mac">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="ty">int</span> uffd = <span class="fn">syscall</span>(<span class="en">SYS_userfaultfd</span>,
+                   <span class="en">O_CLOEXEC</span> | <span class="en">O_NONBLOCK</span> | <span class="en">UFFD_USER_MODE_ONLY</span>);
+<span class="cm">/* UFFD_USER_MODE_ONLY (Linux 5.11+) is what lets this work unprivileged.
+   More on why in a moment. */</span></code></pre>
+
+    <h2>The two-step handshake</h2>
+    <p data-anchor="uffd-api">Before anything else you perform a version handshake with
+    <code class="inl">UFFDIO_API</code>. You declare the API version you were built against; the kernel
+    replies with the feature bits and ioctls it actually supports. This is the same defensive pattern
+    as Landlock's ABI probe two chapters from now &mdash; announce, don't assume.</p>
+
+    <pre class="tab" data-anchor="uffd-handshake"><span class="cap">c &middot; handshake, then register a range</span><code><span class="ty">struct</span> <span class="ty">uffdio_api</span> api = { .api = <span class="en">UFFD_API</span>, .features = <span class="num">0</span> };
+<span class="kw">if</span> (<span class="fn">ioctl</span>(uffd, <span class="en">UFFDIO_API</span>, &amp;api) == <span class="num">-1</span>)
+    <span class="fn">die</span>(<span class="str">"UFFDIO_API"</span>);
+<span class="cm">/* api.features and api.ioctls now describe what this kernel can do. */</span>
+
+<span class="ty">struct</span> <span class="ty">uffdio_register</span> reg = {
+    .range = { .start = (<span class="ty">unsigned long</span>)addr, .len = len },
+    .mode  = <span class="en">UFFDIO_REGISTER_MODE_MISSING</span>,
+};
+<span class="kw">if</span> (<span class="fn">ioctl</span>(uffd, <span class="en">UFFDIO_REGISTER</span>, &amp;reg) == <span class="num">-1</span>)
+    <span class="fn">die</span>(<span class="str">"UFFDIO_REGISTER"</span>);</code></pre>
+
+    <h2>Three things you can be notified about</h2>
+    <table class="grid" data-anchor="uffd-modes">
+      <tr><th>Registration mode</th><th>Fires when&hellip;</th><th>Since</th></tr>
+      <tr><td class="mono">UFFDIO_REGISTER_MODE_MISSING</td><td>a page in the range is touched and nothing is mapped there yet</td><td class="mono">4.10</td></tr>
+      <tr><td class="mono">UFFDIO_REGISTER_MODE_WP</td><td>a write hits a write-protected page in the range</td><td class="mono">5.7</td></tr>
+      <tr><td class="mono">UFFDIO_REGISTER_MODE_MINOR</td><td>a minor fault occurs &mdash; the page is in the page cache but not mapped into this process</td><td class="mono">5.13</td></tr>
+    </table>
+    <p data-anchor="uffd-modes-note"><code class="inl">MODE_MISSING</code> is the one to picture first: it is
+    &ldquo;this memory is empty and someone wants it.&rdquo; <code class="inl">MODE_WP</code> gives you
+    write-tracking &mdash; the foundation for incremental snapshots and concurrent garbage collectors.
+    Write-protection support reached shared memory and hugetlbfs in <strong>Linux 5.19</strong>.</p>
+
+    <h2>The handler loop</h2>
+    <p data-anchor="uffd-loop">The descriptor becomes readable when there's a fault to service. You
+    <code class="inl">poll</code> it, read a <code class="inl">struct uffd_msg</code>, and answer with
+    <code class="inl">UFFDIO_COPY</code> (here is the data) or <code class="inl">UFFDIO_ZEROPAGE</code>
+    (it's all zeroes). The blocked thread resumes the instant you do.</p>
+
+    <pre class="tab" data-anchor="uffd-handler"><span class="cap">c &middot; the manager loop &mdash; answering a fault</span><code><span class="ty">struct</span> <span class="ty">pollfd</span> pfd = { .fd = uffd, .events = <span class="en">POLLIN</span> };
+<span class="fn">poll</span>(&amp;pfd, <span class="num">1</span>, <span class="num">-1</span>);
+
+<span class="ty">struct</span> <span class="ty">uffd_msg</span> msg;
+<span class="fn">read</span>(uffd, &amp;msg, <span class="kw">sizeof</span>(msg));
+
+<span class="kw">if</span> (msg.event == <span class="en">UFFD_EVENT_PAGEFAULT</span>) {
+    <span class="ty">unsigned long</span> page = msg.arg.pagefault.address &amp; ~(page_size - <span class="num">1</span>);
+
+    <span class="cm">/* Fetch it from wherever the truth lives — a socket, a
+       remote host, a decompressor — into page_buffer, then: */</span>
+    <span class="ty">struct</span> <span class="ty">uffdio_copy</span> copy = {
+        .dst  = page,
+        .src  = (<span class="ty">unsigned long</span>)page_buffer,
+        .len  = page_size,
+        .mode = <span class="num">0</span>,
+    };
+    <span class="fn">ioctl</span>(uffd, <span class="en">UFFDIO_COPY</span>, &amp;copy);  <span class="cm">/* faulting thread wakes up here */</span>
+}</code></pre>
+
+    <figure data-anchor="uffd-fig">
+    <svg viewBox="0 0 640 240" class="figure-svg" role="img" aria-label="Two stacked timelines. The top shows a normal page fault: the thread traps into the kernel, the kernel resolves the page from disk or swap on its own, and resumes the thread. The bottom shows a userfaultfd fault: the thread traps, the kernel forwards a message to a userspace manager process, the manager fetches the page from a remote source and answers with UFFDIO_COPY, and only then does the kernel resume the thread.">
+      <text x="14" y="18" font-family="monospace" font-size="11" fill="#2b2114" font-weight="bold">the ordinary page fault &mdash; the kernel decides</text>
+      <g font-family="monospace" font-size="9" fill="#2b2114">
+        <rect x="14" y="30" width="96" height="30" rx="5" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="30" y="49">thread touch</text>
+        <path d="M112 45 H160" stroke="#6f5c3e" stroke-width="1.5" marker-end="url(#a1)"/>
+        <rect x="162" y="30" width="86" height="30" rx="5" fill="#e2d4ab" stroke="#d8c49c"/>
+        <text x="180" y="49">kernel trap</text>
+        <path d="M250 45 H298" stroke="#6f5c3e" stroke-width="1.5" marker-end="url(#a1)"/>
+        <rect x="300" y="30" width="120" height="30" rx="5" fill="#e2d4ab" stroke="#d8c49c"/>
+        <text x="312" y="49">disk / swap / zero</text>
+        <path d="M422 45 H470" stroke="#3f6d3a" stroke-width="1.5" marker-end="url(#a2)"/>
+        <rect x="472" y="30" width="90" height="30" rx="5" fill="#e6efe0" stroke="#3f6d3a"/>
+        <text x="486" y="49" fill="#3f6d3a">resumed</text>
+        <text x="576" y="49" fill="#6f5c3e">&micro;s</text>
+      </g>
+
+      <line x1="14" y1="86" x2="626" y2="86" stroke="#d8c49c" stroke-dasharray="3 3"/>
+
+      <text x="14" y="112" font-family="monospace" font-size="11" fill="#8a2f22" font-weight="bold">with userfaultfd &mdash; you decide</text>
+      <g font-family="monospace" font-size="9" fill="#2b2114">
+        <rect x="14" y="124" width="96" height="30" rx="5" fill="#efe3c6" stroke="#d8c49c"/>
+        <text x="30" y="143">thread touch</text>
+        <path d="M112 139 H160" stroke="#6f5c3e" stroke-width="1.5" marker-end="url(#a1)"/>
+        <rect x="162" y="124" width="86" height="30" rx="5" fill="#e2d4ab" stroke="#d8c49c"/>
+        <text x="176" y="143">kernel trap</text>
+        <path d="M205 156 V186" stroke="#8a2f22" stroke-width="1.5" marker-end="url(#a3)"/>
+        <text x="212" y="176" fill="#8a2f22" font-size="8">uffd_msg</text>
+
+        <rect x="162" y="188" width="150" height="30" rx="5" fill="#f7e9e2" stroke="#8a2f22"/>
+        <text x="172" y="207" fill="#8a2f22">manager: fetch page</text>
+        <path d="M314 203 H392" stroke="#8a2f22" stroke-width="1.5" marker-end="url(#a3)"/>
+        <rect x="394" y="188" width="112" height="30" rx="5" fill="#f7e9e2" stroke="#8a2f22"/>
+        <text x="404" y="207" fill="#8a2f22">UFFDIO_COPY</text>
+        <path d="M450 186 V158" stroke="#3f6d3a" stroke-width="1.5" marker-end="url(#a2)"/>
+
+        <rect x="472" y="124" width="90" height="30" rx="5" fill="#e6efe0" stroke="#3f6d3a"/>
+        <text x="486" y="143" fill="#3f6d3a">resumed</text>
+        <text x="570" y="143" fill="#a5561a">ms &mdash; but</text>
+        <text x="570" y="154" fill="#a5561a">correct</text>
+      </g>
+      <defs>
+        <marker id="a1" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0 0 L6 2.5 L0 5 z" fill="#6f5c3e"/></marker>
+        <marker id="a2" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0 0 L6 2.5 L0 5 z" fill="#3f6d3a"/></marker>
+        <marker id="a3" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0 0 L6 2.5 L0 5 z" fill="#8a2f22"/></marker>
+      </defs>
+    </svg>
+    <figcaption>The thread is stopped either way. The difference is only who gets asked &mdash; and a userspace manager can answer with a page that was never on this machine.</figcaption>
+    </figure>
+
+    <h2>Why anyone would want this</h2>
+    <div class="usecase" data-anchor="uffd-use-qemu">
+      <span class="tag">Real-world use</span>
+      <strong>QEMU/KVM post-copy live migration</strong> is the use case userfaultfd was built for &mdash;
+      the initial 4.3 implementation was designed around it. Migrating a VM to another host, you can
+      copy all its RAM first and then switch over (pre-copy), but a busy guest keeps dirtying pages
+      faster than you ship them. Post-copy flips it: switch the guest over to the destination
+      <em>immediately</em>, with almost no memory, and register its entire address space with
+      <code class="inl">userfaultfd</code>. The guest runs; every page it actually touches faults; the
+      manager pulls that page over the network on demand. The VM is live in milliseconds and pages
+      itself in over the next few seconds.
+    </div>
+    <div class="usecase" data-anchor="uffd-use-criu">
+      <span class="tag">Real-world use</span>
+      <strong>CRIU</strong> (Checkpoint/Restore In Userspace) uses it for <em>lazy restore</em>. Rather
+      than reading a whole checkpoint image back into memory before letting the process run, CRIU
+      registers the lazy regions with userfaultfd and starts the process at once, faulting pages in
+      from the image only as they're needed. The 4.3 interface wasn't enough for this; the
+      &ldquo;non-cooperative&rdquo; mode added in <strong>Linux 4.11</strong> is what made it workable.
+    </div>
+
+    <h2>The security story &mdash; and a sysctl you'll meet</h2>
+    <p data-anchor="uffd-security">Here is the uncomfortable part. A userfaultfd manager can hold a
+    faulting thread <em>stopped, indefinitely, at a moment of its choosing</em>. That is a remarkable
+    gift to someone writing a kernel exploit: many kernel bugs are races with windows measured in
+    nanoseconds, and stalling a fault in the middle of a syscall that's copying to or from user memory
+    stretches that window open for as long as the attacker likes. A hard race becomes a reliable one.</p>
+
+    <p data-anchor="uffd-sysctl">So since <strong>Linux 5.11</strong> the kernel splits the feature in two,
+    gated by <code class="inl">/proc/sys/vm/unprivileged_userfaultfd</code>:</p>
+    <table class="grid" data-anchor="uffd-sysctl-table">
+      <tr><th>Value</th><th>Meaning</th></tr>
+      <tr><td class="mono">0 <em>(default)</em></td><td>restrict unprivileged users to handling page faults in <strong>user mode only</strong> &mdash; callers without <code class="inl">CAP_SYS_PTRACE</code> must pass <code class="inl">UFFD_USER_MODE_ONLY</code> for the call to succeed</td></tr>
+      <tr><td class="mono">1</td><td>allow unprivileged users to use the userfaultfd syscalls without any restrictions</td></tr>
+    </table>
+    <p data-anchor="uffd-umo">That's what <code class="inl">UFFD_USER_MODE_ONLY</code> in the first snippet
+    was doing. With it set, your manager only ever sees faults raised by user-space code touching the
+    range. If the <em>kernel</em> faults on that memory &mdash; a <code class="inl">copy_to_user</code>
+    deep inside some syscall &mdash; the kernel handles it normally and never asks you. You keep the
+    legitimate use case; you lose the exploit primitive.</p>
+
+    <div class="callout warn" data-anchor="uffd-warn">
+      <span class="tag">If you get EPERM</span>
+      Since <strong>Linux 5.2</strong>, <code class="inl">userfaultfd()</code> fails with
+      <code class="inl">EPERM</code> when the caller lacks <code class="inl">CAP_SYS_PTRACE</code> in the
+      initial user namespace and the sysctl is <code class="inl">0</code>. The fix is almost never to
+      flip the sysctl to <code class="inl">1</code> &mdash; it's to add
+      <code class="inl">UFFD_USER_MODE_ONLY</code> to your flags. Post-copy migration needs the
+      unrestricted form, which is why libvirt had to grow explicit support for granting it to QEMU.
+    </div>
+
+    <div class="callout funny" data-anchor="uffd-funny">
+      <span class="tag">A small delight</span>
+      Virtual memory's founding promise was the lie that your process has a big flat array of bytes
+      all to itself, and the kernel works tirelessly to keep the lie convincing. userfaultfd lets you
+      take over telling the lie. The memory can be on another continent. Your program will never
+      notice &mdash; it just does a load, and waits a little longer than usual.
+    </div>
+
+    <div class="sources" data-anchor="uffd-sources">
+      Sources: <a href="https://man7.org/linux/man-pages/man2/userfaultfd.2.html">userfaultfd(2)</a>,
+      <a href="https://man7.org/linux/man-pages/man2/ioctl_userfaultfd.2.html">ioctl_userfaultfd(2)</a> &mdash; man7.org;
+      <a href="https://docs.kernel.org/admin-guide/sysctl/vm.html">Documentation for /proc/sys/vm/ (unprivileged_userfaultfd)</a> &mdash; kernel.org;
+      <a href="https://criu.org/Userfaultfd">Userfaultfd</a> &mdash; criu.org.
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-kernel-tuning-secrets.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-copy-file-range.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

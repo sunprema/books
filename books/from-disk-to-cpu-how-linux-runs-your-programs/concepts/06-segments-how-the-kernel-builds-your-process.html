@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Segments: How the Kernel Builds Your Process · From Disk to CPU</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="bolt">&gt;_</span> From Disk to CPU</div>
+  <div class="spacer"></div>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapno">Chapter 06</div>
+    <div class="eyebrow">The loader's list</div>
+    <h1 data-anchor="ch6-h1">Segments: How the Kernel Builds Your Process</h1>
+
+    <p class="lead" data-anchor="ch6-p1">The program header table is a short list — usually under a dozen entries — of <em class="term">segments</em>. Each entry is the kernel's construction instruction for one contiguous chunk of memory: "take these bytes from the file, put them at this virtual address, and mark the memory with these permissions."</p>
+
+    <pre class="code" data-anchor="ch6-code1"><span class="kw">typedef</span> <span class="kw">struct</span> {
+  <span class="ty">uint32_t</span> p_type;    <span class="cm">// PT_LOAD, PT_INTERP, PT_DYNAMIC, ...</span>
+  <span class="ty">uint32_t</span> p_flags;   <span class="cm">// PF_R=4, PF_W=2, PF_X=1 (bitmask)</span>
+  <span class="ty">Elf64_Off</span> p_offset;  <span class="cm">// where in the FILE this segment starts</span>
+  <span class="ty">Elf64_Addr</span> p_vaddr; <span class="cm">// where in MEMORY it should land</span>
+  <span class="ty">Elf64_Addr</span> p_paddr; <span class="cm">// physical address (irrelevant on Linux)</span>
+  <span class="ty">uint64_t</span> p_filesz;  <span class="cm">// bytes to copy FROM the file</span>
+  <span class="ty">uint64_t</span> p_memsz;   <span class="cm">// bytes to reserve IN memory</span>
+  <span class="ty">uint64_t</span> p_align;   <span class="cm">// required alignment</span>
+} <span class="ty">Elf64_Phdr</span>;</pre>
+
+    <h2 data-anchor="ch6-h2a">The segment types worth knowing</h2>
+
+    <table class="grid" data-anchor="ch6-table1">
+      <tr><th>p_type</th><th>Meaning</th></tr>
+      <tr><td class="mono">PT_LOAD</td><td>A chunk to actually map into memory. A typical binary has 2–4 of these: one for code, one or two for data, sometimes one read-only.</td></tr>
+      <tr><td class="mono">PT_INTERP</td><td>"Before you run me, go run this other program first" — holds the path to the dynamic linker, e.g. <code class="inl">/lib64/ld-linux-x86-64.so.2</code>.</td></tr>
+      <tr><td class="mono">PT_DYNAMIC</td><td>Points to the dynamic linking info: which shared libraries are needed, where the symbol tables and relocations live.</td></tr>
+      <tr><td class="mono">PT_NOTE</td><td>Free-form vendor/build metadata (build IDs, ABI tags).</td></tr>
+      <tr><td class="mono">PT_GNU_STACK</td><td>Tells the kernel whether the stack should be executable — modern toolchains always say no.</td></tr>
+      <tr><td class="mono">PT_GNU_RELRO</td><td>"After you've finished relocations, make this region read-only" — a hardening trick, see Chapter 12.</td></tr>
+      <tr><td class="mono">PT_PHDR</td><td>The program header table itself, describing its own location — useful for the dynamic linker to find it.</td></tr>
+    </table>
+
+    <div class="aside" data-anchor="ch6-aside1">Here's the physical analogy that made this click for me: imagine unpacking a flat-pack wardrobe. The file is the flat box — everything compressed and stacked efficiently to save shipping space. The program headers are the assembly instructions: "panel A goes here, screw it at this angle, use these four screws." <em>PT_LOAD</em> segments are the panels you actually place. And <em class="term">.bss</em> — the space for uninitialized globals — is like the little bag of "extra shelf space, no parts needed" that the instructions tell you to leave empty. You don't ship empty space; you just leave room for it.</div>
+
+    <h2 data-anchor="ch6-h2b">Why memsz can be bigger than filesz</h2>
+
+    <p data-anchor="ch6-p2">This is the detail that trips people up the first time, and it's worth sitting with: for a data segment, <code class="inl">p_memsz</code> is often <em>larger</em> than <code class="inl">p_filesz</code>. The kernel copies <code class="inl">p_filesz</code> bytes from the file starting at <code class="inl">p_offset</code>, and then <em>zero-fills</em> the remaining <code class="inl">p_memsz − p_filesz</code> bytes. That trailing zero-filled region is exactly your program's <code class="inl">.bss</code> — every uninitialized global variable you declared. The file never had to store those zeros; the kernel just materializes them at load time, for free.</p>
+
+    <figure class="diagram" data-anchor="ch6-fig1">
+      <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ch6fig1title">
+        <title id="ch6fig1title">Diagram showing ELF segments on disk mapped into virtual memory regions, with permission flags and the .bss zero-fill region shown growing past the end of the file data.</title>
+        <text x="140" y="30" fill="#46b1e0" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="13" text-anchor="middle">ON DISK (the file)</text>
+        <text x="740" y="30" fill="#7fd1c8" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="13" text-anchor="middle">IN MEMORY (the process)</text>
+
+        <!-- file column -->
+        <g font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="11">
+          <rect x="40" y="55" width="200" height="50" fill="#0f2b41" stroke="#9fd35a" stroke-width="1.5"/>
+          <text x="140" y="76" fill="#dbeaf4" text-anchor="middle">.text (code)</text>
+          <text x="140" y="92" fill="#8fb0c4" text-anchor="middle">p_filesz = p_memsz</text>
+
+          <rect x="40" y="125" width="200" height="50" fill="#0f2b41" stroke="#f0a15a" stroke-width="1.5"/>
+          <text x="140" y="146" fill="#dbeaf4" text-anchor="middle">.data (init'd)</text>
+          <text x="140" y="162" fill="#8fb0c4" text-anchor="middle">p_filesz &lt; p_memsz</text>
+
+          <rect x="40" y="195" width="200" height="30" fill="#0f2b41" stroke="#7fd1c8" stroke-width="1.5"/>
+          <text x="140" y="215" fill="#dbeaf4" text-anchor="middle">.interp path</text>
+        </g>
+
+        <!-- arrows -->
+        <g stroke="#46b1e0" stroke-width="1.5" fill="none" marker-end="url(#arr6)">
+          <path d="M240,80 C 420,80 420,90 660,90"/>
+          <path d="M240,150 C 420,150 420,170 660,170"/>
+        </g>
+        <defs>
+          <marker id="arr6" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#46b1e0"/>
+          </marker>
+        </defs>
+
+        <!-- memory column -->
+        <g font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="11">
+          <rect x="660" y="60" width="220" height="60" fill="#0f2b41" stroke="#9fd35a" stroke-width="1.5"/>
+          <text x="770" y="82" fill="#dbeaf4" text-anchor="middle">code segment</text>
+          <text x="770" y="98" fill="#9fd35a" text-anchor="middle">R-X (read + execute)</text>
+          <text x="770" y="112" fill="#5b7d92" text-anchor="middle" font-size="10">never writable</text>
+
+          <rect x="660" y="140" width="220" height="40" fill="#0f2b41" stroke="#f0a15a" stroke-width="1.5"/>
+          <text x="770" y="158" fill="#dbeaf4" text-anchor="middle">.data</text>
+          <text x="770" y="172" fill="#f0a15a" text-anchor="middle">RW- (read + write)</text>
+
+          <rect x="660" y="180" width="220" height="45" fill="none" stroke="#f0a15a" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <text x="770" y="198" fill="#8fb0c4" text-anchor="middle">.bss (zero-filled</text>
+          <text x="770" y="212" fill="#8fb0c4" text-anchor="middle">by the kernel, not the file)</text>
+        </g>
+
+        <text x="480" y="280" fill="#5b7d92" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="12" text-anchor="middle">p_flags (PF_R=4 · PF_W=2 · PF_X=1) sets each region's permission bits —</text>
+        <text x="480" y="298" fill="#5b7d92" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="12" text-anchor="middle">code is never writable, data is never executable.</text>
+
+        <rect x="60" y="330" width="800" height="60" fill="none" stroke="#244a63" stroke-width="1"/>
+        <text x="470" y="352" fill="#dbeaf4" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="12" text-anchor="middle">Every PT_LOAD segment becomes one mmap()-like mapping — the kernel</text>
+        <text x="470" y="370" fill="#dbeaf4" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="12" text-anchor="middle">never "runs" the file; it just maps pieces of it and jumps to e_entry.</text>
+      </svg>
+      <figcaption>Segments on disk become mapped memory regions. Permissions come from <code class="inl">p_flags</code>; the trailing zero-fill of <code class="inl">.bss</code> exists only in memory, never on disk.</figcaption>
+    </figure>
+
+    <div class="callout warn" data-anchor="ch6-callout1">
+      <span class="tag">Watch out</span>
+      <code class="inl">p_vaddr</code>, <code class="inl">p_offset</code>, and <code class="inl">p_align</code> aren't independent — they must agree modulo the alignment (usually the page size, 4&nbsp;KiB). That's why segment boundaries in a real binary look like oddly specific numbers, not round ones: the linker is satisfying this congruence so the kernel can map the file directly with <code class="inl">mmap()</code> rather than copying bytes around.
+    </div>
+
+    <div class="tryit" data-anchor="ch6-tryit1">
+      <h4>Try this</h4>
+      <p><code class="inl">readelf -l</code> ("l" for "program headers", historically called "the Elf program headers") prints exactly this table:</p>
+      <pre class="code"><span class="prompt">$</span> readelf -l ./hello
+<span class="out">Program Headers:
+  Type           Offset   VirtAddr   FileSiz  MemSiz   Flg
+  PHDR           0x000040 0x000040   0x0002d8 0x0002d8 R
+  INTERP         0x000318 0x000318   0x00001c 0x00001c R
+      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
+  LOAD           0x000000 0x000000   0x000638 0x000638 R
+  LOAD           0x001000 0x001000   0x000191 0x000191 R E
+  LOAD           0x002000 0x002000   0x0000f8 0x0000f8 R
+  LOAD           0x002df0 0x003df0   0x000220 0x000228 RW
+  DYNAMIC        0x002e00 0x003e00   0x0001e0 0x0001e0 RW
+  ...</span></pre>
+      <p>Find the last <code class="inl">LOAD</code> line and compare <code class="inl">FileSiz</code> to <code class="inl">MemSiz</code> — that small gap is your program's <code class="inl">.bss</code>.</p>
+    </div>
+
+    <p class="subtle" data-anchor="ch6-sources">Sources: <a href="https://man7.org/linux/man-pages/man5/elf.5.html">elf(5) — Linux man-pages</a>.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-the-elf-header-the-files-id-card.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-the-dynamic-linker-and-shared-libraries.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Expiration, Eviction, and the Housekeeping Cron &mdash; Redis Internals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html">REDIS <span class="zap">INTERNALS</span></a>
+  <span class="bb-chapter">Chapter 10 &middot; Expiration &amp; Maintenance</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch10-kicker">Chapter 10 of 12 &middot; Expiration and background maintenance</p>
+    <h1 data-anchor="ch10-h1">Expiration, Eviction, and the <span class="hl">Housekeeping Cron</span></h1>
+
+    <p class="lede" data-anchor="ch10-lede">
+      Set a key with a one-second TTL, wait, and read it back:
+    </p>
+
+    <pre class="code" data-anchor="ch10-code1"><span class="cap">Terminal &mdash; a key that expires without anyone asking</span><code><span class="cm">$</span> redis-cli SET session:9 <span class="str">"active"</span> EX 1
+<span class="fn">OK</span>
+<span class="cm">$</span> redis-cli TTL session:9
+<span class="num">(integer) 1</span>
+<span class="cm">$</span> sleep 2 &amp;&amp; redis-cli GET session:9
+<span class="cm">(nil)</span></code></pre>
+
+    <p data-anchor="ch10-p1">
+      Nobody read that key in the gap &mdash; and yet it's gone. Redis
+      doesn't set a timer per key (millions of concurrent timers would be its
+      own scaling nightmare); instead it combines two much cheaper mechanisms
+      that only cost anything when they actually need to.
+    </p>
+
+    <h2 data-anchor="ch10-h2-passive">Passive Expiration: Check on the Way Past</h2>
+    <p data-anchor="ch10-p2">
+      Every key with a TTL is tracked in a separate expires dictionary
+      (key &rarr; expiry timestamp), sitting alongside the main keyspace
+      dict from Chapter 6. Whenever any command is about to read or write a
+      key, <code>expireIfNeeded()</code> checks that dictionary first: if the
+      key's TTL has passed, it's deleted right then, before the command ever
+      sees it. This costs nothing extra for keys that are never accessed
+      again after expiring &mdash; which is exactly the common case for
+      things like session tokens and rate-limit counters.
+    </p>
+
+    <h2 data-anchor="ch10-h2-active">Active Expiration: Sweep the Rest in Small Batches</h2>
+    <p data-anchor="ch10-p3">
+      Passive expiration alone would leave dead keys sitting in memory
+      forever if nobody happened to touch them again. So a time event, run
+      from <code>serverCron</code>, periodically samples a small number of
+      random keys from the expires dictionary (20 by default), deletes
+      whichever ones have actually expired, and &mdash; only if a large
+      fraction of that sample (more than roughly 10%) turned out to be
+      expired &mdash; immediately samples another batch, on the theory that a
+      dictionary with lots of stale keys probably has more nearby. If the
+      sample comes back mostly alive, the cycle backs off and waits for its
+      next scheduled turn instead of scanning further.
+    </p>
+
+    <figure class="diagram" data-anchor="ch10-diagram">
+      <svg viewBox="0 0 700 210" role="img" aria-labelledby="ch10-svg-title">
+        <title id="ch10-svg-title">The active expire cycle samples a small random batch of keys from the expires dictionary; if many are expired it samples again immediately, if few are expired it backs off until its next scheduled run.</title>
+        <g font-family="var(--font-mono)" font-size="10">
+          <rect x="30" y="30" width="220" height="150" rx="8" fill="var(--bg-2)" stroke="var(--rule)" stroke-width="1.3"></rect>
+          <text x="140" y="20" text-anchor="middle" fill="var(--ink-soft)" font-size="10">expires dict (all TTL keys)</text>
+          <g fill="var(--code-bg)" stroke="var(--rule)" stroke-width="1">
+            <circle cx="65"  cy="60"  r="12"></circle>
+            <circle cx="105" cy="60"  r="12"></circle>
+            <circle cx="145" cy="60"  r="12"></circle>
+            <circle cx="185" cy="60"  r="12"></circle>
+            <circle cx="225" cy="60"  r="12"></circle>
+            <circle cx="65"  cy="100" r="12"></circle>
+            <circle cx="105" cy="100" r="12"></circle>
+            <circle cx="145" cy="100" r="12"></circle>
+            <circle cx="185" cy="100" r="12"></circle>
+            <circle cx="225" cy="100" r="12"></circle>
+            <circle cx="65"  cy="140" r="12"></circle>
+            <circle cx="105" cy="140" r="12"></circle>
+            <circle cx="145" cy="140" r="12"></circle>
+            <circle cx="185" cy="140" r="12"></circle>
+            <circle cx="225" cy="140" r="12"></circle>
+          </g>
+          <circle cx="105" cy="60"  r="12" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="2"></circle>
+          <circle cx="185" cy="100" r="12" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="2"></circle>
+          <circle cx="145" cy="140" r="12" fill="var(--code-bg)" stroke="var(--kw)" stroke-width="2"></circle>
+          <text x="140" y="196" text-anchor="middle" fill="var(--kw)" font-size="9">sampled 20, 3 expired &mdash; below 10%? back off</text>
+
+          <path d="M260,105 L360,105" stroke="var(--rule)" stroke-width="1.4" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow10)"></path>
+
+          <rect x="370" y="60" width="300" height="90" rx="8" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.6"></rect>
+          <text x="520" y="88" text-anchor="middle" fill="var(--accent)" font-weight="700">serverCron, hz=10</text>
+          <text x="520" y="108" text-anchor="middle" fill="var(--ink-soft)" font-size="9">many expired in sample &rarr; sample again now</text>
+          <text x="520" y="126" text-anchor="middle" fill="var(--ink-soft)" font-size="9">few expired &rarr; wait for next scheduled tick</text>
+        </g>
+        <defs>
+          <marker id="arrow10" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--rule)"></path></marker>
+        </defs>
+      </svg>
+      <figcaption>
+        <strong>Approximate, adaptive, and cheap.</strong> The cycle never
+        scans the whole expires dictionary at once &mdash; it samples,
+        reacts to what it finds, and stops as soon as the evidence suggests
+        there's nothing urgent left to reclaim.
+      </figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch10-key-1">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Passive expiration guarantees correctness (an expired key is never
+        returned to a client, ever, even if the active cycle hasn't reached
+        it yet); active expiration is what actually reclaims the memory in
+        the background, cheaply, using sampling instead of an exhaustive
+        scan. Correctness and cleanup are solved by two different, narrowly
+        scoped mechanisms &mdash; not one mechanism trying to do both.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch10-h2-eviction">Eviction: When Memory Runs Out</h2>
+    <p data-anchor="ch10-p4">
+      Expiration is voluntary &mdash; keys you told Redis had a TTL.
+      <strong>Eviction</strong> is what happens when <code>maxmemory</code>
+      is set and the dataset grows past it, and it applies even to keys with
+      no TTL, depending on the configured <code>maxmemory-policy</code>
+      (<code>noeviction</code>, <code>allkeys-lru</code>,
+      <code>volatile-lru</code>, <code>allkeys-lfu</code>,
+      <code>volatile-lfu</code>, <code>allkeys-random</code>,
+      <code>volatile-random</code>, <code>volatile-ttl</code>). Redis doesn't
+      track a perfectly-ordered LRU or LFU list &mdash; that itself would be
+      bookkeeping overhead on every single access. Instead it
+      <strong>approximates</strong>:
+    </p>
+    <ul data-anchor="ch10-list-approx">
+      <li><strong>LRU</strong> is approximated with a 24-bit clock stored
+      directly in each object's <code>robj</code> header, updated on access.
+      When eviction is needed, Redis samples a small number of random keys
+      (<code>maxmemory-samples</code>, default 5) and evicts whichever
+      sampled key has the oldest clock value &mdash; not the single oldest
+      key in the whole dataset, just the oldest among a small random sample,
+      refined across calls by keeping a small pool of good eviction
+      candidates from previous rounds.</li>
+      <li><strong>LFU</strong> is approximated with a tiny probabilistic
+      counter (a <em>Morris counter</em>) packed into just a few bits per
+      object, which increments less and less often as it grows (so a
+      wildly popular key doesn't need an ever-larger counter) and decays
+      slowly over time so old popularity fades.</li>
+    </ul>
+
+    <div class="callout tip" data-anchor="ch10-tip-1">
+      <span class="co-tag">Pro Tip</span>
+      <p>
+        <code>OBJECT FREQ key</code> (with an LFU policy active) and
+        <code>OBJECT IDLETIME key</code> (with an LRU policy active) let you
+        read these approximated values directly &mdash; handy for
+        understanding why a specific key did or didn't get evicted.
+      </p>
+    </div>
+
+    <div class="callout warn" data-anchor="ch10-warn-1">
+      <span class="co-tag">Warning</span>
+      <p>
+        <code>noeviction</code> is the factory default: with no
+        <code>maxmemory-policy</code> configured for eviction, once
+        <code>maxmemory</code> is hit, Redis starts <strong>rejecting
+        writes</strong> with an OOM error rather than silently dropping data.
+        If you're using Redis as a pure cache, you almost certainly want an
+        explicit <code>allkeys-lru</code> or <code>allkeys-lfu</code> instead
+        &mdash; check this before you're surprised by write errors in
+        production.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch10-h2-cron">serverCron: Everything Else That Runs in the Background</h2>
+    <p data-anchor="ch10-p5">
+      Active expiration is just one of many jobs <code>serverCron</code>
+      handles &mdash; the single recurring time event this whole chapter has
+      been describing (and the same time event Chapter 2's reactor loop
+      showed alongside the client sockets). By default it fires <code>hz</code>
+      times per second (10, and <code>dynamic-hz yes</code> lets it speed up
+      automatically under load). In each tick it nudges forward every
+      background job that must never be allowed to run unbounded in one
+      shot: incremental dict rehashing (Chapter 6), the active expire cycle
+      above, AOF fsync scheduling (Chapter 8), replication pings and backlog
+      housekeeping (Chapter 9), client idle-timeout checks, and statistics
+      updates.
+    </p>
+
+    <div class="callout key" data-anchor="ch10-key-2">
+      <span class="co-tag">Key Idea</span>
+      <p>
+        Notice the pattern repeating across the whole chapter &mdash; and
+        really across the whole book: rehashing, expiration, and eviction are
+        three completely different problems that all get solved the same
+        way, in small time-boxed or randomly-sampled increments, driven from
+        the same recurring cron, specifically so none of them can ever cause
+        the one big pause Chapter 1 set out to avoid.
+      </p>
+    </div>
+
+    <p data-anchor="ch10-close-p1">
+      That repeating pattern is worth naming explicitly, and worth asking
+      where else it shows up. Before that, though: how do you actually watch
+      all of this happening in a live server, and how do you know
+      <em>why</em> Redis is fast rather than just taking it on faith? That's
+      next.
+    </p>
+
+    <p class="sources" data-anchor="ch10-sources">
+      <span class="src-tag">Further Reading</span>
+      <a href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">redis.io &mdash; Key eviction</a>
+      &middot;
+      <a href="https://deepwiki.com/redis/redis/4.1-eviction-and-expiration-policies" target="_blank" rel="noopener">DeepWiki &mdash; Eviction and Expiration Policies</a>
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="09-replication-and-clustering.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="11-why-redis-is-fast.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>

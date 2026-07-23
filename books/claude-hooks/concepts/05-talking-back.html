@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Talking Back — Claude Hooks</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">&#9741;</span> Claude Hooks</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow">Chapter 05 · Output</p>
+    <h1 data-anchor="ch5-title">Talking Back</h1>
+    <p class="lead" data-anchor="ch5-lead">A hook that only watches is a logger. A hook that
+    <em>decides</em> is a guardrail. There are two ways your script talks back to Claude Code — a
+    simple one and a rich one — and you should reach for the simple one first.</p>
+
+    <h2 data-anchor="ch5-simple-h">The simple channel: exit codes</h2>
+    <p data-anchor="ch5-simple-1">Your script’s exit code carries the whole decision for most jobs.
+    There are exactly three cases to remember:</p>
+
+    <table class="grid" data-anchor="ch5-exit-table">
+      <thead><tr><th>Exit code</th><th>Meaning</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="mono calm">0</td><td>success</td><td>proceed; if stdout is valid JSON, apply its decisions</td></tr>
+        <tr><td class="mono fire">2</td><td>blocking error</td><td>block the action; <strong>stderr</strong> is fed back as the reason</td></tr>
+        <tr><td class="mono">other</td><td>non-blocking error</td><td>show stderr; the action still happens</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch5-simple-2">That is the crux of the whole system: <strong>exit 2 blocks</strong>,
+    and whatever you wrote to <em>stderr</em> becomes the message Claude (or you) sees. Want to stop
+    a dangerous Bash command? Print why, then <code class="inl">exit 2</code>. Done.</p>
+
+    <pre class="code" data-anchor="ch5-block-script"><span class="cap">.claude/hooks/block-rm.sh — a PreToolUse guard</span><span class="cm">#!/usr/bin/env bash</span>
+<span class="ty">cmd</span>=$(<span class="fn">jq</span> -r <span class="str">'.tool_input.command'</span> &lt; /dev/stdin)
+
+<span class="kw">if</span> <span class="fn">grep</span> -qE <span class="str">'rm[[:space:]]+-rf'</span> &lt;&lt;&lt;<span class="str">"$cmd"</span>; <span class="kw">then</span>
+  <span class="fn">echo</span> <span class="str">"Blocked: refuse to run 'rm -rf' from the agent."</span> &gt;&amp;2
+  <span class="kw">exit</span> <span class="num">2</span>    <span class="cm"># ← blocks the tool call; stderr is the reason</span>
+<span class="kw">fi</span>
+<span class="kw">exit</span> <span class="num">0</span></pre>
+
+    <div class="callout warn" data-anchor="ch5-exit2-nuance">
+      <span class="tag">exit 2 doesn’t mean the same thing everywhere</span>
+      For most events, <code class="inl">exit 2</code> blocks. But its meaning is <em>per event</em>:
+      on <code class="inl">PostToolUse</code> the tool already ran, so 2 can only surface stderr to
+      Claude — it can’t un-edit the file. On <code class="inl">Stop</code>, 2 means the opposite of
+      “stop”: it keeps the agent working. Use the simulator below to feel the difference.
+    </div>
+
+    <div class="sim" data-sim="exit" data-event="PreToolUse" data-anchor="ch5-sim">
+      <div class="wtitle"><span class="dot"></span> Exit-code simulator · PreToolUse</div>
+      <div class="btnrow">
+        <button type="button" class="btn" data-exit="0">exit 0</button>
+        <button type="button" class="btn" data-exit="2">exit 2</button>
+        <button type="button" class="btn" data-exit="n">exit 1 (other)</button>
+      </div>
+      <div class="readout"></div>
+    </div>
+
+    <h2 data-anchor="ch5-rich-h">The rich channel: JSON on stdout</h2>
+    <p data-anchor="ch5-rich-1">Exit codes are blunt — block or don’t. When you need nuance (allow
+    <em>and</em> add a note; block <em>and</em> tell the user why; rewrite the command before it
+    runs), print a JSON object to <strong>stdout</strong> and <code class="inl">exit 0</code>.
+    Claude Code parses it and obeys.</p>
+
+    <p data-anchor="ch5-rich-2">A few fields are common to every event:</p>
+    <table class="grid" data-anchor="ch5-common-out">
+      <thead><tr><th>Field</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">continue</td><td><code>false</code> stops Claude entirely (wins over any decision below)</td></tr>
+        <tr><td class="mono">stopReason</td><td>message shown to you when <code>continue:false</code></td></tr>
+        <tr><td class="mono">systemMessage</td><td>a warning surfaced to the user</td></tr>
+        <tr><td class="mono">suppressOutput</td><td><code>true</code> hides stdout from the transcript</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch5-rich-3">The interesting control is <code class="inl">hookSpecificOutput</code>,
+    whose shape depends on the event. For <code class="inl">PreToolUse</code>, it carries a
+    <code class="inl">permissionDecision</code> — the cleanest way to allow, deny, or escalate:</p>
+
+    <pre class="code" data-anchor="ch5-pretool-json"><span class="cap">PreToolUse — allow / deny / ask via JSON</span>{
+  <span class="pk">"hookSpecificOutput"</span>: {
+    <span class="pk">"hookEventName"</span>: <span class="str">"PreToolUse"</span>,
+    <span class="pk">"permissionDecision"</span>: <span class="str">"deny"</span>,   <span class="cm">// allow · deny · ask · defer</span>
+    <span class="pk">"permissionDecisionReason"</span>: <span class="str">"writes outside the repo"</span>
+  }
+}</pre>
+
+    <table class="grid" data-anchor="ch5-perm-table">
+      <thead><tr><th>permissionDecision</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="mono calm">allow</td><td>run the tool, skipping the usual permission prompt</td></tr>
+        <tr><td class="mono fire">deny</td><td>block the tool call</td></tr>
+        <tr><td class="mono">ask</td><td>escalate to the user with a permission dialog</td></tr>
+        <tr><td class="mono">defer</td><td>fall through to the normal permission flow</td></tr>
+      </tbody>
+    </table>
+
+    <h3 data-anchor="ch5-inject-h">Injecting context (the sleeper feature)</h3>
+    <p data-anchor="ch5-inject-1">Several events let you add text straight into Claude’s context via
+    <code class="inl">additionalContext</code>. On <code class="inl">UserPromptSubmit</code> and
+    <code class="inl">SessionStart</code> this is gold: silently prepend the current git branch,
+    open tickets, or house rules to <em>every</em> prompt — no manual pasting.</p>
+
+    <pre class="code" data-anchor="ch5-inject-json"><span class="cap">UserPromptSubmit — add context, then let it proceed</span>{
+  <span class="pk">"hookSpecificOutput"</span>: {
+    <span class="pk">"hookEventName"</span>: <span class="str">"UserPromptSubmit"</span>,
+    <span class="pk">"additionalContext"</span>: <span class="str">"Branch: feat/auth · run mix test before finishing."</span>
+  }
+}</pre>
+
+    <div class="callout key" data-anchor="ch5-block-decision">
+      <span class="tag">Blocking with a reason, the JSON way</span>
+      Events like <code class="inl">Stop</code>, <code class="inl">UserPromptSubmit</code>, and
+      <code class="inl">PostToolUse</code> accept a top-level <code class="inl">{"decision":"block",
+      "reason":"…"}</code>. The <code class="inl">reason</code> is handed to Claude as its next
+      instruction — this is how a Stop hook says “tests failed, keep going and fix them.”
+    </div>
+
+    <div class="reflect" data-anchor="ch5-reflect">
+      <h4>So what did we actually gain?</h4>
+      <p>A voice. Our scripts can now allow, block, escalate, rewrite input, and quietly inject
+      context — the full vocabulary. Reach for <strong>exit codes</strong> when the answer is
+      yes/no, and <strong>JSON</strong> when you need to say <em>why</em> or say <em>more</em>.
+      With input (Ch. 04) and output (Ch. 05) in hand, we can build real guardrails.</p>
+    </div>
+
+    <div class="challenges" data-anchor="ch5-challenges">
+      <h4>Challenges</h4>
+      <ol>
+        <li>Switch the simulator’s <code class="inl">data-event</code> to <code class="inl">Stop</code> in your head: what does <code class="inl">exit 2</code> do there, and why is it the useful case?</li>
+        <li>Write the JSON a <code class="inl">PreToolUse</code> hook prints to <em>silently allow</em> a call while adding the note “reviewed by policy hook.”</li>
+      </ol>
+    </div>
+
+    <div class="sources" data-anchor="ch5-sources">
+      Source: Claude Code Hooks reference — code.claude.com/docs/en/hooks (exit-code semantics &amp; per-event table, common output fields, hookSpecificOutput, permissionDecision, decision/reason, additionalContext).
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-the-input-contract.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-matchers.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/hooks.js"></script>
+<script src="../assets/book.js"></script>
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  // From file:// (a pulled/copied book) the shelf index may not exist and the
+  // URL isn't shareable — hide the whole bar.
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      // Esc -> shelf. Defer to the BookBank app's WebView (it sets
+      // __bookbankNav) and to browser fullscreen, where Esc means "exit".
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}  // nothing useful to do
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        // Rejects on user-cancel (AbortError) and other failures — ignore both.
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+</body>
+</html>
