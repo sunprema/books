@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 &middot; How VS Code Uses Containers &mdash; Dev Containers for Real Teams</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="chalk-mark">&#10022;</span> Dev Containers for Real Teams</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="eyebrow" data-anchor="vscode-eyebrow">Chapter 02 &middot; Architecture</p>
+    <h1 data-anchor="vscode-h1">How VS Code Uses Containers</h1>
+    <div class="chalk-rule" aria-hidden="true"><svg viewBox="0 0 88 10" preserveAspectRatio="none"><path d="M2 6 Q12 2 22 6 T42 6 T62 6 T86 6" fill="none" stroke-width="2" stroke-linecap="round" stroke-dasharray="1 4.2" style="stroke:var(--accent)"/></svg></div>
+
+    <p class="lead" data-anchor="vscode-lead">VS Code doesn&rsquo;t just &ldquo;attach to a container.&rdquo; It installs a full server process inside the container, splits extensions between client and server, and proxies every file operation, terminal session, and debug connection through a structured protocol. Understanding this architecture explains most of the behavior you&rsquo;ll observe&mdash;and most of the bugs you&rsquo;ll hit.</p>
+
+    <!-- ===== SECTION 1 ===== -->
+    <h2 data-anchor="vscode-client-server">The Client-Server Split</h2>
+
+    <p>VS Code Remote (the umbrella that includes Dev Containers, Remote-SSH, and WSL) uses a <strong>client-server architecture</strong>. The desktop application you interact with is the <em class="term">client</em>. It handles UI rendering, theming, and keybindings&mdash;everything that touches pixels. The heavy lifting&mdash;language servers, file I/O, terminal processes, debugging&mdash;runs on the <em class="term">VS Code Server</em>, which lives <em>inside</em> the container.</p>
+
+<pre class="tab" data-anchor="vscode-server-path">
+<span class="cm"># Where VS Code installs its server inside the container</span>
+~/.vscode-server/
+  bin/
+    &lt;commit-hash&gt;/
+      node              <span class="cm"># bundled Node.js runtime</span>
+      bin/
+        code-server     <span class="cm"># the server binary</span>
+      extensions/       <span class="cm"># workspace extensions installed here</span>
+</pre>
+
+    <p>The client and server communicate over a <strong>JSON-RPC</strong> protocol, multiplexed over a single connection (a Unix socket when local, or a WebSocket/SSH tunnel when remote). This is not HTTP&mdash;it&rsquo;s a persistent, bidirectional channel.</p>
+
+    <div class="callout note">
+      <span class="tag">How this differs from Remote-SSH</span>
+      Remote-SSH installs the same VS Code Server on a remote host via SSH. Dev Containers does the same thing but targets a Docker container instead. The protocol, extension split, and server binary are identical. The only difference is the transport layer and how the environment is provisioned.
+    </div>
+
+    <!-- ===== SECTION 2 ===== -->
+    <h2 data-anchor="vscode-extensions">The Extension Host Split</h2>
+
+    <p>This is where most confusion lives. VS Code classifies every extension into one of two categories:</p>
+
+    <table class="grid" data-anchor="vscode-ext-table">
+      <thead>
+        <tr>
+          <th>Category</th>
+          <th>Runs where</th>
+          <th>Examples</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono">UI Extension</td>
+          <td>Client (your desktop)</td>
+          <td>Themes, icon packs, keymaps, some status-bar widgets</td>
+        </tr>
+        <tr>
+          <td class="mono">Workspace Extension</td>
+          <td>Server (inside container)</td>
+          <td>Language servers, linters, formatters, debuggers, Git</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>When you specify extensions in <code class="inl">devcontainer.json</code>, those extensions are installed <em>inside the container&rsquo;s</em> VS Code Server. They run against the container&rsquo;s file system and runtimes, which is exactly what you want&mdash;ESLint uses the container&rsquo;s Node, the Python extension uses the container&rsquo;s Python, the Go extension uses the container&rsquo;s Go toolchain.</p>
+
+<pre class="tab" data-anchor="vscode-ext-config">
+{
+  <span class="str">"customizations"</span>: {
+    <span class="str">"vscode"</span>: {
+      <span class="str">"extensions"</span>: [
+        <span class="str">"dbaeumer.vscode-eslint"</span>,      <span class="cm">// workspace ext &rarr; runs in container</span>
+        <span class="str">"esbenp.prettier-vscode"</span>,      <span class="cm">// workspace ext &rarr; runs in container</span>
+        <span class="str">"ms-python.python"</span>             <span class="cm">// workspace ext &rarr; runs in container</span>
+      ]
+    }
+  }
+}
+</pre>
+
+    <p class="voice">A common gotcha: you install a theme extension via <code class="inl">devcontainer.json</code>, rebuild the container, and it doesn&rsquo;t show up. That&rsquo;s because themes are UI extensions&mdash;they run on the client side. They should be installed locally, not in the container. The extension marketplace page tells you which kind it is, but the labeling is easy to miss.</p>
+
+    <div class="callout warn">
+      <span class="tag">Foot-gun</span>
+      Extensions that need native binaries (e.g., C++ compiler tools) must match the container&rsquo;s architecture. If your container runs <code class="inl">linux/arm64</code> but an extension only ships <code class="inl">linux/x64</code> binaries, it will silently fail to activate. Check the Output panel &rarr; &ldquo;Extension Host&rdquo; for clues.
+    </div>
+
+    <!-- ===== SECTION 3 ===== -->
+    <h2 data-anchor="vscode-lifecycle">The Dev Container Lifecycle</h2>
+
+    <p>When you open a folder with a <code class="inl">.devcontainer/</code> config, the Dev Containers extension executes a specific sequence. Knowing these steps helps you debug &ldquo;why is my container stuck?&rdquo; issues.</p>
+
+    <h3 data-anchor="vscode-lifecycle-steps">The Six-Step Startup</h3>
+
+    <ol>
+      <li><strong>Detect</strong> &mdash; the extension finds <code class="inl">.devcontainer/devcontainer.json</code> (or offers to create one)</li>
+      <li><strong>Build</strong> &mdash; runs <code class="inl">docker build</code> (or <code class="inl">docker compose build</code>) using your Dockerfile. Caches layers when possible</li>
+      <li><strong>Create</strong> &mdash; runs <code class="inl">docker run</code> (or <code class="inl">docker compose up</code>) with the arguments derived from <code class="inl">devcontainer.json</code>: mounts, ports, env vars, <code class="inl">runArgs</code></li>
+      <li><strong>Install Server</strong> &mdash; copies the VS Code Server binary + bundled Node into the running container</li>
+      <li><strong>Install Extensions</strong> &mdash; installs workspace extensions inside the container&rsquo;s server</li>
+      <li><strong>Connect</strong> &mdash; establishes the JSON-RPC channel and opens the remote window</li>
+    </ol>
+
+    <p>Lifecycle scripts fire at specific points within this sequence:</p>
+
+<pre class="tab" data-anchor="vscode-lifecycle-hooks">
+<span class="cm">// Execution order of lifecycle hooks</span>
+
+<span class="fn">initializeCommand</span>     <span class="cm">// runs on HOST before anything else</span>
+  &darr;
+<span class="fn">onCreateCommand</span>       <span class="cm">// runs IN CONTAINER on first create only</span>
+  &darr;
+<span class="fn">updateContentCommand</span>  <span class="cm">// runs when content changes (e.g., git pull in Codespaces)</span>
+  &darr;
+<span class="fn">postCreateCommand</span>    <span class="cm">// runs after create + content update (good for npm install)</span>
+  &darr;
+<span class="fn">postStartCommand</span>     <span class="cm">// runs every time container starts (including restart)</span>
+  &darr;
+<span class="fn">postAttachCommand</span>    <span class="cm">// runs every time VS Code attaches (including window reload)</span>
+</pre>
+
+    <div class="callout key">
+      <span class="tag">Production trade-off</span>
+      Put slow, one-time setup in <code class="inl">onCreateCommand</code> (dependency installs, database migrations). Put fast recurring setup in <code class="inl">postStartCommand</code> (starting background services). Put user-specific setup in <code class="inl">postAttachCommand</code> (shell customizations). Getting this wrong means either rebuilds take forever or you lose state on restart.
+    </div>
+
+    <!-- ===== DIAGRAM ===== -->
+    <figure class="chalk-fig" data-anchor="vscode-architecture-diagram">
+      <svg class="figure-svg" viewBox="0 0 720 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram showing VS Code client-server architecture with container">
+        <defs>
+          <marker id="arrAcc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+          </marker>
+          <marker id="arrFn" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8" fill="none" stroke="var(--fn)" stroke-width="1.5"/>
+          </marker>
+          <marker id="arrTy" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8" fill="none" stroke="var(--ty)" stroke-width="1.5"/>
+          </marker>
+        </defs>
+
+        <!-- CLIENT SIDE -->
+        <rect x="20" y="20" width="220" height="310" rx="12" fill="var(--panel-2)" stroke="var(--fn)" stroke-width="2"/>
+        <text x="80" y="48" font-family="var(--font-display)" font-size="14" fill="var(--fn)">VS Code Client</text>
+        <text x="45" y="70" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">runs on your desktop</text>
+
+        <!-- Client components -->
+        <rect x="40" y="88" width="180" height="32" rx="5" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="58" y="109" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">UI Rendering (Electron)</text>
+
+        <rect x="40" y="130" width="180" height="32" rx="5" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="58" y="151" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">UI Extensions (themes)</text>
+
+        <rect x="40" y="172" width="180" height="32" rx="5" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="58" y="193" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">Port Forwarding Proxy</text>
+
+        <rect x="40" y="214" width="180" height="32" rx="5" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="58" y="235" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">Keybindings / Menus</text>
+
+        <rect x="40" y="256" width="180" height="32" rx="5" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="58" y="277" font-family="var(--font-mono)" font-size="11" fill="var(--ink)">Dev Containers Ext.</text>
+
+        <!-- CONNECTION -->
+        <line x1="240" y1="160" x2="320" y2="160" stroke="var(--accent)" stroke-width="2.5" marker-end="url(#arrAcc)"/>
+        <line x1="320" y1="160" x2="240" y2="160" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 3"/>
+        <text x="250" y="148" font-family="var(--font-mono)" font-size="9" fill="var(--accent)">JSON-RPC</text>
+        <text x="250" y="178" font-family="var(--font-mono)" font-size="8" fill="var(--ink-soft)">stdio / socket</text>
+
+        <!-- CONTAINER SIDE -->
+        <rect x="320" y="10" width="380" height="330" rx="12" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="6 4"/>
+        <text x="340" y="38" font-family="var(--font-mono)" font-size="12" fill="var(--accent)">DOCKER CONTAINER</text>
+
+        <!-- VS Code Server -->
+        <rect x="340" y="55" width="200" height="180" rx="8" fill="var(--panel)" stroke="var(--kw)" stroke-width="1.5"/>
+        <text x="368" y="78" font-family="var(--font-display)" font-size="13" fill="var(--kw)">VS Code Server</text>
+
+        <rect x="355" y="92" width="170" height="26" rx="4" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="370" y="110" font-family="var(--font-mono)" font-size="10" fill="var(--ty)">Extension Host (workspace)</text>
+
+        <rect x="355" y="126" width="170" height="26" rx="4" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="370" y="144" font-family="var(--font-mono)" font-size="10" fill="var(--fn)">Language Servers</text>
+
+        <rect x="355" y="160" width="170" height="26" rx="4" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="370" y="178" font-family="var(--font-mono)" font-size="10" fill="var(--fn)">File System Watcher</text>
+
+        <rect x="355" y="194" width="170" height="26" rx="4" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="370" y="212" font-family="var(--font-mono)" font-size="10" fill="var(--fn)">Debug Adapter</text>
+
+        <!-- Terminal -->
+        <rect x="340" y="250" width="120" height="38" rx="6" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="358" y="274" font-family="var(--font-mono)" font-size="11" fill="var(--ty)">Terminal (pty)</text>
+
+        <!-- Workspace files -->
+        <rect x="560" y="55" width="120" height="70" rx="6" fill="var(--code-bg)" stroke="var(--str)" stroke-width="1.5"/>
+        <text x="575" y="78" font-family="var(--font-mono)" font-size="10" fill="var(--str)">/workspaces/</text>
+        <text x="575" y="96" font-family="var(--font-mono)" font-size="10" fill="var(--ink-soft)">my-project/</text>
+        <text x="583" y="114" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">src/ package.json</text>
+
+        <!-- Runtimes -->
+        <rect x="560" y="140" width="120" height="50" rx="6" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="575" y="162" font-family="var(--font-mono)" font-size="10" fill="var(--ty)">Runtimes</text>
+        <text x="575" y="180" font-family="var(--font-mono)" font-size="9" fill="var(--ink-soft)">node, python, go</text>
+
+        <!-- Port forwarding -->
+        <rect x="560" y="250" width="120" height="38" rx="6" fill="var(--code-bg)" stroke="var(--edge)" stroke-width="1"/>
+        <text x="575" y="274" font-family="var(--font-mono)" font-size="10" fill="var(--num)">:3000 :5432</text>
+
+        <!-- Arrows: server to files -->
+        <line x1="540" y1="90" x2="560" y2="90" stroke="var(--fn)" stroke-width="1.5" marker-end="url(#arrFn)"/>
+
+        <!-- Port forwarding arrow -->
+        <line x1="240" y1="228" x2="270" y2="228" stroke="var(--ty)" stroke-width="1"/>
+        <line x1="270" y1="228" x2="270" y2="305" stroke="var(--ty)" stroke-width="1"/>
+        <line x1="270" y1="305" x2="555" y2="305" stroke="var(--ty)" stroke-width="1"/>
+        <line x1="555" y1="305" x2="555" y2="270" stroke="var(--ty)" stroke-width="1" marker-end="url(#arrTy)"/>
+        <text x="350" y="320" font-family="var(--font-mono)" font-size="9" fill="var(--ty)">port forwarding (localhost:3000 &rarr; container:3000)</text>
+      </svg>
+      <figcaption>The VS Code client runs on your desktop. A full server process runs inside the container, hosting workspace extensions, language servers, and terminals. Ports are forwarded transparently to localhost.</figcaption>
+    </figure>
+
+    <!-- ===== SECTION 4 ===== -->
+    <h2 data-anchor="vscode-ports-rebuilds">Port Forwarding and Container Rebuilds</h2>
+
+    <h3 data-anchor="vscode-port-forwarding">How Port Forwarding Works</h3>
+
+    <p>When a process inside the container listens on a port, VS Code can automatically detect it and forward it to <code class="inl">localhost</code> on the host. This happens through the VS Code Server, not through Docker&rsquo;s <code class="inl">-p</code> flag.</p>
+
+<pre class="tab" data-anchor="vscode-port-config">
+{
+  <span class="cm">// Explicitly forward ports</span>
+  <span class="str">"forwardPorts"</span>: [<span class="num">3000</span>, <span class="num">5432</span>],
+
+  <span class="cm">// Control auto-detection</span>
+  <span class="str">"otherPortsAttributes"</span>: {
+    <span class="str">"onAutoForward"</span>: <span class="str">"silent"</span>    <span class="cm">// "notify" | "openBrowser" | "silent" | "ignore"</span>
+  },
+
+  <span class="cm">// Per-port labels and visibility</span>
+  <span class="str">"portsAttributes"</span>: {
+    <span class="str">"3000"</span>: { <span class="str">"label"</span>: <span class="str">"Frontend"</span>, <span class="str">"onAutoForward"</span>: <span class="str">"openBrowser"</span> },
+    <span class="str">"5432"</span>: { <span class="str">"label"</span>: <span class="str">"Postgres"</span>, <span class="str">"onAutoForward"</span>: <span class="str">"silent"</span> }
+  }
+}
+</pre>
+
+    <p class="voice">The port forwarding is more intelligent than Docker&rsquo;s <code class="inl">-p</code>. It detects new listeners dynamically&mdash;you start a dev server, and VS Code offers to open the browser. This works because the server inside the container monitors <code class="inl">/proc/net/tcp</code> and reports new listeners back to the client.</p>
+
+    <h3 data-anchor="vscode-rebuilds">How Rebuilds Work</h3>
+
+    <p>When you change <code class="inl">devcontainer.json</code> or the Dockerfile, you need to rebuild. VS Code offers two commands:</p>
+
+    <table class="grid" data-anchor="vscode-rebuild-table">
+      <thead>
+        <tr>
+          <th>Command</th>
+          <th>What it does</th>
+          <th>When to use</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono">Rebuild Container</td>
+          <td>Rebuilds the image and recreates the container. Runs <code class="inl">onCreateCommand</code> + <code class="inl">postCreateCommand</code> again</td>
+          <td>Dockerfile or Feature changes</td>
+        </tr>
+        <tr>
+          <td class="mono">Rebuild Without Cache</td>
+          <td>Same as above but passes <code class="inl">--no-cache</code> to Docker. Full clean build</td>
+          <td>Debugging broken layers or stale caches</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn">
+      <span class="tag">Gotcha</span>
+      A rebuild <strong>destroys the container</strong>. Anything stored outside of mounted volumes is lost&mdash;including <code class="inl">apt install</code> packages you ran manually in the terminal, pip packages installed outside a requirements file, and any files written outside the workspace mount. If you need something to survive a rebuild, it must be in the Dockerfile, a Feature, or a lifecycle script.
+    </div>
+
+    <div class="callout note">
+      <span class="tag">Container persistence</span>
+      Between rebuilds, the container <em>persists</em>. Closing VS Code does not destroy it&mdash;it stops the container, and reopening reconnects to the same instance. Only an explicit rebuild, or <code class="inl">docker rm</code>, destroys it. Named volumes and bind mounts survive rebuilds because they live outside the container filesystem.
+    </div>
+
+    <div class="matters" data-anchor="vscode-matters">
+      <h4>Why this matters</h4>
+      <p>Every debugging session with Dev Containers eventually comes down to understanding this architecture. &ldquo;Why can&rsquo;t my extension find Python?&rdquo;&mdash;because it&rsquo;s a workspace extension running inside the container, and Python isn&rsquo;t installed there. &ldquo;Why did my terminal history vanish?&rdquo;&mdash;because you rebuilt the container without a persistent volume for shell history. &ldquo;Why is port 3000 not reachable?&rdquo;&mdash;because the process is binding to <code class="inl">127.0.0.1</code> inside the container, and you need <code class="inl">0.0.0.0</code>. The architecture is not complex, but it is unfamiliar, and most issues trace back to forgetting which side of the client-server boundary you&rsquo;re on.</p>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-introduction-to-dev-containers.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-first-dev-container-project.html">Next &#8250;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
