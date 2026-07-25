@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 &middot; Data Channels: Beyond Media &mdash; WebRTC</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html"><span class="tile"></span>WEBRTC</a>
+  <span class="bb-chapter">08 &middot; Data Channels: Beyond Media</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker">Chapter 08</span>
+    <h1>Data Channels: <span class="hl">Beyond Media</span></h1>
+
+    <p class="lede">WebRTC is famous for audio and video, but its most versatile feature hides in plain sight. <code>RTCDataChannel</code> lets two peers exchange arbitrary data&mdash;text, binary blobs, structured messages&mdash;over the same encrypted peer-to-peer connection that carries media. No intermediary server. No extra ports. Just a bidirectional pipe with delivery guarantees you control down to the packet level.</p>
+
+    <div class="callout key">
+      <span class="co-tag">Key Insight</span>
+      <p>Data channels turn every WebRTC peer connection into a general-purpose networking primitive. Once signaling establishes the connection and DTLS secures it, you can open dozens of independent data channels on a single <code>RTCPeerConnection</code>&mdash;each with its own reliability semantics, ordering guarantees, and label. Think of them as named, multiplexed streams riding on top of an already-encrypted tunnel. A video call can carry chat messages, file transfers, and cursor-position updates simultaneously, each on its own channel with its own trade-offs.</p>
+    </div>
+
+    <h2>The SCTP Transport Layer</h2>
+
+    <p>Underneath every data channel sits <span class="proto green">SCTP</span> (Stream Control Transmission Protocol), wrapped in <span class="proto teal">DTLS</span> for encryption, riding on <span class="proto blue">UDP</span>. This layering is deliberate. SCTP was designed in the telecom world for exactly the kind of flexibility WebRTC needs: multiple independent streams within a single association, configurable reliability per stream, and message-oriented framing rather than the byte-stream model of TCP.</p>
+
+    <p>The browser handles the full SCTP stack internally. You never touch SCTP packets directly. But understanding the transport explains why data channels behave the way they do&mdash;why you can mix ordered and unordered channels on the same connection, why message boundaries are preserved, and why partial reliability is a first-class option rather than an afterthought.</p>
+
+    <div class="callout note">
+      <span class="co-tag">Note</span>
+      <p>Unlike TCP, which delivers a continuous byte stream, SCTP is <strong>message-oriented</strong>. When you send a 4 KB message on a data channel, the receiver gets exactly one <code>message</code> event with exactly 4 KB of data&mdash;not a fragment, not two merged messages. This framing guarantee eliminates the need for application-level length-prefixing or delimiter parsing that plagues raw TCP and WebSocket designs. Each <code>send()</code> call maps to one <code>message</code> event on the other side, regardless of the underlying packet fragmentation.</p>
+    </div>
+
+    <h2>Creating a Data Channel</h2>
+
+    <p>Opening a data channel is a single method call on an existing <code>RTCPeerConnection</code>. The first argument is a human-readable label; the second is an options object that controls delivery semantics.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="k">const</span> pc = <span class="k">new</span> <span class="t">RTCPeerConnection</span>(config);
+
+<span class="c">// Create a reliable, ordered channel (the default)</span>
+<span class="k">const</span> chat = pc.<span class="f">createDataChannel</span>(<span class="s">'chat'</span>);
+
+<span class="c">// Create an unreliable, unordered channel for game state</span>
+<span class="k">const</span> gameState = pc.<span class="f">createDataChannel</span>(<span class="s">'game-state'</span>, {
+  <span class="s">ordered</span>: <span class="k">false</span>,
+  <span class="s">maxRetransmits</span>: <span class="n">0</span>
+});
+
+<span class="c">// Create a partially reliable channel with a time limit</span>
+<span class="k">const</span> telemetry = pc.<span class="f">createDataChannel</span>(<span class="s">'telemetry'</span>, {
+  <span class="s">ordered</span>: <span class="k">true</span>,
+  <span class="s">maxPacketLifeTime</span>: <span class="n">1000</span>  <span class="c">// abandon after 1 second</span>
+});</pre>
+
+    <h3>Channel Options in Detail</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Option</th>
+          <th>Type</th>
+          <th>Default</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ordered</code></td>
+          <td><code>boolean</code></td>
+          <td><code>true</code></td>
+          <td>Whether messages arrive in the order they were sent. Setting to <code>false</code> allows faster delivery when a packet is lost&mdash;subsequent messages are not held back.</td>
+        </tr>
+        <tr>
+          <td><code>maxRetransmits</code></td>
+          <td><code>number</code></td>
+          <td>(unlimited)</td>
+          <td>Maximum number of times to retransmit a lost message before giving up. Setting to <code>0</code> means fire-and-forget&mdash;no retransmissions at all.</td>
+        </tr>
+        <tr>
+          <td><code>maxPacketLifeTime</code></td>
+          <td><code>number</code></td>
+          <td>(unlimited)</td>
+          <td>Maximum milliseconds a message can spend waiting for acknowledgment before it is abandoned. Useful for time-sensitive data that becomes stale.</td>
+        </tr>
+        <tr>
+          <td><code>protocol</code></td>
+          <td><code>string</code></td>
+          <td><code>""</code></td>
+          <td>A subprotocol name (like WebSocket subprotocols). Purely informational&mdash;the browser does not enforce it, but both peers can read it for dispatching.</td>
+        </tr>
+        <tr>
+          <td><code>negotiated</code></td>
+          <td><code>boolean</code></td>
+          <td><code>false</code></td>
+          <td>If <code>true</code>, both peers must create the channel with the same <code>id</code> independently&mdash;no in-band negotiation occurs. Avoids an extra SDP renegotiation round.</td>
+        </tr>
+        <tr>
+          <td><code>id</code></td>
+          <td><code>number</code></td>
+          <td>(auto)</td>
+          <td>The SCTP stream identifier. Required when <code>negotiated</code> is <code>true</code>. Must match on both peers.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>You cannot set both <code>maxRetransmits</code> and <code>maxPacketLifeTime</code> on the same channel. They are mutually exclusive strategies for partial reliability. Specifying both throws a <code>TypeError</code>.</p>
+
+    <h2>Ordered vs. Unordered Delivery</h2>
+
+    <p>The <code>ordered</code> flag controls head-of-line blocking behavior. When <code>ordered</code> is <code>true</code> (the default), SCTP holds back later messages until any earlier lost message has been retransmitted and delivered. This guarantees FIFO order but introduces latency spikes when packets drop. When <code>ordered</code> is <code>false</code>, each message is delivered as soon as it arrives, regardless of sequence gaps. This is ideal for data where the latest value matters more than the complete history&mdash;mouse positions, player coordinates, sensor readings.</p>
+
+    <h2>Reliable vs. Unreliable Modes</h2>
+
+    <p>By default, data channels are fully reliable: every message is retransmitted until the other peer acknowledges it, just like TCP. But unlike TCP, SCTP lets you dial reliability down on a per-channel basis. Setting <code>maxRetransmits: 0</code> creates a fire-and-forget channel that behaves like UDP with encryption. Setting <code>maxRetransmits: 3</code> allows up to three retransmission attempts before giving up. Setting <code>maxPacketLifeTime: 500</code> retransmits for at most half a second. The channel stays open regardless&mdash;only individual messages are abandoned.</p>
+
+    <p>This spectrum between full reliability and best-effort delivery is what makes data channels powerful. A chat application needs every message delivered. A multiplayer game sending 60 position updates per second does not care about a dropped frame from 100 milliseconds ago&mdash;the next update already supersedes it.</p>
+
+    <h2>Data Channel Events</h2>
+
+    <p>A data channel fires five events over its lifecycle. Understanding when each fires is essential for building robust applications.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="k">const</span> channel = pc.<span class="f">createDataChannel</span>(<span class="s">'demo'</span>);
+
+<span class="c">// Fires when the SCTP association is established</span>
+channel.<span class="f">onopen</span> = () =&gt; {
+  console.<span class="f">log</span>(<span class="s">'Channel open, readyState:'</span>, channel.readyState);
+  channel.<span class="f">send</span>(<span class="s">'Hello from this peer!'</span>);
+};
+
+<span class="c">// Fires for each incoming message</span>
+channel.<span class="f">onmessage</span> = (event) =&gt; {
+  console.<span class="f">log</span>(<span class="s">'Received:'</span>, event.data);
+  <span class="c">// event.data is a string, ArrayBuffer, or Blob</span>
+};
+
+<span class="c">// Fires when the channel is closing or closed</span>
+channel.<span class="f">onclose</span> = () =&gt; {
+  console.<span class="f">log</span>(<span class="s">'Channel closed'</span>);
+};
+
+<span class="c">// Fires on transport-level errors</span>
+channel.<span class="f">onerror</span> = (err) =&gt; {
+  console.<span class="f">error</span>(<span class="s">'Channel error:'</span>, err);
+};
+
+<span class="c">// Fires when bufferedAmount drops below bufferedAmountLowThreshold</span>
+channel.<span class="s">bufferedAmountLowThreshold</span> = <span class="n">65536</span>;  <span class="c">// 64 KB</span>
+channel.<span class="f">onbufferedamountlow</span> = () =&gt; {
+  console.<span class="f">log</span>(<span class="s">'Buffer drained, safe to send more'</span>);
+};</pre>
+
+    <p>The remote peer receives incoming channels through the <code>ondatachannel</code> event on the <code>RTCPeerConnection</code> itself:</p>
+
+    <pre class="code" data-lang="JavaScript">pc.<span class="f">ondatachannel</span> = (event) =&gt; {
+  <span class="k">const</span> channel = event.channel;
+  console.<span class="f">log</span>(<span class="s">'Incoming channel:'</span>, channel.label);
+
+  channel.<span class="f">onmessage</span> = (e) =&gt; {
+    <span class="c">// Handle messages on this channel</span>
+  };
+};</pre>
+
+    <h2>Binary Data: ArrayBuffer and Blob</h2>
+
+    <p>Data channels are not limited to text. The <code>send()</code> method accepts four types: <code>string</code>, <code>ArrayBuffer</code>, <code>ArrayBufferView</code> (typed arrays like <code>Uint8Array</code>), and <code>Blob</code>. The <code>binaryType</code> property on the channel controls whether incoming binary data arrives as an <code>ArrayBuffer</code> (the default) or a <code>Blob</code>.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="c">// Send binary data</span>
+<span class="k">const</span> buffer = <span class="k">new</span> <span class="t">ArrayBuffer</span>(<span class="n">256</span>);
+<span class="k">const</span> view = <span class="k">new</span> <span class="t">Uint8Array</span>(buffer);
+view.<span class="f">fill</span>(<span class="n">42</span>);
+channel.<span class="f">send</span>(buffer);
+
+<span class="c">// Receive as ArrayBuffer (default)</span>
+channel.<span class="s">binaryType</span> = <span class="s">'arraybuffer'</span>;
+channel.<span class="f">onmessage</span> = (event) =&gt; {
+  <span class="k">if</span> (event.data <span class="k">instanceof</span> <span class="t">ArrayBuffer</span>) {
+    <span class="k">const</span> bytes = <span class="k">new</span> <span class="t">Uint8Array</span>(event.data);
+    console.<span class="f">log</span>(<span class="s">'Binary payload:'</span>, bytes.length, <span class="s">'bytes'</span>);
+  }
+};</pre>
+
+    <h2>Example: Peer-to-Peer Chat</h2>
+
+    <p>The simplest useful data channel application is text chat. Two peers open a reliable, ordered channel and exchange JSON-serialized messages. The signaling setup is identical to previous chapters&mdash;only the media-handling code is replaced with data channel logic.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">// Complete peer-to-peer chat over a data channel</span>
+
+<span class="k">const</span> pc = <span class="k">new</span> <span class="t">RTCPeerConnection</span>({
+  <span class="s">iceServers</span>: [{ <span class="s">urls</span>: <span class="s">'stun:stun.l.google.com:19302'</span> }]
+});
+
+<span class="c">// Negotiated channel &mdash; both peers create independently</span>
+<span class="k">const</span> chat = pc.<span class="f">createDataChannel</span>(<span class="s">'chat'</span>, {
+  <span class="s">negotiated</span>: <span class="k">true</span>,
+  <span class="s">id</span>: <span class="n">0</span>
+});
+
+<span class="c">// Message history for the UI</span>
+<span class="k">const</span> messages = [];
+
+chat.<span class="f">onopen</span> = () =&gt; {
+  console.<span class="f">log</span>(<span class="s">'Chat channel open'</span>);
+  <span class="f">enableSendButton</span>();
+};
+
+chat.<span class="f">onmessage</span> = (event) =&gt; {
+  <span class="k">const</span> msg = <span class="t">JSON</span>.<span class="f">parse</span>(event.data);
+  messages.<span class="f">push</span>({
+    <span class="s">sender</span>: <span class="s">'remote'</span>,
+    <span class="s">text</span>: msg.text,
+    <span class="s">timestamp</span>: msg.timestamp
+  });
+  <span class="f">renderMessages</span>(messages);
+};
+
+<span class="k">function</span> <span class="f">sendMessage</span>(text) {
+  <span class="k">const</span> msg = {
+    <span class="s">text</span>: text,
+    <span class="s">timestamp</span>: <span class="t">Date</span>.<span class="f">now</span>()
+  };
+  chat.<span class="f">send</span>(<span class="t">JSON</span>.<span class="f">stringify</span>(msg));
+  messages.<span class="f">push</span>({ <span class="s">sender</span>: <span class="s">'local'</span>, ...msg });
+  <span class="f">renderMessages</span>(messages);
+}
+
+chat.<span class="f">onclose</span> = () =&gt; {
+  console.<span class="f">log</span>(<span class="s">'Chat channel closed'</span>);
+  <span class="f">disableSendButton</span>();
+};</pre>
+
+    <p>This example uses a <em>negotiated</em> channel (<code>negotiated: true, id: 0</code>), meaning both peers create the channel with the same ID independently. No SDP renegotiation is triggered&mdash;useful when you want data channels ready before the connection fully establishes, or when you want to avoid an extra offer/answer round.</p>
+
+    <h2>Example: File Transfer with Flow Control</h2>
+
+    <p>File transfer pushes data channels harder than chat. Files can be megabytes or gigabytes, and sending them in a tight loop will overflow the SCTP send buffer. The <code>bufferedAmount</code> property and the <code>bufferedamountlow</code> event provide the backpressure mechanism you need.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">// Chunked file transfer with backpressure</span>
+
+<span class="k">const</span> CHUNK_SIZE = <span class="n">16384</span>;  <span class="c">// 16 KB per chunk</span>
+<span class="k">const</span> MAX_BUFFER = <span class="n">1048576</span>;  <span class="c">// Pause at 1 MB buffered</span>
+
+<span class="k">const</span> fileChannel = pc.<span class="f">createDataChannel</span>(<span class="s">'file-transfer'</span>, {
+  <span class="s">negotiated</span>: <span class="k">true</span>,
+  <span class="s">id</span>: <span class="n">1</span>
+});
+fileChannel.<span class="s">binaryType</span> = <span class="s">'arraybuffer'</span>;
+fileChannel.<span class="s">bufferedAmountLowThreshold</span> = <span class="n">65536</span>;  <span class="c">// 64 KB</span>
+
+<span class="k">async function</span> <span class="f">sendFile</span>(file) {
+  <span class="c">// Send metadata first</span>
+  fileChannel.<span class="f">send</span>(<span class="t">JSON</span>.<span class="f">stringify</span>({
+    <span class="s">type</span>: <span class="s">'file-meta'</span>,
+    <span class="s">name</span>: file.name,
+    <span class="s">size</span>: file.size,
+    <span class="s">mimeType</span>: file.type
+  }));
+
+  <span class="k">const</span> reader = file.<span class="f">stream</span>().<span class="f">getReader</span>();
+  <span class="k">let</span> offset = <span class="n">0</span>;
+
+  <span class="k">while</span> (<span class="k">true</span>) {
+    <span class="k">const</span> { done, value } = <span class="k">await</span> reader.<span class="f">read</span>();
+    <span class="k">if</span> (done) <span class="k">break</span>;
+
+    <span class="c">// Split ReadableStream chunks into CHUNK_SIZE pieces</span>
+    <span class="k">for</span> (<span class="k">let</span> i = <span class="n">0</span>; i &lt; value.byteLength; i += CHUNK_SIZE) {
+      <span class="k">const</span> chunk = value.<span class="f">slice</span>(i, i + CHUNK_SIZE);
+
+      <span class="c">// Backpressure: wait if buffer is too full</span>
+      <span class="k">if</span> (fileChannel.bufferedAmount &gt; MAX_BUFFER) {
+        <span class="k">await</span> <span class="k">new</span> <span class="t">Promise</span>((resolve) =&gt; {
+          fileChannel.<span class="f">onbufferedamountlow</span> = resolve;
+        });
+      }
+
+      fileChannel.<span class="f">send</span>(chunk);
+      offset += chunk.byteLength;
+      <span class="f">updateProgress</span>(offset / file.size);
+    }
+  }
+
+  <span class="c">// Signal completion</span>
+  fileChannel.<span class="f">send</span>(<span class="t">JSON</span>.<span class="f">stringify</span>({ <span class="s">type</span>: <span class="s">'file-complete'</span> }));
+}</pre>
+
+    <p>The receiver reassembles chunks into a <code>Blob</code> and triggers a download. The key insight is that the sender monitors <code>bufferedAmount</code> and pauses when the outgoing buffer exceeds a threshold. Without this backpressure, you will overwhelm the SCTP association and the browser will either stall or throw.</p>
+
+    <h2>Flow Control: bufferedAmount Monitoring</h2>
+
+    <p>The <code>bufferedAmount</code> property reports how many bytes of data are currently queued in the outgoing SCTP buffer, waiting to be sent over the network. Unlike WebSocket, where you can only check this value by polling, data channels provide the <code>bufferedamountlow</code> event for efficient notification.</p>
+
+    <p>The pattern is straightforward. Set <code>bufferedAmountLowThreshold</code> to your desired low-water mark. When <code>bufferedAmount</code> drops below that threshold, the <code>bufferedamountlow</code> event fires. Use this to resume sending after a backpressure pause. This avoids both busy-waiting (polling <code>bufferedAmount</code> in a tight loop) and buffer overflows (sending without checking).</p>
+
+    <p>A well-tuned flow control setup balances throughput and responsiveness. Too-small chunks waste CPU on framing overhead. Too-large chunks increase latency for other channels sharing the same connection. For file transfers, 16 KB chunks with a 1 MB high-water mark and a 64 KB low-water mark is a reasonable starting point. For real-time data, smaller chunks (1&ndash;4 KB) and tighter thresholds keep latency low.</p>
+
+    <h2>DataChannel vs. WebSocket</h2>
+
+    <p>Data channels and WebSockets both provide bidirectional message passing, but they solve fundamentally different problems. The following table maps the distinctions that matter in practice.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Dimension</th>
+          <th>RTCDataChannel</th>
+          <th>WebSocket</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Topology</td>
+          <td>Peer-to-peer (direct between browsers)</td>
+          <td>Client-to-server (always via a relay)</td>
+        </tr>
+        <tr>
+          <td>Transport</td>
+          <td><span class="proto green">SCTP</span> over <span class="proto teal">DTLS</span> over <span class="proto blue">UDP</span></td>
+          <td><span class="proto teal">TCP</span> (optionally over TLS)</td>
+        </tr>
+        <tr>
+          <td>Encryption</td>
+          <td>Mandatory (DTLS, always on)</td>
+          <td>Optional (WSS vs. WS)</td>
+        </tr>
+        <tr>
+          <td>Reliability</td>
+          <td>Configurable: fully reliable, partially reliable, or unreliable</td>
+          <td>Always fully reliable (TCP guarantees)</td>
+        </tr>
+        <tr>
+          <td>Ordering</td>
+          <td>Configurable per channel</td>
+          <td>Always ordered (TCP stream)</td>
+        </tr>
+        <tr>
+          <td>Framing</td>
+          <td>Message-oriented (SCTP preserves boundaries)</td>
+          <td>Message-oriented (WebSocket frames)</td>
+        </tr>
+        <tr>
+          <td>Latency</td>
+          <td>Lower (no server hop, UDP-based, no head-of-line blocking when unordered)</td>
+          <td>Higher (server round-trip, TCP head-of-line blocking)</td>
+        </tr>
+        <tr>
+          <td>Setup Complexity</td>
+          <td>High (requires signaling, ICE, DTLS handshake)</td>
+          <td>Low (single HTTP upgrade)</td>
+        </tr>
+        <tr>
+          <td>Server Cost</td>
+          <td>None after connection (peer-to-peer)</td>
+          <td>Server relays all traffic</td>
+        </tr>
+        <tr>
+          <td>NAT Traversal</td>
+          <td>Built-in (ICE, STUN, TURN)</td>
+          <td>Not applicable (server has a public address)</td>
+        </tr>
+        <tr>
+          <td>Multiple Streams</td>
+          <td>Many independent channels on one connection</td>
+          <td>One bidirectional stream per connection</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Choose WebSocket when you need a server in the data path&mdash;for persistence, fan-out to many clients, or server-side processing. Choose data channels when latency matters, when you want to avoid server bandwidth costs, or when you need configurable reliability. Many production applications use both: WebSocket for signaling and server communication, data channels for peer-to-peer data exchange after the connection is established.</p>
+
+    <h2>Use Cases</h2>
+
+    <p>Data channels unlock a range of applications that go far beyond what audio and video alone can do. Each use case maps naturally to specific channel configuration choices.</p>
+
+    <div class="tilegrid">
+      <div class="tile-card">
+        <h3>Text Chat</h3>
+        <p>Reliable, ordered channels carrying JSON-serialized messages. Zero server bandwidth after signaling. End-to-end encrypted by default. Add typing indicators, read receipts, and message history as application-layer features on top of the channel.</p>
+      </div>
+      <div class="tile-card">
+        <h3>File Transfer</h3>
+        <p>Reliable channels with flow control via <code>bufferedAmount</code> monitoring. Files are chunked into 16 KB pieces and reassembled on the receiving end. Progress tracking, pause/resume, and multi-file queuing are all application concerns. No file-size limits beyond available memory.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Game State Sync</h3>
+        <p>Unreliable, unordered channels for position updates and physics state (<code>maxRetransmits: 0</code>). Reliable channels for critical events like score changes and game-over signals. Two channels, two reliability profiles, one connection.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Remote Control</h3>
+        <p>Mouse movements and keyboard events streamed over unreliable channels for minimum latency. Command acknowledgments on a separate reliable channel. Combined with a video track of the remote screen, this builds a full remote desktop experience in the browser.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Collaborative Editing</h3>
+        <p>Operational transforms or CRDTs transmitted over reliable, ordered channels. Every edit must arrive in sequence to maintain document consistency. Data channels eliminate the server round-trip that adds latency to keystroke-by-keystroke collaboration.</p>
+      </div>
+      <div class="tile-card">
+        <h3>IoT Sensor Streams</h3>
+        <p>Partially reliable channels (<code>maxPacketLifeTime: 500</code>) for sensor telemetry where stale readings are worthless. Combined with a signaling server that authenticates devices, data channels provide encrypted, low-latency device-to-dashboard pipelines without a message broker.</p>
+      </div>
+    </div>
+
+    <h2>Negotiated vs. In-Band Channels</h2>
+
+    <p>By default, when one peer calls <code>createDataChannel()</code>, the browser triggers an SDP renegotiation to inform the remote peer about the new channel. The remote peer receives the channel via the <code>ondatachannel</code> event. This is <em>in-band</em> negotiation&mdash;convenient but it costs an offer/answer exchange.</p>
+
+    <p>The alternative is <em>negotiated</em> channels (<code>negotiated: true</code>). Both peers call <code>createDataChannel()</code> independently with the same <code>id</code>. No renegotiation occurs because both sides already know about the channel. This is faster and simpler when both peers run the same application code&mdash;which is the common case in symmetric architectures like gaming or collaboration tools.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="c">// Both peers run this identical code</span>
+<span class="k">const</span> control = pc.<span class="f">createDataChannel</span>(<span class="s">'control'</span>, {
+  <span class="s">negotiated</span>: <span class="k">true</span>,
+  <span class="s">id</span>: <span class="n">10</span>,
+  <span class="s">protocol</span>: <span class="s">'json-rpc'</span>
+});
+
+<span class="k">const</span> bulk = pc.<span class="f">createDataChannel</span>(<span class="s">'bulk'</span>, {
+  <span class="s">negotiated</span>: <span class="k">true</span>,
+  <span class="s">id</span>: <span class="n">11</span>,
+  <span class="s">ordered</span>: <span class="k">false</span>,
+  <span class="s">maxRetransmits</span>: <span class="n">2</span>
+});</pre>
+
+    <div class="callout warn">
+      <span class="co-tag">Warning</span>
+      <p>When using negotiated channels, both peers must agree on the <code>id</code> before the connection is established. If one peer uses <code>id: 5</code> and the other uses <code>id: 6</code>, you get two separate, disconnected channels. There is no error&mdash;just silence. Hard-code the IDs in shared application code, or exchange them via your signaling channel before the peer connection is created.</p>
+    </div>
+
+    <h2>Practical Limits and Browser Behavior</h2>
+
+    <p>The WebRTC specification does not mandate a maximum number of simultaneous data channels, but browsers impose practical limits. Chrome and Firefox support hundreds of concurrent channels on a single peer connection. The SCTP association has a 65,535-stream ceiling, but you will hit memory or CPU limits long before that. In practice, 10&ndash;50 channels covers every realistic use case.</p>
+
+    <p>Maximum message size varies by browser. Chrome supports messages up to 256 KB by default. Firefox handles messages up to 1 GB by fragmenting them internally via the EOR (End of Record) SCTP extension. For portable code, keep individual messages under 64 KB and implement your own chunking for larger payloads&mdash;as shown in the file transfer example above.</p>
+
+    <h2>Putting It All Together</h2>
+
+    <p>Data channels transform WebRTC from a media-streaming protocol into a general-purpose, peer-to-peer networking layer. The SCTP transport gives you message framing for free. The configurable reliability model lets you pick the exact trade-off between latency and delivery guarantees that your application demands. Flow control via <code>bufferedAmount</code> prevents you from overwhelming the transport. And the entire data path is encrypted by DTLS, with no server in the loop to eavesdrop.</p>
+
+    <p>The combination of media tracks and data channels on a single peer connection is what makes WebRTC uniquely powerful. A video call with a chat sidebar, a screen-sharing session with remote keyboard input, a multiplayer game with voice chat and position sync&mdash;all of these are one <code>RTCPeerConnection</code> with the right mix of tracks and channels. In the next chapter, we examine the security architecture that makes all of this safe: DTLS, SRTP, and the trust model that protects both media and data from interception.</p>
+
+    <div class="sources">
+      <span class="src-tag">Sources</span>
+      <ol>
+        <li>Jesup, R., Loreto, S., and Tuexen, M. &ldquo;WebRTC Data Channels,&rdquo; <em>RFC 8831</em>, IETF, January 2021.</li>
+        <li>Jesup, R., Loreto, S., and Tuexen, M. &ldquo;WebRTC Data Channel Establishment Protocol,&rdquo; <em>RFC 8832</em>, IETF, January 2021.</li>
+        <li>Stewart, R. &ldquo;Stream Control Transmission Protocol,&rdquo; <em>RFC 4960</em>, IETF, September 2007.</li>
+        <li>W3C. &ldquo;WebRTC 1.0: Real-Time Communication Between Browsers &mdash; RTCDataChannel Interface,&rdquo; W3C Recommendation, January 2021.</li>
+        <li>Otemma, S. &ldquo;WebRTC for the Curious &mdash; Data Communication,&rdquo; webrtcforthecurious.com, 2020.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-audio-and-video.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="09-security-by-design.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

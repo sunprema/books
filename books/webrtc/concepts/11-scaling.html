@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 &middot; Scaling: Mesh, SFU &amp; MCU &mdash; WebRTC</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html"><span class="tile"></span>WEBRTC</a>
+  <span class="bb-chapter">11 &middot; Scaling: Mesh, SFU &amp; MCU</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker">Chapter 11</span>
+    <h1>Scaling: <span class="hl">Mesh, SFU &amp; MCU</span></h1>
+
+    <p class="lede">A 1:1 WebRTC call is elegant: one peer connection, one negotiation, one set of ICE candidates. The moment a third participant joins, the architecture question becomes unavoidable. Do you connect everyone to everyone? Route streams through a server? Mix them into a single composite? Each answer trades bandwidth for CPU, simplicity for scale, and client cost for server cost. Choosing wrong means dropped frames, spiraling cloud bills, or a rewrite six months before launch. This chapter maps the three canonical topologies&mdash;mesh, SFU, and MCU&mdash;so you can pick the right one before your first user hits &ldquo;Join.&rdquo;</p>
+
+    <h2>The 1:1 Baseline</h2>
+
+    <p>Every WebRTC deployment starts here. Two peers negotiate a single <code>RTCPeerConnection</code>, exchange an offer and an answer through a signaling server, and media flows directly between them once ICE connectivity checks succeed. The signaling server exits the picture after negotiation&mdash;it never touches media. Each peer sends one audio and one video track and receives one of each. Bandwidth is symmetric: what you send equals what you receive.</p>
+
+    <p>This model works flawlessly and is the architecture behind the vast majority of telehealth visits, customer-support calls, and one-on-one tutoring sessions. But the instant you need a group call, the peer-to-peer purity of 1:1 starts to crack.</p>
+
+    <h2>Mesh: Everyone Connects to Everyone</h2>
+
+    <p>The most intuitive extension of 1:1 is <strong>full mesh</strong>. If three people are in a call, each peer opens a connection to every other peer. Four people means each peer maintains three connections. The total number of connections in the room follows a simple formula:</p>
+
+    <pre class="code"><span class="cap">Connection Count</span>
+<span class="c">// Full mesh: N participants</span>
+connections = N &times; (N - 1) / 2
+
+<span class="c">// 3 participants &rarr;  3 connections</span>
+<span class="c">// 4 participants &rarr;  6 connections</span>
+<span class="c">// 5 participants &rarr; 10 connections</span>
+<span class="c">// 6 participants &rarr; 15 connections</span></pre>
+
+    <p>Each peer must <em>encode</em> its video once per outgoing connection and <em>decode</em> every incoming stream. With four participants, each client encodes three copies of its video (one per peer) and decodes three incoming streams. That is six concurrent video codec operations on every client device. On a modern laptop this is manageable. On a mid-range phone it is thermal-throttle territory. On a tablet running an older chipset, it is a crash.</p>
+
+    <p>Bandwidth scales just as aggressively. If 720p video costs roughly 1.5 Mbps, a four-person mesh requires each participant to upload 4.5 Mbps (three streams) and download 4.5 Mbps (three streams). Rural broadband and mobile networks buckle under this load. The practical ceiling for mesh is <strong>three to four participants</strong>, and even that demands careful codec tuning and resolution capping.</p>
+
+    <div class="callout note">
+      <span class="co-tag">Note</span>
+      <p>Mesh is not useless&mdash;it is perfect for low-participant, high-privacy scenarios where no media should transit a server. End-to-end encryption is trivially guaranteed because there is no intermediary. Peer-to-peer file sharing, private pair-programming sessions, and small-team standups are legitimate mesh use cases. Just know the ceiling exists and plan for it.</p>
+    </div>
+
+    <h2>SFU: The Selective Forwarding Unit</h2>
+
+    <p>The <strong>Selective Forwarding Unit</strong> is the dominant production architecture for multi-party WebRTC. The concept is straightforward: instead of connecting to every other peer, each participant opens a single upstream connection to a central server and <em>N&minus;1</em> downstream connections from it. The server receives every participant&rsquo;s media and forwards each stream to the appropriate recipients&mdash;without ever decoding or re-encoding the packets.</p>
+
+    <p>That last point is the key. An SFU operates at the <span class="proto blue">RTP</span> packet level. It reads packet headers to make routing decisions, but it never touches the encoded payload. No decoding means no transcoding means minimal CPU. A single commodity server running an SFU can often handle hundreds of simultaneous streams, because the bottleneck is network I/O rather than compute.</p>
+
+    <div class="callout key">
+      <span class="co-tag">Key Insight</span>
+      <p>The SFU is the standard architecture for production WebRTC at scale. Google Meet, Zoom (in WebRTC mode), Discord, Slack Huddles, Loom, and virtually every commercial video platform you use daily runs an SFU at its core. If you are building a product that needs to support more than four participants, an SFU is almost certainly the right answer. Start here and only deviate if you have a specific reason that the SFU model cannot satisfy.</p>
+    </div>
+
+    <h3>How SFU Routing Works</h3>
+
+    <p>Each participant establishes one <code>RTCPeerConnection</code> to the SFU with all of its local tracks (typically one audio, one video). The SFU then creates outbound subscriptions: for each participant, it forwards every other participant&rsquo;s audio and video tracks downstream. The client sees multiple remote streams arriving on a single peer connection (via <code>ontrack</code> events), each tagged with a distinct <code>mid</code> or SSRC that the application uses to render the correct video tile.</p>
+
+    <p>Because the SFU controls which streams reach which client, it can make intelligent decisions. A participant who has muted their microphone? The SFU stops forwarding their audio packets entirely, saving downstream bandwidth. A user whose video tile is minimized on another user&rsquo;s screen? The SFU can drop their video to a lower layer or pause it altogether. This selective behavior is where the architecture gets its name, and it is what makes SFUs so efficient at scale.</p>
+
+    <h3>Simulcast: Resolution Layers</h3>
+
+    <p>In a naive SFU, every participant receives the same video quality. But in a real meeting, one participant is the active speaker displayed in a large tile, while the other eight are in thumbnail strips. Sending full-resolution 720p to every tile wastes bandwidth.</p>
+
+    <p><strong>Simulcast</strong> solves this. The sending client encodes its video at multiple resolutions simultaneously&mdash;typically three layers: high (720p), medium (360p), and low (180p). All three streams are sent upstream to the SFU. The SFU then selects which layer to forward to each receiver based on the receiver&rsquo;s layout, bandwidth estimate, and explicit subscription requests from the client application.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">Enabling simulcast on a sender</span>
+<span class="k">const</span> sender = pc.<span class="f">addTransceiver</span>(<span class="s">'video'</span>, {
+  <span class="s">direction</span>: <span class="s">'sendrecv'</span>,
+  <span class="s">sendEncodings</span>: [
+    { <span class="s">rid</span>: <span class="s">'low'</span>,  <span class="s">maxBitrate</span>:  <span class="n">150_000</span>, <span class="s">scaleResolutionDownBy</span>: <span class="n">4</span> },
+    { <span class="s">rid</span>: <span class="s">'mid'</span>,  <span class="s">maxBitrate</span>:  <span class="n">500_000</span>, <span class="s">scaleResolutionDownBy</span>: <span class="n">2</span> },
+    { <span class="s">rid</span>: <span class="s">'high'</span>, <span class="s">maxBitrate</span>: <span class="n">1_500_000</span> }
+  ]
+});
+<span class="c">// The SFU decides which layer each receiver gets</span></pre>
+
+    <p>Simulcast is configured entirely on the sender via the <code>sendEncodings</code> parameter. The SFU handles layer selection transparently. Most production SFUs support simulcast out of the box, and the browser-side API is standardized across Chrome, Firefox, and Safari. If you are running an SFU and you are <em>not</em> using simulcast, you are leaving significant bandwidth savings on the table.</p>
+
+    <h3>Popular SFU Implementations</h3>
+
+    <div class="tilegrid">
+      <div class="tile-card">
+        <h3>mediasoup</h3>
+        <p>C++ core with a Node.js control API. Extremely flexible, widely used in custom-built platforms. Handles simulcast, SVC, and data channels. Open source (ISC license).</p>
+      </div>
+      <div class="tile-card">
+        <h3>Janus</h3>
+        <p>General-purpose WebRTC server written in C. Plugin architecture supports SFU, MCU, SIP gateway, and streaming. Mature project maintained by Meetecho. Open source (GPLv3).</p>
+      </div>
+      <div class="tile-card">
+        <h3>Jitsi Videobridge</h3>
+        <p>Java-based SFU powering Jitsi Meet. Designed for large-scale conferences with thousands of participants. Excellent OOCSI (oN-oFF) bandwidth estimation. Open source (Apache 2.0).</p>
+      </div>
+      <div class="tile-card">
+        <h3>LiveKit</h3>
+        <p>Go-based SFU with a full real-time platform built on top: room management, token auth, recording, egress/ingress. Strong developer experience and growing ecosystem. Open source (Apache 2.0).</p>
+      </div>
+      <div class="tile-card">
+        <h3>Cloudflare Calls</h3>
+        <p>Managed SFU running at the edge on Cloudflare&rsquo;s network. No servers to provision. Pay-per-minute pricing. Good for teams that want SFU semantics without infrastructure operations.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Pion (WebRTC in Go)</h3>
+        <p>Not a turnkey SFU but a WebRTC library in Go that many teams use to build custom SFUs. Gives maximum control over packet handling, routing, and recording hooks.</p>
+      </div>
+    </div>
+
+    <h2>MCU: Multipoint Control Unit</h2>
+
+    <p>The <strong>Multipoint Control Unit</strong> takes the opposite approach from the SFU. Instead of forwarding individual streams, the MCU <em>decodes</em> every participant&rsquo;s video, composites them into a single mixed stream (the familiar grid layout), re-encodes the result, and sends one output stream to each participant. Audio is similarly mixed: the MCU decodes every audio track, sums the PCM samples (minus the participant&rsquo;s own voice to prevent echo), and encodes one mixed audio track per receiver.</p>
+
+    <p>The advantage is simplicity for the client. Each participant sees exactly one audio track and one video track, regardless of room size. Low-powered devices&mdash;legacy IP phones, IoT screens, embedded hardware&mdash;can join conferences they could never handle with an SFU, because they only decode a single stream.</p>
+
+    <p>The cost is enormous server-side CPU. Every incoming stream must be decoded, every outgoing composite must be encoded. For <em>N</em> participants, the MCU performs <em>N</em> decodes and <em>N</em> encodes per media type, per frame. A 30fps conference with ten participants means 300 video decodes and 300 video encodes every second on the server. This is why MCUs require beefy hardware (often GPU-accelerated) and why managed MCU services charge premium rates.</p>
+
+    <div class="callout warn">
+      <span class="co-tag">Warning</span>
+      <p>MCU architectures introduce a composition delay&mdash;typically 100&ndash;300 ms&mdash;on top of normal WebRTC latency. The server must buffer at least one frame from every participant before it can composite and re-encode. For interactive conversations this added latency is noticeable. For broadcast or webinar scenarios where participants are mostly passive viewers, it is acceptable. Factor this into your architecture decision.</p>
+    </div>
+
+    <h2>Architecture Comparison</h2>
+
+    <p>The three topologies occupy different positions in the design space. The table below summarizes the trade-offs that matter most when choosing.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Dimension</th>
+          <th>Mesh</th>
+          <th>SFU</th>
+          <th>MCU</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Server role</strong></td>
+          <td>Signaling only</td>
+          <td>Packet forwarding</td>
+          <td>Decode + mix + re-encode</td>
+        </tr>
+        <tr>
+          <td><strong>Server CPU</strong></td>
+          <td>Negligible</td>
+          <td>Low (no codec work)</td>
+          <td>Very high (full transcode)</td>
+        </tr>
+        <tr>
+          <td><strong>Client upload</strong></td>
+          <td>N&minus;1 streams</td>
+          <td>1 stream (+ simulcast layers)</td>
+          <td>1 stream</td>
+        </tr>
+        <tr>
+          <td><strong>Client download</strong></td>
+          <td>N&minus;1 streams</td>
+          <td>N&minus;1 streams (layer-selected)</td>
+          <td>1 composite stream</td>
+        </tr>
+        <tr>
+          <td><strong>Client CPU</strong></td>
+          <td>N&minus;1 encodes + N&minus;1 decodes</td>
+          <td>1 encode + N&minus;1 decodes</td>
+          <td>1 encode + 1 decode</td>
+        </tr>
+        <tr>
+          <td><strong>Max participants</strong></td>
+          <td>3&ndash;4</td>
+          <td>50&ndash;1,000+</td>
+          <td>20&ndash;50 (hardware-bound)</td>
+        </tr>
+        <tr>
+          <td><strong>Latency</strong></td>
+          <td>Lowest (direct P2P)</td>
+          <td>Low (forward delay only)</td>
+          <td>Higher (composition + re-encode)</td>
+        </tr>
+        <tr>
+          <td><strong>E2E encryption</strong></td>
+          <td>Natural (no server in media path)</td>
+          <td>Possible (Insertable Streams)</td>
+          <td>Not possible (server decodes)</td>
+        </tr>
+        <tr>
+          <td><strong>Infrastructure cost</strong></td>
+          <td>Near zero</td>
+          <td>Moderate (bandwidth-bound)</td>
+          <td>High (CPU/GPU-bound)</td>
+        </tr>
+        <tr>
+          <td><strong>Best for</strong></td>
+          <td>Private 1:1&ndash;3 calls</td>
+          <td>General-purpose conferencing</td>
+          <td>Legacy device support, broadcast</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Bandwidth Math</h2>
+
+    <p>Concrete numbers anchor architecture decisions. The figures below represent typical bitrates for WebRTC media under default codec settings. Actual rates vary with content complexity, codec choice, and network conditions, but these are the ballpark numbers that drive capacity planning.</p>
+
+    <div class="statrow">
+      <div class="stat">
+        <span class="bignum">~1.5</span>
+        <span class="lbl">Mbps for 720p video (VP8/H.264)</span>
+      </div>
+      <div class="stat">
+        <span class="bignum">~2.5</span>
+        <span class="lbl">Mbps for 1080p video</span>
+      </div>
+      <div class="stat">
+        <span class="bignum">~40</span>
+        <span class="lbl">kbps for Opus audio</span>
+      </div>
+      <div class="stat">
+        <span class="bignum">~150</span>
+        <span class="lbl">kbps for 180p low layer</span>
+      </div>
+    </div>
+
+    <p>Plug these into the topology formulas. A ten-person SFU call where each participant receives the active speaker at 720p and eight thumbnails at 180p costs each client roughly 1.5 + (8 &times; 0.15) + (9 &times; 0.04) = <strong>2.96 Mbps downstream</strong>. Compare that to mesh: 9 &times; 1.5 = 13.5 Mbps downstream&mdash;impossible on most connections. The SFU with simulcast cuts download bandwidth by nearly 80% for a ten-person call.</p>
+
+    <p>Upload is even more dramatic. In mesh, every participant sends nine video streams at 1.5 Mbps each: 13.5 Mbps upload. In an SFU with three simulcast layers, a participant sends roughly 1.5 + 0.5 + 0.15 = <strong>2.15 Mbps upload</strong>, regardless of room size. This is why SFUs scale.</p>
+
+    <h2>Room Topology Patterns</h2>
+
+    <p>Production platforms rarely use a single pure topology. Hybrid patterns emerge to handle different meeting shapes within the same product.</p>
+
+    <p><strong>Small-room mesh with SFU fallback.</strong> Start a call as peer-to-peer for two participants. When a third joins, transparently migrate all streams through an SFU. This avoids server costs for 1:1 calls (which are the majority of calls in most products) while scaling gracefully for group calls. Google Meet and several other platforms use this pattern.</p>
+
+    <p><strong>Cascaded SFUs.</strong> For global deployments, a single SFU becomes a latency bottleneck when participants span continents. Cascading connects multiple SFU instances in different regions, forwarding streams between them. A participant in Tokyo connects to a Tokyo SFU; a participant in Berlin connects to a Berlin SFU; the two SFUs exchange streams over a dedicated backbone. Jitsi Videobridge supports cascading natively via its Ocentus bridge protocol.</p>
+
+    <p><strong>SFU with MCU recording.</strong> Use an SFU for live participants to keep latency low, but route a copy of each stream to an MCU process that composites them into a single recorded file. This gives you the best of both worlds: interactive-grade latency for live users and a clean composite recording for archival.</p>
+
+    <p><strong>Selective MCU for specific clients.</strong> Most participants connect to an SFU, but a legacy SIP phone or a low-powered embedded device connects to an MCU gateway that mixes the SFU streams into a single composite before forwarding. This is common in healthcare and enterprise environments where legacy video endpoints must coexist with modern browsers.</p>
+
+    <h2>Recording in Each Architecture</h2>
+
+    <p>How you record a call depends heavily on the topology.</p>
+
+    <p><strong>Mesh recording</strong> is difficult. No server has access to the media streams, so recording must happen on the client using <code>MediaRecorder</code> against the local <code>MediaStream</code>. Each participant records their own view, producing inconsistent files. There is no single source of truth for the meeting, and client-side recording is fragile&mdash;if the browser tab closes, the recording is lost.</p>
+
+    <p><strong>SFU recording</strong> is the most flexible approach. Because all streams pass through the server, the SFU can fork each stream into a recording pipeline without affecting live delivery. Two recording strategies exist. <em>Individual track recording</em> saves each participant&rsquo;s audio and video as separate files, enabling post-production mixing (useful for podcasts and content creation). <em>Composite recording</em> pipes the individual tracks into a server-side mixer that produces a single combined file in real time. LiveKit, mediasoup, and Janus all support recording hooks.</p>
+
+    <p><strong>MCU recording</strong> is trivial. The MCU already produces a composited stream&mdash;recording is just writing that stream to disk. The output is a single file with all participants arranged in the server&rsquo;s layout. The trade-off is that the layout is baked in at record time and cannot be changed later.</p>
+
+    <pre class="code" data-lang="pseudocode"><span class="cap">Recording strategy by topology</span>
+<span class="t">Mesh</span>:  client-side MediaRecorder &rarr; upload after call
+       <span class="c">// fragile, no single source of truth</span>
+
+<span class="t">SFU</span>:   server forks RTP streams &rarr; individual track files
+       <span class="c">// or pipes to compositor for single output</span>
+       <span class="c">// most flexible, post-production possible</span>
+
+<span class="t">MCU</span>:   server writes composite output &rarr; single file
+       <span class="c">// layout baked in, zero post-production flexibility</span></pre>
+
+    <h2>Choosing Your Architecture</h2>
+
+    <p>The decision tree is shorter than it might seem. Ask three questions:</p>
+
+    <ol>
+      <li><strong>How many participants?</strong> If always 1:1 or at most three peers, mesh is fine. Beyond that, you need a server in the media path.</li>
+      <li><strong>Do your clients have CPU constraints?</strong> If you must support very low-powered devices, SIP phones, or embedded hardware, an MCU (or MCU gateway) is the only option that guarantees a single decode per client.</li>
+      <li><strong>Do you need end-to-end encryption?</strong> If the server must never see media payloads, mesh or SFU with Insertable Streams (the <span class="proto blue">WebRTC Encoded Transform</span> API) are your options. MCU is eliminated.</li>
+    </ol>
+
+    <p>For the vast majority of products&mdash;video meetings, live classes, remote collaboration, telehealth groups, webinars with interaction&mdash;the answer is an SFU with simulcast. It is the architecture that the industry has converged on because it offers the best balance of scale, latency, cost, and flexibility. Start there. Optimize from there.</p>
+
+    <div class="callout key">
+      <span class="co-tag">Key Takeaway</span>
+      <p>Every topology is a trade-off between where the hard work happens. Mesh pushes all cost to clients. MCU pushes all cost to the server. SFU splits the difference&mdash;cheap forwarding on the server, selective decoding on the client&mdash;and that balance is why it dominates production WebRTC. Understand the trade-offs, but default to an SFU unless you have a compelling reason not to.</p>
+    </div>
+
+    <div class="sources">
+      <span class="src-tag">Sources</span>
+      <ol>
+        <li>Otemma, S. &ldquo;WebRTC for the Curious &mdash; Media Communication,&rdquo; webrtcforthecurious.com, 2020.</li>
+        <li>Oertlin, B. &ldquo;Janus: the general purpose WebRTC server,&rdquo; Meetecho, 2024.</li>
+        <li>LiveKit. &ldquo;Architecture Overview,&rdquo; docs.livekit.io, 2024.</li>
+        <li>mediasoup. &ldquo;Design Goals and Architecture,&rdquo; mediasoup.org, 2024.</li>
+        <li>Oertli, P. and Oertli, B. &ldquo;Ocentus: Scalable Jitsi Videobridge Cascading,&rdquo; Ocentus/Oertli Labs, 2022.</li>
+        <li>W3C. &ldquo;WebRTC Encoded Transform,&rdquo; W3C Working Draft, 2024.</li>
+        <li>Oertli, T. &ldquo;Simulcast in WebRTC,&rdquo; webrtcHacks.com, 2023.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="10-building-the-app.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="12-debugging-and-beyond.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

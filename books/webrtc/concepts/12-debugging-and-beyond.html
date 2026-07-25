@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 &middot; Debugging &amp; Advanced Patterns &mdash; WebRTC</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html"><span class="tile"></span>WEBRTC</a>
+  <span class="bb-chapter">12 &middot; Debugging &amp; Advanced Patterns</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker">Chapter 12</span>
+    <h1>Debugging &amp; <span class="hl">Advanced Patterns</span></h1>
+
+    <p class="lede">A working demo is not a shipped product. The distance between the two is measured in late-night debugging sessions, stubborn quality regressions, and the slow accumulation of production wisdom. This final chapter arms you with the diagnostic tools that make WebRTC observable and the advanced techniques that make it scale&mdash;from reading raw stats off the wire to encoding video in layered streams that adapt to every viewer&rsquo;s bandwidth.</p>
+
+    <h2>The getStats() API: Your Runtime Microscope</h2>
+
+    <p>Every <code>RTCPeerConnection</code> exposes a <code>getStats()</code> method that returns a promise resolving to an <code>RTCStatsReport</code>&mdash;a <code>Map</code>-like collection of stat dictionaries covering every aspect of the connection. This is not a debugging afterthought; it is the primary instrumentation surface for WebRTC in production. Call quality dashboards, adaptive bitrate logic, and automated alerting all begin here.</p>
+
+    <p>The stats report contains dozens of metric types, but a handful dominate day-to-day work. These are the numbers you will check first when something goes wrong, and the numbers you will chart in Grafana when things go right:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Stat</th>
+          <th>Type</th>
+          <th>What It Tells You</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>bytesReceived</code></td>
+          <td>inbound-rtp</td>
+          <td>Total bytes received on this RTP stream. Compare snapshots over time to compute instantaneous bitrate.</td>
+        </tr>
+        <tr>
+          <td><code>bytesSent</code></td>
+          <td>outbound-rtp</td>
+          <td>Total bytes sent. A sudden drop flags encoder stalls or paused tracks.</td>
+        </tr>
+        <tr>
+          <td><code>packetsLost</code></td>
+          <td>inbound-rtp</td>
+          <td>Cumulative packets lost on the receive side. Divide the delta by total packets to get loss rate&mdash;above 2&ndash;3% and audio quality degrades noticeably.</td>
+        </tr>
+        <tr>
+          <td><code>jitter</code></td>
+          <td>inbound-rtp</td>
+          <td>Interarrival jitter in seconds. High jitter (&gt;30 ms) causes choppy playback even when no packets are lost, because the jitter buffer cannot smooth it.</td>
+        </tr>
+        <tr>
+          <td><code>roundTripTime</code></td>
+          <td>remote-inbound-rtp</td>
+          <td>Current RTT in seconds as measured by RTCP. The single best indicator of network health. Above 300 ms, interactive conversation becomes difficult.</td>
+        </tr>
+        <tr>
+          <td><code>framesPerSecond</code></td>
+          <td>inbound-rtp</td>
+          <td>Decoded video frame rate. If this drops while <code>framesReceived</code> stays steady, the decoder is struggling. If both drop, the sender reduced its frame rate&mdash;likely a bandwidth adaptation.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Polling <code>getStats()</code> on a timer gives you a time series. The pattern below samples every two seconds and computes a running bitrate:</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">// Polling getStats() for live bitrate and loss metrics</span>
+
+<span class="k">let</span> prevBytes = <span class="n">0</span>;
+<span class="k">let</span> prevTime  = <span class="n">0</span>;
+
+<span class="k">async function</span> <span class="f">pollStats</span>(pc) {
+  <span class="k">const</span> report = <span class="k">await</span> pc.<span class="f">getStats</span>();
+
+  report.<span class="f">forEach</span>((stat) =&gt; {
+    <span class="k">if</span> (stat.type === <span class="s">'inbound-rtp'</span> &amp;&amp; stat.kind === <span class="s">'video'</span>) {
+      <span class="k">const</span> now     = stat.timestamp;
+      <span class="k">const</span> bytes   = stat.bytesReceived;
+      <span class="k">const</span> elapsed = (now - prevTime) / <span class="n">1000</span>; <span class="c">// seconds</span>
+
+      <span class="k">if</span> (prevTime &gt; <span class="n">0</span> &amp;&amp; elapsed &gt; <span class="n">0</span>) {
+        <span class="k">const</span> bitrate = <span class="n">8</span> * (bytes - prevBytes) / elapsed;
+        console.<span class="f">log</span>(
+          <span class="s">`Video bitrate: ${(bitrate / <span class="n">1000</span>).toFixed(<span class="n">0</span>)} kbps`</span>
+        );
+        console.<span class="f">log</span>(
+          <span class="s">`Packets lost:  ${stat.packetsLost}`</span>
+        );
+        console.<span class="f">log</span>(
+          <span class="s">`Jitter:        ${(stat.jitter * <span class="n">1000</span>).toFixed(<span class="n">1</span>)} ms`</span>
+        );
+        console.<span class="f">log</span>(
+          <span class="s">`Frames/sec:    ${stat.framesPerSecond}`</span>
+        );
+      }
+
+      prevBytes = bytes;
+      prevTime  = now;
+    }
+
+    <span class="c">// RTT lives on the remote-inbound-rtp report</span>
+    <span class="k">if</span> (stat.type === <span class="s">'remote-inbound-rtp'</span>) {
+      console.<span class="f">log</span>(
+        <span class="s">`RTT:           ${(stat.roundTripTime * <span class="n">1000</span>).toFixed(<span class="n">0</span>)} ms`</span>
+      );
+    }
+  });
+}
+
+<span class="c">// Poll every 2 seconds</span>
+<span class="f">setInterval</span>(() =&gt; <span class="f">pollStats</span>(pc), <span class="n">2000</span>);</pre>
+
+    <div class="callout key">
+      <span class="co-tag">Key Insight</span>
+      <p>The single most powerful debugging tool in the WebRTC ecosystem is <code>chrome://webrtc-internals</code>. Open it in a separate tab while your application runs and it will capture every <code>RTCPeerConnection</code> created on the page: full stats graphs, event logs, SDP offers and answers, ICE candidate pairs, DTLS state transitions, and codec negotiation results. No code changes required. If you remember one URL from this book, make it this one. Firefox offers a comparable tool at <code>about:webrtc</code>, though the interface is less visual. Safari provides a WebRTC inspector through its Develop menu under &ldquo;WebRTC&rdquo; when Web Inspector is open.</p>
+    </div>
+
+    <h2>Connection Failure Debugging</h2>
+
+    <p>When a call fails to connect, the root cause almost always falls into one of three categories. Knowing which one you are facing saves hours of misdirected effort.</p>
+
+    <h3>ICE Failures</h3>
+
+    <p>If the <code>iceConnectionState</code> reaches <code>"failed"</code>, the peers could not find a working network path. Check the ICE candidate pair in <code>chrome://webrtc-internals</code>&mdash;if only host candidates appear and no server-reflexive or relay candidates exist, your STUN/TURN configuration is wrong or unreachable. The most common cause is a missing or misconfigured TURN server. Symmetric NATs (common in enterprise and mobile carrier networks) block direct connections and require TURN relay. If your application works on the same LAN but fails across the internet, this is the first thing to verify.</p>
+
+    <h3>DTLS Failures</h3>
+
+    <p>A DTLS handshake failure usually means the fingerprint in the SDP does not match the certificate presented during the handshake. This happens when an intermediary (a buggy SFU, a poorly written SDP munger, or a load balancer that accidentally modifies the signaling payload) alters the SDP <code>a=fingerprint</code> line. It can also occur if one peer re-creates its <code>RTCPeerConnection</code> (which generates a new certificate) without re-negotiating. Watch for <code>connectionState</code> stuck at <code>"connecting"</code> with no progress&mdash;that is often DTLS failing silently.</p>
+
+    <h3>Codec Mismatch</h3>
+
+    <p>If the SDP negotiation succeeds but no media flows, check whether the peers agreed on a codec. Open the SDP answer in <code>chrome://webrtc-internals</code> and verify that the accepted <code>m=</code> lines contain at least one payload type both sides support. Hardware-accelerated codecs (H.264 on mobile, for example) sometimes advertise profiles the remote side cannot decode. Using <code>setCodecPreferences()</code> to force a known-good codec like VP8 is a quick diagnostic step.</p>
+
+    <h2>Media Quality Issues</h2>
+
+    <p>Connection established, media flowing&mdash;but the quality is terrible. These are the most frustrating bugs because they are intermittent, hardware-dependent, and often have nothing to do with your code.</p>
+
+    <p><strong>Echo.</strong> Acoustic echo happens when the speaker output is picked up by the microphone. The browser&rsquo;s built-in echo cancellation (<code>echoCancellation: true</code> in <code>getUserMedia</code> constraints) handles most cases, but it fails with external speakers at high volume, Bluetooth devices with their own DSP, and hardware that introduces unexpected latency. If users report echo, first confirm echo cancellation is enabled, then check whether the device is on the browser&rsquo;s supported list.</p>
+
+    <p><strong>Choppy audio.</strong> Packet loss above 2% or jitter above 30 ms causes audible artifacts. The <code>getStats()</code> metrics above will confirm this. Solutions include switching to a more loss-resilient codec (Opus with FEC enabled, which is the default), ensuring TURN relay is available as a fallback for congested paths, and reducing video bitrate to leave more headroom for audio.</p>
+
+    <p><strong>Frozen video.</strong> A video track that freezes while audio continues usually means the available bandwidth dropped below the minimum viable video bitrate. The encoder pauses rather than sending unwatchable frames. Check <code>qualityLimitationReason</code> in the outbound-rtp stats: it will read <code>"bandwidth"</code>, <code>"cpu"</code>, or <code>"other"</code>. If it reads <code>"cpu"</code>, the device cannot encode at the requested resolution in real time&mdash;lower the resolution or switch to a hardware-accelerated codec.</p>
+
+    <h2>Simulcast: Multiple Resolution Layers</h2>
+
+    <p>Simulcast solves a fundamental scaling problem. In a group call routed through an SFU, each viewer has different bandwidth. Without simulcast, the sender encodes a single stream and every viewer gets the same quality&mdash;which means the lowest-bandwidth viewer drags everyone down, or is dropped entirely.</p>
+
+    <p>With simulcast, the sender encodes the same source at two or three resolutions simultaneously (typically labeled low, medium, and high). The SFU chooses which layer to forward to each viewer based on their available bandwidth, viewport size, and whether they are the active speaker. The SFU never transcodes&mdash;it simply selects and forwards, keeping CPU costs minimal.</p>
+
+    <p>Enabling simulcast in the browser requires using <code>addTransceiver()</code> with encoding parameters:</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">// Enabling 3-layer simulcast</span>
+
+pc.<span class="f">addTransceiver</span>(videoTrack, {
+  <span class="s">direction</span>: <span class="s">'sendonly'</span>,
+  <span class="s">sendEncodings</span>: [
+    { <span class="s">rid</span>: <span class="s">'low'</span>,  <span class="s">maxBitrate</span>:  <span class="n">150000</span>, <span class="s">scaleResolutionDownBy</span>: <span class="n">4</span> },
+    { <span class="s">rid</span>: <span class="s">'mid'</span>,  <span class="s">maxBitrate</span>:  <span class="n">500000</span>, <span class="s">scaleResolutionDownBy</span>: <span class="n">2</span> },
+    { <span class="s">rid</span>: <span class="s">'high'</span>, <span class="s">maxBitrate</span>: <span class="n">1500000</span> }
+  ]
+});</pre>
+
+    <p>The SFU sees three distinct RTP streams (identified by their <code>rid</code> values in <span class="proto blue">RTP</span> header extensions) and can switch between them mid-stream without renegotiation. From the viewer&rsquo;s perspective, the transition is seamless&mdash;a brief resolution change, nothing more.</p>
+
+    <h2>SVC: Temporal and Spatial Layers</h2>
+
+    <p>Scalable Video Coding takes a different approach to the same problem. Instead of encoding three independent streams, SVC encodes a single stream with internal layers. <span class="proto teal">VP9</span> and <span class="proto teal">AV1</span> both support SVC natively in Chrome.</p>
+
+    <p><strong>Temporal layers</strong> let the SFU drop frames to reduce frame rate without re-encoding. A stream with three temporal layers might encode at 30 fps, but the SFU can forward only the base layer (7.5 fps) to bandwidth-constrained viewers. <strong>Spatial layers</strong> embed multiple resolutions within a single encoded stream, letting the SFU strip higher-resolution data without touching the decoder. The combination gives fine-grained quality control with a single encode on the sender side.</p>
+
+    <p>SVC uses less upstream bandwidth than simulcast (one encoded stream vs. three) at the cost of slightly higher per-frame encoding complexity. For large calls where upstream bandwidth is the bottleneck&mdash;mobile participants on cellular, for example&mdash;SVC is the better trade-off.</p>
+
+    <h2>Insertable Streams and Encoded Transform</h2>
+
+    <p>The <strong>Encoded Transform</strong> API (formerly called Insertable Streams) gives you access to encoded media frames after the encoder but before they hit the packetizer&mdash;or after the depacketizer but before the decoder. This pipeline tap enables two major use cases.</p>
+
+    <p><strong>End-to-end encryption.</strong> In a standard SFU architecture, media is encrypted between each peer and the SFU (via DTLS-SRTP), but the SFU itself can see the cleartext media. Encoded Transform lets you apply an additional encryption layer (AES-GCM, for example) to each frame before it leaves the sender. The SFU forwards the opaque ciphertext without being able to decrypt it. Only participants who hold the shared key can decode. This is how services like Cloudflare Calls and LiveKit implement true E2E encryption.</p>
+
+    <p><strong>Custom frame processing.</strong> Beyond encryption, Encoded Transform enables watermarking, frame-level metadata injection, custom error correction, and experimental codec research&mdash;all in JavaScript, running in a worker thread to avoid blocking the main thread.</p>
+
+    <p>A related pair of APIs, <code>MediaStreamTrackProcessor</code> and <code>MediaStreamTrackGenerator</code>, operate on raw (decoded) video frames as <code>VideoFrame</code> objects. These are lower-level and enable effects like background blur, virtual backgrounds, and ML-driven video processing without canvas hacks. They are the building blocks for the next generation of in-browser video manipulation.</p>
+
+    <h2>Server-Side Recording</h2>
+
+    <p>Recording a WebRTC call is deceptively complex. The browser&rsquo;s <code>MediaRecorder</code> API can capture local media, but recording a multi-party call requires server-side work. There are two approaches.</p>
+
+    <p><strong>Composite recording</strong> mixes all participant streams into a single video on the server in real time, using tools like FFmpeg or GStreamer. The result is a single file that looks like a Zoom recording&mdash;a grid of faces. This is simple for the consumer but expensive on CPU and inflexible after the fact.</p>
+
+    <p><strong>Individual track recording</strong> stores each participant&rsquo;s audio and video as separate files, then composites them in post-processing. This is more flexible (you can re-layout, re-edit, or transcribe individual tracks) but requires more storage and a post-processing pipeline. Most production SFUs (mediasoup, Janus, LiveKit) support forwarding raw RTP to a recording endpoint where it is written to disk as WebM or raw RTP dumps.</p>
+
+    <h2>Bandwidth Estimation and GCC</h2>
+
+    <p>WebRTC does not blindly send media at a fixed bitrate. It continuously estimates available bandwidth and adapts the encoder&rsquo;s output to match. The algorithm driving this in Chrome is <strong>GCC</strong>&mdash;Google Congestion Control, described in <span class="proto orange">RFC 8698</span> (the NADA algorithm) and the earlier draft-alvestrand-rmcat-congestion.</p>
+
+    <p>GCC works by measuring two signals: <strong>delay-based</strong> (tracking interarrival time variations of received packets, similar to jitter measurement) and <strong>loss-based</strong> (reacting to packet loss reported via RTCP receiver reports). When delay increases, GCC interprets it as early congestion and reduces the sending bitrate before loss occurs. When loss is detected, it cuts more aggressively. When conditions improve, it probes upward gradually.</p>
+
+    <p>Understanding GCC explains many behaviors that seem mysterious: why video suddenly drops to a lower resolution (bandwidth probe detected congestion), why it takes 10&ndash;15 seconds to ramp up to full quality after a call starts (the probing ramp), and why a brief network hiccup can take 30 seconds to recover from (the conservative upward ramp after a loss event).</p>
+
+    <div class="callout note">
+      <span class="co-tag">Note</span>
+      <p><strong>WHIP and WHEP</strong> (WebRTC-HTTP Ingestion Protocol and WebRTC-HTTP Egress Protocol) are IETF standards that define a simple HTTP-based signaling mechanism for publishing and consuming WebRTC streams. Instead of building custom WebSocket signaling for broadcast use cases, a sender POSTs an SDP offer to a WHIP endpoint and receives an SDP answer in the HTTP response. A viewer does the same against a WHEP endpoint. This makes WebRTC interoperable with existing HTTP infrastructure&mdash;CDNs, load balancers, API gateways&mdash;and is rapidly becoming the standard for low-latency live streaming. OBS Studio, FFmpeg, and GStreamer all support WHIP output natively. If you are building a broadcasting platform, WHIP/WHEP should be your starting point.</p>
+    </div>
+
+    <h2>WebTransport: A Future Complement</h2>
+
+    <p>WebTransport is not a replacement for WebRTC, but it fills gaps that WebRTC was never designed to address. Built on <span class="proto teal">HTTP/3</span> and <span class="proto teal">QUIC</span>, WebTransport provides reliable and unreliable data streams with lower connection setup latency than WebSocket (0-RTT with session resumption) and built-in multiplexing without head-of-line blocking.</p>
+
+    <p>For WebRTC applications, WebTransport is interesting in two roles. First, as a <strong>signaling transport</strong>: its support for datagrams and unidirectional streams maps cleanly to the fire-and-forget nature of ICE candidate exchange. Second, as a <strong>data channel alternative</strong>: where WebRTC data channels require a full peer connection (ICE, DTLS, SCTP), WebTransport connects directly to a server over QUIC, with better congestion control and no NAT traversal overhead for client-server topologies.</p>
+
+    <p>The two technologies are likely to coexist. WebRTC remains unmatched for peer-to-peer media with built-in echo cancellation, noise suppression, and adaptive codecs. WebTransport shines for client-to-server data transport, game state synchronization, and scenarios where the full WebRTC stack is overkill. Several SFU vendors are already experimenting with WebTransport as an alternative ingest path alongside WHIP.</p>
+
+    <div class="callout warn">
+      <span class="co-tag">Warning</span>
+      <p>WebTransport is still maturing. Browser support is growing but not universal, and the server ecosystem is less mature than WebRTC&rsquo;s. Do not bet a production architecture on WebTransport alone today&mdash;but do track its progress. The combination of WebRTC for media and WebTransport for data is likely the future architecture for real-time web applications.</p>
+    </div>
+
+    <h2>Common Error Patterns and Quick Fixes</h2>
+
+    <p>After eleven chapters and one appendix, here is a rapid-fire summary of the failure modes that catch every WebRTC developer at least once:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Symptom</th>
+          <th>Likely Cause</th>
+          <th>Fix</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>ICE state stuck at <code>checking</code></td>
+          <td>No TURN server, symmetric NAT</td>
+          <td>Add a TURN relay server to <code>iceServers</code></td>
+        </tr>
+        <tr>
+          <td>One-way audio/video</td>
+          <td>Only one peer adds tracks before offer</td>
+          <td>Ensure both peers add tracks or use <code>addTransceiver()</code> with <code>sendrecv</code></td>
+        </tr>
+        <tr>
+          <td>Black video, audio works</td>
+          <td>Video element missing <code>autoplay</code> / <code>playsinline</code></td>
+          <td>Add <code>autoplay playsinline</code> attributes to <code>&lt;video&gt;</code></td>
+        </tr>
+        <tr>
+          <td><code>addIceCandidate</code> throws</td>
+          <td>Candidate arrives before remote description is set</td>
+          <td>Queue candidates until <code>setRemoteDescription()</code> succeeds</td>
+        </tr>
+        <tr>
+          <td>Renegotiation fails silently</td>
+          <td>Glare&mdash;both peers offer simultaneously</td>
+          <td>Implement perfect negotiation (polite/impolite roles)</td>
+        </tr>
+        <tr>
+          <td>Call works locally, fails across network</td>
+          <td>STUN/TURN server unreachable or misconfigured</td>
+          <td>Test TURN with <code>iceTransportPolicy: 'relay'</code> to force relay</td>
+        </tr>
+        <tr>
+          <td><code>getUserMedia</code> rejected</td>
+          <td>Page not served over HTTPS (or localhost)</td>
+          <td>Serve over HTTPS or use <code>localhost</code> for development</td>
+        </tr>
+        <tr>
+          <td>Audio echo on remote side</td>
+          <td>Echo cancellation disabled or ineffective</td>
+          <td>Verify <code>echoCancellation: true</code> in constraints; test with headphones</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Where to Go from Here</h2>
+
+    <p>This book has taken you from the first principles of real-time networking through the full WebRTC stack: NAT traversal, signaling, SDP, ICE, DTLS, SRTP, codecs, data channels, SFU architectures, scaling, and now debugging and advanced patterns. The protocol is deep, the ecosystem is wide, and the frontier is still moving.</p>
+
+    <p>Build something. Start with a 1:1 call, graduate to an SFU, add simulcast, instrument with <code>getStats()</code>, and break it on purpose so you learn to fix it. Read the RFCs when the abstractions leak. Contribute to the open-source SFUs and libraries that make this ecosystem thrive. The web was built for documents; WebRTC made it a place for conversation. That is worth understanding thoroughly.</p>
+
+    <div class="sources">
+      <span class="src-tag">Sources</span>
+      <ol>
+        <li>W3C. &ldquo;WebRTC 1.0: Real-Time Communication Between Browsers &mdash; RTCStatsReport,&rdquo; W3C Recommendation, January 2021.</li>
+        <li>Holmer, S., et al. &ldquo;A Google Congestion Control Algorithm for Real-Time Communication,&rdquo; <em>draft-ietf-rmcat-gcc</em>, IETF, 2016.</li>
+        <li>Murillo, S. and Gouaillard, A. &ldquo;WebRTC-HTTP Ingestion Protocol (WHIP),&rdquo; <em>RFC 9725</em>, IETF, February 2025.</li>
+        <li>Murillo, S. and Gouaillard, A. &ldquo;WebRTC-HTTP Egress Protocol (WHEP),&rdquo; <em>draft-ietf-wish-whep</em>, IETF, 2024.</li>
+        <li>W3C. &ldquo;WebRTC Encoded Transform,&rdquo; W3C Working Draft, 2024.</li>
+        <li>IETF. &ldquo;WebTransport over HTTP/3,&rdquo; <em>RFC 9297</em>, August 2022.</li>
+        <li>Otemma, S. &ldquo;WebRTC for the Curious,&rdquo; webrtcforthecurious.com, 2020.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="11-scaling.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

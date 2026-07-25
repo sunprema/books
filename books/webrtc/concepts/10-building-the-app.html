@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 &middot; Building a Complete App &mdash; WebRTC</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html"><span class="tile"></span>WEBRTC</a>
+  <span class="bb-chapter">10 &middot; Building a Complete App</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker">Chapter 10</span>
+    <h1>Building a <span class="hl">Complete App</span></h1>
+
+    <p class="lede">You have the theory. You understand ICE, SDP, DTLS, and signaling as individual concepts. Now it is time to wire them together into a working product&mdash;a 1:1 video chat application you can open in two browser tabs and use to talk to yourself (the loneliest, most satisfying test in all of real-time development). This chapter is a guided build from zero to a functional app, with every line of client code shown, every error mode addressed, and every UI control explained.</p>
+
+    <div class="callout key">
+      <span class="co-tag">Key Insight</span>
+      <p>A complete WebRTC application has three cooperating layers: a <strong>signaling server</strong> that relays offers, answers, and ICE candidates between peers; a <strong>STUN/TURN configuration</strong> that helps peers discover their public addresses and relay media when direct connections fail; and <strong>client-side JavaScript</strong> that orchestrates media capture, peer connection setup, UI controls, and error recovery. None of these layers is complex in isolation. The challenge is wiring them together correctly and handling the edge cases that emerge when real networks, real browsers, and real users get involved.</p>
+    </div>
+
+    <h2>Architecture Overview</h2>
+
+    <p>Before touching code, understand the topology. Our application consists of three pieces running across two machines (or two tabs on one machine for testing).</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Component</th>
+          <th>Role</th>
+          <th>Technology</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Signaling Server</strong></td>
+          <td>Relays SDP offers/answers and ICE candidates between peers. Manages room membership.</td>
+          <td>Node.js + <span class="proto blue">WebSocket</span> (the server from Chapter 4)</td>
+        </tr>
+        <tr>
+          <td><strong>STUN/TURN Servers</strong></td>
+          <td>Help peers discover their public IP (STUN) and relay media when direct paths fail (TURN).</td>
+          <td>Google public STUN; self-hosted or provider <span class="proto teal">TURN</span></td>
+        </tr>
+        <tr>
+          <td><strong>Client Application</strong></td>
+          <td>Captures local media, creates <code>RTCPeerConnection</code>, manages UI controls, renders remote video.</td>
+          <td>Vanilla JavaScript + <span class="proto green">WebRTC API</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The signaling server is the one from Chapter 4&mdash;a lightweight WebSocket relay that routes JSON messages by room ID. We reuse it here without modification. The client application is where all the new work lives: it captures the camera, creates the peer connection, negotiates the session, renders remote media, and gives the user controls for mute, camera toggle, and hang-up.</p>
+
+    <h2>Step-by-Step: Building the 1:1 Video Chat</h2>
+
+    <p>What follows is the full construction sequence. Each step builds on the last, and by the end you will have a complete, working application. The signaling server is already in place from Chapter 4; we focus entirely on the client.</p>
+
+    <div class="flow">
+      <div class="f-step">
+        <div class="f-arrow right">Step 1 &middot; Connect to Signaling</div>
+        <div class="f-body">Open a WebSocket to the signaling server. Join a room by name. When the server responds with <code>joined</code>, store whether you are the initiator. When <code>peer-joined</code> arrives, you know it is time to create an offer.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Step 2 &middot; Capture Local Media</div>
+        <div class="f-body">Call <code>navigator.mediaDevices.getUserMedia()</code> requesting audio and video. Attach the returned <code>MediaStream</code> to a local <code>&lt;video&gt;</code> element so the user sees their own camera feed.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Step 3 &middot; Create RTCPeerConnection</div>
+        <div class="f-body">Instantiate the peer connection with an <code>iceServers</code> array containing STUN (and optionally TURN) URLs. Wire up event handlers: <code>onicecandidate</code>, <code>ontrack</code>, <code>oniceconnectionstatechange</code>, <code>onnegotiationneeded</code>.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Step 4 &middot; Add Local Tracks</div>
+        <div class="f-body">Iterate over the local stream&rsquo;s tracks and call <code>pc.addTrack(track, stream)</code> for each. This tells the peer connection what media to offer to the remote peer.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Step 5 &middot; Offer / Answer Exchange</div>
+        <div class="f-body">The initiator calls <code>createOffer()</code>, sets the local description, and sends the SDP through signaling. The receiver sets the remote description, calls <code>createAnswer()</code>, sets its local description, and sends the answer back.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">Step 6 &middot; Exchange ICE Candidates</div>
+        <div class="f-body">As each peer gathers candidates, it sends them via the signaling channel. The remote peer feeds them into <code>addIceCandidate()</code>. Candidates that arrive before the remote description is set are queued and flushed once it is.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">Step 7 &middot; Render Remote Media</div>
+        <div class="f-body">The <code>ontrack</code> callback fires when the remote peer&rsquo;s media arrives. Attach the received stream to a remote <code>&lt;video&gt;</code> element. The call is now live.</div>
+      </div>
+    </div>
+
+    <h2>ICE Server Configuration</h2>
+
+    <p>The <code>iceServers</code> array you pass to <code>RTCPeerConnection</code> determines how peers discover network paths to each other. For localhost testing, you technically need nothing&mdash;both tabs share the same host candidates. For anything beyond that, you need at minimum a STUN server, and for production reliability, a TURN server.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="k">const</span> iceConfig = {
+  <span class="s">iceServers</span>: [
+    <span class="c">// Public STUN server (free, no auth)</span>
+    { <span class="s">urls</span>: <span class="s">'stun:stun.l.google.com:19302'</span> },
+
+    <span class="c">// TURN server (required for symmetric NATs)</span>
+    {
+      <span class="s">urls</span>: <span class="s">'turn:turn.example.com:3478'</span>,
+      <span class="s">username</span>: <span class="s">'user'</span>,
+      <span class="s">credential</span>: <span class="s">'pass'</span>
+    }
+  ]
+};</pre>
+
+    <p>In the full code below, we use Google&rsquo;s public STUN server for simplicity. When you deploy to production, add a TURN server&mdash;roughly 10&ndash;15% of real-world connections require relay to succeed, and that number climbs higher on mobile networks and behind corporate firewalls.</p>
+
+    <h2>The Complete Client Code</h2>
+
+    <p>Here is the entire client-side JavaScript for our 1:1 video chat application. This is not a sketch or a fragment&mdash;it is the full implementation, ready to drop into an HTML page with two <code>&lt;video&gt;</code> elements (<code>#localVideo</code> and <code>#remoteVideo</code>) and three buttons (<code>#muteBtn</code>, <code>#camBtn</code>, <code>#hangupBtn</code>). It assumes the signaling server from Chapter 4 is running on the same host.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">client.js &mdash; Complete 1:1 Video Chat Client</span>
+<span class="c">// ── Configuration ──────────────────────────────────────────</span>
+
+<span class="k">const</span> SIGNALING_URL = <span class="s">'ws://localhost:8080'</span>;
+<span class="k">const</span> ROOM_ID       = <span class="s">'demo-room'</span>;
+
+<span class="k">const</span> ICE_SERVERS = [
+  { <span class="s">urls</span>: <span class="s">'stun:stun.l.google.com:19302'</span> },
+  { <span class="s">urls</span>: <span class="s">'stun:stun1.l.google.com:19302'</span> }
+];
+
+<span class="c">// ── DOM References ─────────────────────────────────────────</span>
+
+<span class="k">const</span> localVideo  = document.<span class="f">getElementById</span>(<span class="s">'localVideo'</span>);
+<span class="k">const</span> remoteVideo = document.<span class="f">getElementById</span>(<span class="s">'remoteVideo'</span>);
+<span class="k">const</span> muteBtn     = document.<span class="f">getElementById</span>(<span class="s">'muteBtn'</span>);
+<span class="k">const</span> camBtn      = document.<span class="f">getElementById</span>(<span class="s">'camBtn'</span>);
+<span class="k">const</span> hangupBtn   = document.<span class="f">getElementById</span>(<span class="s">'hangupBtn'</span>);
+
+<span class="c">// ── State ──────────────────────────────────────────────────</span>
+
+<span class="k">let</span> ws;                          <span class="c">// WebSocket to signaling server</span>
+<span class="k">let</span> pc;                          <span class="c">// RTCPeerConnection</span>
+<span class="k">let</span> localStream;                 <span class="c">// local MediaStream</span>
+<span class="k">let</span> pendingCandidates = [];      <span class="c">// ICE candidates that arrive early</span>
+<span class="k">let</span> hasRemoteDesc    = <span class="k">false</span>;   <span class="c">// tracks setRemoteDescription state</span>
+<span class="k">let</span> isMuted          = <span class="k">false</span>;   <span class="c">// audio mute toggle</span>
+<span class="k">let</span> isCamOff         = <span class="k">false</span>;   <span class="c">// camera toggle</span>
+
+<span class="c">// ── 1. Get User Media ──────────────────────────────────────</span>
+
+<span class="k">async function</span> <span class="f">startMedia</span>() {
+  <span class="k">try</span> {
+    localStream = <span class="k">await</span> navigator.mediaDevices.<span class="f">getUserMedia</span>({
+      <span class="s">video</span>: { <span class="s">width</span>: { <span class="s">ideal</span>: <span class="n">1280</span> }, <span class="s">height</span>: { <span class="s">ideal</span>: <span class="n">720</span> } },
+      <span class="s">audio</span>: <span class="k">true</span>
+    });
+    localVideo.srcObject = localStream;
+  } <span class="k">catch</span> (err) {
+    <span class="k">if</span> (err.name === <span class="s">'NotAllowedError'</span>) {
+      <span class="f">showError</span>(<span class="s">'Camera/mic permission denied. Grant access and reload.'</span>);
+    } <span class="k">else if</span> (err.name === <span class="s">'NotFoundError'</span>) {
+      <span class="f">showError</span>(<span class="s">'No camera or microphone found on this device.'</span>);
+    } <span class="k">else</span> {
+      <span class="f">showError</span>(<span class="s">`Media error: ${err.message}`</span>);
+    }
+    <span class="k">throw</span> err;
+  }
+}
+
+<span class="c">// ── 2. Create Peer Connection ──────────────────────────────</span>
+
+<span class="k">function</span> <span class="f">createPeerConnection</span>() {
+  pc = <span class="k">new</span> <span class="t">RTCPeerConnection</span>({ <span class="s">iceServers</span>: ICE_SERVERS });
+
+  <span class="c">// Send ICE candidates to remote peer via signaling</span>
+  pc.<span class="f">onicecandidate</span> = ({ candidate }) =&gt; {
+    <span class="k">if</span> (candidate) {
+      <span class="f">send</span>({ <span class="s">type</span>: <span class="s">'ice-candidate'</span>, <span class="s">candidate</span>: candidate });
+    }
+  };
+
+  <span class="c">// Render remote media when tracks arrive</span>
+  pc.<span class="f">ontrack</span> = (event) =&gt; {
+    <span class="k">if</span> (remoteVideo.srcObject !== event.streams[<span class="n">0</span>]) {
+      remoteVideo.srcObject = event.streams[<span class="n">0</span>];
+      console.<span class="f">log</span>(<span class="s">'Remote stream attached'</span>);
+    }
+  };
+
+  <span class="c">// Monitor connection state for disconnection / failure</span>
+  pc.<span class="f">oniceconnectionstatechange</span> = () =&gt; {
+    console.<span class="f">log</span>(<span class="s">'ICE connection state:'</span>, pc.iceConnectionState);
+
+    <span class="k">switch</span> (pc.iceConnectionState) {
+      <span class="k">case</span> <span class="s">'disconnected'</span>:
+        console.<span class="f">warn</span>(<span class="s">'Peer disconnected &mdash; waiting for recovery...'</span>);
+        <span class="k">break</span>;
+      <span class="k">case</span> <span class="s">'failed'</span>:
+        console.<span class="f">error</span>(<span class="s">'ICE failed &mdash; attempting restart'</span>);
+        <span class="f">attemptIceRestart</span>();
+        <span class="k">break</span>;
+      <span class="k">case</span> <span class="s">'closed'</span>:
+        <span class="f">hangUp</span>();
+        <span class="k">break</span>;
+    }
+  };
+
+  <span class="c">// Add local tracks to the connection</span>
+  <span class="k">for</span> (<span class="k">const</span> track <span class="k">of</span> localStream.<span class="f">getTracks</span>()) {
+    pc.<span class="f">addTrack</span>(track, localStream);
+  }
+}
+
+<span class="c">// ── 3. Signaling via WebSocket ─────────────────────────────</span>
+
+<span class="k">function</span> <span class="f">connectSignaling</span>() {
+  ws = <span class="k">new</span> <span class="t">WebSocket</span>(SIGNALING_URL);
+
+  ws.<span class="f">onopen</span> = () =&gt; {
+    console.<span class="f">log</span>(<span class="s">'Connected to signaling server'</span>);
+    <span class="f">send</span>({ <span class="s">type</span>: <span class="s">'join'</span>, <span class="s">room</span>: ROOM_ID });
+  };
+
+  ws.<span class="f">onmessage</span> = <span class="k">async</span> (event) =&gt; {
+    <span class="k">const</span> msg = <span class="t">JSON</span>.<span class="f">parse</span>(event.data);
+    <span class="k">await</span> <span class="f">handleSignalingMessage</span>(msg);
+  };
+
+  ws.<span class="f">onclose</span> = () =&gt; {
+    console.<span class="f">warn</span>(<span class="s">'Signaling connection lost'</span>);
+  };
+
+  ws.<span class="f">onerror</span> = (err) =&gt; {
+    console.<span class="f">error</span>(<span class="s">'Signaling error:'</span>, err);
+  };
+}
+
+<span class="k">function</span> <span class="f">send</span>(msg) {
+  <span class="k">if</span> (ws &amp;&amp; ws.readyState === <span class="t">WebSocket</span>.OPEN) {
+    ws.<span class="f">send</span>(<span class="t">JSON</span>.<span class="f">stringify</span>(msg));
+  }
+}
+
+<span class="c">// ── 4. Handle Signaling Messages ───────────────────────────</span>
+
+<span class="k">async function</span> <span class="f">handleSignalingMessage</span>(msg) {
+  <span class="k">try</span> {
+    <span class="k">switch</span> (msg.type) {
+
+      <span class="c">// Server tells us a peer arrived &mdash; we create the offer</span>
+      <span class="k">case</span> <span class="s">'peer-joined'</span>: {
+        <span class="f">createPeerConnection</span>();
+        <span class="k">const</span> offer = <span class="k">await</span> pc.<span class="f">createOffer</span>();
+        <span class="k">await</span> pc.<span class="f">setLocalDescription</span>(offer);
+        <span class="f">send</span>({ <span class="s">type</span>: <span class="s">'offer'</span>, <span class="s">sdp</span>: pc.localDescription });
+        <span class="k">break</span>;
+      }
+
+      <span class="c">// We are the second peer &mdash; set remote, create answer</span>
+      <span class="k">case</span> <span class="s">'joined'</span>: {
+        <span class="k">if</span> (msg.initiator) {
+          <span class="c">// We are the second peer; wait for the offer</span>
+          <span class="f">createPeerConnection</span>();
+        }
+        <span class="k">break</span>;
+      }
+
+      <span class="c">// Incoming offer from the remote peer</span>
+      <span class="k">case</span> <span class="s">'offer'</span>: {
+        <span class="k">if</span> (!pc) <span class="f">createPeerConnection</span>();
+        <span class="k">await</span> pc.<span class="f">setRemoteDescription</span>(<span class="k">new</span> <span class="t">RTCSessionDescription</span>(msg.sdp));
+        hasRemoteDesc = <span class="k">true</span>;
+        <span class="f">flushCandidates</span>();
+
+        <span class="k">const</span> answer = <span class="k">await</span> pc.<span class="f">createAnswer</span>();
+        <span class="k">await</span> pc.<span class="f">setLocalDescription</span>(answer);
+        <span class="f">send</span>({ <span class="s">type</span>: <span class="s">'answer'</span>, <span class="s">sdp</span>: pc.localDescription });
+        <span class="k">break</span>;
+      }
+
+      <span class="c">// Incoming answer from the remote peer</span>
+      <span class="k">case</span> <span class="s">'answer'</span>: {
+        <span class="k">await</span> pc.<span class="f">setRemoteDescription</span>(<span class="k">new</span> <span class="t">RTCSessionDescription</span>(msg.sdp));
+        hasRemoteDesc = <span class="k">true</span>;
+        <span class="f">flushCandidates</span>();
+        <span class="k">break</span>;
+      }
+
+      <span class="c">// Incoming ICE candidate</span>
+      <span class="k">case</span> <span class="s">'ice-candidate'</span>: {
+        <span class="k">const</span> candidate = <span class="k">new</span> <span class="t">RTCIceCandidate</span>(msg.candidate);
+        <span class="k">if</span> (hasRemoteDesc &amp;&amp; pc) {
+          <span class="k">await</span> pc.<span class="f">addIceCandidate</span>(candidate);
+        } <span class="k">else</span> {
+          pendingCandidates.<span class="f">push</span>(candidate);
+        }
+        <span class="k">break</span>;
+      }
+
+      <span class="c">// Remote peer left the room</span>
+      <span class="k">case</span> <span class="s">'peer-left'</span>: {
+        <span class="f">hangUp</span>();
+        console.<span class="f">log</span>(<span class="s">'Remote peer left the call'</span>);
+        <span class="k">break</span>;
+      }
+    }
+  } <span class="k">catch</span> (err) {
+    console.<span class="f">error</span>(<span class="s">'Error handling signaling message:'</span>, err);
+  }
+}
+
+<span class="c">// Flush candidates that arrived before the remote description</span>
+<span class="k">async function</span> <span class="f">flushCandidates</span>() {
+  <span class="k">for</span> (<span class="k">const</span> c <span class="k">of</span> pendingCandidates) {
+    <span class="k">await</span> pc.<span class="f">addIceCandidate</span>(c);
+  }
+  pendingCandidates = [];
+}
+
+<span class="c">// ── 5. UI Controls ────────────────────────────────────────</span>
+
+muteBtn.<span class="f">addEventListener</span>(<span class="s">'click'</span>, () =&gt; {
+  isMuted = !isMuted;
+  localStream.<span class="f">getAudioTracks</span>().<span class="f">forEach</span>(t =&gt; { t.enabled = !isMuted; });
+  muteBtn.textContent = isMuted ? <span class="s">'Unmute'</span> : <span class="s">'Mute'</span>;
+});
+
+camBtn.<span class="f">addEventListener</span>(<span class="s">'click'</span>, () =&gt; {
+  isCamOff = !isCamOff;
+  localStream.<span class="f">getVideoTracks</span>().<span class="f">forEach</span>(t =&gt; { t.enabled = !isCamOff; });
+  camBtn.textContent = isCamOff ? <span class="s">'Camera On'</span> : <span class="s">'Camera Off'</span>;
+});
+
+hangupBtn.<span class="f">addEventListener</span>(<span class="s">'click'</span>, () =&gt; {
+  <span class="f">hangUp</span>();
+  <span class="f">send</span>({ <span class="s">type</span>: <span class="s">'leave'</span> });
+});
+
+<span class="c">// ── 6. Hang Up &amp; Cleanup ──────────────────────────────────</span>
+
+<span class="k">function</span> <span class="f">hangUp</span>() {
+  <span class="k">if</span> (pc) {
+    pc.<span class="f">close</span>();
+    pc = <span class="k">null</span>;
+  }
+  remoteVideo.srcObject = <span class="k">null</span>;
+  hasRemoteDesc = <span class="k">false</span>;
+  pendingCandidates = [];
+}
+
+<span class="c">// ── 7. ICE Restart (Reconnection) ─────────────────────────</span>
+
+<span class="k">async function</span> <span class="f">attemptIceRestart</span>() {
+  <span class="k">if</span> (!pc) <span class="k">return</span>;
+  <span class="k">try</span> {
+    <span class="k">const</span> offer = <span class="k">await</span> pc.<span class="f">createOffer</span>({ <span class="s">iceRestart</span>: <span class="k">true</span> });
+    <span class="k">await</span> pc.<span class="f">setLocalDescription</span>(offer);
+    <span class="f">send</span>({ <span class="s">type</span>: <span class="s">'offer'</span>, <span class="s">sdp</span>: pc.localDescription });
+    console.<span class="f">log</span>(<span class="s">'ICE restart offer sent'</span>);
+  } <span class="k">catch</span> (err) {
+    console.<span class="f">error</span>(<span class="s">'ICE restart failed:'</span>, err);
+    <span class="f">hangUp</span>();
+  }
+}
+
+<span class="c">// ── 8. Error Display Helper ───────────────────────────────</span>
+
+<span class="k">function</span> <span class="f">showError</span>(message) {
+  <span class="k">const</span> el = document.<span class="f">getElementById</span>(<span class="s">'errorDisplay'</span>);
+  <span class="k">if</span> (el) { el.textContent = message; el.hidden = <span class="k">false</span>; }
+  console.<span class="f">error</span>(message);
+}
+
+<span class="c">// ── 9. Boot Sequence ──────────────────────────────────────</span>
+
+(<span class="k">async function</span> <span class="f">init</span>() {
+  <span class="k">await</span> <span class="f">startMedia</span>();
+  <span class="f">connectSignaling</span>();
+})();</pre>
+
+    <h2>How the Call Setup Flows</h2>
+
+    <p>Once both peers have joined the room and the code above is running, the call setup proceeds through a precise sequence of events. The following flow shows every message and state transition, from the moment the second peer joins until media is flowing.</p>
+
+    <div class="flow">
+      <div class="f-step">
+        <div class="f-arrow right">Peer A joins room</div>
+        <div class="f-body">Peer A opens the page, captures local media, connects to the signaling server, and sends <code>{ type: "join", room: "demo-room" }</code>. The server responds with <code>{ type: "joined", initiator: false }</code>. Peer A waits.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Peer B joins room</div>
+        <div class="f-body">Peer B opens the page in a second tab, captures media, and sends a join message. The server responds to Peer B with <code>{ type: "joined", initiator: true }</code> and sends Peer A the <code>peer-joined</code> event.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Peer A &rarr; Offer</div>
+        <div class="f-body">On receiving <code>peer-joined</code>, Peer A creates an <code>RTCPeerConnection</code>, adds local tracks, calls <code>createOffer()</code>, sets the local description, and sends the SDP offer through signaling.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">Peer B &rarr; Answer</div>
+        <div class="f-body">Peer B receives the offer, sets it as the remote description, creates an answer, sets the local description, and sends the SDP answer back. Both peers now have matching session descriptions.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">ICE Candidates (both directions)</div>
+        <div class="f-body">Both peers fire <code>onicecandidate</code> events as they discover host, server-reflexive, and relay candidates. Each candidate is sent via signaling to the other peer and applied with <code>addIceCandidate()</code>.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">DTLS Handshake + Media Flow</div>
+        <div class="f-body">Once ICE connectivity checks succeed, the DTLS handshake establishes encryption. SRTP media begins flowing. The <code>ontrack</code> handler fires on both peers, and the remote video appears. The call is live.</div>
+      </div>
+    </div>
+
+    <h2>UI Controls: Mute, Camera, Hang Up</h2>
+
+    <p>The three UI controls in our application map directly to track manipulation on the local <code>MediaStream</code>. This is one of the more elegant aspects of the WebRTC API: you do not need to renegotiate the session to mute audio or disable video. You simply toggle the <code>enabled</code> property on the relevant track.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Control</th>
+          <th>Action</th>
+          <th>Effect on Remote Peer</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Mute / Unmute</strong></td>
+          <td>Sets <code>audioTrack.enabled = false</code></td>
+          <td>Remote peer hears silence. The track remains in the session; no renegotiation required.</td>
+        </tr>
+        <tr>
+          <td><strong>Camera Off / On</strong></td>
+          <td>Sets <code>videoTrack.enabled = false</code></td>
+          <td>Remote peer sees a black frame. The video track stays active but sends no pixel data.</td>
+        </tr>
+        <tr>
+          <td><strong>Hang Up</strong></td>
+          <td>Calls <code>pc.close()</code> and clears remote video</td>
+          <td>The peer connection is torn down. The signaling server notifies the remote peer via <code>peer-left</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Setting <code>track.enabled = false</code> is distinct from calling <code>track.stop()</code>. The former is reversible&mdash;toggle it back to <code>true</code> and audio/video resumes instantly. The latter permanently ends the track, turns off the camera indicator light, and requires a new <code>getUserMedia()</code> call to restart. For mute and camera toggle, always use <code>enabled</code>.</p>
+
+    <h2>Reconnection and ICE Restart</h2>
+
+    <p>Network conditions change. A user walks between Wi-Fi access points. A cellular tower hands off. A brief routing disruption drops packets for two seconds. When this happens, the ICE connection state transitions from <code>connected</code> to <code>disconnected</code>. If connectivity returns quickly, the state recovers on its own. If it does not, the state eventually moves to <code>failed</code>.</p>
+
+    <p>An <strong>ICE restart</strong> is the protocol-level mechanism for recovering from failure without tearing down the entire peer connection. You create a new offer with the <code>iceRestart</code> flag set to <code>true</code>. This tells the browser to generate fresh ICE credentials and gather new candidates, while preserving the existing DTLS association and media session. The remote peer receives the new offer, creates a new answer, and both peers run a new round of connectivity checks.</p>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">ICE Restart &mdash; Triggered on Connection Failure</span>
+<span class="k">const</span> offer = <span class="k">await</span> pc.<span class="f">createOffer</span>({ <span class="s">iceRestart</span>: <span class="k">true</span> });
+<span class="k">await</span> pc.<span class="f">setLocalDescription</span>(offer);
+<span class="f">send</span>({ <span class="s">type</span>: <span class="s">'offer'</span>, <span class="s">sdp</span>: pc.localDescription });</pre>
+
+    <p>The key detail: ICE restart reuses the existing <code>RTCPeerConnection</code> object. You do not close and recreate it. The DTLS session, the track bindings, the data channels&mdash;everything survives. Only the ICE layer resets. This makes recovery fast and seamless when it works. When it does not (the remote peer has truly vanished), the state will fail again, and you should fall back to a full hang-up and rejoin.</p>
+
+    <h2>Error Handling</h2>
+
+    <p>A production WebRTC application must handle every failure mode gracefully. Errors can originate from three layers: media capture, signaling, and the peer connection itself.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Error</th>
+          <th>Cause</th>
+          <th>Recovery</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>NotAllowedError</code></td>
+          <td>User denied camera/mic permission</td>
+          <td>Show a clear message explaining how to re-grant permissions in browser settings. Cannot proceed without user action.</td>
+        </tr>
+        <tr>
+          <td><code>NotFoundError</code></td>
+          <td>No camera or microphone available</td>
+          <td>Offer audio-only or video-only fallback. Modify <code>getUserMedia</code> constraints to request only available devices.</td>
+        </tr>
+        <tr>
+          <td><code>NotReadableError</code></td>
+          <td>Device in use by another application</td>
+          <td>Prompt the user to close other apps using the camera. Retry after a delay.</td>
+        </tr>
+        <tr>
+          <td>WebSocket close/error</td>
+          <td>Signaling server unreachable or crashed</td>
+          <td>Implement exponential backoff reconnection. Buffer unsent messages. An existing call survives signaling loss&mdash;only new negotiations fail.</td>
+        </tr>
+        <tr>
+          <td>ICE state <code>failed</code></td>
+          <td>No viable network path between peers</td>
+          <td>Attempt ICE restart. If restart fails, inform the user and offer to retry the call. Check that TURN is configured&mdash;most failures stem from missing relay servers.</td>
+        </tr>
+        <tr>
+          <td><code>setRemoteDescription</code> rejects</td>
+          <td>Malformed or incompatible SDP</td>
+          <td>Log the full SDP for debugging. This usually indicates a version mismatch or corrupted signaling message. Wrap all signaling handlers in <code>try/catch</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn">
+      <span class="co-tag">Warning</span>
+      <p>The most common mistakes when building your first WebRTC app: (1) Calling <code>addIceCandidate()</code> before <code>setRemoteDescription()</code>&mdash;this throws an error that kills the connection silently. Always queue early candidates. (2) Forgetting to add tracks before creating the offer&mdash;the resulting SDP will have no media lines, and the remote peer will receive nothing. (3) Not configuring TURN servers&mdash;your app works on localhost and fails for any two users behind different NATs. (4) Calling <code>track.stop()</code> instead of <code>track.enabled = false</code> for mute&mdash;this kills the track permanently and turns off the camera light, confusing users when they try to unmute.</p>
+    </div>
+
+    <h2>Testing with Two Tabs</h2>
+
+    <p>The simplest way to test a WebRTC application is to open two tabs in the same browser, both pointed at your local server. This works because each tab gets its own <code>RTCPeerConnection</code>, its own media stream, and its own WebSocket connection. The signaling server sees them as two independent peers.</p>
+
+    <div class="callout note">
+      <span class="co-tag">Note</span>
+      <p>Testing in two tabs on <code>localhost</code> is convenient but does not exercise the full ICE stack. Both tabs share the same host candidates (same machine, same network interfaces), so ICE connectivity checks succeed trivially. You will never see server-reflexive or relay candidates in this configuration. To test STUN/TURN behavior, deploy to two different machines (or use browser flags to force relay-only mode: <code>iceTransportPolicy: "relay"</code> in the <code>RTCPeerConnection</code> configuration). For a quick smoke test, however, two tabs are invaluable&mdash;you can verify the entire offer/answer/candidate flow, see both video feeds, and test mute/unmute in under a minute.</p>
+    </div>
+
+    <p>A minimal HTML page to host the client code looks like this:</p>
+
+    <pre class="code" data-lang="HTML"><span class="k">&lt;!DOCTYPE</span> <span class="t">html</span><span class="k">&gt;</span>
+<span class="k">&lt;html</span> <span class="s">lang</span>=<span class="s">"en"</span><span class="k">&gt;</span>
+<span class="k">&lt;head&gt;</span>
+  <span class="k">&lt;meta</span> <span class="s">charset</span>=<span class="s">"utf-8"</span><span class="k">&gt;</span>
+  <span class="k">&lt;title&gt;</span>Video Chat<span class="k">&lt;/title&gt;</span>
+  <span class="k">&lt;style&gt;</span>
+    video { width: <span class="n">45</span>%; background: <span class="s">#000</span>; }
+  <span class="k">&lt;/style&gt;</span>
+<span class="k">&lt;/head&gt;</span>
+<span class="k">&lt;body&gt;</span>
+  <span class="k">&lt;video</span> <span class="s">id</span>=<span class="s">"localVideo"</span> <span class="s">autoplay</span> <span class="s">muted</span> <span class="s">playsinline</span><span class="k">&gt;&lt;/video&gt;</span>
+  <span class="k">&lt;video</span> <span class="s">id</span>=<span class="s">"remoteVideo"</span> <span class="s">autoplay</span> <span class="s">playsinline</span><span class="k">&gt;&lt;/video&gt;</span>
+  <span class="k">&lt;div&gt;</span>
+    <span class="k">&lt;button</span> <span class="s">id</span>=<span class="s">"muteBtn"</span><span class="k">&gt;</span>Mute<span class="k">&lt;/button&gt;</span>
+    <span class="k">&lt;button</span> <span class="s">id</span>=<span class="s">"camBtn"</span><span class="k">&gt;</span>Camera Off<span class="k">&lt;/button&gt;</span>
+    <span class="k">&lt;button</span> <span class="s">id</span>=<span class="s">"hangupBtn"</span><span class="k">&gt;</span>Hang Up<span class="k">&lt;/button&gt;</span>
+  <span class="k">&lt;/div&gt;</span>
+  <span class="k">&lt;p</span> <span class="s">id</span>=<span class="s">"errorDisplay"</span> <span class="s">hidden</span> <span class="s">style</span>=<span class="s">"color:red"</span><span class="k">&gt;&lt;/p&gt;</span>
+  <span class="k">&lt;script</span> <span class="s">src</span>=<span class="s">"client.js"</span><span class="k">&gt;&lt;/script&gt;</span>
+<span class="k">&lt;/body&gt;</span>
+<span class="k">&lt;/html&gt;</span></pre>
+
+    <p>Serve both the HTML page and the signaling server from the same host. Open two tabs, and you should see your own camera feed in both. Within a second or two, the remote video will appear in each tab as the peer connection completes. Open the browser console to watch ICE state transitions and signaling messages flow.</p>
+
+    <h2>From Demo to Production</h2>
+
+    <p>The application above is a fully working 1:1 video chat. To take it from demo to production, you would add: authentication on the signaling server (reject unauthenticated WebSocket connections), TURN server credentials fetched from your backend (never hardcode long-lived credentials in client-side code), UI feedback for connection states (a spinner during ICE negotiation, a banner when disconnected), and graceful degradation when media devices are unavailable (fall back to audio-only, or display a message explaining the problem).</p>
+
+    <p>But the core is here. Every production WebRTC application&mdash;from telehealth platforms to live-streaming tools to collaborative whiteboards&mdash;runs the same sequence you just built: capture media, create a peer connection, exchange offers and answers through a signaling channel, trickle ICE candidates, and render the remote stream. The protocols do the heavy lifting. Your job is to wire them together correctly and handle failure gracefully. You now know how.</p>
+
+    <div class="sources">
+      <span class="src-tag">Sources</span>
+      <ol>
+        <li>W3C. &ldquo;WebRTC 1.0: Real-Time Communication Between Browsers,&rdquo; W3C Recommendation, January 2021.</li>
+        <li>Jennings, C., et al. &ldquo;Overview: Real-Time Protocols for Browser-Based Applications,&rdquo; <em>RFC 8825</em>, IETF, January 2021.</li>
+        <li>Rosenberg, J. and Schulzrinne, H. &ldquo;An Offer/Answer Model with the Session Description Protocol (SDP),&rdquo; <em>RFC 3264</em>, IETF, June 2002.</li>
+        <li>Otemma, S. &ldquo;WebRTC for the Curious,&rdquo; webrtcforthecurious.com, 2020.</li>
+        <li>MDN Web Docs. &ldquo;RTCPeerConnection,&rdquo; Mozilla Developer Network, 2024.</li>
+        <li>MDN Web Docs. &ldquo;MediaDevices.getUserMedia(),&rdquo; Mozilla Developer Network, 2024.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="09-security-by-design.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="11-scaling.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 &middot; Security by Design &mdash; WebRTC</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html"><span class="tile"></span>WEBRTC</a>
+  <span class="bb-chapter">09 &middot; Security by Design</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker">Chapter 09</span>
+    <h1>Security <span class="hl">by Design</span></h1>
+
+    <p class="lede">WebRTC is the rare web platform where security was not bolted on as an afterthought. From day one, the architects embedded encryption at every layer, made it mandatory rather than optional, and refused to provide an API escape hatch that could silently downgrade a session to plaintext. The result is a protocol stack where every media packet, every data channel message, and every key exchange is encrypted by default&mdash;and by requirement. Understanding why, and where the remaining attack surface lives, is essential for anyone building production real-time applications.</p>
+
+    <div class="callout key">
+      <span class="co-tag">Key Insight</span>
+      <p>Encryption in WebRTC is not optional. There is no configuration flag, no browser setting, no SDP attribute that can disable it. Every <span class="proto teal">DTLS</span> handshake, every <span class="proto blue">SRTP</span> packet, every data channel frame is encrypted. This was a deliberate, non-negotiable design decision documented in <span class="proto orange">RFC 8827</span>. The spec authors watched what happened when protocols made encryption optional&mdash;deployments skipped it for performance, carriers stripped it for lawful intercept, and users were left unprotected. WebRTC closed that door permanently.</p>
+    </div>
+
+    <h2>Secure Origins: The HTTPS Requirement</h2>
+
+    <p>Before a single frame of video leaves a camera, the browser enforces the first security gate: <strong>secure origins</strong>. The <code>getUserMedia()</code>, <code>getDisplayMedia()</code>, and <code>RTCPeerConnection</code> APIs are available only on pages served over <span class="proto teal">HTTPS</span> (or <code>localhost</code> during development). This is not a WebRTC-specific rule&mdash;it is part of the broader Secure Contexts specification (<span class="proto orange">W3C Secure Contexts</span>)&mdash;but its impact on real-time communication is profound. An attacker who compromises a plain HTTP page could silently activate the user&rsquo;s camera and microphone. The HTTPS requirement eliminates that class of attack entirely by ensuring that the page origin is authenticated via TLS before any powerful API becomes available.</p>
+
+    <p>In practice, this means every WebRTC deployment requires a valid TLS certificate. Self-signed certificates will trigger browser warnings and, in many cases, block API access. Services like Let&rsquo;s Encrypt have made this free and automated, but it remains a hard prerequisite.</p>
+
+    <h2>User Permissions: Explicit Consent</h2>
+
+    <p>Even on a secure origin, the browser will not hand over camera or microphone access silently. The user must grant explicit permission through a browser-controlled prompt that your JavaScript cannot suppress, style, or auto-dismiss. This prompt is managed entirely by the browser&rsquo;s permission system, not by your application code. When the user clicks &ldquo;Allow,&rdquo; the permission is scoped to that origin and can be revoked at any time through browser settings.</p>
+
+    <p>For screen sharing via <code>getDisplayMedia()</code>, the rules are even stricter. The browser must show a picker that lets the user choose which screen, window, or tab to share. No application can pre-select the capture target or silently begin recording the user&rsquo;s display. These restrictions exist because screen sharing exposes far more information than a camera feed&mdash;passwords, private messages, financial data&mdash;all visible in a single frame.</p>
+
+    <h2>DTLS: Encrypting the Key Exchange</h2>
+
+    <p><span class="proto teal">DTLS</span> (Datagram Transport Layer Security) is the UDP-adapted sibling of TLS. Where TLS secures TCP streams (your HTTPS connection, for example), DTLS secures individual datagrams&mdash;exactly what WebRTC needs for its UDP-based media transport. Every WebRTC peer connection begins with a DTLS handshake that establishes a shared secret between the two peers. This shared secret is then used to derive the encryption keys for <span class="proto blue">SRTP</span> media packets.</p>
+
+    <p>The DTLS handshake runs directly between the two peers, not through any intermediary server. Even if your signaling server is compromised, the attacker cannot decrypt the media because the DTLS keys are negotiated peer-to-peer. This is a critical architectural property: the signaling layer carries metadata <em>about</em> the session, but the encryption protects the session content independently.</p>
+
+    <h2>SRTP: Encrypting Media in Transit</h2>
+
+    <p>Once DTLS establishes keys, all audio and video packets are encrypted with <span class="proto blue">SRTP</span> (Secure Real-time Transport Protocol, defined in <span class="proto orange">RFC 3711</span>). SRTP encrypts the media payload of each RTP packet while leaving the header unencrypted&mdash;routers and middleboxes can still route packets without reading their content. The encryption algorithm is typically <span class="proto blue">AES-128-CM</span> (Counter Mode) with <span class="proto blue">HMAC-SHA1</span> for authentication, though modern implementations increasingly support <span class="proto blue">AES-256-GCM</span> for both encryption and authentication in a single pass.</p>
+
+    <p>The combination of DTLS for key exchange and SRTP for media encryption is known as <strong>DTLS-SRTP</strong>, specified in <span class="proto orange">RFC 5764</span>. It is the only key exchange mechanism permitted for WebRTC&mdash;the older SDES (Session Description Protocol Security Descriptions) method, which embedded keys directly in the SDP, was explicitly excluded because it requires the signaling channel to be trusted. DTLS-SRTP does not.</p>
+
+    <div class="statrow">
+      <div class="stat">
+        <span class="bignum">0</span>
+        <span class="lbl">Unencrypted calls possible</span>
+      </div>
+      <div class="stat">
+        <span class="bignum">100%</span>
+        <span class="lbl">Mandatory encryption</span>
+      </div>
+      <div class="stat">
+        <span class="bignum">2</span>
+        <span class="lbl">Layers of encryption (DTLS + SRTP)</span>
+      </div>
+    </div>
+
+    <h2>The DTLS-SRTP Handshake Flow</h2>
+
+    <p>Understanding how DTLS-SRTP bootstraps a secure media channel is worth walking through step by step. The process begins during signaling, extends through the ICE connectivity check, and completes with the first encrypted media packet.</p>
+
+    <div class="flow">
+      <div class="f-step">
+        <div class="f-arrow right">SDP Offer with DTLS Fingerprint</div>
+        <div class="f-body">The offerer generates a self-signed certificate, computes its SHA-256 fingerprint, and embeds it in the SDP offer as an <code>a=fingerprint</code> attribute. This fingerprint is sent to the remote peer through the signaling channel.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">SDP Answer with DTLS Fingerprint</div>
+        <div class="f-body">The answerer generates its own self-signed certificate, computes its fingerprint, and includes it in the SDP answer. Both peers now know what certificate to expect from the other side.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">ICE Connectivity Check</div>
+        <div class="f-body">ICE finds a working network path between the peers using STUN binding requests. Once a candidate pair is validated, the transport is ready for the DTLS handshake.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">DTLS ClientHello</div>
+        <div class="f-body">The DTLS client (determined by the <code>a=setup</code> SDP attribute) sends a ClientHello over the validated ICE transport. The handshake negotiates cipher suites and exchanges certificates.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">DTLS ServerHello + Certificate</div>
+        <div class="f-body">The DTLS server responds with its certificate. Each peer verifies that the received certificate&rsquo;s fingerprint matches the one declared in the SDP. A mismatch aborts the connection&mdash;this is the MITM defense.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">SRTP Keys Derived</div>
+        <div class="f-body">The completed DTLS handshake produces a shared master secret. Both peers use the <code>DTLS-SRTP</code> key export mechanism (<span class="proto orange">RFC 5764</span>) to derive symmetric encryption keys for SRTP. Encrypted media begins flowing.</div>
+      </div>
+    </div>
+
+    <h2>Fingerprint Verification: Preventing Man-in-the-Middle Attacks</h2>
+
+    <p>The <code>a=fingerprint</code> line in SDP is the linchpin of WebRTC&rsquo;s MITM defense. When Peer A sends its SDP offer, it includes the SHA-256 hash of its DTLS certificate. When the DTLS handshake later occurs directly between peers, each side checks that the certificate presented during the handshake matches the fingerprint declared in the SDP. If an attacker intercepts the DTLS handshake and substitutes their own certificate, the fingerprint will not match, and the browser will refuse to complete the connection.</p>
+
+    <p>This mechanism works because it binds the signaling-layer identity (the fingerprint in SDP) to the transport-layer identity (the certificate in DTLS). An attacker would need to compromise <em>both</em> the signaling channel and the media transport simultaneously to succeed&mdash;a significantly harder attack than intercepting either one alone.</p>
+
+    <pre class="code" data-lang="SDP"><span class="cap">SDP fingerprint attribute</span>
+<span class="c">// The SHA-256 hash of the peer's DTLS certificate</span>
+<span class="k">a</span>=<span class="t">fingerprint</span>:<span class="s">sha-256</span> <span class="n">4A:1B:2C:3D:4E:5F:...</span>
+<span class="k">a</span>=<span class="t">setup</span>:<span class="s">actpass</span>
+<span class="k">a</span>=<span class="t">rtcp-mux</span></pre>
+
+    <h2>Mandatory Encryption: No Opt-Out</h2>
+
+    <p>It is worth emphasizing just how absolute this requirement is. <span class="proto orange">RFC 8827</span> (WebRTC Security Architecture) states that implementations <strong>MUST</strong> support DTLS-SRTP and <strong>MUST NOT</strong> offer or accept unencrypted media. There is no <code>encryption: false</code> option in the <code>RTCPeerConnection</code> constructor. There is no browser flag to disable it. Even the internal Ozone/Electron-based applications that embed Chromium cannot bypass this requirement without forking the WebRTC library itself.</p>
+
+    <p>This design philosophy extends to data channels as well. Every <span class="proto green">SCTP</span> data channel runs over the same DTLS transport that secures media. There is no mechanism to create an unencrypted data channel. The protocol treats encryption as a structural requirement of the connection, not a feature that can be toggled.</p>
+
+    <h2>IP Address Leakage and mDNS Obfuscation</h2>
+
+    <div class="callout warn">
+      <span class="co-tag">Warning</span>
+      <p>WebRTC can leak a user&rsquo;s real IP address&mdash;including private network addresses behind a NAT&mdash;through ICE candidates. Host candidates contain the machine&rsquo;s local IP (e.g., <code>192.168.1.42</code>), and server-reflexive candidates reveal the public IP even when the user is behind a VPN. This is a well-documented privacy concern that has been exploited for browser fingerprinting, VPN detection, and geolocation tracking.</p>
+    </div>
+
+    <p>The ICE candidate gathering process is inherently leaky. When a browser gathers host candidates, it enumerates local network interfaces and includes their IP addresses in the candidate strings. These candidates travel through the signaling channel to the remote peer&mdash;and to anyone operating the signaling server. For users behind VPNs, this can reveal their true IP address, defeating the purpose of the VPN.</p>
+
+    <p>Modern browsers mitigate this with <strong>mDNS obfuscation</strong>. Instead of exposing raw IP addresses in host candidates, the browser generates a random UUID-based <code>.local</code> hostname (e.g., <code>a1b2c3d4-e5f6-7890-abcd-ef1234567890.local</code>) and uses mDNS to resolve it on the local network. The remote peer receives the <code>.local</code> address instead of a numeric IP. This prevents the signaling server and the remote peer from learning the user&rsquo;s local network topology.</p>
+
+    <pre class="code" data-lang="SDP"><span class="cap">ICE candidate with mDNS obfuscation</span>
+<span class="c">// Before mDNS (leaks private IP)</span>
+<span class="k">a</span>=<span class="t">candidate</span>:<span class="n">1</span> <span class="n">1</span> <span class="s">udp</span> <span class="n">2122260223</span> <span class="s">192.168.1.42</span> <span class="n">54321</span> <span class="s">typ host</span>
+
+<span class="c">// After mDNS (IP address hidden)</span>
+<span class="k">a</span>=<span class="t">candidate</span>:<span class="n">1</span> <span class="n">1</span> <span class="s">udp</span> <span class="n">2122260223</span> <span class="s">a1b2c3d4-e5f6-7890-abcd-ef1234567890.local</span> <span class="n">54321</span> <span class="s">typ host</span></pre>
+
+    <p>Note that mDNS obfuscation only protects host candidates. Server-reflexive candidates still reveal the user&rsquo;s public IP by design&mdash;without them, connectivity through NAT would be impossible. Users who need full IP privacy must route all traffic through a TURN relay, which hides their address behind the TURN server&rsquo;s IP.</p>
+
+    <h2>ICE Consent Freshness</h2>
+
+    <p>Establishing a connection is not enough&mdash;WebRTC must continuously verify that the remote peer still wants to receive traffic. The <strong>ICE consent freshness</strong> mechanism, defined in <span class="proto orange">RFC 7675</span>, requires each peer to send periodic STUN binding requests to the remote peer throughout the session. If a peer stops responding to these checks for 30 seconds, the browser terminates the connection.</p>
+
+    <p>This mechanism serves two purposes. First, it prevents a scenario where an attacker redirects traffic to a victim&rsquo;s IP address after the initial handshake&mdash;the victim would not respond to consent checks, and the connection would be torn down. Second, it ensures that abandoned connections are cleaned up promptly, releasing network and system resources.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Parameter</th>
+          <th>Value</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Check interval</td>
+          <td>Every 5 seconds</td>
+          <td>Verify remote peer still consents to receive traffic</td>
+        </tr>
+        <tr>
+          <td>Consent timeout</td>
+          <td>30 seconds</td>
+          <td>Connection terminated if no response within this window</td>
+        </tr>
+        <tr>
+          <td>Transaction ID</td>
+          <td>Random per check</td>
+          <td>Prevent replay attacks on consent responses</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Screen Sharing Security Indicators</h2>
+
+    <p>When a user shares their screen via <code>getDisplayMedia()</code>, browsers display persistent visual indicators that cannot be hidden or dismissed by the web application. In Chrome, this is a blue &ldquo;Sharing&rdquo; bar at the top of the shared window or a system notification. In Firefox, it is a pulsing tab indicator and a persistent notification. These indicators serve as an ongoing consent signal&mdash;the user can always see that sharing is active and can stop it with a single click.</p>
+
+    <p>Browsers also restrict what <code>getDisplayMedia()</code> can capture. Audio capture from screen shares is limited (some browsers only support it for tab captures, not window or screen captures). The <code>displaySurface</code> constraint can request a specific surface type but cannot enforce it&mdash;the user always makes the final choice. And importantly, <code>getDisplayMedia()</code> cannot be called without a user gesture (a click or keypress)&mdash;background tabs cannot silently begin capturing.</p>
+
+    <h2>TURN Server Trust Considerations</h2>
+
+    <p>When traffic flows through a <span class="proto teal">TURN</span> relay, the TURN server sees the encrypted SRTP packets but cannot decrypt them&mdash;it lacks the DTLS keys. However, the TURN server <em>can</em> observe metadata: which IP addresses are communicating, when, for how long, and how much bandwidth they consume. This metadata can be valuable to an adversary.</p>
+
+    <p>For this reason, choose your TURN provider carefully. Self-hosted TURN servers (using <code>coturn</code> or <code>Pion TURN</code>) give you full control over the relay infrastructure. Cloud-hosted TURN services (Twilio, Xirsys, Cloudflare) are convenient but mean trusting a third party with connection metadata. In highly sensitive deployments&mdash;healthcare, legal, government&mdash;self-hosted TURN behind your own network perimeter is the safer choice.</p>
+
+    <div class="callout note">
+      <span class="co-tag">Note</span>
+      <p>TURN credentials should be short-lived. Use the time-limited credential mechanism described in <span class="proto orange">RFC 8656</span>, where the signaling server generates temporary TURN credentials (typically valid for 5&ndash;10 minutes) that are included in the <code>iceServers</code> configuration. This limits the window of abuse if credentials are intercepted.</p>
+    </div>
+
+    <h2>Common Security Mistakes</h2>
+
+    <p>Even though WebRTC provides strong encryption by default, developers can still introduce vulnerabilities in the layers they control. These are the mistakes that appear most frequently in production deployments.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Mistake</th>
+          <th>Risk</th>
+          <th>Mitigation</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Signaling over plain HTTP</td>
+          <td>MITM can inject rogue SDP, redirect media</td>
+          <td>Always use WSS/HTTPS for signaling</td>
+        </tr>
+        <tr>
+          <td>No signaling authentication</td>
+          <td>Anyone can join any room, eavesdrop on calls</td>
+          <td>Require JWT or session tokens before room join</td>
+        </tr>
+        <tr>
+          <td>Long-lived TURN credentials</td>
+          <td>Credential theft enables relay abuse, bandwidth theft</td>
+          <td>Use time-limited credentials (5&ndash;10 min expiry)</td>
+        </tr>
+        <tr>
+          <td>Logging raw SDP to disk</td>
+          <td>Exposes DTLS fingerprints, ICE candidates, IPs</td>
+          <td>Redact sensitive fields before logging</td>
+        </tr>
+        <tr>
+          <td>Ignoring <code>iceTransportPolicy</code></td>
+          <td>Host candidates leak local IPs even when relay-only is needed</td>
+          <td>Set <code>iceTransportPolicy: "relay"</code> for privacy-sensitive apps</td>
+        </tr>
+        <tr>
+          <td>Trusting SDP from untrusted sources</td>
+          <td>Malformed SDP can crash parsers or trigger unexpected behavior</td>
+          <td>Validate and sanitize SDP before applying</td>
+        </tr>
+        <tr>
+          <td>No rate limiting on signaling</td>
+          <td>DoS via candidate flooding, room join spam</td>
+          <td>Rate-limit signaling messages per connection</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <pre class="code" data-lang="JavaScript"><span class="cap">Enforcing relay-only transport for IP privacy</span>
+<span class="k">const</span> pc = <span class="k">new</span> <span class="t">RTCPeerConnection</span>({
+  <span class="s">iceServers</span>: [{
+    <span class="s">urls</span>: <span class="s">'turn:turn.example.com:443?transport=tcp'</span>,
+    <span class="s">username</span>: temporaryUsername,
+    <span class="s">credential</span>: temporaryPassword
+  }],
+  <span class="c">// Force all traffic through TURN &mdash; no host or srflx candidates</span>
+  <span class="s">iceTransportPolicy</span>: <span class="s">'relay'</span>
+});</pre>
+
+    <h2>Defense in Depth: The Full Picture</h2>
+
+    <p>WebRTC&rsquo;s security model is not a single lock on the front door&mdash;it is a series of gates, each defending a different layer. Secure origins ensure the page is authentic. User permissions ensure consent is explicit. DTLS ensures keys are exchanged securely. SRTP ensures media is encrypted in transit. Fingerprint verification ensures the peer is who they claim to be. Consent freshness ensures the peer still wants to participate. And mDNS obfuscation limits the metadata leaked during connection setup.</p>
+
+    <p>None of these mechanisms require developer action to enable. They are all on by default, all mandatory, and all enforced by the browser. Your job as a developer is not to implement encryption&mdash;it is to avoid undermining the encryption that is already there. Secure your signaling channel. Authenticate your users. Manage your TURN credentials. And understand that the weakest link in any WebRTC deployment is almost never the protocol itself&mdash;it is the application code wrapped around it.</p>
+
+    <div class="sources">
+      <span class="src-tag">Sources</span>
+      <ol>
+        <li>Rescorla, E. &ldquo;WebRTC Security Architecture,&rdquo; <em>RFC 8827</em>, IETF, January 2021.</li>
+        <li>Rescorla, E. and Modadugu, N. &ldquo;Datagram Transport Layer Security Version 1.2,&rdquo; <em>RFC 6347</em>, IETF, January 2012.</li>
+        <li>McGrew, D. and Rescorla, E. &ldquo;Datagram Transport Layer Security (DTLS) Extension to Establish Keys for the Secure Real-time Transport Protocol (SRTP),&rdquo; <em>RFC 5764</em>, IETF, May 2010.</li>
+        <li>Baugher, M., et al. &ldquo;The Secure Real-time Transport Protocol (SRTP),&rdquo; <em>RFC 3711</em>, IETF, March 2004.</li>
+        <li>Perumal, M., et al. &ldquo;STUN Usage for Consent Freshness,&rdquo; <em>RFC 7675</em>, IETF, October 2015.</li>
+        <li>Uberti, J. and Otemma, S. &ldquo;WebRTC IP Address Handling Requirements,&rdquo; <em>RFC 8828</em>, IETF, January 2021.</li>
+        <li>W3C. &ldquo;WebRTC 1.0: Real-Time Communication Between Browsers,&rdquo; W3C Recommendation, January 2021.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="08-data-channels.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="10-building-the-app.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>
