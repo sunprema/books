@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>06 · Building and Using OAuth Systems — What Is OAuth?</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">What Is OAuth?</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="bld-head">
+      <span class="chapter-num">06</span>
+      <span class="chapter-kicker">From paper to production</span>
+      <h1>Building and Using OAuth Systems</h1>
+    </header>
+
+    <p class="lede" data-anchor="bld-lede">Everything so far has been about how OAuth behaves. This chapter is about what you type, in what order, and what you will be staring at when it does not work. The build order matters more than the theory, because almost every OAuth outage I have watched came from a step someone skipped rather than a concept someone misunderstood.</p>
+
+    <h2 data-anchor="bld-h-client">Building a client, in order</h2>
+
+    <p data-anchor="bld-p-client-intro">Do these in sequence. The order is not aesthetic — each step produces the input the next one needs, and the steps people reorder are exactly the ones that produce the errors nobody can diagnose later.</p>
+
+    <ol data-anchor="bld-client-steps">
+      <li><strong>Fetch the metadata document before writing any code.</strong> When you meet an unfamiliar provider, <code>/.well-known/openid-configuration</code> or the RFC 8414 document at <code>/.well-known/oauth-authorization-server</code> returns the live endpoint URLs and the advertised capabilities. These are two distinct endpoints and may return different documents on the same host. Whichever you use, the <code>issuer</code> in the response must be identical to the issuer identifier you derived the URL from; if it is not, discard the document.</li>
+      <li><strong>Register, and record three strings exactly.</strong> The <code>client_id</code>, the client secret if you are a confidential client, and the redirect URI — character for character. RFC 9700 requires authorization servers to compare redirect URIs by exact string matching, with a narrow carve-out for loopback URIs whose port varies at runtime. A trailing slash is a different URI.</li>
+      <li><strong>Generate the verifier and challenge.</strong> A <span class="term">code_verifier</span> is 43 to 128 characters from the unreserved set, and RFC 7636 asks for a minimum of 256 bits of entropy — base64url-encoding 32 random octets gives you a compliant 43-character string. Then <code>code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))</code>. Hash the ASCII bytes of the verifier string, not the random octets you generated it from.</li>
+      <li><strong>Generate a one-time <code>state</code> bound to the user-agent session.</strong> RFC 9700 asks for one-time-use CSRF tokens securely bound to the user agent. A random value that is reusable, or that lives in a global map with no session binding, protects nothing.</li>
+      <li><strong>Build the authorization URL.</strong> Parameters go in the query component in <code>application/x-www-form-urlencoded</code> form: <code>response_type=code</code>, <code>client_id</code>, <code>redirect_uri</code>, <code>scope</code>, <code>state</code>, <code>code_challenge</code>, <code>code_challenge_method=S256</code>.</li>
+      <li><strong>Write the redirect handler so it validates before it touches the code.</strong> Compare <code>state</code> against the value bound to this session and burn it. Where the server offers RFC 9207's <code>iss</code> parameter, form-urldecode it and compare it by simple string comparison to the issuer you sent the request to, rejecting on mismatch. Only then read <code>code</code>.</li>
+      <li><strong>POST to the token endpoint over TLS.</strong> RFC 6749 requires TLS on both the authorization and token endpoints. Send <code>grant_type=authorization_code</code>, <code>code</code>, <code>client_id</code>, <code>code_verifier</code>, and the same <code>redirect_uri</code> you used in the authorization request — it is repeated here for verification, not decoration.</li>
+      <li><strong>Store what came back according to client type.</strong> A confidential web application keeps credentials and tokens on the server, where the resource owner cannot reach them. A browser application should not hold them in JavaScript at all; the Backend-For-Frontend pattern routes resource requests through a backend so tokens never enter the page.</li>
+      <li><strong>Attach the token as a header.</strong> <code>Authorization: Bearer …</code>, never a query parameter — RFC 9700 states clients MUST NOT pass access tokens in a URI query parameter, because they leak into logs, history and <code>Referer</code>.</li>
+      <li><strong>Handle 401 by refreshing once, then re-authorizing.</strong> One refresh attempt, and if that fails, start a fresh authorization request. A retry loop against a dead grant just generates noise in someone's audit log.</li>
+      <li><strong>Persist the rotated refresh token on every refresh.</strong> Public clients' refresh tokens must be sender-constrained or rotated, so assume the response carries a new one and that the old one is dead the moment you receive it.</li>
+    </ol>
+
+    <p data-anchor="bld-p-skipped">Three of those get skipped, reliably. Step one: people copy endpoint URLs out of a blog post and never discover that the provider moved them or that the tenant they were pointed at has a different issuer. Step six: the redirect handler reads <code>code</code> first and validates <code>state</code> in a branch that a refactor eventually deletes. Step eleven: the client writes the new access token and quietly drops the rotated refresh token, which works perfectly until the access token expires and the client presents a credential the server has already retired. That last one is the classic "it broke overnight and nothing changed" ticket.</p>
+
+    <div class="callout key" data-anchor="bld-key1">
+      <span class="callout-title">Key idea</span>
+      <p>Validation happens before use. <code>state</code> and <code>iss</code> are checked before the authorization code is read; <code>aud</code> and the signature are checked before a token's claims are trusted. Any code path that reverses that order is the bug.</p>
+    </div>
+
+    <p class="code-label" data-anchor="bld-codelabel1">Discovery — the first thing to run against an unfamiliar provider</p>
+<pre data-anchor="bld-code1"><span class="fn">curl</span> -s <span class="str">https://accounts.example.com/.well-known/openid-configuration</span> \
+  | <span class="fn">jq</span> <span class="str">'{issuer, authorization_endpoint, token_endpoint, userinfo_endpoint, jwks_uri}'</span></pre>
+
+    <p class="code-label" data-anchor="bld-codelabel2">Deriving the S256 challenge from the shell</p>
+<pre data-anchor="bld-code2"><span class="at">code_verifier</span>=$(<span class="fn">openssl</span> rand -base64 <span class="num">96</span> | <span class="fn">tr</span> -d <span class="str">'\n=+/'</span> | <span class="fn">cut</span> -c1-64)
+<span class="at">code_challenge</span>=$(<span class="fn">printf</span> <span class="str">'%s'</span> <span class="str">"$code_verifier"</span> \
+  | <span class="fn">openssl</span> dgst -binary -sha256 \
+  | <span class="fn">openssl</span> base64 | <span class="fn">tr</span> <span class="str">'+/'</span> <span class="str">'-_'</span> | <span class="fn">tr</span> -d <span class="str">'='</span>)</pre>
+
+    <h2 data-anchor="bld-h-as">What an authorization server is actually made of</h2>
+
+    <p data-anchor="bld-p-as-intro">If you are considering writing one, it helps to see the shape of the state it must keep. The endpoints are the easy part: an authorization endpoint, a token endpoint, and then whichever of the optional ones you commit to — introspection (RFC 7662), revocation (RFC 7009), device authorization (RFC 8628), a <code>jwks_uri</code> and a metadata document. The stores behind them are where the work lives.</p>
+
+    <dl class="kv" data-anchor="bld-as-state">
+      <dt>clients + registered redirect URIs</dt>
+      <dd>Identity and credentials per client, plus the URI set the server compares against by exact string match. This table is the whole defence against code exfiltration.</dd>
+      <dt>authorization codes</dt>
+      <dd>Single-use, short-lived — RFC 6749 recommends a maximum lifetime of ten minutes — with the <code>code_challenge</code> and <code>code_challenge_method</code> bound to each code at issue time, because that binding is what the token endpoint compares against.</dd>
+      <dt>replay detection on codes</dt>
+      <dd>If a code is presented twice the server must deny the request and should revoke all tokens previously issued from it. That means codes cannot simply be deleted on use; the server has to remember it saw them.</dd>
+      <dt>grants</dt>
+      <dd>The durable record of what this user allowed this client to do, and at what scope. This is what a revocation UI operates on, and what an audit log has to be able to reconstruct.</dd>
+      <dt>refresh token families</dt>
+      <dd>Rotation is a detection mechanism, not a prevention one, and detection needs lineage: presentation of a rotated-out token is evidence of theft and should kill the whole family.</dd>
+      <dt>signing keys</dt>
+      <dd>Published through <code>jwks_uri</code> over https so resource servers can validate JWT access tokens. Keys must roll without breaking tokens already in flight, which means overlapping validity and a publication schedule.</dd>
+    </dl>
+
+    <p data-anchor="bld-p-as-work">Read that list again and notice how little of it is protocol. The message formats are a weekend. Consent UX that users understand, key rotation that does not cause an outage, revocation that actually revokes, and audit logging that survives a compliance review — that is the product. The protocol is the small part.</p>
+
+    <blockquote class="pull" data-anchor="bld-pull1">
+      The protocol is the small part. Consent, key rotation, revocation and audit logging are the system.
+      <cite>Why most teams should not write one</cite>
+    </blockquote>
+
+    <div class="callout spec" data-anchor="bld-spec1">
+      <span class="callout-title">In the spec</span>
+      <p>RFC 9126 defines the pushed authorization request endpoint: the client pushes its authorization parameters to the server over a back channel and receives a <code>request_uri</code> to reference at the authorization endpoint. If you are building a server, it is the available option for keeping request parameters off the front channel entirely.</p>
+    </div>
+
+    <h2 data-anchor="bld-h-test">Testing an integration</h2>
+
+    <p data-anchor="bld-p-test1">Start at discovery, always. The metadata document tells you the endpoints, the issuer, and what the server claims to support, which is a faster way to find out that a provider does not offer the device grant than reading its marketing pages. Then get a real authorization response onto your laptop: a loopback redirect URI, <code>http://127.0.0.1:{port}/{path}</code> for IPv4 or <code>http://[::1]:{port}/{path}</code> for IPv6, is the spec-sanctioned way to do it, and RFC 8252 requires the authorization server to allow any port to be specified at request time. Do not hardcode the port. Bind to an ephemeral one and put it in the request.</p>
+
+    <p data-anchor="bld-p-test2">From there, the token endpoint response is your primary debugging artifact. It is a JSON object, its <code>error</code> member is the server's machine-readable diagnosis, and everything else you might do — adding logging, bisecting parameters, asking the provider's support desk — is downstream of reading it properly. Where the provider issues JWT access tokens under the RFC 9068 profile, you can base64url-decode the header and claims and look at <code>iss</code>, <code>aud</code>, <code>exp</code> and <code>scope</code> directly; that is a decode, not a validation, and it works because base64url is not encryption. For opaque tokens, RFC 7662 introspection is the server-side answer: the response's <code>active</code> member is the authoritative liveness signal, and the optional <code>scope</code> and <code>client_id</code> members tell you what the token actually carries rather than what you hoped it carried.</p>
+
+    <p class="code-label" data-anchor="bld-codelabel3">Introspection — ask the server what the token really is</p>
+<pre data-anchor="bld-code3"><span class="kw">POST</span> /introspect HTTP/1.1
+<span class="ty">Host</span>: server.example.com
+<span class="ty">Authorization</span>: Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW
+<span class="ty">Content-Type</span>: application/x-www-form-urlencoded
+
+<span class="at">token</span>=<span class="str">mF_9.B5f-4.1JqM</span></pre>
+
+    <p data-anchor="bld-p-test3">One more path worth wiring in: RFC 9728 lets a resource server answer a 401 with a challenge carrying a <code>resource_metadata</code> URL, which turns "this API rejected me" into a discoverable route to that resource's requirements. If you follow it, check that the <code>resource</code> value in the returned metadata is identical to the URL you used to reach the resource server — the spec requires it, and it is the check that stops a metadata document from redirecting you somewhere it should not.</p>
+
+    <p class="code-label" data-anchor="bld-codelabel4">A 401 that tells you where to look next</p>
+<pre data-anchor="bld-code4">HTTP/1.1 <span class="num">401</span> Unauthorized
+<span class="ty">WWW-Authenticate</span>: Bearer <span class="at">error</span>=<span class="str">"invalid_token"</span>,
+  <span class="at">resource_metadata</span>=<span class="str">"https://api.example.com/.well-known/oauth-protected-resource"</span></pre>
+
+    <figure class="diagram" data-anchor="bld-fig1">
+      <svg viewBox="0 0 420 280" role="img" aria-label="Decision tree for debugging a 401 from an API: check whether the token expired, refresh once, and if still failing, introspect the token to check active, audience and scope; a 403 with insufficient_scope means re-authorize with a wider scope instead.">
+        <rect class="box-hot" x="60" y="6" width="200" height="30" rx="2" />
+        <text x="160" y="26" text-anchor="middle">401 from the API</text>
+        <path class="flow" d="M160 36 V58" marker-end="url(#bld-arrow)" />
+
+        <rect class="box-alt" x="60" y="60" width="200" height="36" rx="2" />
+        <text x="160" y="78" text-anchor="middle">Is the token expired?</text>
+        <text class="lbl" x="160" y="90" text-anchor="middle">exp / expires_in</text>
+        <path class="flow" d="M160 96 V118" marker-end="url(#bld-arrow)" />
+
+        <rect class="box" x="60" y="120" width="200" height="36" rx="2" />
+        <text x="160" y="138" text-anchor="middle">Refresh once</text>
+        <text class="lbl" x="160" y="150" text-anchor="middle">persist the rotated token</text>
+        <path class="flow" d="M160 156 V178" marker-end="url(#bld-arrow)" />
+
+        <rect class="box-alt" x="60" y="180" width="200" height="30" rx="2" />
+        <text x="160" y="200" text-anchor="middle">Still 401?</text>
+        <path class="flow" d="M160 210 V232" marker-end="url(#bld-arrow)" />
+
+        <rect class="box-hot" x="60" y="234" width="200" height="38" rx="2" />
+        <text x="160" y="252" text-anchor="middle">Introspect the token</text>
+        <text class="lbl-hot" x="160" y="265" text-anchor="middle">active · aud · scope</text>
+
+        <path class="flow-dash" d="M60 78 H26 V253 H56" marker-end="url(#bld-arrow)" />
+        <text class="lbl" x="26" y="170" text-anchor="middle">not expiry</text>
+
+        <path class="flow" d="M260 195 H286" marker-end="url(#bld-arrow)" />
+        <rect class="box" x="288" y="178" width="124" height="36" rx="2" />
+        <text class="lbl" x="350" y="194" text-anchor="middle">403 insufficient_scope:</text>
+        <text class="lbl" x="350" y="206" text-anchor="middle">re-authorize, wider scope</text>
+
+        <defs>
+          <marker id="bld-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="currentColor" />
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>Debugging a 401 in the order that costs least: expiry, then one refresh, then introspection. A 403 with <code>insufficient_scope</code> is a different failure — no amount of refreshing widens a grant.</figcaption>
+    </figure>
+
+    <h2 data-anchor="bld-h-errors">Reading the errors</h2>
+
+    <p data-anchor="bld-p-errors-intro">This is the table I would put on the wall. The codes are terse by design, and the gap between what a code literally means and what actually caused it is where the debugging time goes.</p>
+
+    <table data-anchor="bld-tbl-errors">
+      <caption>Token and authorization endpoint errors, and what they really mean</caption>
+      <thead>
+        <tr><th>Error</th><th>Literal meaning</th><th>What actually causes it</th><th>Where to look</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>invalid_request</code></td>
+          <td>Missing a required parameter, an invalid parameter value, a parameter sent more than once, or otherwise malformed.</td>
+          <td>A duplicated parameter from a URL builder; a missing <code>code_challenge</code> where the server requires PKCE; wrong content type on the token POST.</td>
+          <td>The exact bytes of the request you sent, not the ones your library logged.</td>
+        </tr>
+        <tr>
+          <td><code>invalid_client</code></td>
+          <td>Client authentication failed.</td>
+          <td>Wrong <code>client_id</code>/secret pair; the right secret for the wrong environment; the wrong client authentication method (header vs. form body).</td>
+          <td>The 401 response — if you authenticated via the Authorization header, RFC 6749 requires a matching <code>WWW-Authenticate</code> header back.</td>
+        </tr>
+        <tr>
+          <td><code>invalid_grant</code></td>
+          <td>The grant or refresh token is invalid, expired, revoked, does not match the redirect URI used in the authorization request, or was issued to another client.</td>
+          <td>A code redeemed twice; a PKCE verifier mismatch; a rotated-out refresh token.</td>
+          <td>Server-side logs. See below — this one cannot be resolved from the client.</td>
+        </tr>
+        <tr>
+          <td><code>unauthorized_client</code></td>
+          <td>This authenticated client is not authorized to use this grant type.</td>
+          <td>Client credentials or device grant not enabled on the registration; a grant type the server supports but this client is not approved for; a confidential-only grant attempted by a public client.</td>
+          <td>The client registration, and <code>grant_types_supported</code> in the metadata document.</td>
+        </tr>
+        <tr>
+          <td><code>invalid_scope</code></td>
+          <td>The requested scope is invalid, unknown, malformed, or exceeds the scope granted by the resource owner.</td>
+          <td>A typo or wrong delimiter in the scope string; a scope not enabled for this client; a refresh request asking for more scope than was originally granted.</td>
+          <td>The provider's scope list, and the <code>scope</code> value in the original token response.</td>
+        </tr>
+        <tr>
+          <td><code>unsupported_grant_type</code></td>
+          <td>The authorization server does not support this grant type.</td>
+          <td>A grant type URN mistyped or not URL-encoded; the password grant, which is a flat MUST NOT under RFC 9700; a device grant on a provider that has none.</td>
+          <td><code>grant_types_supported</code> in the metadata document.</td>
+        </tr>
+        <tr>
+          <td><code>redirect_uri_mismatch</code></td>
+          <td>Not an RFC 6749 registered error code — a provider-specific string, often surfaced as an <code>invalid_request</code> variant.</td>
+          <td>A trailing slash; <code>http</code> vs. <code>https</code> or a differing port; the wrong environment's callback registered.</td>
+          <td>A rendered error page in the browser, not a redirect. The server must not redirect to an unverified URI, so nothing reaches your handler.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="bld-p-invalidgrant">Give <code>invalid_grant</code> its own respect. It is the most overloaded code in the specification: an expired authorization code, a replayed authorization code, a PKCE verifier that does not transform to the stored challenge, a refresh token that has been rotated out or revoked, and a redirect URI that does not match the one used in the authorization request all arrive at your client as the same six words. That overloading is deliberate — the server declines to tell an unauthenticated caller which of those it was — and it means <code>invalid_grant</code> cannot be diagnosed from the client side alone. When you get it, stop guessing and go and read the authorization server's logs, or ask someone who can. If you own the server, the single highest-value thing you can do for your own future debugging is log which of those five branches fired.</p>
+
+    <div class="callout warn" data-anchor="bld-warn1">
+      <span class="callout-title">Trap</span>
+      <p><code>error_description</code> is explicitly for humans. Branching client logic on its text works right up until the provider rewords a string, and then it fails in production with no code change on your side. Switch on <code>error</code>; log <code>error_description</code>.</p>
+    </div>
+
+    <div class="callout spec" data-anchor="bld-spec2">
+      <span class="callout-title">In the spec</span>
+      <p>RFC 6749 requires the authorization server not to automatically redirect the user agent when the redirect URI is missing, invalid, or mismatched. That single rule is why redirect URI failures show up as an error page rather than as an <code>error=</code> parameter on your callback.</p>
+    </div>
+
+    <h2 data-anchor="bld-h-buyorbuild">Build or buy</h2>
+
+    <p data-anchor="bld-p-buy1">Buy. For most teams, most of the time, the recommendation is not close, and I will name the axes so you can check whether you are the exception.</p>
+
+    <p data-anchor="bld-p-buy2">The first axis is <strong>who your users are</strong>. If they are your own employees, you already have an identity provider and the question is integration, not construction. If they are consumers, you are signing up for password reset, account recovery, session management and abuse handling, none of which is OAuth and all of which you will build anyway. If they are machines — a client credentials grant scoped to one audience, no user, no consent — that is genuinely the small case, and a narrowly scoped token issuer is defensible.</p>
+
+    <p data-anchor="bld-p-buy3">The second is <strong>federation</strong>. The moment you must accept identities from providers you do not run, you inherit their key rotation schedules, their metadata quirks, and mix-up attack surface, plus the discipline of checking every <code>iss</code> against the server you actually addressed. Bought products have already absorbed that.</p>
+
+    <p data-anchor="bld-p-buy4">The third is <strong>the standing cost of key rotation and revocation</strong>, which is where home-grown servers go to die. Rotation is not a feature you ship once; it is a recurring operation that must not invalidate tokens in flight. Revocation is only meaningful if it propagates to resource servers, which means either short token lifetimes or an introspection call on the hot path — a real latency and availability decision, not a checkbox.</p>
+
+    <p data-anchor="bld-p-buy5">The fourth is <strong>regulatory scope</strong>. If your sector requires evidence of who authorized what and when, the audit trail is a first-class deliverable with retention and integrity requirements, and it is far cheaper to buy something whose logs an auditor already recognises.</p>
+
+    <p data-anchor="bld-p-buy6">Build when the authorization server is your product, when data residency or air-gap constraints genuinely rule out every hosted option, or when the machine-to-machine case above is the entire requirement and will stay that way. Everything in between — "we only need a small one", "our needs are unusual" — is the failure mode. What starts as a token issuer becomes a consent UI, then a revocation console, then an on-call rotation. Buy the server; spend your engineering on the resource servers, where validating <code>iss</code>, <code>aud</code> and <code>exp</code> correctly is work only you can do.</p>
+
+    <p class="code-label" data-anchor="bld-codelabel5">The artifact you will spend the most time reading</p>
+<pre data-anchor="bld-code5">{
+  <span class="at">"error"</span>: <span class="str">"invalid_grant"</span>,
+  <span class="at">"error_description"</span>: <span class="str">"Authorization code expired or already redeemed"</span>
+}</pre>
+
+    <h2 data-anchor="bld-h-takeaway">What to take away</h2>
+    <ul data-anchor="bld-takeaway-list">
+      <li>Discovery first, always: the metadata document gives you live endpoints and a verifiable <code>issuer</code>, and it must byte-match the identifier you derived the URL from.</li>
+      <li>The redirect handler validates <code>state</code> and, where offered, <code>iss</code> before it reads the code. Reversing that order is the bug.</li>
+      <li>Persist the rotated refresh token on every single refresh, or you will lock yourself out on the next call.</li>
+      <li><code>invalid_grant</code> covers expired codes, replayed codes, PKCE mismatch, rotated-out refresh tokens and redirect URI mismatch — it is not diagnosable from the client alone.</li>
+      <li>Switch on <code>error</code>, never on <code>error_description</code>; <code>redirect_uri_mismatch</code> is not an RFC 6749 code and arrives as a page, not a redirect.</li>
+      <li>Buy the authorization server unless it is your product. The protocol is the small part; consent, key rotation, revocation and audit logging are the system.</li>
+    </ul>
+
+    <div class="sources" data-anchor="bld-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc6749">RFC 6749 — The OAuth 2.0 Authorization Framework</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc6750">RFC 6750 — OAuth 2.0: Bearer Token Usage</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc7636">RFC 7636 — Proof Key for Code Exchange by OAuth Public Clients (PKCE)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc7009">RFC 7009 — OAuth 2.0 Token Revocation</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc7662">RFC 7662 — OAuth 2.0 Token Introspection</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc8252.html">RFC 8252 — OAuth 2.0 for Native Apps (BCP 212)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc8414">RFC 8414 — OAuth 2.0 Authorization Server Metadata</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc8628">RFC 8628 — OAuth 2.0 Device Authorization Grant</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9068">RFC 9068 — JWT Profile for OAuth 2.0 Access Tokens</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9126">RFC 9126 — OAuth 2.0 Pushed Authorization Requests</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9207">RFC 9207 — OAuth 2.0 Authorization Server Issuer Identification</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9700">RFC 9700 — Best Current Practice for OAuth 2.0 Security (BCP 240)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9728">RFC 9728 — OAuth 2.0 Protected Resource Metadata</a></li>
+        <li><a href="https://openid.net/specs/openid-connect-discovery-1_0.html">OpenID Connect Discovery 1.0</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/">OAuth 2.0 for Browser-Based Applications (draft-ietf-oauth-browser-based-apps-27)</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-security-pitfalls-and-practices.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-oidc-and-oauth-2-1.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>
