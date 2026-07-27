@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>05 · Security, Pitfalls, and Best Practices — What Is OAuth?</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">What Is OAuth?</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="sec-head">
+      <span class="chapter-num">05</span>
+      <span class="chapter-kicker">Where it actually breaks</span>
+      <h1>Security, Pitfalls, and Best Practices</h1>
+    </header>
+
+    <p class="lede" data-anchor="sec-lede">Every chapter so far described the protocol working. This one describes it under attack. The useful way to hold this material is not as a list of rules but as a set of failure domains: for each control, know what an attacker walks away with when that control fails, and know which other control is still standing behind it. A single mitigation that carries an entire flow is a design smell.</p>
+
+    <h2 data-anchor="sec-h-9700">The document that changed the defaults</h2>
+
+    <p data-anchor="sec-p-9700-1"><span class="term">RFC 9700</span>, "Best Current Practice for OAuth 2.0 Security", was published in January 2025 as <span class="term">BCP 240</span>. It is the published successor to the long-running <code>draft-ietf-oauth-security-topics</code> series, which many teams cited for years while it was still a draft. If your internal standards document points at a security-topics draft revision, that pointer is now stale.</p>
+
+    <p data-anchor="sec-p-9700-2">The important structural fact is that RFC 9700 <em>updates</em> RFC 6749, RFC 6750, and RFC 6819 — it does not obsolete them. It extends their threat model and deprecates modes of operation deemed less secure or insecure. Practically: RFC 6749 still defines what the parameters are and what the endpoints do; RFC 9700 redefines what a correct implementation of RFC 6749 looks like in 2025. You need both open. Reading 6749 alone will lead you to build something that was compliant in 2012 and is not defensible now.</p>
+
+    <div class="callout spec" data-anchor="sec-spec-pkce">
+      <span class="callout-title">In the spec</span>
+      <p>RFC 9700 says public clients <strong>MUST</strong> use PKCE to prevent authorization code injection and misuse of authorization codes, and that for confidential clients use of PKCE is <strong>RECOMMENDED</strong>. Authorization servers MUST support it. The blanket "PKCE for every client, always" mandate is OAuth 2.1's, not RFC 9700's — quote the right document when you are writing a policy someone has to comply with.</p>
+    </div>
+
+    <h2 data-anchor="sec-h-redirect">Redirect URI validation is the whole boundary</h2>
+
+    <p data-anchor="sec-p-redirect-1">RFC 9700 requires that authorization servers use <span class="term">exact string matching</span> when comparing a client's redirection URI against the pre-registered ones. Exact means the whole URI, not just the origin — not the host, not the host plus a path prefix. Wildcard paths, wildcard subdomains, and tolerated extra query parameters all reopen the same hole: they let an attacker name a redirect target that the authorization server accepts but that the client's own infrastructure will forward somewhere else.</p>
+
+    <p data-anchor="sec-p-redirect-2">That "somewhere else" is the <span class="term">open redirector</span>. RFC 9700 states that clients and authorization servers MUST NOT expose open redirectors — URLs that forward the browser to an arbitrary URI taken from a query parameter — precisely because they enable exfiltration of codes and access tokens. The point that gets missed in reviews: the open redirector does not have to live on an OAuth endpoint. Any forwarding endpoint anywhere on the client's registered domain is enough, because the authorization server's exact match already succeeded before the forward happens. The audit scope is the whole site — marketing landing pages, legacy <code>/out?url=</code> handlers, login-return helpers — not the four routes your OAuth library owns.</p>
+
+    <p data-anchor="sec-p-redirect-3">Native apps get one narrow carve-out from exact matching. RFC 8252 loopback redirects use a port chosen at runtime, so the authorization server must accept any port for those. Hardcoding a fixed port in a desktop client is the pitfall on the other side of that rule: the port will eventually be taken, and the flow will fail on a user's machine you cannot reach.</p>
+
+    <p class="code-label" data-anchor="sec-codelabel-loopback">Loopback redirect forms (RFC 8252)</p>
+<pre data-anchor="sec-code-loopback"><span class="cm">http://127.0.0.1:{port}/{path}</span>   <span class="cm">IPv4</span>
+<span class="cm">http://[::1]:{port}/{path}</span>       <span class="cm">IPv6</span></pre>
+
+    <p data-anchor="sec-p-redirect-4">Failure domain: if exact matching is broken or an open redirector exists, the attacker receives authorization codes minted for real users. What is still standing is PKCE — the code is inert without the <code>code_verifier</code>, which never left the legitimate client. That is exactly why PKCE is a MUST for public clients rather than a nice-to-have. Redirect validation and PKCE are two independent layers over the same asset, and you should assume you will one day need the second one.</p>
+
+    <h2 data-anchor="sec-h-csrf">CSRF at the redirection endpoint</h2>
+
+    <p data-anchor="sec-p-csrf-1">RFC 9700 requires clients to prevent CSRF against the redirection endpoint: requests that arrive at your redirect URI carrying a code but that did not originate at the authorization server. The concrete harm is account grafting — the attacker gets their own authorization code delivered into the victim's browser session, and the victim's account at your client ends up linked to the attacker's resources.</p>
+
+    <p data-anchor="sec-p-csrf-2">The stated countermeasure is a one-time-use CSRF token carried in <code>state</code> and <em>securely bound to the user agent</em>. Both halves are load-bearing. A 256-bit random <code>state</code> that your server accepts twice, or that is not tied to the browser session that started the flow, is decoration; it looks like entropy and provides no CSRF protection at all.</p>
+
+    <div class="callout warn" data-anchor="sec-warn-state">
+      <span class="callout-title">Trap</span>
+      <p>Randomness is not the property that matters here. Single use and binding to the user agent are. Storing <code>state</code> in a shared cache keyed only by its own value, and deleting it "eventually", fails both tests while passing every code review that only greps for <code>secrets.token_urlsafe</code>.</p>
+    </div>
+
+    <p data-anchor="sec-p-csrf-3">RFC 9700 does permit a client to rely on PKCE's CSRF protection instead of <code>state</code> — but only once the client has confirmed that the authorization server supports PKCE. Confirmed, not assumed: against a server that silently ignores <code>code_challenge</code>, dropping <code>state</code> removes your only CSRF control. In OpenID Connect flows the <code>nonce</code> parameter also provides CSRF protection. What <code>nonce</code> does not do is protect a public client's authorization codes, because an attacker holding a stolen code can call the token endpoint directly and never touch the ID token. PKCE is the defence for that; <code>nonce</code> is not a substitute.</p>
+
+    <h2 data-anchor="sec-h-mixup">Mix-up attacks</h2>
+
+    <p data-anchor="sec-p-mixup-1">A <span class="term">mix-up attack</span> arises when a client talks to two or more authorization servers and at least one of them is attacker-controlled. The attacker tricks the client into sending a code or token issued by the honest server to the compromised one. If your client only ever talks to a single authorization server, this class does not apply to you — which is worth saying out loud, because it is the cheapest way to know whether the countermeasure is on your critical path or not. The moment you add a second identity provider, or ship multi-tenant "bring your own IdP", it moves onto that path.</p>
+
+    <figure class="diagram" data-anchor="sec-fig-mixup">
+      <svg viewBox="0 0 420 260" role="img" aria-label="A mix-up attack: the client starts a flow at an attacker-controlled authorization server, which redirects to the honest server; the honest server's code returns to the client, and the client then sends that code to the attacker's token endpoint.">
+        <rect class="box" x="14" y="100" width="96" height="44" rx="2" />
+        <text x="62" y="127" text-anchor="middle">Client</text>
+
+        <rect class="box" x="286" y="16" width="118" height="44" rx="2" />
+        <text x="345" y="43" text-anchor="middle">Honest AS</text>
+
+        <rect class="box-hot" x="286" y="182" width="118" height="48" rx="2" />
+        <text x="345" y="203" text-anchor="middle">Attacker AS</text>
+        <text class="lbl-hot" x="345" y="219" text-anchor="middle">token endpoint</text>
+
+        <path class="flow-hot" d="M110 132 H 200 V 196 H 282" marker-end="url(#sec-arrow-hot)" />
+        <text class="lbl-hot" x="242" y="190" text-anchor="middle">1 authz request</text>
+
+        <path class="flow-dash" d="M345 182 V 66" marker-end="url(#sec-arrow)" />
+        <text class="lbl" x="352" y="126" text-anchor="start">2 redirect</text>
+
+        <path class="flow" d="M286 38 H 62 V 96" marker-end="url(#sec-arrow)" />
+        <text class="lbl" x="180" y="30" text-anchor="middle">3 code comes back</text>
+
+        <path class="flow-hot" d="M62 148 V 244 H 282 V 234" marker-end="url(#sec-arrow-hot)" />
+        <text class="lbl-hot" x="160" y="240" text-anchor="middle">4 code redeemed at the wrong server</text>
+
+        <defs>
+          <marker id="sec-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="currentColor" />
+          </marker>
+          <marker id="sec-arrow-hot" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="var(--accent)" />
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>The honest server issues a perfectly valid code; the client's mistake is losing track of which server it was talking to, and handing that code to the attacker's token endpoint.</figcaption>
+    </figure>
+
+    <p data-anchor="sec-p-mixup-2">The countermeasure is RFC 9207, which defines the <code>iss</code> authorization response parameter carrying the authorization server's issuer identifier explicitly. A supporting client extracts <code>iss</code> from the authorization response, form-urldecodes it, and compares it by simple string comparison to the issuer identifier of the server it actually sent the request to — rejecting the response on mismatch.</p>
+
+    <p class="code-label" data-anchor="sec-codelabel-iss">Authorization response with the issuer identifier</p>
+<pre data-anchor="sec-code-iss"><span class="kw">HTTP/1.1</span> <span class="num">302</span> Found
+<span class="ty">Location</span>: https://client.example.org/cb?<span class="at">code</span>=<span class="str">SplxlOBeZQQYbYS6WxSbIA</span>
+   &amp;<span class="at">state</span>=<span class="str">af0ifjsldkj</span>
+   &amp;<span class="at">iss</span>=<span class="str">https%3A%2F%2Fserver.example.com</span></pre>
+
+    <div class="callout warn" data-anchor="sec-warn-iss">
+      <span class="callout-title">Trap</span>
+      <p>Receiving <code>iss</code> is not the defence. Comparing it against the issuer you started the flow with, and rejecting on mismatch, is the defence. A client that logs <code>iss</code>, or stores it, or trusts it as the issuer instead of checking it against its own record, has added a field and no security.</p>
+    </div>
+
+    <h2 data-anchor="sec-h-leak">Leakage: where secrets fall out of the flow</h2>
+
+    <p data-anchor="sec-p-leak-1">RFC 9700 states that clients MUST NOT pass access tokens in a URI query parameter in the manner described in Section 2.3 of RFC 6750. Query strings are copied into server logs, proxy logs, browser history, and analytics pipelines, none of which are designed to hold credentials. The Authorization header is the only carriage you should be building on.</p>
+
+    <p data-anchor="sec-p-leak-2">The <code>Referer</code> header is the second channel, and it is subtler because nobody writes the leak deliberately. RFC 9700 identifies it as a way the authorization request or response URI can be disclosed — from the authorization server's own pages or from the client's. That is why the RFC advises the authorization endpoint and the page rendered from the authorization response SHOULD NOT include third-party resources or links to external sites. A tag manager on your OAuth callback page is a code exfiltration channel with a vendor invoice attached.</p>
+
+    <p data-anchor="sec-p-leak-3">Third is clickjacking of the consent screen: a malicious site loads the target authorization page in a transparent iframe positioned over decoy buttons, so the user grants consent while believing they clicked something else. The consent screen is a UI security control, and like any UI control it is only as good as the guarantee that the user sees what they are approving.</p>
+
+    <figure class="img-slot" data-img-slot="attack-surface" data-img-file="assets/img/attack-surface.webp" style="--img-aspect:16 / 9">
+      <img class="img-real" src="../assets/img/attack-surface.webp" alt="A schematic OAuth flow with the leak points marked" width="1280" height="720" onerror="this.closest('.img-slot').classList.add('img-missing')" />
+      <div class="img-drop"><div class="img-drop-inner">
+        <strong>Image needed</strong>
+        <p class="img-prompt">Swiss International Typographic Style technical schematic on a pure white field: a horizontal chain of four thin-stroke black rectangles connected by straight arrows, representing a request passing through a system. At four points along the chain, small precise Swiss-red (#e63329) circular markers sit slightly above the line, each with a short red leader rule pointing down to the exact junction. Thin 1px linework, strict grid alignment, no shading, no gradients, no rounded corners, generous whitespace. Red appears only on the four markers and their leaders. No baked-in text or labels. Target size ~1280×720px, 16:9 landscape; compose as an on-page figure with the chain centred and safe margins — it is letterboxed into a 16:9 box, so keep nothing important near the edges.</p>
+        <button type="button" class="img-copy">Copy prompt</button>
+        <p class="img-hint">Generate this with your image agent, then drop the file here.</p>
+      </div></div>
+      <figcaption>The flow is only as strong as its junctions: every redirect, every hand-off, every place a value is stored.</figcaption>
+    </figure>
+
+    <h2 data-anchor="sec-h-replay">Replay, and the honest limits of rotation</h2>
+
+    <p data-anchor="sec-p-replay-1">Authorization codes are single use by construction. RFC 6749 says the client MUST NOT use a code more than once, recommends a maximum lifetime of ten minutes, and requires the authorization server to deny a reused code and SHOULD revoke, where possible, all tokens previously issued from it. That last clause is the interesting one: reuse is treated as evidence of compromise, not as a client bug to be forgiven. Build your retry logic accordingly — a naive retry loop around the token request will burn the grant.</p>
+
+    <p data-anchor="sec-p-replay-2">Refresh tokens are the long-lived asset, so RFC 9700 requires that refresh tokens for public clients MUST either be sender-constrained or use refresh token rotation. Section 4.14.2 presents rotation as a <em>detection and correction</em> mechanism for refresh token theft, not a prevention mechanism. Nothing about rotation stops a stolen token from being redeemed once. What rotation buys you is that the legitimate client and the thief now hold divergent state, and one of them will present a rotated-out token.</p>
+
+    <blockquote class="pull" data-anchor="sec-pull-rotation">
+      Rotation without reuse detection is bookkeeping, not security.
+      <cite>RFC 9700 §4.14.2, read honestly</cite>
+    </blockquote>
+
+    <p class="code-label" data-anchor="sec-codelabel-refresh">Refresh request</p>
+<pre data-anchor="sec-code-refresh"><span class="kw">POST</span> /token HTTP/1.1
+<span class="ty">Host</span>: server.example.com
+<span class="ty">Content-Type</span>: application/x-www-form-urlencoded
+
+<span class="at">grant_type</span>=<span class="str">refresh_token</span>&amp;<span class="at">refresh_token</span>=<span class="str">tGzv3JOkF0XG5Qx2TlKWIA</span>&amp;<span class="at">scope</span>=<span class="str">read</span></pre>
+
+    <p class="code-label" data-anchor="sec-codelabel-rotated">Response — the refresh token must be a new one</p>
+<pre data-anchor="sec-code-rotated">{
+  <span class="at">"access_token"</span>: <span class="str">"2YotnFZFEjr1zCsicMWpAA"</span>,
+  <span class="at">"token_type"</span>: <span class="str">"Bearer"</span>,
+  <span class="at">"expires_in"</span>: <span class="num">3600</span>,
+  <span class="at">"refresh_token"</span>: <span class="str">"XkP2rQ9vLb7ZmT4dHs1Nuw"</span>   <span class="cm">// not tGzv3JOk...</span>
+}</pre>
+
+    <p data-anchor="sec-p-replay-3">Then the part that is easy to skip: presentation of <code>tGzv3JOkF0XG5Qx2TlKWIA</code> after this response is evidence of theft, and the server must treat it that way — revoke the whole grant, not just reject the request. A deployment that rotates and then quietly issues a fresh token to whoever shows up with a stale one has implemented the ceremony and none of the mechanism.</p>
+
+    <table data-anchor="sec-tbl-threats">
+      <caption>Threat, mitigation, and the document that says so</caption>
+      <thead><tr><th>Attack</th><th>What stops it</th><th>Where it is written</th></tr></thead>
+      <tbody>
+        <tr><td>Authorization code interception</td><td>PKCE — the code cannot be redeemed without the <code>code_verifier</code>; MUST for public clients, RECOMMENDED for confidential ones</td><td>RFC 7636; RFC 9700</td></tr>
+        <tr><td>CSRF at the redirection endpoint</td><td>One-time-use CSRF token in <code>state</code>, bound to the user agent; PKCE may substitute once AS support is confirmed; <code>nonce</code> in OIDC flows</td><td>RFC 9700</td></tr>
+        <tr><td>Mix-up (multi-AS clients only)</td><td><code>iss</code> in the authorization response, form-urldecoded and string-compared to the expected issuer, rejected on mismatch</td><td>RFC 9207; RFC 9700</td></tr>
+        <tr><td>Open redirector exfiltration</td><td>Exact string matching of the full redirect URI, plus no open redirectors anywhere on the client's domain</td><td>RFC 9700</td></tr>
+        <tr><td><code>Referer</code> leak of code or token</td><td>No third-party resources or external links on the authorization endpoint or the redirect landing page</td><td>RFC 9700</td></tr>
+        <tr><td>Consent-screen clickjacking</td><td>Prevent the authorization page being loaded in a third-party site's transparent iframe</td><td>RFC 9700</td></tr>
+        <tr><td>Token replay in URLs</td><td>Access tokens MUST NOT travel in a URI query parameter; use the Authorization header</td><td>RFC 9700; RFC 6750 §2.3</td></tr>
+        <tr><td>Authorization code replay</td><td>Single-use codes; reuse denied and previously issued tokens revoked</td><td>RFC 6749</td></tr>
+        <tr><td>Refresh token theft</td><td>Sender-constraining, or rotation <em>with</em> reuse detection that revokes the grant — detection and correction, not prevention</td><td>RFC 9700 §4.14</td></tr>
+        <tr><td>XSS in a single-page app</td><td>Architecture: keep tokens out of JavaScript (BFF). Short lifetimes and rotation do not help against an active attacker</td><td>draft-ietf-oauth-browser-based-apps</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="sec-h-storage">Where tokens live, by client type</h2>
+
+    <p data-anchor="sec-p-storage-1">A confidential client running on a web server is the easy case, and it is easy for a structural reason: the client credentials and the issued tokens are stored on the server and are never exposed to the user agent. There is no browser storage question because there is nothing in the browser to store.</p>
+
+    <p data-anchor="sec-p-storage-2">Native and mobile apps are governed by RFC 8252 (BCP 212), which requires that authorization requests be made through an external user-agent — normally the system browser — and not an embedded one. The reason is definitional: an embedded user-agent is hosted by the requesting app and shares its security domain, so the app can read cookie storage and inspect or modify page content. A webview turns "the user types their password into their identity provider" into "the user types their password into your app". The in-app browser tab is the endorsed middle ground: it renders inside your app but retains the browser's full security properties and authentication state. RFC 8252 defines three redirect mechanisms — private-use URI scheme, claimed <code>https</code> scheme, and loopback interface. Private-use schemes are the weak one, because multiple installed apps can register the same scheme and it is indeterminate which receives the code; PKCE is what keeps that survivable.</p>
+
+    <p data-anchor="sec-p-storage-3">Browser apps are the hard case, and the reference is "OAuth 2.0 for Browser-Based Applications", an IETF Internet-Draft with intended status Best Current Practice — as of this writing, revision <code>-27</code>, and not yet an RFC. It presents three architectural patterns in decreasing order of security: Backend-For-Frontend, Token-Mediating Backend, and Browser-Based OAuth Client. In the BFF pattern the browser app delegates all OAuth responsibilities to a backend and routes every resource request through it, so tokens never reach JavaScript at all.</p>
+
+    <div class="callout warn" data-anchor="sec-warn-xss">
+      <span class="callout-title">Trap</span>
+      <p>Short access token lifetimes and refresh token rotation are ineffective against an <em>active</em> XSS attacker. Script running in your page simply starts its own flow and obtains a fresh, independent set of tokens. Rotation shortens the life of what was stolen; it does nothing about the attacker's ability to steal again. Treat in-page token custody as an architecture decision, not a storage decision.</p>
+    </div>
+
+    <table data-anchor="sec-tbl-storage">
+      <caption>Client type, token custody, and the rule you cannot break</caption>
+      <thead><tr><th>Client type</th><th>Where tokens live</th><th>The one rule</th></tr></thead>
+      <tbody>
+        <tr><td>Confidential web app (server-rendered)</td><td>On the server, in server-side session or grant storage</td><td>Tokens and client credentials never leave the server or reach the user agent.</td></tr>
+        <tr><td>Native / mobile app (RFC 8252)</td><td>Platform keystore or secure storage on the device</td><td>The authorization request goes through the system browser or an in-app browser tab — never an embedded webview.</td></tr>
+        <tr><td>Desktop app with loopback redirect</td><td>On the device; the redirect listener is bound to loopback only</td><td>Take an ephemeral port and send it in the redirect URI; the AS must accept any port.</td></tr>
+        <tr><td>SPA with a Backend-For-Frontend</td><td>On the backend; the browser holds only a session cookie</td><td>No token ever reaches JavaScript — resource calls are proxied.</td></tr>
+        <tr><td>Browser-based OAuth client (tokens in JS)</td><td>In the page — memory, a closure, or a Service Worker</td><td>Accept that XSS equals full compromise, and if you cannot use a non-exportable key API, isolate any private key in a closure variable or Service Worker.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="sec-h-constrained">Sender-constrained tokens</h2>
+
+    <p data-anchor="sec-p-constrained-1">A bearer token is worth whatever it costs to steal it; sender-constraining changes that economics by making possession insufficient. RFC 9449 defines <span class="term">DPoP</span>, an application-layer mechanism that binds access and refresh tokens to a client-held public key proven on every request, independently of the client authentication method. RFC 8705 defines <span class="term">mutual-TLS</span> client authentication and certificate-bound access tokens, binding a token to the client's X.509 certificate — carried as the <code>x5t#S256</code> confirmation method inside <code>cnf</code> — so the protected resource can verify the presenter is the client the token was issued to.</p>
+
+    <div class="callout key" data-anchor="sec-key-choose">
+      <span class="callout-title">Key idea</span>
+      <p>The selection rule is deployment-shaped, not security-shaped. mTLS suits server-to-server and regulated back-end deployments that already run a PKI. DPoP suits public clients, browser apps, and mobile apps that cannot present a client certificate — RFC 9449 names the dynamically downloaded single-page application explicitly. Choose on whether you can issue and rotate certificates, because both mechanisms defeat plain token theft.</p>
+    </div>
+
+    <p data-anchor="sec-p-constrained-2">DPoP's honest limit in the browser: it does not stop an attacker who is present at the moment of token issuance, because that attacker can bind fresh tokens to their own key pair. DPoP raises the cost of exfiltrating a token to somewhere else; it does not evict an attacker who is already executing in your page. That is a different failure domain, and the answer to it is the BFF, not a signing key.</p>
+
+    <h2 data-anchor="sec-h-scope">Scope, audience, and keeping parameters off the front channel</h2>
+
+    <p data-anchor="sec-p-scope-1">Scope is the mechanism for limiting an application's access to a user's account — requested by the client, granted by the resource owner. Least privilege here is not a slogan; it is the thing that bounds the blast radius of every failure above. When redirect validation fails and PKCE saves you, the scope on the token is what would have been lost.</p>
+
+    <p data-anchor="sec-p-scope-2">Coarse scopes also quietly break audience restriction. RFC 8707 resource indicators let a client name the resource it intends to use the token at, and say the authorization server SHOULD audience-restrict issued access tokens to those resources, expressed as the <code>aud</code> claim in a JWT or in the introspection response. RFC 9068 goes further and requires every individual scope string in a JWT access token's <code>scope</code> claim to have meaning for the resources named in <code>aud</code>. Without resource indicators, a token minted for one API is replayable at every other API that trusts the same issuer — you have an authorization boundary on paper and a shared bearer credential in practice.</p>
+
+    <p data-anchor="sec-p-scope-3">If you want to shrink the front channel entirely, RFC 9126 defines <span class="term">pushed authorization requests</span>: the client pushes the authorization request parameters to the authorization server over a back channel and receives a <code>request_uri</code> to reference them at the authorization endpoint. Nothing sensitive travels in the browser's address bar, so the Referer and history channels have nothing to leak. It costs one extra round trip and requires server support; where you have both, it is the cheapest structural reduction of attack surface on this list.</p>
+
+    <h2 data-anchor="sec-h-takeaway">What to take away</h2>
+
+    <p data-anchor="sec-p-takeaway-lead">Audit against this list. Every item is a yes or no, and a "mostly" is a no.</p>
+
+    <ul data-anchor="sec-takeaway-list">
+      <li>Your policy document cites RFC 9700 (BCP 240, January 2025), not a security-topics draft revision — and quotes MUST/RECOMMENDED at the strength the RFC uses.</li>
+      <li>The authorization server compares the full redirect URI by exact string match, with a loopback-port exception only for native apps.</li>
+      <li>Someone has audited the client's <em>entire</em> domain for open redirectors, not just its OAuth routes.</li>
+      <li>Public clients use PKCE. If any client drops <code>state</code>, it did so after confirming the AS actually supports PKCE.</li>
+      <li><code>state</code> is one-time-use and bound to the user agent session — not merely random.</li>
+      <li>If the client talks to more than one authorization server, it compares <code>iss</code> against the expected issuer and rejects on mismatch.</li>
+      <li>No access token appears in a URI query parameter, and the authorization and redirect pages carry no third-party resources or external links.</li>
+      <li>Refresh token rotation is paired with reuse detection that revokes the grant; code reuse revokes the tokens issued from that code.</li>
+      <li>Native apps use the system browser or an in-app browser tab; no embedded webview anywhere in the authorization path.</li>
+      <li>Browser apps have chosen a pattern deliberately — BFF where possible — and nobody is claiming short token lifetimes as an XSS defence.</li>
+      <li>Sender-constraining is chosen on deployment: mTLS where PKI exists, DPoP where certificates are impossible.</li>
+      <li>Scopes are narrow enough that <code>aud</code> means something, and resource indicators are used where more than one resource server trusts the issuer.</li>
+    </ul>
+
+    <div class="sources" data-anchor="sec-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9700">RFC 9700 — Best Current Practice for OAuth 2.0 Security (BCP 240)</a></li>
+        <li><a href="https://www.rfc-editor.org/info/rfc9700/">RFC 9700 metadata record — status, BCP number, publication date</a></li>
+        <li><a href="https://oauth.net/2/oauth-best-practice/">OAuth 2.0 Security Best Current Practice — oauth.net</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9207">RFC 9207 — OAuth 2.0 Authorization Server Issuer Identification</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc8252.html">RFC 8252 — OAuth 2.0 for Native Apps (BCP 212)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/">OAuth 2.0 for Browser-Based Applications (draft-ietf-oauth-browser-based-apps-27)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9449">RFC 9449 — OAuth 2.0 Demonstrating Proof of Possession (DPoP)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc8705">RFC 8705 — OAuth 2.0 Mutual-TLS Client Authentication and Certificate-Bound Access Tokens</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9126">RFC 9126 — OAuth 2.0 Pushed Authorization Requests</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc8707">RFC 8707 — Resource Indicators for OAuth 2.0</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9068">RFC 9068 — JWT Profile for OAuth 2.0 Access Tokens</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc7636">RFC 7636 — Proof Key for Code Exchange by OAuth Public Clients (PKCE)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc6749">RFC 6749 — The OAuth 2.0 Authorization Framework</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc6750">RFC 6750 — OAuth 2.0: Bearer Token Usage</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc6819.html">RFC 6819 — OAuth 2.0 Threat Model and Security Considerations</a></li>
+        <li><a href="https://oauth.net/2.1/">OAuth 2.1 — oauth.net</a></li>
+        <li><a href="https://oauth.net/2/scope/">OAuth 2.0 Scopes — oauth.net</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-oauth-flows-in-practice.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-building-and-using-oauth.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>
