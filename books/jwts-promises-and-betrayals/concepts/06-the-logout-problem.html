@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The logout problem — JWTs: Promises and Betrayals</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="book-title"><span class="chip">J</span>JWTs: Promises and Betrayals</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="c6-head">
+      <div class="chapter-rule"></div>
+      <div class="chapter-meta">
+        <span>Chapter Six</span>
+        <span class="kicker-accent">The problem cryptography cannot solve</span>
+      </div>
+      <span class="chapter-numeral">06</span>
+      <h1>The logout problem</h1>
+      <p class="dek">Everything so far has been about tokens that should not have
+      been accepted. This chapter is about a token that was issued correctly,
+      verifies perfectly, and must nevertheless stop working — right now.</p>
+    </header>
+
+    <p data-anchor="c6-p1">A session identifier is a pointer. The server holds the
+    session; deleting it ends the session everywhere, instantly. That is not a
+    feature anyone designed — it falls out of the fact that the credential means
+    nothing on its own.</p>
+
+    <p data-anchor="c6-p2">A JWT is the opposite by design. It is
+    <span class="term">self-contained</span>: valid because its signature and claims
+    check out, not because a server says so. That is exactly why it scales, and
+    exactly why you cannot take it back. There is nothing to delete.</p>
+
+    <div class="pullquote" data-anchor="c6-pull">
+      "Stateless authentication" is not a claim that no state exists. It is a
+      decision about where the state lives — and revocation is the bill that
+      arrives for it.
+    </div>
+
+    <h2 data-anchor="c6-h-attack">How I would approach this</h2>
+
+    <div class="callout attack" data-anchor="c6-attack1">
+      <span class="label">The attack — outliving my welcome</span>
+      <p>I have your token: from an XSS, a stolen laptop, a leaked log, a shared
+      machine in a library. You notice. You lock the account, reset the password,
+      revoke my device, and email the user that everything is secure.</p>
+      <p>None of that touches me. Your API does not consult a session store on each
+      request — that was the point. It verifies my token, finds a valid signature
+      and an <code>exp</code> in the future, and serves me. I keep working until
+      that timestamp, and the only question that matters is how far away you set it.</p>
+      <p>Twenty-four hours is common. Thirty days is not rare. I have seen tokens
+      with no <code>exp</code> at all.</p>
+    </div>
+
+    <figure data-anchor="c6-fig1">
+      <svg class="diagram" viewBox="0 0 560 180" role="img" aria-labelledby="c6fig1t">
+        <title id="c6fig1t">The window between logout and token expiry during which a stolen token still works</title>
+        <path d="M16 60 L544 60" class="stroke"/>
+        <path d="M16 54 L16 66" class="stroke"/>
+        <path d="M180 46 L180 74" class="stroke"/>
+        <path d="M520 54 L520 66" class="stroke"/>
+        <text x="16" y="40">issued</text>
+        <text x="150" y="40" class="red">logout</text>
+        <text x="470" y="40">exp</text>
+
+        <rect x="180" y="82" width="340" height="26" class="stroke-red"/>
+        <text x="190" y="100" class="big red">the token still works</text>
+
+        <path d="M180 122 L520 122" class="stroke-red"/>
+        <path d="M188 118 L180 122 L188 126" class="stroke-red"/>
+        <path d="M512 118 L520 122 L512 126" class="stroke-red"/>
+        <text x="180" y="142">this gap is your access-token lifetime</text>
+        <text x="16" y="168" class="big">Shortening it is the only defense that needs no extra machinery.</text>
+      </svg>
+      <figcaption><b>Revocation is a race against <code>exp</code>.</b> Every design
+      below is a way of making that red bar shorter, or of putting something in the
+      request path that can cut it short.</figcaption>
+    </figure>
+
+    <h2 data-anchor="c6-h-defense">Three answers, in increasing order of honesty</h2>
+
+    <h3 data-anchor="c6-h3-1">1. Short lifetimes</h3>
+    <p data-anchor="c6-p3">Make the window small enough that it stops mattering.
+    Five to fifteen minutes is the range most systems settle on. This costs you
+    nothing architecturally and bounds every other failure in this book: a leaked
+    token, a stolen token, a token in an old log entry — all of them expire on their
+    own. If you do one thing from this chapter, do this one.</p>
+
+    <h3 data-anchor="c6-h3-2">2. A denylist keyed on <code>jti</code></h3>
+    <p data-anchor="c6-p4">Chapter four introduced <code>jti</code> as a unique
+    identifier for a specific token. That is what makes selective revocation
+    possible: on logout, record the <code>jti</code>; on each request, reject tokens
+    whose <code>jti</code> appears in the list.</p>
+
+    <p data-anchor="c6-p5">Be honest about the trade — you have reintroduced a
+    lookup on the hot path, which is the thing you adopted JWTs to avoid. Two
+    details keep it cheap. Entries only need to live until the token's own
+    <code>exp</code>, so a store with TTL support expires them for you and the list
+    stays bounded. And the lookup is a small key-value read, not a session load.</p>
+
+<pre data-anchor="c6-code-denylist"><code><span class="cm"># On logout: remember only until the token would have died anyway.</span>
+SETEX <span class="str">"revoked:"</span>$jti  $(exp - now)  <span class="num">1</span>
+
+<span class="cm"># On each request, after signature + claim checks:</span>
+EXISTS <span class="str">"revoked:"</span>$jti   <span class="cm"># 1 -> reject</span></code></pre>
+
+    <h3 data-anchor="c6-h3-3">3. Split the credential in two</h3>
+    <p data-anchor="c6-p6">The design most production systems converge on, and the
+    one the OAuth security BCP assumes: a short-lived, stateless
+    <span class="term">access token</span> that services verify locally, plus a
+    long-lived, stateful <span class="term">refresh token</span> that only the
+    issuer sees and can revoke centrally.</p>
+
+    <p data-anchor="c6-p7">The refresh token is where revocation lives, and it is
+    consulted every few minutes rather than every request. Logout deletes the
+    refresh record; the access token dies of old age shortly after. You get local
+    verification on the hot path and a real off switch, and you pay for it with one
+    round trip per token refresh.</p>
+
+    <div class="callout defense" data-anchor="c6-defense1">
+      <span class="label">The defense — RFC 9700 on refresh tokens</span>
+      <p>A long-lived refresh token is a high-value target, so the OAuth 2.0
+      Security BCP does not leave it unprotected. Section 2.2.2 requires that
+      refresh tokens for public clients be <em>sender-constrained</em> or use
+      <em>refresh token rotation</em>; section 4.14 details both.</p>
+      <p><strong>Rotation</strong> means each use issues a new refresh token and
+      invalidates the old one. Its real value is detection: if an old token is ever
+      replayed, either I stole it or the legitimate client did — and the issuer
+      cannot tell which, so it revokes the whole chain and forces a fresh login.
+      Theft becomes visible instead of silent.</p>
+    </div>
+
+    <figure data-anchor="c6-fig2">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="c6fig2t">
+        <title id="c6fig2t">Refresh token rotation makes a replayed old token detectable</title>
+        <rect x="16" y="30" width="90" height="28" class="stroke fill-soft"/>
+        <text x="24" y="48" class="big">RT-1</text>
+        <path d="M106 44 L156 44" class="stroke"/>
+        <path d="M148 40 L156 44 L148 48" class="stroke"/>
+        <rect x="156" y="30" width="90" height="28" class="stroke fill-soft"/>
+        <text x="164" y="48" class="big">RT-2</text>
+        <path d="M246 44 L296 44" class="stroke"/>
+        <path d="M288 40 L296 44 L288 48" class="stroke"/>
+        <rect x="296" y="30" width="90" height="28" class="stroke fill-soft"/>
+        <text x="304" y="48" class="big">RT-3</text>
+        <text x="400" y="48">current</text>
+
+        <path d="M60 62 L60 96 L296 96" class="stroke-red"/>
+        <path d="M288 92 L296 96 L288 100" class="stroke-red"/>
+        <text x="66" y="114" class="red">RT-1 replayed — already spent</text>
+        <text x="16" y="140" class="big">Issuer revokes the entire chain and forces re-authentication.</text>
+      </svg>
+      <figcaption><b>A spent token that comes back is evidence.</b> Without
+      rotation, a stolen refresh token is quietly usable for its whole lifetime.</figcaption>
+    </figure>
+
+    <div class="trust-boundaries" data-anchor="c6-trust">
+      <h3>Trust boundaries</h3>
+      <dl>
+        <dt>Trusted</dt>
+        <dd>That a verified, unexpired token was validly issued at some point in the past.</dd>
+        <dt class="never">Never trusted</dt>
+        <dd class="never">That a valid token reflects the account's <em>current</em> state — permissions, password, employment, or consent.</dd>
+        <dt>Revocable only through</dt>
+        <dd>A short <code>exp</code>, a <code>jti</code> denylist, or a stateful refresh step. Nothing else can withdraw a token.</dd>
+        <dt>Check</dt>
+        <dd>Time it: from clicking "log out everywhere", how long does a captured token keep working? That number is your real answer, whatever the UI said.</dd>
+      </dl>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-key-confusion-and-header-abuse.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-where-tokens-leak.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
