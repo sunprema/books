@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>04 · OAuth 2.0 Flows in Practice — What Is OAuth?</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">What Is OAuth?</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="flows-head">
+      <span class="chapter-num">04</span>
+      <span class="chapter-kicker">Pick the right dance</span>
+      <h1>OAuth 2.0 Flows in Practice</h1>
+    </header>
+
+    <p class="lede" data-anchor="flows-lede">RFC 6749 defines four grant types — authorization code, implicit, resource owner password credentials, and client credentials — plus a mechanism for defining more. That reads like a menu. It is not. It is a record of pressure being applied to one design until it broke in four different places. Start from the simplest system that works, apply the pressure yourself, and the zoo turns into a short decision procedure.</p>
+
+    <h2 data-anchor="flows-h-default">Start with the flow that already works</h2>
+
+    <p data-anchor="flows-p1">Chapter 2 walked the authorization code flow: the client sends the user to the authorization endpoint with <code>response_type=code</code>, the server redirects back with a code, and the client trades that code at the token endpoint for an access token. Nothing about that is provisional. It is the default, and for every client type discussed in this chapter the answer starts from it. The reason is structural rather than aesthetic. The redirect carries a code, not a token, so anything that observes the redirect — browser history, a proxy log, a <code>Referer</code> header — sees a value that is single-use, short-lived (a maximum lifetime of ten minutes is recommended), and useless without a second request to the token endpoint. That second request is a back channel the client controls, which gives the server a second place to check things.</p>
+
+    <p data-anchor="flows-p2">The original design assumed the client could authenticate on that second request. A web application running on a server is a <span class="term">confidential client</span>: the client secret and the issued tokens live on the server and are never exposed to the resource owner. The code alone is worth nothing to a thief, because redeeming it also requires the secret. Under that assumption the flow is complete and the rest of this chapter would be unnecessary.</p>
+
+    <h2 data-anchor="flows-h-pkce">Pressure one: the client cannot keep a secret</h2>
+
+    <p data-anchor="flows-p3">Now the client is a mobile app. You ship it to a hundred thousand phones, and whatever secret you compile into it is a secret that a hundred thousand people can extract. It is a <span class="term">public client</span> — it authenticates with nothing but its <code>client_id</code>, which is not a credential, it is a name. The token endpoint can no longer ask "are you really this client?" and so the entire security of the exchange rests on one assumption: that nobody but the real client sees the authorization code.</p>
+
+    <p data-anchor="flows-p4">That assumption does not hold on a phone. RFC 8252 gives native apps three ways to receive the redirect, and the common one — a private-use URI scheme such as <code>com.example.app:/oauth</code> — is explicitly weak, because multiple apps can register the same scheme and it is indeterminate which one the operating system hands the redirect to. A malicious app that registers your scheme receives your authorization code. It has your <code>client_id</code>, because that is public. It has the code. It has everything the token endpoint asks for. This is the <span class="term">authorization code interception</span> attack, and it is the specific hole PKCE was built to close.</p>
+
+    <p data-anchor="flows-p5">Proof Key for Code Exchange fixes the shape of the problem rather than the symptom. If the client cannot prove its identity with a long-lived secret, let it prove continuity with a fresh one: generate a random value per authorization request, send only a hash of it up the front channel, and present the original at the token endpoint. The server binds the hash to the code at issuance and checks it at redemption. An attacker who intercepts the code never saw the original value and cannot produce it. Beyond interception, this same binding is what prevents authorization code injection and gives the flow CSRF protection.</p>
+
+    <div class="callout key" data-anchor="flows-key1">
+      <span class="callout-title">Key idea</span>
+      <p>PKCE does not make the authorization code harder to steal. It makes a stolen code unredeemable, because the token endpoint now demands a value that only ever existed inside the real client.</p>
+    </div>
+
+    <h3 data-anchor="flows-h-derivation">The derivation, exactly</h3>
+
+    <p data-anchor="flows-p6">The client generates a <code>code_verifier</code>. Its grammar is <code>43*128unreserved</code>, where <code>unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"</code> — between 43 and 128 characters, drawn from that set and nothing else. It must be cryptographically random with enough entropy that guessing is impractical; the specification recommends a minimum of 256 bits. Those two constraints meet neatly: base64url-encoding a 32-octet random sequence produces a 43-octet URL-safe string, which is both the shortest legal verifier and a full 256 bits of entropy. That is why nearly every correct implementation you will read looks the same.</p>
+
+    <p class="code-label" data-anchor="flows-codelabel1">The S256 transformation</p>
+<pre data-anchor="flows-code1"><span class="at">code_challenge</span> = <span class="fn">BASE64URL-ENCODE</span>(<span class="fn">SHA256</span>(<span class="fn">ASCII</span>(<span class="at">code_verifier</span>)))</pre>
+
+    <p class="code-label" data-anchor="flows-codelabel2">Deriving verifier and challenge in Python</p>
+<pre data-anchor="flows-code2"><span class="kw">import</span> os, hashlib, base64
+
+verifier = base64.<span class="fn">urlsafe_b64encode</span>(os.<span class="fn">urandom</span>(<span class="num">32</span>)).<span class="fn">rstrip</span>(<span class="str">b'='</span>).<span class="fn">decode</span>(<span class="str">'ascii'</span>)
+challenge = base64.<span class="fn">urlsafe_b64encode</span>(
+    hashlib.<span class="fn">sha256</span>(verifier.<span class="fn">encode</span>(<span class="str">'ascii'</span>)).<span class="fn">digest</span>()
+).<span class="fn">rstrip</span>(<span class="str">b'='</span>).<span class="fn">decode</span>(<span class="str">'ascii'</span>)</pre>
+
+    <p data-anchor="flows-p7">Read the second statement again, because the whole extension turns on it. The hash input is <code>verifier.encode('ascii')</code> — the ASCII bytes of the verifier <em>string</em>. It is not <code>os.urandom(32)</code>, the raw octets the string was derived from. Both are 32-ish bytes of random-looking material, both produce a plausible-looking challenge, and only one of them interoperates. This is the single most common PKCE bug, and it is miserable to diagnose because the failure appears at the token endpoint, in the other party's code, as a generic <code>invalid_grant</code>.</p>
+
+    <div class="callout warn" data-anchor="flows-warn1">
+      <span class="callout-title">Trap</span>
+      <p>Hash the ASCII bytes of the verifier string, never the random octets you generated it from. Two related traps sit beside it: strip the <code>=</code> padding from base64url output and translate <code>+</code>/<code>/</code> to <code>-</code>/<code>_</code>, or the server rejects the challenge; and derive the verifier from 32 random <em>octets</em>, not 32 random <em>characters</em>, which yields materially less than the recommended 256 bits.</p>
+    </div>
+
+    <p data-anchor="flows-p8">RFC 7636 ships a test vector in Appendix B precisely so you can settle this in thirty seconds rather than in a support ticket. Feed the verifier below into your implementation. If you do not get the challenge below, you are hashing the wrong thing.</p>
+
+    <p class="code-label" data-anchor="flows-codelabel3">RFC 7636 Appendix B test vector</p>
+<pre data-anchor="flows-code3">code_verifier  = <span class="str">dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk</span>
+code_challenge = <span class="str">E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM</span></pre>
+
+    <h3 data-anchor="flows-h-s256">S256 against plain, and what the server owes you</h3>
+
+    <p data-anchor="flows-p9">There are two challenge methods. With <code>plain</code>, <code>code_challenge = code_verifier</code> — the secret travels up the front channel in the clear, so anything that could intercept the code could also have read the challenge on the way past. With <code>S256</code> the challenge is the hash, and an eavesdropper who observes or intercepts it gains nothing, because the challenge cannot be used without the verifier. Servers that support PKCE at all are required to support <code>S256</code>. There is no trade-off here worth deliberating: use <code>S256</code>, and treat a server that quietly accepts <code>plain</code> as offering no protection.</p>
+
+    <figure class="diagram" data-anchor="flows-fig1">
+      <svg viewBox="0 0 420 260" role="img" aria-label="Sequence diagram: the client generates a code verifier locally, sends only the S256 challenge to the authorization endpoint, the server binds the challenge to the issued code, the client later presents the verifier at the token endpoint, and the server recomputes the hash and compares it.">
+        <rect class="box" x="10" y="12" width="120" height="46" rx="2" />
+        <text x="70" y="32" text-anchor="middle">Client</text>
+        <text class="lbl" x="70" y="47" text-anchor="middle">public</text>
+        <rect class="box" x="290" y="12" width="120" height="46" rx="2" />
+        <text x="350" y="32" text-anchor="middle">Authorization</text>
+        <text x="350" y="47" text-anchor="middle">server</text>
+
+        <path class="flow-dash" d="M70 58 V244" />
+        <path class="flow-dash" d="M350 58 V244" />
+
+        <rect class="box-alt" x="18" y="66" width="104" height="24" rx="2" />
+        <text class="lbl" x="70" y="81" text-anchor="middle">verifier stays here</text>
+
+        <path class="flow-hot" d="M70 108 H346" marker-end="url(#flows-pkce-arrow-hot)" />
+        <text class="lbl-hot" x="208" y="102" text-anchor="middle">1 — code_challenge (S256)</text>
+
+        <rect class="box-alt" x="288" y="116" width="118" height="24" rx="2" />
+        <text class="lbl" x="347" y="131" text-anchor="middle">bind to the code</text>
+
+        <path class="flow" d="M350 158 H74" marker-end="url(#flows-pkce-arrow)" />
+        <text class="lbl" x="212" y="152" text-anchor="middle">2 — code on the redirect</text>
+
+        <path class="flow-hot" d="M70 190 H346" marker-end="url(#flows-pkce-arrow-hot)" />
+        <text class="lbl-hot" x="208" y="184" text-anchor="middle">3 — code + code_verifier</text>
+
+        <rect class="box-alt" x="288" y="198" width="118" height="38" rx="2" />
+        <text class="lbl" x="347" y="213" text-anchor="middle">SHA256(verifier)</text>
+        <text class="lbl" x="347" y="228" text-anchor="middle">equals challenge?</text>
+
+        <defs>
+          <marker id="flows-pkce-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="currentColor" />
+          </marker>
+          <marker id="flows-pkce-arrow-hot" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="currentColor" />
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>The PKCE binding. Only the hash crosses the front channel; the verifier crosses once, on the back channel, at redemption.</figcaption>
+    </figure>
+
+    <p data-anchor="flows-p10">The server has two obligations, one at each endpoint. When it issues the authorization code it MUST associate the <code>code_challenge</code> and <code>code_challenge_method</code> values with that code — the binding is state on the server, not something carried in the code by convention. At the token endpoint it transforms the received <code>code_verifier</code> according to the method it recorded and compares the result against the stored challenge; if the values are not equal the request must be rejected. And if the server requires PKCE but the client omits <code>code_challenge</code>, the authorization endpoint must return an authorization error response with <code>error</code> set to <code>invalid_request</code>, explaining that a challenge is required. A server that ignores a missing challenge has an extension it does not enforce, which is worse than none because it reads as protection in a review.</p>
+
+    <p class="code-label" data-anchor="flows-codelabel4">Authorization code + PKCE token request</p>
+<pre data-anchor="flows-code4"><span class="kw">POST</span> /token HTTP/1.1
+<span class="ty">Host</span>: server.example.com
+<span class="ty">Content-Type</span>: application/x-www-form-urlencoded
+
+<span class="at">grant_type</span>=<span class="str">authorization_code</span>&amp;<span class="at">code</span>=<span class="str">SplxlOBeZQQYbYS6WxSbIA</span>&amp;<span class="at">redirect_uri</span>=<span class="str">https%3A%2F%2Fclient.example.org%2Fcb</span>&amp;<span class="at">client_id</span>=<span class="str">s6BhdRkqt3</span>&amp;<span class="at">code_verifier</span>=<span class="str">dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk</span></pre>
+
+    <blockquote class="pull" data-anchor="flows-pull1">
+      PKCE ensures that an attacker cannot redeem a stolen authorization code without knowledge of the code verifier.
+      <cite>RFC 9700, in one line</cite>
+    </blockquote>
+
+    <p data-anchor="flows-p11">The current security best practice has moved past treating this as an option. RFC 9700 states that authorization servers MUST support PKCE and that public clients MUST use it to prevent injection of authorization codes into the authorization response. For confidential clients RFC 9700 makes it RECOMMENDED rather than required; OAuth 2.1 is the document that folds it into the base authorization code grant for everyone. Either way, the engineering answer is the same and it is not a judgement call: turn it on everywhere. It costs one hash.</p>
+
+    <h2 data-anchor="flows-h-cc">Pressure two: there is no user</h2>
+
+    <p data-anchor="flows-p12">Now remove the human. A nightly reporting job needs to read from an internal API. There is no resource owner sitting at a browser to consent, no redirect to come back to, and no session to maintain. Every mechanism in the authorization code flow exists to route a decision through a person, and there is no person. Running the flow anyway — with a service account, a headless browser and a scraped consent screen — is a well-known way to build something that breaks at three in the morning.</p>
+
+    <p data-anchor="flows-p13">The <span class="term">client credentials</span> grant is the honest version. The client authenticates as itself directly at the token endpoint and receives a token. It applies when the authorization scope is limited to protected resources under the control of the client, or to resources previously arranged with the authorization server — that is, when the client is acting on its own behalf rather than on anyone's. Two things follow. There is no refresh token to manage, because re-authenticating is exactly as cheap as refreshing. And the client is confidential by definition: if it cannot hold a credential, this grant has nothing to stand on.</p>
+
+    <p class="code-label" data-anchor="flows-codelabel5">Client credentials request</p>
+<pre data-anchor="flows-code5"><span class="kw">POST</span> /token HTTP/1.1
+<span class="ty">Content-Type</span>: application/x-www-form-urlencoded
+<span class="ty">Authorization</span>: <span class="str">Basic czZCaGRSa3F0Mzo3RmpmcDBaQnIxS3REUmJuZlZkbUl3</span>
+
+<span class="at">grant_type</span>=<span class="str">client_credentials</span>&amp;<span class="at">scope</span>=<span class="str">reports.read</span></pre>
+
+    <h2 data-anchor="flows-h-device">Pressure three: there is no keyboard</h2>
+
+    <p data-anchor="flows-p14">Now put the client on a television. There is a user, and they can consent, but the device has a ten-foot display and a four-way remote. Typing a password into it is hostile; typing it into an on-screen keyboard in front of a room of people is worse. The input constraint, not the security model, is what breaks here — so the device authorization grant of RFC 8628 moves the browser part of the flow onto a second device the user already has in their pocket.</p>
+
+    <p data-anchor="flows-p15">The device asks the device authorization endpoint (advertised in authorization server metadata as <code>device_authorization_endpoint</code>) for a session, and gets back six fields. <code>device_code</code> is the device's own handle, kept internally. <code>user_code</code> is the short string the device puts on screen. <code>verification_uri</code> is where the user goes to enter it — GitHub, for instance, uses <code>https://github.com/login/device</code>. <code>verification_uri_complete</code> is the same URI with the user code already embedded, designed for non-textual transmission such as a QR code, which removes the typing entirely. <code>expires_in</code> bounds the session, and <code>interval</code> is the minimum number of seconds the client should wait between polls — if the server omits it, clients MUST default to 5 seconds. Defaulting to zero because the field was absent is how a device gets rate-limited on its first boot.</p>
+
+    <p data-anchor="flows-p16">Meanwhile the device polls the token endpoint with the grant type URN <code>urn:ietf:params:oauth:grant-type:device_code</code>, form-encoded like any other token request.</p>
+
+    <p class="code-label" data-anchor="flows-codelabel6">Device grant poll request</p>
+<pre data-anchor="flows-code6"><span class="kw">POST</span> /token HTTP/1.1
+<span class="ty">Content-Type</span>: application/x-www-form-urlencoded
+
+<span class="at">grant_type</span>=<span class="str">urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code</span>&amp;<span class="at">device_code</span>=<span class="str">GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS</span>&amp;<span class="at">client_id</span>=<span class="str">1406020730</span></pre>
+
+    <p class="code-label" data-anchor="flows-codelabel7">The usual answer, for a while</p>
+<pre data-anchor="flows-code7">{<span class="at">"error"</span>: <span class="str">"authorization_pending"</span>}</pre>
+
+    <p data-anchor="flows-p17">The poll loop has four terminal-or-not outcomes, and the most common implementation mistake is treating the first two as failures. They are flow control.</p>
+
+    <table data-anchor="flows-tbl1">
+      <caption>Device grant poll responses</caption>
+      <thead><tr><th>Response</th><th>Meaning</th><th>What the client does</th></tr></thead>
+      <tbody>
+        <tr><td><code>authorization_pending</code></td><td>The authorization request is still pending.</td><td>Keep polling; wait at least <code>interval</code> seconds, or 5 if none was given.</td></tr>
+        <tr><td><code>slow_down</code></td><td>A variant of pending: you are polling too fast.</td><td>Keep polling, but increase the interval by 5 seconds for this and <em>all subsequent</em> requests.</td></tr>
+        <tr><td><code>expired_token</code></td><td>The <code>device_code</code> expired; the session has concluded.</td><td>Stop. Start a new device authorization request.</td></tr>
+        <tr><td><code>access_denied</code></td><td>The authorization request was denied.</td><td>Stop. Tell the user.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn" data-anchor="flows-warn2">
+      <span class="callout-title">Trap</span>
+      <p>The <code>slow_down</code> increase is permanent, not a one-request penalty. A client that backs off by five seconds and then resets to its original interval on the next successful-ish poll will keep tripping the same limit and can be cut off entirely.</p>
+    </div>
+
+    <p data-anchor="flows-p18">The user code deserves more design attention than it usually gets, because a human retypes it under mild social pressure. Because it is typed by hand, shorter codes are preferred for usability, and its entropy is typically lower than the device code's — which is exactly why the server should rate-limit attempts against it. On the input side, if the code set is only <code>A-Z</code>, uppercase the user's input before comparison, and strip characters outside the chosen set so that spaces and stray dashes do not cause failures. These are small mercies that remove most of the support load from the flow.</p>
+
+    <h2 data-anchor="flows-h-dont">The two flows to stop reaching for</h2>
+
+    <p data-anchor="flows-p19">The <span class="term">implicit</span> grant returned an access token directly from the authorization endpoint, in the URL fragment, skipping the token endpoint entirely. It existed because browsers once could not make the cross-origin token request. They can now, and what remains is a design that puts a bearer token in a URL, where it is vulnerable to leakage and to replay. The <span class="term">resource owner password credentials</span> grant had the client collect the user's actual username and password. It existed for migration, and it inverts the premise of the entire framework: using the authorization server as the intermediary, rather than having the client handle the user's credentials, is the preferred method and always was.</p>
+
+    <div class="callout spec" data-anchor="flows-spec1">
+      <span class="callout-title">In the spec</span>
+      <p>RFC 9700 states that clients SHOULD NOT use the implicit grant or any other response type issuing access tokens in the authorization response, and SHOULD use the response type <code>code</code> instead, which lets the authorization server detect replay attempts and keeps access tokens out of URLs. Of the password grant it is blunter: it MUST NOT be used. OAuth 2.1 omits both grants from the specification altogether.</p>
+    </div>
+
+    <p data-anchor="flows-p20">Note the register. "Discouraged" and "legacy but allowed" are not what these documents say, and the difference matters when you are the one arguing against a vendor SDK in a design review. Cite the normative words.</p>
+
+    <h2 data-anchor="flows-h-guide">The decision guide</h2>
+
+    <p data-anchor="flows-p21">Here is the whole chapter compressed. Find your client type, take the flow, and move on. The third column is the question that actually decides it — if you find yourself debating, that is the question you are debating.</p>
+
+    <table data-anchor="flows-tbl2">
+      <caption>Client type to flow</caption>
+      <thead><tr><th>Client</th><th>Use this</th><th>The deciding question</th></tr></thead>
+      <tbody>
+        <tr><td>Server-side web app</td><td>Authorization code with PKCE, authenticating as a confidential client</td><td>Can the client hold a secret the browser never sees? Yes — so authenticate, and add PKCE anyway.</td></tr>
+        <tr><td>Browser SPA</td><td>Authorization code with PKCE, preferably behind a Backend-For-Frontend</td><td>Can tokens be kept out of JavaScript? A BFF is the pattern that says yes.</td></tr>
+        <tr><td>Mobile / native app</td><td>Authorization code with PKCE, in the system browser or an in-app browser tab</td><td>Could another installed app claim your redirect? With private-use URI schemes, yes — so PKCE is not optional.</td></tr>
+        <tr><td>CLI / desktop tool</td><td>Authorization code with PKCE on a loopback redirect, <code>http://127.0.0.1:{port}/{path}</code></td><td>Can this machine open a browser and listen on an ephemeral port? If yes, no special flow is needed.</td></tr>
+        <tr><td>TV, console, smart device</td><td>Device authorization grant (RFC 8628)</td><td>Can the user comfortably type into this device? If no, move the browser to their phone.</td></tr>
+        <tr><td>Backend service, no user</td><td>Client credentials</td><td>Is there a resource owner to ask? If no, stop pretending there is one.</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="flows-p22">Two entries in that table are the same flow wearing different clothes, and that is the point. Web app, SPA, mobile, CLI — all authorization code with PKCE. What changes is the redirect mechanism and whether the client can additionally authenticate. The device grant is a genuinely different flow because a genuinely different constraint produced it, and client credentials is different because it deletes the user rather than routing around them. Everything else is one flow with the interception hole patched. If a provider offers you a fifth option that is not on this list, the burden is on that option to explain which constraint it exists to relieve.</p>
+
+    <h2 data-anchor="flows-h-takeaway">What to take away</h2>
+    <ul data-anchor="flows-takeaway-list">
+      <li>Authorization code with PKCE is the default for every client that has a user. The differences between web, SPA, mobile and CLI are redirect mechanics, not different flows.</li>
+      <li><code>code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))</code>, always <code>S256</code>. Hash the ASCII bytes of the verifier string; check yourself against the Appendix B vector before you ship.</li>
+      <li>A 43-character verifier from 32 random octets satisfies both the <code>43*128unreserved</code> grammar and the 256-bit entropy recommendation.</li>
+      <li>The server's job is two-sided: bind challenge and method to the code at issuance, recompute and compare at the token endpoint.</li>
+      <li>Client credentials when there is no user; device grant when there is a user but no usable keyboard, with <code>authorization_pending</code> and <code>slow_down</code> handled as flow control rather than errors.</li>
+      <li>Implicit is SHOULD NOT and password is MUST NOT under RFC 9700, and OAuth 2.1 omits both. Use the normative words, not "discouraged".</li>
+    </ul>
+
+    <div class="sources" data-anchor="flows-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc6749">RFC 6749 — The OAuth 2.0 Authorization Framework</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc7636">RFC 7636 — Proof Key for Code Exchange by OAuth Public Clients (PKCE)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc8628">RFC 8628 — OAuth 2.0 Device Authorization Grant</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc9700">RFC 9700 — Best Current Practice for OAuth 2.0 Security</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc8252.html">RFC 8252 — OAuth 2.0 for Native Apps (BCP 212)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/html/rfc8414">RFC 8414 — OAuth 2.0 Authorization Server Metadata</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/">The OAuth 2.1 Authorization Framework (draft-ietf-oauth-v2-1)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/">OAuth 2.0 for Browser-Based Applications (draft-ietf-oauth-browser-based-apps-27)</a></li>
+        <li><a href="https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps">Authorizing OAuth apps — GitHub Docs</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-tokens-up-close.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-security-pitfalls-and-practices.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 &middot; The Network Beneath &mdash; WebRTC</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="book-topbar">
+  <a class="bb-title" href="../index.html"><span class="tile"></span>WEBRTC</a>
+  <span class="bb-chapter">02 &middot; The Network Beneath</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <span class="kicker">Chapter 02</span>
+    <h1>The <span class="hl">Network Beneath</span></h1>
+
+    <p class="lede">Before you write a single line of WebRTC JavaScript, you need to understand the plumbing it runs on. The browser API is the steering wheel, but UDP datagrams, NAT boxes, and RTP packets are the engine, transmission, and road surface. Ignore them and your video call will stutter, freeze, or never connect at all. This chapter maps the terrain so you can build on solid ground.</p>
+
+    <h2>Client&ndash;Server vs. Peer-to-Peer</h2>
+
+    <p>Most of the web is client&ndash;server. Your browser sends an HTTP request to a server; the server sends back HTML, JSON, or a video stream. Every byte travels through a centralized machine that the service operator owns. That model works beautifully for web pages and API calls, but it introduces a mandatory detour for real-time media.</p>
+
+    <p>Imagine two people sitting in the same office building, each on a video call through a server hosted three thousand kilometers away. Their voice packets leave the building, cross half a continent, bounce off a data center, then travel all the way back. The round-trip adds 60&ndash;120&nbsp;ms of latency that simply would not exist if the packets went directly from one laptop to the other across the office LAN.</p>
+
+    <p>Peer-to-peer (<span class="proto blue">P2P</span>) eliminates that detour. Once two endpoints discover each other, media flows on the shortest network path between them. The benefits are tangible:</p>
+
+    <div class="tilegrid">
+      <div class="tile-card">
+        <h3>Lower Latency</h3>
+        <p>Packets take the shortest route rather than detouring through a relay server, shaving tens of milliseconds off every frame of audio and video.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Better Privacy</h3>
+        <p>Media never touches a server you do not control. End-to-end encryption between peers means no intermediary can inspect the content of your conversation.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Reduced Server Cost</h3>
+        <p>Bandwidth is the most expensive line item for media servers. P2P offloads that cost to the edges, where bandwidth is essentially free for the participants.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Natural Scalability</h3>
+        <p>Each new peer brings its own upload capacity. For small-group calls (2&ndash;4 participants), a mesh of direct connections can handle the load without any server infrastructure.</p>
+      </div>
+    </div>
+
+    <p>The catch is that P2P connections are harder to establish. Both sides need to agree on addresses, punch through NATs, and negotiate codecs&mdash;problems that a centralized server handles trivially. WebRTC exists precisely to solve those problems inside the browser.</p>
+
+    <h2>TCP vs. UDP: Choosing the Right Pipe</h2>
+
+    <p>Every byte on the internet rides on one of two transport protocols. <span class="proto teal">TCP</span> guarantees delivery: if a packet gets lost, it retransmits it, and the receiving side waits until every byte arrives in order. <span class="proto orange">UDP</span> makes no such promise: it fires datagrams into the network and moves on. If one goes missing, nobody looks back.</p>
+
+    <p>For a web page, TCP is perfect. You want every byte of that HTML file, and you can afford to wait a few extra milliseconds for a retransmission. But for a live voice conversation, TCP&rsquo;s reliability guarantee becomes a liability.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Characteristic</th>
+          <th>TCP</th>
+          <th>UDP</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Delivery guarantee</td>
+          <td>Ordered, reliable</td>
+          <td>Best-effort, unordered</td>
+        </tr>
+        <tr>
+          <td>Connection setup</td>
+          <td>3-way handshake</td>
+          <td>None (connectionless)</td>
+        </tr>
+        <tr>
+          <td>Head-of-line blocking</td>
+          <td>Yes &mdash; one lost packet stalls all subsequent data</td>
+          <td>No &mdash; each datagram is independent</td>
+        </tr>
+        <tr>
+          <td>Congestion control</td>
+          <td>Built in (slow start, AIMD)</td>
+          <td>None by default (app must implement)</td>
+        </tr>
+        <tr>
+          <td>Latency profile</td>
+          <td>Variable &mdash; spikes on retransmission</td>
+          <td>Consistent &mdash; no retransmission delay</td>
+        </tr>
+        <tr>
+          <td>Typical use</td>
+          <td>HTTP, file transfer, email</td>
+          <td>Voice/video, gaming, DNS</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The critical concept is <strong>head-of-line blocking</strong>. When TCP detects a lost packet, it pauses delivery of everything behind it until the retransmission arrives. For a file download, that pause is invisible. For live audio, it means a 200&nbsp;ms freeze while the stack waits for a packet that is already stale. By the time the retransmitted audio sample arrives, the conversation has moved on&mdash;the listener would rather hear a tiny gap than a 200&nbsp;ms delay that throws off the rhythm of speech.</p>
+
+    <p>This is why WebRTC sends media over <span class="proto orange">UDP</span>. It accepts occasional packet loss in exchange for consistent, low latency. The application layer (codecs and jitter buffers) handles the missing data, either concealing the gap or interpolating the missing audio frame.</p>
+
+    <div class="callout note">
+      <span class="co-tag">Note</span>
+      <p>WebRTC does use TCP as a fallback when UDP is completely blocked by a firewall. It also uses TCP for its data channel when ordered, reliable delivery is requested. But for media&mdash;voice and video&mdash;UDP is always the first choice.</p>
+    </div>
+
+    <h2>Latency, Jitter, and Packet Loss</h2>
+
+    <p>Three numbers define the quality of any real-time connection. Understanding them is the difference between debugging a choppy call in five minutes and staring at dashboards for hours.</p>
+
+    <h3>Latency (Delay)</h3>
+
+    <p>Latency is the time a packet takes to travel from sender to receiver, measured in milliseconds. It includes propagation delay (speed of light through fiber), processing delay (router queues, codec encoding), and transmission delay (serializing bits onto the wire). For a comfortable voice conversation, you need the one-way latency to stay under 150&nbsp;ms. Go beyond 300&nbsp;ms and people start talking over each other; beyond 400&nbsp;ms, the call feels like a satellite phone from the 1990s.</p>
+
+    <div class="statrow">
+      <div class="stat">
+        <span class="bignum">150 ms</span>
+        <span class="lbl">One-way target for voice</span>
+      </div>
+      <div class="stat">
+        <span class="bignum">300 ms</span>
+        <span class="lbl">Noticeable awkwardness begins</span>
+      </div>
+      <div class="stat">
+        <span class="bignum">400 ms</span>
+        <span class="lbl">Round-trip ceiling (ITU-T G.114)</span>
+      </div>
+    </div>
+
+    <h3>Jitter (Variation in Delay)</h3>
+
+    <p>Jitter is the variation in packet arrival times. If packets arrive every 20&nbsp;ms like clockwork, jitter is zero. If one arrives at 15&nbsp;ms, the next at 35&nbsp;ms, then 10&nbsp;ms, you have high jitter. The receiver cannot play audio frames at irregular intervals without audible glitches, so it uses a <em>jitter buffer</em>&mdash;a small queue that absorbs variation by introducing a fixed additional delay. A larger buffer handles more jitter but adds latency. A smaller buffer keeps latency low but risks underruns when packets arrive late. Tuning this tradeoff is one of the core challenges in real-time media.</p>
+
+    <h3>Packet Loss</h3>
+
+    <p>On the open internet, between 0.1% and 2% of UDP packets will simply vanish. They hit a congested router, the router drops them, and nobody retransmits. Modern audio codecs like <span class="proto green">Opus</span> can conceal up to about 5% loss before the listener notices degradation. Video is less forgiving&mdash;a single lost keyframe can corrupt every subsequent frame until the next keyframe arrives. WebRTC handles this with techniques like Forward Error Correction (<span class="proto blue">FEC</span>), negative acknowledgments (<span class="proto blue">NACK</span>), and dynamic bitrate adaptation.</p>
+
+    <div class="callout key">
+      <span class="co-tag">Key Concept</span>
+      <p>Real-time media is a constant negotiation between latency, quality, and reliability. You cannot have all three at maximum. WebRTC&rsquo;s congestion control algorithms (like Google Congestion Control, <span class="proto teal">GCC</span>) automatically adjust bitrate, resolution, and frame rate in response to changing network conditions. Understanding the underlying tradeoffs helps you configure and debug these systems.</p>
+    </div>
+
+    <h2>NAT: The Invisible Wall</h2>
+
+    <p>Network Address Translation is the reason peer-to-peer connections are hard. Nearly every device on the internet sits behind a NAT. Your laptop does not have a public IP address&mdash;it has a private address like <code>192.168.1.42</code>, and your router translates that to its single public IP when packets leave your network. When the response comes back, the router maps it back to your private address.</p>
+
+    <p>This works seamlessly for client&ndash;server traffic because the client always initiates the connection. The router creates a mapping entry when the outbound packet leaves, and the server&rsquo;s response matches that entry. But when two peers behind two different NATs want to talk to each other, neither one has a routable public address to target. Both routers are waiting for an inbound packet that matches an existing mapping&mdash;and no such mapping exists.</p>
+
+    <div class="callout warn">
+      <span class="co-tag">The NAT Problem</span>
+      <p>Two devices behind separate NATs cannot directly connect. Device A has private address <code>192.168.1.42</code> and Device B has <code>10.0.0.17</code>&mdash;neither address is routable on the public internet. Even if they knew each other&rsquo;s public IPs (the router&rsquo;s external address), the routers would drop unsolicited inbound packets because no outbound mapping exists for them. This is why WebRTC needs STUN servers to discover public addresses and ICE to coordinate simultaneous connection attempts from both sides. When even that fails, a TURN relay server acts as a last-resort intermediary.</p>
+    </div>
+
+    <h3>The Four NAT Types</h3>
+
+    <p>Not all NATs behave the same way. The differences matter because they determine how hard (or impossible) it is to punch through.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>NAT Type</th>
+          <th>Mapping Rule</th>
+          <th>Filtering Rule</th>
+          <th>P2P Difficulty</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Full Cone</strong></td>
+          <td>Same external port for all destinations</td>
+          <td>Any external host can send to the mapped port</td>
+          <td>Easy</td>
+        </tr>
+        <tr>
+          <td><strong>Address-Restricted Cone</strong></td>
+          <td>Same external port for all destinations</td>
+          <td>Only hosts the internal device has contacted can reply</td>
+          <td>Moderate</td>
+        </tr>
+        <tr>
+          <td><strong>Port-Restricted Cone</strong></td>
+          <td>Same external port for all destinations</td>
+          <td>Only the exact host:port pair previously contacted can reply</td>
+          <td>Hard</td>
+        </tr>
+        <tr>
+          <td><strong>Symmetric</strong></td>
+          <td>Different external port for each destination</td>
+          <td>Only the exact host:port pair previously contacted can reply</td>
+          <td>Very hard &mdash; often requires TURN</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Think of it like a mailroom in an office building. A full-cone NAT is a mailroom that accepts packages from anyone as long as they are addressed to the right suite number. A symmetric NAT is a mailroom that only accepts a package if it comes from the exact courier service that the suite already has an outgoing shipment with&mdash;and it assigns a different suite number for every courier. That second mailroom makes it nearly impossible for a new courier to deliver a package without prior arrangement.</p>
+
+    <p>Most consumer routers implement port-restricted cone or symmetric NAT. Corporate firewalls tend toward symmetric. This is why roughly 8&ndash;15% of WebRTC calls require a TURN relay to succeed&mdash;the NATs on both sides are too restrictive for direct connectivity.</p>
+
+    <h2>Firewalls and Their Effect on P2P</h2>
+
+    <p>Firewalls add another layer of filtering on top of NAT. A NAT translates addresses; a firewall enforces policy. Corporate firewalls often block all inbound UDP traffic by default and may restrict outbound traffic to specific ports (80 for HTTP, 443 for HTTPS). Since WebRTC media uses high-numbered UDP ports, these firewalls can silently drop every media packet.</p>
+
+    <p>The typical escalation path looks like this:</p>
+
+    <div class="flow">
+      <div class="f-step">
+        <div class="f-arrow right">Try direct UDP</div>
+        <div class="f-body">Peer A sends a STUN binding request directly to Peer B&rsquo;s discovered public address. If both NATs cooperate, a direct UDP path is established with minimal latency.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Try STUN-assisted UDP</div>
+        <div class="f-body">Both peers use a STUN server to discover their public IP and port. They exchange these via signaling and attempt simultaneous connection (&ldquo;hole punching&rdquo;). Works through most cone-type NATs.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Fall back to TURN relay</div>
+        <div class="f-body">When NAT or firewall blocks all direct paths, both peers relay through a TURN server. Media flows peer &rarr; TURN &rarr; peer, adding latency but guaranteeing connectivity.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">TURN over TCP/443</div>
+        <div class="f-body">The most restrictive firewalls block all UDP. TURN can tunnel media over TCP port 443, disguising it as HTTPS traffic. This is the last resort&mdash;it works almost everywhere but adds TCP&rsquo;s head-of-line blocking overhead.</div>
+      </div>
+    </div>
+
+    <p>WebRTC&rsquo;s <span class="proto blue">ICE</span> (Interactive Connectivity Establishment) framework automates this entire escalation. It gathers candidates at every level, tests them in parallel, and picks the best working path&mdash;all before the first frame of video appears. You will build this system in detail in Chapter 04.</p>
+
+    <h2>Media Traffic vs. Signaling Traffic</h2>
+
+    <p>WebRTC splits communication into two fundamentally different channels, and confusing them is one of the most common mistakes newcomers make.</p>
+
+    <div class="tilegrid">
+      <div class="tile-card">
+        <h3>Media Traffic</h3>
+        <p>The actual audio and video data. Encoded by codecs (<span class="proto green">Opus</span>, <span class="proto green">VP8</span>, <span class="proto green">H.264</span>), packetized into <span class="proto blue">RTP</span> datagrams, and sent over UDP directly between peers. High bandwidth (hundreds of kbps to several Mbps), latency-sensitive, encrypted with <span class="proto teal">SRTP</span>. This is the data the user cares about.</p>
+      </div>
+      <div class="tile-card">
+        <h3>Signaling Traffic</h3>
+        <p>The metadata that sets up the media session: SDP offers and answers describing codec capabilities, ICE candidates listing network addresses, and session lifecycle messages (join, leave, mute). Low bandwidth (a few KB per session), not latency-critical, travels through your server. WebRTC does not define a signaling protocol&mdash;you choose your own.</p>
+      </div>
+    </div>
+
+    <h3>Why You Need a Signaling Server</h3>
+
+    <p>This confuses people. If WebRTC is peer-to-peer, why do you need a server at all? The answer is a bootstrapping problem: before two peers can exchange media directly, they need to exchange their connection parameters&mdash;IP candidates, supported codecs, encryption fingerprints. They have no direct channel yet, so this initial exchange must happen through a shared intermediary.</p>
+
+    <p>Think of it like two people who want to meet in a large city. They need to agree on a meeting point before they can walk there. The phone call where they agree on &ldquo;the coffee shop on 5th and Main&rdquo; is the signaling. The actual face-to-face meeting is the media session. The phone network (your signaling server) is essential for coordination but carries none of the actual conversation.</p>
+
+    <p>Your signaling server can be a WebSocket server, a REST API, a Firebase Realtime Database, or even a shared Google Doc with copy-paste&mdash;WebRTC genuinely does not care. It just needs the SDP offer to get from Peer A to Peer B, and the SDP answer to come back. Here is a minimal example:</p>
+
+    <pre class="code" data-lang="js"><span class="c">// Minimal signaling with WebSocket</span>
+<span class="k">const</span> <span class="t">ws</span> = <span class="k">new</span> <span class="f">WebSocket</span>(<span class="s">'wss://signal.example.com'</span>);
+
+<span class="c">// Send our offer to the signaling server</span>
+<span class="k">const</span> <span class="t">offer</span> = <span class="k">await</span> <span class="t">pc</span>.<span class="f">createOffer</span>();
+<span class="k">await</span> <span class="t">pc</span>.<span class="f">setLocalDescription</span>(<span class="t">offer</span>);
+<span class="t">ws</span>.<span class="f">send</span>(<span class="t">JSON</span>.<span class="f">stringify</span>({
+  <span class="s">'type'</span>: <span class="s">'offer'</span>,
+  <span class="s">'sdp'</span>: <span class="t">pc</span>.<span class="t">localDescription</span>
+}));
+
+<span class="c">// Receive the remote answer via signaling</span>
+<span class="t">ws</span>.<span class="f">addEventListener</span>(<span class="s">'message'</span>, <span class="k">async</span> (<span class="t">event</span>) =&gt; {
+  <span class="k">const</span> <span class="t">msg</span> = <span class="t">JSON</span>.<span class="f">parse</span>(<span class="t">event</span>.<span class="t">data</span>);
+  <span class="k">if</span> (<span class="t">msg</span>.<span class="t">type</span> === <span class="s">'answer'</span>) {
+    <span class="k">await</span> <span class="t">pc</span>.<span class="f">setRemoteDescription</span>(<span class="t">msg</span>.<span class="t">sdp</span>);
+  }
+  <span class="k">if</span> (<span class="t">msg</span>.<span class="t">type</span> === <span class="s">'candidate'</span>) {
+    <span class="k">await</span> <span class="t">pc</span>.<span class="f">addIceCandidate</span>(<span class="t">msg</span>.<span class="t">candidate</span>);
+  }
+});</pre>
+
+    <h2>RTP and RTCP: How Media Packets Work</h2>
+
+    <p>Once the peer-to-peer path is established, media does not travel as raw audio samples or raw pixel data. It is wrapped in the <span class="proto blue">Real-time Transport Protocol (RTP)</span>, defined in RFC 3550. RTP adds just enough structure to make real-time playback possible without the overhead of TCP.</p>
+
+    <h3>Inside an RTP Packet</h3>
+
+    <p>Every RTP packet carries a compact header followed by the encoded media payload. The header fields that matter most:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Field</th>
+          <th>Size</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>Sequence Number</code></td>
+          <td>16 bits</td>
+          <td>Increments by 1 per packet. The receiver detects loss and reordering by watching for gaps.</td>
+        </tr>
+        <tr>
+          <td><code>Timestamp</code></td>
+          <td>32 bits</td>
+          <td>Encodes when the media sample was captured, using the codec&rsquo;s clock rate (e.g., 48000 Hz for Opus). The jitter buffer uses this to schedule playback.</td>
+        </tr>
+        <tr>
+          <td><code>SSRC</code></td>
+          <td>32 bits</td>
+          <td>Synchronization Source identifier. Uniquely identifies each media stream so the receiver can demultiplex audio and video arriving on the same port.</td>
+        </tr>
+        <tr>
+          <td><code>Payload Type</code></td>
+          <td>7 bits</td>
+          <td>Identifies the codec (e.g., 111 for Opus, 96 for VP8). Mapped to specific codecs during SDP negotiation.</td>
+        </tr>
+        <tr>
+          <td><code>Marker Bit</code></td>
+          <td>1 bit</td>
+          <td>Signals frame boundaries. For video, it marks the last packet of a frame; for audio, it can indicate the start of a talkspurt after silence.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Notice what is <em>not</em> in the header: there is no acknowledgment field, no retransmission request, no flow control. RTP deliberately stays lean. The feedback loop is handled by a companion protocol.</p>
+
+    <h3>RTCP: The Feedback Channel</h3>
+
+    <p><span class="proto teal">RTCP</span> (RTP Control Protocol) runs alongside RTP on a separate logical channel. While RTP carries the media, RTCP carries statistics <em>about</em> the media. It sends periodic reports that tell each side how the other is doing:</p>
+
+    <div class="flow">
+      <div class="f-step">
+        <div class="f-arrow right">Sender Report (SR)</div>
+        <div class="f-body">The media sender transmits an SR every few seconds, containing the number of packets and bytes sent, plus NTP and RTP timestamp pairs for synchronization between audio and video streams.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">Receiver Report (RR)</div>
+        <div class="f-body">The receiver responds with packet loss fraction, cumulative loss count, jitter measurements, and round-trip delay estimates. These metrics drive congestion control decisions.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow left">NACK / PLI / FIR</div>
+        <div class="f-body">When the receiver detects a lost packet, it can send a Negative Acknowledgment (<span class="proto blue">NACK</span>) requesting retransmission. For video, a Picture Loss Indication (<span class="proto blue">PLI</span>) or Full Intra Request (<span class="proto blue">FIR</span>) asks the sender to emit a fresh keyframe.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">REMB / TMMBR</div>
+        <div class="f-body">Receiver Estimated Maximum Bitrate messages let the receiver tell the sender to slow down when bandwidth is constrained. This is how WebRTC adapts video quality in real time without buffering.</div>
+      </div>
+    </div>
+
+    <p>The beauty of this design is separation of concerns. RTP stays fast and stateless&mdash;it just ships media. RTCP provides the intelligence layer on top, letting both sides adapt to network conditions without adding overhead to every media packet. WebRTC bundles both onto a single UDP port using multiplexing (RFC 5761), which simplifies NAT traversal since only one port needs to be punched through.</p>
+
+    <pre class="code" data-lang="text"><span class="c">  0                   1                   2                   3</span>
+<span class="c">  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1</span>
+<span class="c"> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+ |<span class="t">V=2</span>|<span class="t">P</span>|<span class="t">X</span>|  <span class="t">CC</span>   |<span class="t">M</span>|     <span class="k">PT</span>      |       <span class="f">Sequence Number</span>       |
+<span class="c"> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+ |                           <span class="f">Timestamp</span>                           |
+<span class="c"> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+ |                             <span class="f">SSRC</span>                              |
+<span class="c"> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+ |                     <span class="s">Payload (encoded media)</span>                   |
+<span class="c"> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span></pre>
+
+    <h2>Putting It All Together</h2>
+
+    <p>Here is the full picture, layer by layer, of what happens when Peer A calls Peer B:</p>
+
+    <div class="flow">
+      <div class="f-step">
+        <div class="f-arrow right">Signaling (WebSocket / HTTP)</div>
+        <div class="f-body">Peer A creates an SDP offer describing its media capabilities and ICE candidates. The offer travels through your signaling server to Peer B. Peer B generates an SDP answer and sends it back. Both sides now know what codecs to use and where to send packets.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">ICE Connectivity Checks</div>
+        <div class="f-body">Both peers test candidate pairs&mdash;direct, STUN-reflected, and TURN-relayed&mdash;by sending STUN binding requests. The first pair that gets a response wins. The ICE agent selects the best available path.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">DTLS Handshake</div>
+        <div class="f-body">Once a working path exists, both peers perform a <span class="proto teal">DTLS</span> handshake over the same UDP connection. This establishes encryption keys for <span class="proto teal">SRTP</span>, ensuring that media packets are encrypted end-to-end.</div>
+      </div>
+      <div class="f-step">
+        <div class="f-arrow right">Media Flow (SRTP over UDP)</div>
+        <div class="f-body">Encoded audio and video frames are packetized into RTP, encrypted into SRTP, and sent as UDP datagrams directly between peers. RTCP flows alongside, providing continuous quality feedback and driving bitrate adaptation.</div>
+      </div>
+    </div>
+
+    <div class="callout key">
+      <span class="co-tag">Key Takeaway</span>
+      <p>The network beneath WebRTC is a carefully layered stack: UDP provides the low-latency transport, RTP adds sequencing and timing for media playback, RTCP provides the feedback loop for quality adaptation, SRTP adds encryption, ICE handles NAT traversal, and your signaling server bootstraps the entire exchange. Every layer solves exactly one problem, and understanding each layer gives you the vocabulary to debug real-world issues. When a call fails, you can now ask the right question: is it a NAT problem, a codec mismatch, packet loss, or a firewall blocking UDP?</p>
+    </div>
+
+    <footer class="sources">
+      <span class="src-tag">Sources</span>
+      RFC 3550 &mdash; RTP: A Transport Protocol for Real-Time Applications (Schulzrinne et al., 2003) &bull;
+      RFC 5245 &mdash; Interactive Connectivity Establishment (Rosenberg, 2010) &bull;
+      RFC 8445 &mdash; ICE: A Protocol for NAT Traversal (Keranen et al., 2018) &bull;
+      ITU-T Recommendation G.114 &mdash; One-Way Transmission Time (2003) &bull;
+      RFC 5761 &mdash; Multiplexing RTP and RTCP on a Single Port (Perkins &amp; Westerlund, 2010) &bull;
+      RFC 3711 &mdash; The Secure Real-time Transport Protocol (SRTP) (Baugher et al., 2004)
+    </footer>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="01-real-time-on-the-open-web.html">&#8249; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="03-the-api-surface.html">Next &#8250;</a>
+</nav>
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -15,10 +15,14 @@
     tubule:'#3f7fd4', tubuleD:'#2c62a8', cargo:'#e5643b', motor:'#6d5bd0'
   };
 
-  /* ---------- 1) MEMBRANE: selective permeability ---------- */
+  /* ---------- 1) MEMBRANE: selective permeability ----------
+   O2 diffuses IN, CO2 diffuses OUT, bare Na+ is turned away by the oily core,
+   and glucose crosses through a transport protein (a GLUT-style carrier, not
+   an open pore). Directions matter here — they are the lesson. */
   ANIM.membrane = function(ctx, w, h, t){
     ctx.clearRect(0,0,w,h);
     var midY = h*0.5, amp = h*0.014, headR = Math.max(4, w*0.011);
+    var pR = Math.max(14, w*0.021);            // particle radius -> legible label
     var n = Math.max(14, Math.floor(w/26));
     var tailLen = h*0.12;
     // two leaflets of phospholipids, heads facing out, tails facing the middle
@@ -52,13 +56,13 @@
     roundRect(ctx, px-pw*0.16, midY-tailLen*0.85, pw*0.32, tailLen*1.7, 4); ctx.fill();
 
     // particles: O2 (small, crosses freely), charged ion (bounces), glucose via channel
-    drawParticle(ctx, C.o2, particleY(t,0.0,h,midY,true),  w*0.20, headR*0.9, 'O₂');
-    drawParticle(ctx, C.co2,particleY(t,0.5,h,midY,true),  w*0.36, headR*0.9, 'CO₂');
+    drawParticle(ctx, C.o2,  particleY(t,0.0,h,midY,false), w*0.20, pR, 'O₂');   // in
+    drawParticle(ctx, C.co2, particleY(t,0.5,h,midY,true),  w*0.36, pR, 'CO₂');  // out
     // charged ion: approaches from top, bounces back (never crosses)
     var by = bounceY(t, h, midY, tailLen);
-    drawParticle(ctx, C.charged, by, w*0.50, headR*1.2, 'Na⁺');
+    drawParticle(ctx, C.charged, by, w*0.50, pR*1.05, 'Na⁺');
     // glucose through the channel
-    drawParticle(ctx, C.mito, particleY(t,0.25,h,midY,true), px, headR*1.15, 'glu');
+    drawParticle(ctx, C.mito, particleY(t,0.25,h,midY,false), px, pR, 'glu');
 
     // labels
     ctx.fillStyle = C.faint; ctx.font = (Math.max(10,w*0.016))+'px -apple-system,sans-serif';
@@ -66,9 +70,10 @@
     ctx.fillText('outside the cell', w*0.02, h*0.09);
     ctx.fillText('inside the cell',  w*0.02, h*0.95);
   };
-  function particleY(t, phase, h, midY, cross){
-    var p = ((t*0.28 + phase) % 1);             // 0..1 top->bottom
-    return h*0.06 + p*(h*0.88);
+  function particleY(t, phase, h, midY, outward){
+    var p = ((t*0.28 + phase) % 1);             // 0..1 along the path
+    // outward = inside -> outside (CO2 leaving); otherwise outside -> inside (O2 arriving)
+    return outward ? h*0.94 - p*(h*0.88) : h*0.06 + p*(h*0.88);
   }
   function bounceY(t, h, midY, tailLen){
     var p = (t*0.5) % 2;                          // triangle wave 0..2
@@ -79,7 +84,9 @@
   function drawParticle(ctx, col, y, x, r, label){
     ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
     ctx.fillStyle = col; ctx.fill();
-    ctx.fillStyle='#fff'; ctx.font='bold '+(r*0.9)+'px -apple-system,sans-serif';
+    // 3-glyph labels like CO2 must fit inside the disc, subscript included.
+    var fs = Math.max(10, r*(String(label).length>2 ? 0.62 : 0.78));
+    ctx.fillStyle='#fff'; ctx.font='bold '+fs+'px -apple-system,sans-serif';
     ctx.textAlign='center'; ctx.textBaseline='middle';
     ctx.fillText(label, x, y);
     ctx.textBaseline='alphabetic';
@@ -103,7 +110,9 @@
 
     // motor walks left->right, hand-over-hand; cargo vesicle bobs above
     var speed = w*0.075;                          // px/s
-    var travel = (t*speed) % (w + w*0.3);
+    // Start the motor already ON the track: t=0 is the static first frame (and
+    // the only frame for prefers-reduced-motion), so it must show the motor.
+    var travel = ((t*speed) + w*0.35) % (w + w*0.3);
     var mx = -w*0.15 + travel;
     var step = gap;                               // one dimer per step
     var phase = (t*2.0) % 1;                       // gait cycle

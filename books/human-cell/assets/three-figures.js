@@ -14,124 +14,139 @@
     var RAD = 1.0;    // short half-axis
     var sphereGeo = new THREE.SphereGeometry(1, 64, 44);
 
-    // OUTER membrane — smooth, translucent. A mitochondrion is a bag inside a bag;
-    // this is the smooth outer bag.
+    // Deterministic jitter — real cristae are irregular, but a book figure must
+    // look identical every time it is rendered or screenshotted.
+    var seed = 20260727 >>> 0;
+    function rnd(){
+      seed += 0x6D2B79F5;
+      var r = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    }
+
+    // OUTER membrane — the smooth outer bag.
     var outer = new THREE.Mesh(sphereGeo, new THREE.MeshStandardMaterial({
-      color:0xe5643b, transparent:true, opacity:0.11, roughness:0.5, metalness:0.0,
+      color:0xe5643b, transparent:true, opacity:0.26, roughness:0.5, metalness:0.0,
       side:THREE.DoubleSide, depthWrite:false
     }));
     outer.scale.set(LEN, RAD, RAD);
-    outer.renderOrder = 3;
+    outer.renderOrder = 4;
     group.add(outer);
 
-    // INNER membrane (boundary) — sits just inside the outer, leaving the thin
-    // *intermembrane space* between the two. Its infoldings are the cristae.
+    // INNER BOUNDARY membrane — the second bag, leaving the thin intermembrane
+    // space between the two. The cristae below are infoldings of THIS membrane.
     var inner = new THREE.Mesh(sphereGeo, new THREE.MeshStandardMaterial({
-      color:0xd8552e, transparent:true, opacity:0.15, roughness:0.5, metalness:0.0,
+      color:0xd8552e, transparent:true, opacity:0.30, roughness:0.45, metalness:0.0,
       side:THREE.DoubleSide, depthWrite:false
     }));
-    inner.scale.set(LEN*0.9, RAD*0.86, RAD*0.86);
-    inner.renderOrder = 2;
+    inner.scale.set(LEN*0.88, RAD*0.80, RAD*0.80);   // gap to the outer bag = intermembrane space
+    inner.renderOrder = 3;
     group.add(inner);
 
-    // MATRIX — the gel filling the inner membrane (mtDNA, ribosomes, Krebs-cycle
-    // enzymes). Kept semi-transparent so the cristae read as folds *within* it.
+    // MATRIX — the gel the cristae project into.
     var matrix = new THREE.Mesh(sphereGeo,
-      new THREE.MeshStandardMaterial({ color:0xf4bf9a, transparent:true, opacity:0.34,
+      new THREE.MeshStandardMaterial({ color:0xf4bf9a, transparent:true, opacity:0.26,
         roughness:0.9, metalness:0.0, depthWrite:false }));
-    matrix.scale.set(LEN*0.85, RAD*0.79, RAD*0.79);
+    matrix.scale.set(LEN*0.84, RAD*0.75, RAD*0.75);
     matrix.renderOrder = 1;
     group.add(matrix);
 
-    // CRISTAE — the shelf-like *lamellar* infoldings of the inner membrane. Real
-    // cristae are stacked plates that reach deep across the matrix, joined to the
-    // boundary membrane by narrow necks (crista junctions). Their vast folded
-    // surface is where the energy machinery lives — more folds, more ATP. Here
-    // each is a nearly-complete flattened shelf running across the tube, with a
-    // small gap for the junction; consecutive shelves alternate that gap so the
-    // stack interleaves the way real cristae do.
+    // CRISTAE — lamellar PLATES, not hoops. Each is a flattened sac of inner
+    // membrane attached to the boundary membrane along one edge (through a narrow
+    // crista junction) and projecting across the matrix. Attachment side rotates
+    // around the tube and depth varies, the way real cristae do.
     var cristaeMat = new THREE.MeshStandardMaterial({
       color:0xc9502a, roughness:0.5, metalness:0.04, side:THREE.DoubleSide });
-    // ATP synthase — the F1F0 "lollipops": a stubby F0 stalk anchored in the
-    // crista membrane, topped by the round F1 head that pokes into the matrix and
-    // spins to make ATP. Shared geometry, instanced by hand for a light scene.
-    var headGeo  = new THREE.SphereGeometry(0.05, 12, 12);
-    var stalkGeo = new THREE.CylinderGeometry(0.012, 0.02, 0.1, 6);
+    var junctionMat = new THREE.MeshStandardMaterial({
+      color:0xbf4a26, roughness:0.6, side:THREE.DoubleSide });
+
+    // ATP synthase — F1F0 "lollipops": an F0 stalk in the crista membrane and an
+    // F1 head projecting INTO THE MATRIX. On a plate the matrix lies off both
+    // faces, so heads point along the plate normal (±x), not toward the axis.
+    var headGeo  = new THREE.SphereGeometry(0.058, 12, 12);
+    var stalkGeo = new THREE.CylinderGeometry(0.011, 0.018, 0.085, 6);
     var synthHeadMat = new THREE.MeshStandardMaterial({
       color:0xffd05a, emissive:0xf0a020, emissiveIntensity:0.4, roughness:0.35 });
     var synthStalkMat = new THREE.MeshStandardMaterial({
       color:0xb5842f, roughness:0.6, metalness:0.1 });
-    var UP = new THREE.Vector3(0,1,0), _q = new THREE.Quaternion(), _d = new THREE.Vector3();
-    function addSynthase(x, y, z){
-      // a lollipop planted on the crista at (x,y,z), pointing *inward* to the axis
+    function addSynthase(px, py, pz, sign){
       var g = new THREE.Group();
-      var stalk = new THREE.Mesh(stalkGeo, synthStalkMat); stalk.position.y = 0.05;
-      var head  = new THREE.Mesh(headGeo, synthHeadMat);   head.position.y  = 0.12;
+      var stalk = new THREE.Mesh(stalkGeo, synthStalkMat); stalk.position.y = 0.042;
+      var head  = new THREE.Mesh(headGeo,  synthHeadMat);  head.position.y  = 0.105;
       g.add(stalk); g.add(head);
-      g.position.set(x, y, z);
-      _d.set(0, -y, -z);                                   // toward the long axis
-      if(_d.lengthSq() < 1e-6) _d.set(0,1,0);
-      g.quaternion.copy(_q.setFromUnitVectors(UP, _d.normalize()));
+      g.position.set(px, py, pz);
+      g.rotation.z = sign > 0 ? -Math.PI/2 : Math.PI/2;   // +y local -> ±x world
       group.add(g);
     }
 
     var cristaeX = [];
-    var N = 9;
+    var N = 8;
+    var plateGeo = new THREE.CylinderGeometry(1, 1, 1, 48, 1, false);  // unit disc, scaled per crista
     for(var k=0;k<N;k++){
-      var f = (k/(N-1))*2 - 1;                       // -1..1 along long axis
-      var x = f*1.6;
+      var f = (k/(N-1))*2 - 1;                       // -1..1 along the long axis
+      var x = f*1.52 + (rnd()-0.5)*0.10;             // jittered spacing
       cristaeX.push(x);
-      // inner-membrane radius at this x (follow the inner ellipsoid profile)
-      var prof = Math.sqrt(Math.max(0.03, 1 - (x/(LEN*0.9))*(x/(LEN*0.9))));
-      var rInner = RAD*0.86*prof;
-      var rFold = rInner*0.82;                        // shelf reaches most of the way in
-      // a flattened near-complete torus = a lamellar shelf spanning the tube,
-      // with a narrow gap standing in for the crista junction/neck
-      var tor = new THREE.Mesh(
-        new THREE.TorusGeometry(rFold, 0.055, 14, 60, Math.PI*1.82), cristaeMat.clone());
-      tor.rotation.y = Math.PI/2;                     // shelf plane perpendicular to the axis
-      tor.rotation.z = (k%2 ? 0.9 : -0.9) + 1.6;      // alternate where the junction gap sits
-      tor.position.x = x;
-      tor.scale.set(1, 0.62, 1);                      // flatten into a plate
-      group.add(tor);
-      // line ATP-synthase lollipops along the shelf rim, both faces
-      var heads = 8;
+
+      // local radius of the inner boundary membrane at this x
+      var prof = Math.sqrt(Math.max(0.04, 1 - (x/(LEN*0.9))*(x/(LEN*0.9))));
+      var rInner = RAD*0.80*prof;
+      var rPlate = rInner*(0.58 + rnd()*0.14);       // depth varies crista to crista
+      var off    = rInner - rPlate;                  // so the far edge meets the membrane
+      var phi    = k*2.399 + rnd()*0.5;              // attachment rotates around the tube
+      var cy = Math.cos(phi)*off, cz = Math.sin(phi)*off;
+
+      var plate = new THREE.Mesh(plateGeo, cristaeMat);
+      plate.scale.set(rPlate, 0.042, rPlate);        // thin sac, not a wire
+      plate.rotation.z = Math.PI/2;                  // disc faces perpendicular to the axis
+      plate.rotation.x = (rnd()-0.5)*0.22;           // slight natural tilt
+      plate.position.set(x, cy, cz);
+      group.add(plate);
+
+      // CRISTA JUNCTION — the narrow neck where the sac opens to the
+      // intermembrane space. Small, and that smallness is the point.
+      var jn = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.12, 10), junctionMat);
+      jn.position.set(x, Math.cos(phi)*(rInner+0.02), Math.sin(phi)*(rInner+0.02));
+      jn.rotation.z = Math.PI/2;
+      group.add(jn);
+
+      // ATP synthase rows on BOTH faces of the plate, heads into the matrix.
+      var heads = 5;
       for(var h=0;h<heads;h++){
-        var ang = (h/heads)*Math.PI*1.82 + 0.25;
-        var yy = Math.sin(ang)*rFold*0.62, zz = Math.cos(ang)*rFold;
-        addSynthase(x + (h%2?0.05:-0.05), yy, zz);
+        var a  = (h/heads)*Math.PI*2 + k*0.7;
+        var rr = rPlate*(0.42 + 0.42*((h%3)/2));
+        var yy = cy + Math.cos(a)*rr, zz = cz + Math.sin(a)*rr;
+        addSynthase(x + 0.03, yy, zz, +1);
+        if(h%2===0) addSynthase(x - 0.03, yy, zz, -1);
       }
     }
 
-    // MATRIX CONTENTS — a couple of tangled mtDNA nucleoids and scattered
-    // mitochondrial ribosomes, so the interior reads as a living compartment,
-    // not an empty bag.
+    // MATRIX CONTENTS — mtDNA nucleoids and mitochondrial ribosomes, so the
+    // interior reads as a living compartment rather than an empty bag.
     var dnaMat = new THREE.MeshStandardMaterial({
       color:0x6c4bd0, emissive:0x3a208c, emissiveIntensity:0.25, roughness:0.5 });
-    [[-0.7,0.18,0.1],[0.85,-0.15,-0.12]].forEach(function(p){
-      var dna = new THREE.Mesh(new THREE.TorusKnotGeometry(0.13,0.03,64,8,2,3), dnaMat);
+    [[-0.72,0.20,0.12],[0.88,-0.16,-0.14]].forEach(function(p){
+      var dna = new THREE.Mesh(new THREE.TorusKnotGeometry(0.13,0.028,64,8,2,3), dnaMat);
       dna.position.set(p[0],p[1],p[2]);
       dna.scale.set(1,0.7,0.7);
       group.add(dna);
     });
-    var riboGeo = new THREE.SphereGeometry(0.03, 8, 8);
+    var riboGeo = new THREE.SphereGeometry(0.028, 8, 8);
     var riboMat = new THREE.MeshStandardMaterial({ color:0x8a3b1f, roughness:0.85 });
-    for(var r=0;r<22;r++){
+    for(var r=0;r<14;r++){
       var rb = new THREE.Mesh(riboGeo, riboMat);
-      var ra = r*2.39943, rx = (r/22)*3.0 - 1.5;
-      var rr = 0.5*Math.sqrt(Math.max(0.02, 1-(rx/1.85)*(rx/1.85)));
-      rb.position.set(rx, Math.cos(ra)*rr, Math.sin(ra)*rr);
+      var ra = r*2.39943, rx = (r/14)*2.9 - 1.45;
+      var rr2 = 0.46*Math.sqrt(Math.max(0.02, 1-(rx/1.85)*(rx/1.85)));
+      rb.position.set(rx, Math.cos(ra)*rr2, Math.sin(ra)*rr2);
       group.add(rb);
     }
 
-    // ATP sparks — emissive motes that stream *out* of the cristae, the energy
-    // output leaving the powerhouse.
+    // ATP sparks — emissive motes leaving the cristae.
     var sparks = new THREE.Group();
     for(var s=0;s<12;s++){
-      var sp = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 10),
+      var sp = new THREE.Mesh(new THREE.SphereGeometry(0.045, 10, 10),
         new THREE.MeshStandardMaterial({ color:0xffe08a, emissive:0xf0a020, emissiveIntensity:0.9, roughness:0.3 }));
       sp.userData.seed = s;
-      sp.userData.cx = cristaeX[s % cristaeX.length];  // born at a crista
+      sp.userData.cx = cristaeX[s % cristaeX.length];
       sparks.add(sp);
     }
     group.add(sparks);
@@ -152,7 +167,7 @@
 
     var scene = new THREE.Scene();
     var camera = new THREE.PerspectiveCamera(42, 16/10, 0.1, 100);
-    camera.position.set(0, 1.4, 5.2);
+    camera.position.set(2.35, 1.95, 4.35);   // 3/4 view: see the crista faces, not only their edges
 
     scene.add(new THREE.AmbientLight(0xfff0dd, 0.75));
     var key = new THREE.DirectionalLight(0xffffff, 1.0); key.position.set(3,4,5); scene.add(key);
