@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Case Study: A QA Agent Over Knowledge Graphs — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch08-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch08-head">
+  <span class="chapter-num">08</span>
+  <span class="chapter-kicker">End-to-end in practice</span>
+  <h1 data-anchor="ch08-title">Case Study: A QA Agent Over Knowledge Graphs</h1>
+</header>
+
+<p class="lede" data-anchor="ch08-lede">
+You have a Neo4j database full of interconnected entities&mdash;people, companies, products, transactions&mdash;and a user who wants to ask questions in plain English. The gap between &ldquo;Who are the top suppliers linked to delayed shipments in Q3?&rdquo; and the Cypher query that answers it is surprisingly wide. This chapter builds the bridge: a complete, production-shaped QA agent that turns natural language into graph queries, executes them, and returns human-readable answers. Along the way you&rsquo;ll see every LangGraph pattern from the previous chapters come together in a single, testable pipeline.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-the-problem">The Problem: Natural Language Over a Knowledge Graph</h2>
+
+<p data-anchor="ch08-problem-desc">
+Knowledge graphs excel at representing relationships. A relational database can tell you that order 4417 shipped late; a knowledge graph can tell you <em>why</em>&mdash;because the supplier shares a warehouse with another supplier whose port is under congestion. But writing Cypher (Neo4j&rsquo;s query language) requires expertise that most end users don&rsquo;t have. The question is not whether an LLM can generate Cypher&mdash;it can, with varying reliability&mdash;but how to wrap the generation in a pipeline that handles ambiguity, retries on failure, and presents results transparently.
+</p>
+
+<p data-anchor="ch08-problem-requirements">
+Our requirements are concrete: accept a natural language question, decide whether it needs a graph query at all, extract the relevant schema elements, generate Cypher, execute it against Neo4j, and summarize the raw results into a conversational answer. If the generated Cypher fails, the pipeline should retry with the error message as context. And the whole thing should be accessible through a Streamlit chat interface where the user can see exactly which Cypher was generated and what data came back.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-pipeline-overview">Pipeline Architecture</h2>
+
+<p data-anchor="ch08-pipeline-intro">
+Before touching code, let&rsquo;s map out the full pipeline as a LangGraph state graph. There are six nodes, one conditional edge for the error-retry loop, and a clear entry and exit.
+</p>
+
+<figure class="diagram-fig" data-anchor="ch08-pipeline-diagram">
+<svg class="diagram" viewBox="0 0 820 440" aria-label="QA pipeline over a knowledge graph with six nodes and an error-retry loop">
+  <title>Full pipeline: Intent Classifier, Schema Extractor, Cypher Generator, Query Executor, Summarizer, and Error Handler with retry loop</title>
+  <defs>
+    <marker id="ch08-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink)" />
+    </marker>
+    <marker id="ch08-arrow-hot" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)" />
+    </marker>
+    <marker id="ch08-arrow-dash" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink-soft)" />
+    </marker>
+  </defs>
+
+  <!-- START -->
+  <circle cx="60" cy="90" r="14" fill="var(--ink)" opacity="0.7" />
+  <text x="60" y="94" text-anchor="middle" class="lbl" fill="#fff" font-size="11">S</text>
+
+  <!-- Node 1: Intent Classifier -->
+  <rect class="box" x="120" y="64" width="150" height="52" rx="8" />
+  <text class="lbl" x="195" y="94" text-anchor="middle">Intent Classifier</text>
+
+  <!-- Arrow START -> Intent -->
+  <line class="flow" x1="74" y1="90" x2="118" y2="90" marker-end="url(#ch08-arrow)" />
+
+  <!-- Node 2: Schema Extractor -->
+  <rect class="box" x="320" y="64" width="150" height="52" rx="8" />
+  <text class="lbl" x="395" y="94" text-anchor="middle">Schema Extractor</text>
+
+  <!-- Arrow Intent -> Schema -->
+  <line class="flow" x1="270" y1="90" x2="318" y2="90" marker-end="url(#ch08-arrow)" />
+
+  <!-- Conditional branch: Intent -> END (no graph query needed) -->
+  <line class="flow-dash" x1="195" y1="116" x2="195" y2="400" marker-end="url(#ch08-arrow-dash)" />
+  <text class="lbl" x="205" y="160" font-size="11" fill="var(--ink-soft)">no graph</text>
+  <text class="lbl" x="205" y="175" font-size="11" fill="var(--ink-soft)">query needed</text>
+
+  <!-- Node 3: Cypher Generator -->
+  <rect class="box-alt" x="520" y="64" width="150" height="52" rx="8" />
+  <text class="lbl" x="595" y="94" text-anchor="middle">Cypher Generator</text>
+
+  <!-- Arrow Schema -> Cypher -->
+  <line class="flow" x1="470" y1="90" x2="518" y2="90" marker-end="url(#ch08-arrow)" />
+
+  <!-- Node 4: Query Executor -->
+  <rect class="box" x="520" y="200" width="150" height="52" rx="8" />
+  <text class="lbl" x="595" y="230" text-anchor="middle">Query Executor</text>
+
+  <!-- Arrow Cypher -> Executor -->
+  <line class="flow" x1="595" y1="116" x2="595" y2="198" marker-end="url(#ch08-arrow)" />
+
+  <!-- Node 5: Summarizer -->
+  <rect class="box" x="520" y="340" width="150" height="52" rx="8" />
+  <text class="lbl" x="595" y="370" text-anchor="middle">Summarizer</text>
+
+  <!-- Arrow Executor -> Summarizer (success path) -->
+  <line class="flow" x1="595" y1="252" x2="595" y2="338" marker-end="url(#ch08-arrow)" />
+  <text class="lbl" x="605" y="300" font-size="11" fill="var(--ink-soft)">success</text>
+
+  <!-- Node 6: Error Handler -->
+  <rect class="box-hot" x="320" y="200" width="150" height="52" rx="8" />
+  <text class="lbl-hot" x="395" y="230" text-anchor="middle">Error Handler</text>
+
+  <!-- Arrow Executor -> Error Handler (failure path) -->
+  <line class="flow-hot" x1="520" y1="226" x2="472" y2="226" marker-end="url(#ch08-arrow-hot)" />
+  <text class="lbl-hot" x="496" y="218" font-size="11">failure</text>
+
+  <!-- Arrow Error Handler -> Cypher Generator (retry loop) -->
+  <path class="flow-hot" d="M395,200 L395,150 L520,150 L520,80 L518,80" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#ch08-arrow-hot)" />
+  <text class="lbl-hot" x="460" y="143" font-size="11">retry</text>
+
+  <!-- END node -->
+  <circle cx="595" cy="420" r="14" fill="var(--ink)" opacity="0.7" />
+  <text x="595" y="424" text-anchor="middle" class="lbl" fill="#fff" font-size="11">E</text>
+  <line class="flow" x1="595" y1="392" x2="595" y2="406" marker-end="url(#ch08-arrow)" />
+
+  <!-- Direct answer END -->
+  <circle cx="195" cy="420" r="14" fill="var(--ink)" opacity="0.5" />
+  <text x="195" y="424" text-anchor="middle" class="lbl" fill="#fff" font-size="11">E</text>
+  <text class="lbl" x="215" y="395" font-size="11" fill="var(--ink-soft)">direct answer</text>
+</svg>
+</figure>
+
+<p data-anchor="ch08-pipeline-walkthrough">
+The diagram shows the happy path running top-to-bottom on the right side: Intent Classifier &rarr; Schema Extractor &rarr; Cypher Generator &rarr; Query Executor &rarr; Summarizer &rarr; END. Two branches deviate from that path. First, the Intent Classifier can short-circuit to END when the question doesn&rsquo;t need a graph query (e.g., &ldquo;Hello&rdquo; or &ldquo;What is Cypher?&rdquo;). Second, if the Query Executor encounters a Cypher syntax error or a constraint violation, control flows to the Error Handler, which annotates the state with the error message and loops back to the Cypher Generator for another attempt.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-stages-table">Pipeline Stages at a Glance</h2>
+
+<table data-anchor="ch08-stages-reference">
+<caption data-anchor="ch08-stages-caption">Each node&rsquo;s role, input, and output within the pipeline</caption>
+<thead>
+<tr>
+  <th data-anchor="ch08-th-stage">Stage</th>
+  <th data-anchor="ch08-th-node">Node Name</th>
+  <th data-anchor="ch08-th-responsibility">Responsibility</th>
+  <th data-anchor="ch08-th-output">Key State Update</th>
+</tr>
+</thead>
+<tbody>
+<tr data-anchor="ch08-row-intent">
+  <td>1</td>
+  <td><code>classify_intent</code></td>
+  <td>Decide whether the question requires a graph query or can be answered directly</td>
+  <td><code>intent</code> &mdash; <code>"graph_query"</code> or <code>"direct_answer"</code></td>
+</tr>
+<tr data-anchor="ch08-row-schema">
+  <td>2</td>
+  <td><code>extract_schema</code></td>
+  <td>Identify the node labels, relationship types, and properties relevant to the question</td>
+  <td><code>schema_elements</code> &mdash; list of entities and relations</td>
+</tr>
+<tr data-anchor="ch08-row-cypher">
+  <td>3</td>
+  <td><code>generate_cypher</code></td>
+  <td>Produce a read-only Cypher query using the extracted schema and, on retries, the previous error</td>
+  <td><code>cypher_query</code>, <code>cypher_explanation</code></td>
+</tr>
+<tr data-anchor="ch08-row-executor">
+  <td>4</td>
+  <td><code>execute_query</code></td>
+  <td>Run the Cypher against Neo4j and capture the result set or error</td>
+  <td><code>query_results</code> or <code>query_error</code></td>
+</tr>
+<tr data-anchor="ch08-row-summarizer">
+  <td>5</td>
+  <td><code>summarize_results</code></td>
+  <td>Convert raw query results into a natural language answer</td>
+  <td><code>answer</code></td>
+</tr>
+<tr data-anchor="ch08-row-error">
+  <td>6</td>
+  <td><code>handle_error</code></td>
+  <td>Package the error context and increment the retry counter</td>
+  <td><code>retry_count</code>, <code>error_context</code></td>
+</tr>
+</tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-state-definition">Defining the Pipeline State</h2>
+
+<p data-anchor="ch08-state-intro">
+Everything flows through one TypedDict. Each node reads what it needs, writes what it produces, and leaves the rest untouched. Notice that we include both a <code>query_results</code> field and a <code>query_error</code> field&mdash;only one is populated after the executor runs, and the conditional edge checks which.
+</p>
+
+<p class="code-label" data-anchor="ch08-state-label">Pipeline state definition</p>
+<pre data-anchor="ch08-state-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Optional, Annotated
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> add_messages
+<span class="kw">from</span> langchain_core.messages <span class="kw">import</span> BaseMessage
+
+
+<span class="kw">class</span> <span class="ty">SchemaElement</span>(TypedDict):
+    <span class="str">"""A node label, relationship type, or property from the graph schema."""</span>
+    element_type: <span class="ty">str</span>   <span class="cm"># "node", "relationship", or "property"</span>
+    name: <span class="ty">str</span>
+    description: <span class="ty">str</span>
+
+
+<span class="kw">class</span> <span class="ty">QAState</span>(TypedDict):
+    <span class="cm"># Conversation history (uses add_messages reducer)</span>
+    messages: Annotated[<span class="ty">list</span>[BaseMessage], add_messages]
+
+    <span class="cm"># Intent classification</span>
+    question: <span class="ty">str</span>
+    intent: Optional[<span class="ty">str</span>]            <span class="cm"># "graph_query" | "direct_answer"</span>
+    direct_answer: Optional[<span class="ty">str</span>]
+
+    <span class="cm"># Schema extraction</span>
+    schema_elements: Optional[<span class="ty">list</span>[<span class="ty">SchemaElement</span>]]
+
+    <span class="cm"># Cypher generation</span>
+    cypher_query: Optional[<span class="ty">str</span>]
+    cypher_explanation: Optional[<span class="ty">str</span>]
+
+    <span class="cm"># Execution</span>
+    query_results: Optional[<span class="ty">list</span>[<span class="ty">dict</span>]]
+    query_error: Optional[<span class="ty">str</span>]
+
+    <span class="cm"># Summarization</span>
+    answer: Optional[<span class="ty">str</span>]
+
+    <span class="cm"># Error handling</span>
+    retry_count: <span class="ty">int</span>
+    error_context: Optional[<span class="ty">str</span>]
+    max_retries: <span class="ty">int</span>
+</pre>
+
+<p data-anchor="ch08-state-notes">
+A few things to notice. The <code>messages</code> field uses the <code>add_messages</code> reducer so that each node can append messages without overwriting the conversation history. The <code>retry_count</code> and <code>max_retries</code> fields control how many times the error loop can cycle before giving up. And the <code>error_context</code> field accumulates information from failed attempts so the Cypher generator can learn from its mistakes.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-pydantic-models">Structured Output with Pydantic</h2>
+
+<p data-anchor="ch08-pydantic-intro">
+Several nodes need the LLM to return structured data&mdash;not free-form text. We use Pydantic models and LangChain&rsquo;s <code>with_structured_output</code> to enforce the shape of the LLM&rsquo;s response at each stage.
+</p>
+
+<p class="code-label" data-anchor="ch08-pydantic-label">Pydantic models for structured LLM outputs</p>
+<pre data-anchor="ch08-pydantic-code"><span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel, Field
+
+
+<span class="kw">class</span> <span class="ty">IntentClassification</span>(BaseModel):
+    <span class="str">"""Whether the question needs a graph query."""</span>
+    intent: <span class="ty">str</span> = Field(
+        description=<span class="str">"Either 'graph_query' or 'direct_answer'"</span>
+    )
+    reasoning: <span class="ty">str</span> = Field(
+        description=<span class="str">"Brief explanation of why this intent was chosen"</span>
+    )
+    direct_answer: <span class="ty">str</span> | <span class="ty">None</span> = Field(
+        default=<span class="kw">None</span>,
+        description=<span class="str">"Answer if intent is direct_answer, else None"</span>
+    )
+
+
+<span class="kw">class</span> <span class="ty">ExtractedSchema</span>(BaseModel):
+    <span class="str">"""Relevant schema elements for the user's question."""</span>
+    entities: <span class="ty">list</span>[<span class="ty">str</span>] = Field(
+        description=<span class="str">"Node labels relevant to this question"</span>
+    )
+    relationships: <span class="ty">list</span>[<span class="ty">str</span>] = Field(
+        description=<span class="str">"Relationship types relevant to this question"</span>
+    )
+    properties: <span class="ty">list</span>[<span class="ty">str</span>] = Field(
+        description=<span class="str">"Property names to use in the query"</span>
+    )
+
+
+<span class="kw">class</span> <span class="ty">CypherOutput</span>(BaseModel):
+    <span class="str">"""A generated Cypher query with explanation."""</span>
+    query: <span class="ty">str</span> = Field(
+        description=<span class="str">"The Cypher query to execute"</span>
+    )
+    explanation: <span class="ty">str</span> = Field(
+        description=<span class="str">"What this query does in plain English"</span>
+    )
+</pre>
+
+<p data-anchor="ch08-pydantic-note">
+By asking for a <code>reasoning</code> field on the intent classifier, we get chain-of-thought baked into the structured output. The model must articulate <em>why</em> it chose a particular intent before committing, which improves accuracy&mdash;especially on borderline questions like &ldquo;What types of products do you have?&rdquo; which could be answered from schema metadata alone or from an actual query.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-intent-classifier">Node 1: The Intent Classifier</h2>
+
+<p data-anchor="ch08-intent-intro">
+The first node is a gatekeeper. Not every user message requires a graph query. Greetings, follow-up clarifications, or questions about the system itself should be handled without touching Neo4j. The intent classifier makes this call.
+</p>
+
+<p class="code-label" data-anchor="ch08-intent-label">Intent classifier node</p>
+<pre data-anchor="ch08-intent-code"><span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+
+llm = <span class="fn">ChatAnthropic</span>(model=<span class="str">"claude-sonnet-4-20250514"</span>)
+
+INTENT_PROMPT = <span class="str">"""You are a question classifier for a knowledge graph QA system.
+The knowledge graph contains information about companies, people,
+products, and their relationships.
+
+Given the user's question, determine:
+1. Does this question require querying the knowledge graph? (graph_query)
+2. Can it be answered directly without a query? (direct_answer)
+
+Questions about greetings, system capabilities, or general knowledge
+should be classified as direct_answer.
+
+Questions about specific entities, relationships, counts, or patterns
+in the data should be classified as graph_query.
+
+User question: {question}"""</span>
+
+
+<span class="kw">def</span> <span class="fn">classify_intent</span>(state: <span class="ty">QAState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Classify whether the question needs a graph query."""</span>
+    question = state[<span class="str">"question"</span>]
+
+    classifier = llm.<span class="fn">with_structured_output</span>(<span class="ty">IntentClassification</span>)
+    result = classifier.<span class="fn">invoke</span>(
+        INTENT_PROMPT.<span class="fn">format</span>(question=question)
+    )
+
+    update = {
+        <span class="str">"intent"</span>: result.intent,
+    }
+
+    <span class="kw">if</span> result.intent == <span class="str">"direct_answer"</span>:
+        update[<span class="str">"direct_answer"</span>] = result.direct_answer
+        update[<span class="str">"answer"</span>] = result.direct_answer
+
+    <span class="kw">return</span> update
+</pre>
+
+<p data-anchor="ch08-intent-edge">
+The conditional edge after this node is straightforward: check <code>state["intent"]</code> and route accordingly.
+</p>
+
+<p class="code-label" data-anchor="ch08-intent-router-label">Conditional routing after intent classification</p>
+<pre data-anchor="ch08-intent-router-code"><span class="kw">def</span> <span class="fn">route_after_intent</span>(state: <span class="ty">QAState</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Route to schema extraction or directly to END."""</span>
+    <span class="kw">if</span> state[<span class="str">"intent"</span>] == <span class="str">"graph_query"</span>:
+        <span class="kw">return</span> <span class="str">"extract_schema"</span>
+    <span class="kw">return</span> <span class="str">"__end__"</span>
+</pre>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-schema-extractor">Node 2: The Schema Extractor</h2>
+
+<p data-anchor="ch08-schema-intro">
+Rather than dumping the entire graph schema into the Cypher generation prompt (which can be enormous in production databases), we first extract only the relevant portions. This node takes the user&rsquo;s question and a cached copy of the full schema, then identifies which node labels, relationship types, and properties matter.
+</p>
+
+<p class="code-label" data-anchor="ch08-schema-label">Schema extractor with caching</p>
+<pre data-anchor="ch08-schema-code"><span class="kw">from</span> functools <span class="kw">import</span> lru_cache
+<span class="kw">from</span> neo4j <span class="kw">import</span> GraphDatabase
+
+driver = GraphDatabase.<span class="fn">driver</span>(
+    <span class="str">"bolt://localhost:7687"</span>,
+    auth=(<span class="str">"neo4j"</span>, <span class="str">"password"</span>)
+)
+
+
+<span class="cm">@lru_cache</span>(maxsize=<span class="num">1</span>)
+<span class="kw">def</span> <span class="fn">get_full_schema</span>() -> <span class="ty">str</span>:
+    <span class="str">"""Fetch and cache the graph schema. Called once per process."""</span>
+    <span class="kw">with</span> driver.<span class="fn">session</span>() <span class="kw">as</span> session:
+        <span class="cm"># Get node labels and their properties</span>
+        labels = session.<span class="fn">run</span>(
+            <span class="str">"CALL db.schema.nodeTypeProperties()"</span>
+        ).<span class="fn">data</span>()
+        <span class="cm"># Get relationship types</span>
+        rels = session.<span class="fn">run</span>(
+            <span class="str">"CALL db.schema.relTypeProperties()"</span>
+        ).<span class="fn">data</span>()
+    <span class="kw">return</span> <span class="fn">format_schema</span>(labels, rels)
+
+
+SCHEMA_PROMPT = <span class="str">"""Given the user's question and the full graph schema below,
+identify ONLY the node labels, relationship types, and properties
+that are relevant to answering this question.
+
+Full schema:
+{schema}
+
+User question: {question}"""</span>
+
+
+<span class="kw">def</span> <span class="fn">extract_schema</span>(state: <span class="ty">QAState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Extract relevant schema elements for the question."""</span>
+    full_schema = <span class="fn">get_full_schema</span>()
+
+    extractor = llm.<span class="fn">with_structured_output</span>(<span class="ty">ExtractedSchema</span>)
+    result = extractor.<span class="fn">invoke</span>(
+        SCHEMA_PROMPT.<span class="fn">format</span>(
+            schema=full_schema,
+            question=state[<span class="str">"question"</span>]
+        )
+    )
+
+    <span class="kw">return</span> {
+        <span class="str">"schema_elements"</span>: [
+            {<span class="str">"element_type"</span>: <span class="str">"node"</span>, <span class="str">"name"</span>: e, <span class="str">"description"</span>: <span class="str">""</span>}
+            <span class="kw">for</span> e <span class="kw">in</span> result.entities
+        ] + [
+            {<span class="str">"element_type"</span>: <span class="str">"relationship"</span>, <span class="str">"name"</span>: r, <span class="str">"description"</span>: <span class="str">""</span>}
+            <span class="kw">for</span> r <span class="kw">in</span> result.relationships
+        ]
+    }
+</pre>
+
+<div class="callout note" data-anchor="ch08-schema-cache-callout">
+<span class="callout-title">Schema Caching</span>
+<p data-anchor="ch08-schema-cache-text">
+The <code>@lru_cache</code> decorator means the schema is fetched from Neo4j exactly once per process. In a production deployment, you&rsquo;d want a TTL-based cache (e.g., using <code>cachetools.TTLCache</code>) so that schema changes are picked up within minutes rather than requiring a restart. You might also store the formatted schema string in Redis so that multiple worker processes share it.
+</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-cypher-generator">Node 3: The Cypher Generator</h2>
+
+<p data-anchor="ch08-cypher-intro">
+This is the most critical node. It takes the user&rsquo;s question, the extracted schema, and (on retries) the previous error, then generates a Cypher query. The prompt engineering here matters more than anywhere else in the pipeline.
+</p>
+
+<p class="code-label" data-anchor="ch08-cypher-label">Cypher generator node</p>
+<pre data-anchor="ch08-cypher-code">CYPHER_PROMPT = <span class="str">"""You are a Cypher query expert. Generate a Neo4j Cypher query
+to answer the user's question using ONLY the schema elements provided.
+
+RULES:
+1. Use ONLY read operations (MATCH, RETURN, WITH, WHERE, ORDER BY, LIMIT).
+2. NEVER use write operations (CREATE, MERGE, SET, DELETE, REMOVE, DROP).
+3. Always include a LIMIT clause (max 25 rows).
+4. Use parameterized values where possible.
+5. Prefer explicit relationship directions over undirected patterns.
+
+Relevant schema:
+{schema}
+
+User question: {question}
+{error_context}"""</span>
+
+
+<span class="kw">def</span> <span class="fn">generate_cypher</span>(state: <span class="ty">QAState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Generate a Cypher query from the question and schema."""</span>
+    error_ctx = <span class="str">""</span>
+    <span class="kw">if</span> state.get(<span class="str">"error_context"</span>):
+        error_ctx = (
+            <span class="str">f"\nPrevious attempt failed with error:\n"</span>
+            <span class="str">f"{state['error_context']}\n"</span>
+            <span class="str">f"Please fix the query to avoid this error."</span>
+        )
+
+    schema_text = <span class="fn">format_schema_elements</span>(
+        state[<span class="str">"schema_elements"</span>]
+    )
+
+    generator = llm.<span class="fn">with_structured_output</span>(<span class="ty">CypherOutput</span>)
+    result = generator.<span class="fn">invoke</span>(
+        CYPHER_PROMPT.<span class="fn">format</span>(
+            schema=schema_text,
+            question=state[<span class="str">"question"</span>],
+            error_context=error_ctx
+        )
+    )
+
+    <span class="kw">return</span> {
+        <span class="str">"cypher_query"</span>: result.query,
+        <span class="str">"cypher_explanation"</span>: result.explanation,
+        <span class="str">"query_error"</span>: <span class="kw">None</span>,  <span class="cm"># Clear previous error</span>
+    }
+
+
+<span class="kw">def</span> <span class="fn">format_schema_elements</span>(elements: <span class="ty">list</span>[<span class="ty">dict</span>]) -> <span class="ty">str</span>:
+    <span class="str">"""Format schema elements into a readable string."""</span>
+    nodes = [e[<span class="str">"name"</span>] <span class="kw">for</span> e <span class="kw">in</span> elements <span class="kw">if</span> e[<span class="str">"element_type"</span>] == <span class="str">"node"</span>]
+    rels = [e[<span class="str">"name"</span>] <span class="kw">for</span> e <span class="kw">in</span> elements <span class="kw">if</span> e[<span class="str">"element_type"</span>] == <span class="str">"relationship"</span>]
+    <span class="kw">return</span> (
+        <span class="str">f"Node labels: {', '.join(nodes)}\n"</span>
+        <span class="str">f"Relationship types: {', '.join(rels)}"</span>
+    )
+</pre>
+
+<p data-anchor="ch08-cypher-rules">
+The prompt rules are deliberate guardrails. Rule 1 and 2 prevent the LLM from generating mutation queries&mdash;a critical safety requirement. Rule 3 ensures the result set stays manageable. Rule 5 improves query performance by avoiding undirected pattern matching, which is expensive in large graphs. On retries, the error context gives the model specific information about what went wrong, which typically produces a corrected query on the second attempt.
+</p>
+
+<div class="callout warn" data-anchor="ch08-cypher-injection-callout">
+<span class="callout-title">Cypher Injection Safety</span>
+<p data-anchor="ch08-cypher-injection-text">
+Even with prompt-level guardrails, never trust LLM-generated Cypher without server-side protection. Configure your Neo4j user with <strong>read-only access</strong> at the database level. Use a dedicated user account with only <code>MATCH</code> and <code>RETURN</code> privileges. Additionally, validate the generated Cypher before execution: parse it to confirm it contains no write keywords, or run it in a read-only transaction (<code>session.read_transaction</code>). Prompt injection attacks can cause the LLM to ignore your rules and generate destructive queries&mdash;database-level permissions are your last line of defense, not the prompt.
+</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-query-executor">Node 4: The Query Executor</h2>
+
+<p data-anchor="ch08-executor-intro">
+With a Cypher query in hand, the executor runs it against Neo4j. This node is primarily about error handling: catching exceptions, formatting them for the retry loop, and ensuring the connection is properly managed.
+</p>
+
+<p class="code-label" data-anchor="ch08-executor-label">Query executor with error capture</p>
+<pre data-anchor="ch08-executor-code"><span class="kw">from</span> neo4j.exceptions <span class="kw">import</span> CypherSyntaxError, ClientError
+
+
+<span class="kw">def</span> <span class="fn">execute_query</span>(state: <span class="ty">QAState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Execute the Cypher query against Neo4j."""</span>
+    cypher = state[<span class="str">"cypher_query"</span>]
+
+    <span class="kw">try</span>:
+        <span class="kw">with</span> driver.<span class="fn">session</span>() <span class="kw">as</span> session:
+            <span class="cm"># Use read_transaction for safety</span>
+            result = session.<span class="fn">read_transaction</span>(
+                <span class="kw">lambda</span> tx: tx.<span class="fn">run</span>(cypher).<span class="fn">data</span>()
+            )
+        <span class="kw">return</span> {
+            <span class="str">"query_results"</span>: result,
+            <span class="str">"query_error"</span>: <span class="kw">None</span>,
+        }
+    <span class="kw">except</span> (CypherSyntaxError, ClientError) <span class="kw">as</span> e:
+        <span class="kw">return</span> {
+            <span class="str">"query_results"</span>: <span class="kw">None</span>,
+            <span class="str">"query_error"</span>: <span class="fn">str</span>(e),
+        }
+    <span class="kw">except</span> <span class="ty">Exception</span> <span class="kw">as</span> e:
+        <span class="cm"># Unexpected errors should not retry</span>
+        <span class="kw">return</span> {
+            <span class="str">"query_results"</span>: <span class="kw">None</span>,
+            <span class="str">"query_error"</span>: <span class="str">f"Unexpected error: {e}"</span>,
+        }
+</pre>
+
+<p data-anchor="ch08-executor-note">
+Notice that we use <code>read_transaction</code> rather than a general <code>session.run</code>. This is the database-level enforcement complementing our prompt-level guardrails: even if the LLM produces a <code>CREATE</code> statement despite instructions, the read transaction will reject it.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-error-handler">Node 5: The Error Handler and Retry Loop</h2>
+
+<p data-anchor="ch08-error-intro">
+When Cypher execution fails, the error handler packages up the failure context and increments the retry counter. The conditional edge after the executor decides whether to enter this loop.
+</p>
+
+<p class="code-label" data-anchor="ch08-error-label">Error handler and routing logic</p>
+<pre data-anchor="ch08-error-code"><span class="kw">def</span> <span class="fn">handle_error</span>(state: <span class="ty">QAState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Package error context for the retry loop."""</span>
+    <span class="kw">return</span> {
+        <span class="str">"error_context"</span>: (
+            <span class="str">f"Query: {state['cypher_query']}\n"</span>
+            <span class="str">f"Error: {state['query_error']}"</span>
+        ),
+        <span class="str">"retry_count"</span>: state.get(<span class="str">"retry_count"</span>, <span class="num">0</span>) + <span class="num">1</span>,
+    }
+
+
+<span class="kw">def</span> <span class="fn">route_after_execution</span>(state: <span class="ty">QAState</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Route based on query success or failure."""</span>
+    <span class="kw">if</span> state.get(<span class="str">"query_error"</span>):
+        retry_count = state.get(<span class="str">"retry_count"</span>, <span class="num">0</span>)
+        max_retries = state.get(<span class="str">"max_retries"</span>, <span class="num">2</span>)
+        <span class="kw">if</span> retry_count < max_retries:
+            <span class="kw">return</span> <span class="str">"handle_error"</span>
+        <span class="cm"># Max retries exceeded; summarize the failure</span>
+        <span class="kw">return</span> <span class="str">"summarize_results"</span>
+    <span class="kw">return</span> <span class="str">"summarize_results"</span>
+</pre>
+
+<p data-anchor="ch08-error-detail">
+The routing function checks two conditions: did the query fail, and have we exhausted our retries? If the query failed but retries remain, we go to the error handler which loops back to the Cypher generator. If retries are exhausted or the query succeeded, we proceed to the summarizer&mdash;which handles both success and graceful failure messaging.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-summarizer">Node 6: The Summarizer</h2>
+
+<p data-anchor="ch08-summarizer-intro">
+The final node converts raw Neo4j query results (or a failure message) into a natural language answer. It also appends the answer to the conversation history for continuity.
+</p>
+
+<p class="code-label" data-anchor="ch08-summarizer-label">Summarizer node</p>
+<pre data-anchor="ch08-summarizer-code">SUMMARIZE_PROMPT = <span class="str">"""You are a helpful assistant that explains query results
+in clear, natural language. Given the user's original question and
+the query results from a knowledge graph, provide a concise answer.
+
+If the results are empty, say so clearly and suggest how to refine
+the question. If there was an error, explain what went wrong without
+exposing technical details.
+
+User question: {question}
+Query results: {results}
+Query used: {cypher}"""</span>
+
+
+<span class="kw">def</span> <span class="fn">summarize_results</span>(state: <span class="ty">QAState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Summarize query results into a natural language answer."""</span>
+    results = state.get(<span class="str">"query_results"</span>)
+    error = state.get(<span class="str">"query_error"</span>)
+
+    <span class="kw">if</span> error <span class="kw">and not</span> results:
+        results_text = <span class="str">f"Query failed after retries: {error}"</span>
+    <span class="kw">elif not</span> results:
+        results_text = <span class="str">"No results found."</span>
+    <span class="kw">else</span>:
+        results_text = <span class="fn">str</span>(results[:<span class="num">25</span>])  <span class="cm"># Cap display</span>
+
+    response = llm.<span class="fn">invoke</span>(
+        SUMMARIZE_PROMPT.<span class="fn">format</span>(
+            question=state[<span class="str">"question"</span>],
+            results=results_text,
+            cypher=state.get(<span class="str">"cypher_query"</span>, <span class="str">"N/A"</span>)
+        )
+    )
+
+    <span class="kw">return</span> {
+        <span class="str">"answer"</span>: response.content,
+        <span class="str">"messages"</span>: [response],
+    }
+</pre>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-assembling-graph">Assembling the Graph</h2>
+
+<p data-anchor="ch08-assemble-intro">
+With all nodes and routing functions defined, we wire them together into a LangGraph <code>StateGraph</code>. This is the moment where the architecture diagram from earlier becomes executable code.
+</p>
+
+<p class="code-label" data-anchor="ch08-assemble-label">Full graph assembly with MemorySaver</p>
+<pre data-anchor="ch08-assemble-code"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+
+<span class="cm"># Build the graph</span>
+builder = <span class="fn">StateGraph</span>(<span class="ty">QAState</span>)
+
+<span class="cm"># Add nodes</span>
+builder.<span class="fn">add_node</span>(<span class="str">"classify_intent"</span>, classify_intent)
+builder.<span class="fn">add_node</span>(<span class="str">"extract_schema"</span>, extract_schema)
+builder.<span class="fn">add_node</span>(<span class="str">"generate_cypher"</span>, generate_cypher)
+builder.<span class="fn">add_node</span>(<span class="str">"execute_query"</span>, execute_query)
+builder.<span class="fn">add_node</span>(<span class="str">"summarize_results"</span>, summarize_results)
+builder.<span class="fn">add_node</span>(<span class="str">"handle_error"</span>, handle_error)
+
+<span class="cm"># Set entry point</span>
+builder.<span class="fn">set_entry_point</span>(<span class="str">"classify_intent"</span>)
+
+<span class="cm"># Add edges</span>
+builder.<span class="fn">add_conditional_edges</span>(
+    <span class="str">"classify_intent"</span>,
+    route_after_intent,
+    {
+        <span class="str">"extract_schema"</span>: <span class="str">"extract_schema"</span>,
+        <span class="str">"__end__"</span>: END,
+    }
+)
+
+builder.<span class="fn">add_edge</span>(<span class="str">"extract_schema"</span>, <span class="str">"generate_cypher"</span>)
+builder.<span class="fn">add_edge</span>(<span class="str">"generate_cypher"</span>, <span class="str">"execute_query"</span>)
+
+builder.<span class="fn">add_conditional_edges</span>(
+    <span class="str">"execute_query"</span>,
+    route_after_execution,
+    {
+        <span class="str">"handle_error"</span>: <span class="str">"handle_error"</span>,
+        <span class="str">"summarize_results"</span>: <span class="str">"summarize_results"</span>,
+    }
+)
+
+<span class="cm"># Error handler loops back to Cypher generation</span>
+builder.<span class="fn">add_edge</span>(<span class="str">"handle_error"</span>, <span class="str">"generate_cypher"</span>)
+
+<span class="cm"># Summarizer goes to END</span>
+builder.<span class="fn">add_edge</span>(<span class="str">"summarize_results"</span>, END)
+
+<span class="cm"># Compile with memory for conversation continuity</span>
+memory = <span class="fn">MemorySaver</span>()
+graph = builder.<span class="fn">compile</span>(checkpointer=memory)
+</pre>
+
+<p data-anchor="ch08-assemble-explain">
+The <code>MemorySaver</code> checkpointer gives us conversation continuity across invocations. When a user asks a follow-up question, the graph can access the previous state&mdash;including past queries and answers&mdash;through the thread&rsquo;s checkpoint. This is essential for the Streamlit integration, where users expect a conversational experience.
+</p>
+
+<div class="callout key" data-anchor="ch08-assemble-callout">
+<span class="callout-title">Why MemorySaver Here?</span>
+<p data-anchor="ch08-assemble-callout-text">
+For a local prototype, <code>MemorySaver</code> (an in-memory checkpointer) is fine. In production, you&rsquo;d swap it for <code>SqliteSaver</code> or a PostgreSQL-backed checkpointer so that conversation state persists across deployments. The graph code itself doesn&rsquo;t change&mdash;only the checkpointer argument to <code>compile()</code>.
+</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-running-pipeline">Running the Pipeline</h2>
+
+<p data-anchor="ch08-running-intro">
+Before wiring up Streamlit, let&rsquo;s verify the pipeline works with a direct invocation. This is how you&rsquo;d test it from a script or notebook.
+</p>
+
+<p class="code-label" data-anchor="ch08-running-label">Direct invocation</p>
+<pre data-anchor="ch08-running-code"><span class="cm"># Invoke the graph with a question</span>
+config = {<span class="str">"configurable"</span>: {<span class="str">"thread_id"</span>: <span class="str">"user-session-1"</span>}}
+
+result = graph.<span class="fn">invoke</span>(
+    {
+        <span class="str">"question"</span>: <span class="str">"Which suppliers have more than 3 delayed shipments?"</span>,
+        <span class="str">"messages"</span>: [],
+        <span class="str">"retry_count"</span>: <span class="num">0</span>,
+        <span class="str">"max_retries"</span>: <span class="num">2</span>,
+    },
+    config=config,
+)
+
+<span class="fn">print</span>(<span class="str">"Cypher:"</span>, result[<span class="str">"cypher_query"</span>])
+<span class="fn">print</span>(<span class="str">"Answer:"</span>, result[<span class="str">"answer"</span>])
+</pre>
+
+<p data-anchor="ch08-running-output">
+A typical run produces output like this: the generated Cypher (e.g., <code>MATCH (s:Supplier)-[:SHIPPED]-&gt;(o:Order) WHERE o.status = &rsquo;delayed&rsquo; WITH s, count(o) AS delays WHERE delays &gt; 3 RETURN s.name, delays ORDER BY delays DESC LIMIT 25</code>) and a natural language answer summarizing the results. The transparency of showing the Cypher is valuable for debugging and for users who want to verify the query logic.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-streamlit-integration">Integrating Streamlit for the Frontend</h2>
+
+<p data-anchor="ch08-streamlit-intro">
+A command-line interface is fine for development, but end users need something more approachable. Streamlit gives us a chat interface with minimal code. The key features: streaming responses, displaying the generated Cypher for transparency, and showing the raw query results alongside the natural language answer.
+</p>
+
+<p class="code-label" data-anchor="ch08-streamlit-label">Streamlit chat application</p>
+<pre data-anchor="ch08-streamlit-code"><span class="kw">import</span> streamlit <span class="kw">as</span> st
+<span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage
+
+<span class="cm"># Import the compiled graph from our pipeline module</span>
+<span class="kw">from</span> pipeline <span class="kw">import</span> graph
+
+st.<span class="fn">set_page_config</span>(
+    page_title=<span class="str">"Knowledge Graph QA"</span>,
+    page_icon=<span class="str">"🔍"</span>,
+    layout=<span class="str">"wide"</span>,
+)
+
+st.<span class="fn">title</span>(<span class="str">"Knowledge Graph QA Agent"</span>)
+st.<span class="fn">caption</span>(<span class="str">"Ask questions about your data in natural language"</span>)
+
+<span class="cm"># Initialize session state</span>
+<span class="kw">if</span> <span class="str">"thread_id"</span> <span class="kw">not in</span> st.session_state:
+    st.session_state.thread_id = <span class="str">"streamlit-"</span> + <span class="fn">str</span>(<span class="fn">hash</span>(<span class="fn">id</span>(st)))
+<span class="kw">if</span> <span class="str">"chat_history"</span> <span class="kw">not in</span> st.session_state:
+    st.session_state.chat_history = []
+
+<span class="cm"># Display chat history</span>
+<span class="kw">for</span> msg <span class="kw">in</span> st.session_state.chat_history:
+    <span class="kw">with</span> st.<span class="fn">chat_message</span>(msg[<span class="str">"role"</span>]):
+        st.<span class="fn">markdown</span>(msg[<span class="str">"content"</span>])
+        <span class="kw">if</span> <span class="str">"cypher"</span> <span class="kw">in</span> msg:
+            <span class="kw">with</span> st.<span class="fn">expander</span>(<span class="str">"View Cypher Query"</span>):
+                st.<span class="fn">code</span>(msg[<span class="str">"cypher"</span>], language=<span class="str">"cypher"</span>)
+        <span class="kw">if</span> <span class="str">"results"</span> <span class="kw">in</span> msg:
+            <span class="kw">with</span> st.<span class="fn">expander</span>(<span class="str">"View Raw Results"</span>):
+                st.<span class="fn">json</span>(msg[<span class="str">"results"</span>])
+
+<span class="cm"># Handle new input</span>
+<span class="kw">if</span> prompt := st.<span class="fn">chat_input</span>(<span class="str">"Ask a question about the knowledge graph"</span>):
+    <span class="cm"># Display user message</span>
+    <span class="kw">with</span> st.<span class="fn">chat_message</span>(<span class="str">"user"</span>):
+        st.<span class="fn">markdown</span>(prompt)
+
+    st.session_state.chat_history.<span class="fn">append</span>(
+        {<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: prompt}
+    )
+
+    <span class="cm"># Run the pipeline</span>
+    config = {
+        <span class="str">"configurable"</span>: {
+            <span class="str">"thread_id"</span>: st.session_state.thread_id
+        }
+    }
+
+    <span class="kw">with</span> st.<span class="fn">chat_message</span>(<span class="str">"assistant"</span>):
+        <span class="kw">with</span> st.<span class="fn">spinner</span>(<span class="str">"Thinking..."</span>):
+            result = graph.<span class="fn">invoke</span>(
+                {
+                    <span class="str">"question"</span>: prompt,
+                    <span class="str">"messages"</span>: [<span class="fn">HumanMessage</span>(content=prompt)],
+                    <span class="str">"retry_count"</span>: <span class="num">0</span>,
+                    <span class="str">"max_retries"</span>: <span class="num">2</span>,
+                },
+                config=config,
+            )
+
+        <span class="cm"># Display the answer</span>
+        st.<span class="fn">markdown</span>(result[<span class="str">"answer"</span>])
+
+        <span class="cm"># Show Cypher query if one was generated</span>
+        <span class="kw">if</span> result.get(<span class="str">"cypher_query"</span>):
+            <span class="kw">with</span> st.<span class="fn">expander</span>(<span class="str">"View Cypher Query"</span>):
+                st.<span class="fn">code</span>(result[<span class="str">"cypher_query"</span>], language=<span class="str">"cypher"</span>)
+
+        <span class="cm"># Show raw results if available</span>
+        <span class="kw">if</span> result.get(<span class="str">"query_results"</span>):
+            <span class="kw">with</span> st.<span class="fn">expander</span>(<span class="str">"View Raw Results"</span>):
+                st.<span class="fn">json</span>(result[<span class="str">"query_results"</span>])
+
+    <span class="cm"># Save to chat history</span>
+    history_entry = {
+        <span class="str">"role"</span>: <span class="str">"assistant"</span>,
+        <span class="str">"content"</span>: result[<span class="str">"answer"</span>],
+    }
+    <span class="kw">if</span> result.get(<span class="str">"cypher_query"</span>):
+        history_entry[<span class="str">"cypher"</span>] = result[<span class="str">"cypher_query"</span>]
+    <span class="kw">if</span> result.get(<span class="str">"query_results"</span>):
+        history_entry[<span class="str">"results"</span>] = result[<span class="str">"query_results"</span>]
+    st.session_state.chat_history.<span class="fn">append</span>(history_entry)
+</pre>
+
+<p data-anchor="ch08-streamlit-walkthrough">
+Let&rsquo;s walk through what this gives the user. They type a question into the chat input. A spinner appears while the pipeline runs. When done, the natural language answer appears in the chat, and two expandable sections offer transparency: &ldquo;View Cypher Query&rdquo; shows exactly what was executed against Neo4j, and &ldquo;View Raw Results&rdquo; shows the data that came back. The chat history persists across interactions using Streamlit&rsquo;s session state, and the LangGraph checkpointer ensures the graph&rsquo;s internal state persists too.
+</p>
+
+<p data-anchor="ch08-streamlit-streaming">
+For a more responsive experience, you can replace the <code>invoke</code> call with <code>stream</code> and use Streamlit&rsquo;s <code>st.write_stream</code>. This lets the user see the answer being generated token by token, which is especially helpful for longer answers.
+</p>
+
+<p class="code-label" data-anchor="ch08-streaming-label">Streaming variant</p>
+<pre data-anchor="ch08-streaming-code"><span class="cm"># Replace the invoke block with streaming</span>
+<span class="kw">with</span> st.<span class="fn">chat_message</span>(<span class="str">"assistant"</span>):
+    response_container = st.<span class="fn">empty</span>()
+    full_response = <span class="str">""</span>
+
+    <span class="kw">for</span> event <span class="kw">in</span> graph.<span class="fn">stream</span>(
+        {
+            <span class="str">"question"</span>: prompt,
+            <span class="str">"messages"</span>: [<span class="fn">HumanMessage</span>(content=prompt)],
+            <span class="str">"retry_count"</span>: <span class="num">0</span>,
+            <span class="str">"max_retries"</span>: <span class="num">2</span>,
+        },
+        config=config,
+        stream_mode=<span class="str">"updates"</span>,
+    ):
+        <span class="cm"># Each event is a dict of {node_name: state_update}</span>
+        <span class="kw">for</span> node_name, update <span class="kw">in</span> event.<span class="fn">items</span>():
+            <span class="kw">if</span> node_name == <span class="str">"summarize_results"</span>:
+                full_response = update.get(<span class="str">"answer"</span>, <span class="str">""</span>)
+                response_container.<span class="fn">markdown</span>(full_response)
+            <span class="kw">elif</span> node_name == <span class="str">"generate_cypher"</span>:
+                <span class="kw">with</span> st.<span class="fn">expander</span>(<span class="str">"Generated Cypher"</span>):
+                    st.<span class="fn">code</span>(
+                        update.get(<span class="str">"cypher_query"</span>, <span class="str">""</span>),
+                        language=<span class="str">"cypher"</span>
+                    )
+</pre>
+
+<p data-anchor="ch08-streaming-note">
+With <code>stream_mode="updates"</code>, you receive each node&rsquo;s state update as it completes. This lets you show intermediate results&mdash;the generated Cypher appears as soon as the Cypher Generator node finishes, even while the Query Executor and Summarizer are still running.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-ambiguous-queries">Handling Ambiguous Queries</h2>
+
+<p data-anchor="ch08-ambiguous-intro">
+Real users ask imprecise questions. &ldquo;Show me the top customers&rdquo; doesn&rsquo;t specify what &ldquo;top&rdquo; means&mdash;by revenue, by order count, by recency? There are three strategies for handling this, and a production system typically uses all three.
+</p>
+
+<ol data-anchor="ch08-ambiguous-strategies">
+<li data-anchor="ch08-ambiguous-s1"><strong>Clarification routing.</strong> Add a conditional edge after the intent classifier that detects ambiguity and asks the user for clarification before proceeding. This requires an &ldquo;ambiguous&rdquo; intent and a node that generates a clarification question.</li>
+<li data-anchor="ch08-ambiguous-s2"><strong>Default assumptions with disclosure.</strong> The Cypher generator makes a reasonable assumption (e.g., &ldquo;top by revenue&rdquo;) and the summarizer discloses it: &ldquo;Here are the top customers by revenue. If you meant something else, please specify.&rdquo;</li>
+<li data-anchor="ch08-ambiguous-s3"><strong>Multi-query expansion.</strong> Generate multiple Cypher queries for different interpretations, execute them in parallel, and let the summarizer present all perspectives. This is more expensive but more thorough.</li>
+</ol>
+
+<p data-anchor="ch08-ambiguous-recommendation">
+For most applications, strategy 2 strikes the right balance. It&rsquo;s fast, doesn&rsquo;t block the user, and maintains transparency about what assumptions were made. You can implement it by adding an <code>assumptions</code> field to the <code>CypherOutput</code> model and including it in the summarization prompt.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-guardrails">Guardrails on Generated Cypher</h2>
+
+<p data-anchor="ch08-guardrails-intro">
+We&rsquo;ve already discussed read-only database access. But there are additional guardrails worth applying before the query reaches Neo4j.
+</p>
+
+<p class="code-label" data-anchor="ch08-guardrails-label">Cypher validation before execution</p>
+<pre data-anchor="ch08-guardrails-code"><span class="kw">import</span> re
+
+FORBIDDEN_KEYWORDS = [
+    <span class="str">"CREATE"</span>, <span class="str">"MERGE"</span>, <span class="str">"SET"</span>, <span class="str">"DELETE"</span>,
+    <span class="str">"REMOVE"</span>, <span class="str">"DROP"</span>, <span class="str">"DETACH"</span>,
+    <span class="str">"CALL.*dbms"</span>, <span class="str">"LOAD CSV"</span>,
+]
+
+
+<span class="kw">def</span> <span class="fn">validate_cypher</span>(query: <span class="ty">str</span>) -> <span class="ty">tuple</span>[<span class="ty">bool</span>, <span class="ty">str</span>]:
+    <span class="str">"""Validate that Cypher is read-only and bounded."""</span>
+    upper = query.<span class="fn">upper</span>()
+
+    <span class="cm"># Check for write operations</span>
+    <span class="kw">for</span> keyword <span class="kw">in</span> FORBIDDEN_KEYWORDS:
+        <span class="kw">if</span> re.<span class="fn">search</span>(keyword, upper):
+            <span class="kw">return</span> <span class="kw">False</span>, <span class="str">f"Forbidden keyword: {keyword}"</span>
+
+    <span class="cm"># Ensure LIMIT clause exists</span>
+    <span class="kw">if</span> <span class="str">"LIMIT"</span> <span class="kw">not in</span> upper:
+        <span class="kw">return</span> <span class="kw">False</span>, <span class="str">"Query must include a LIMIT clause"</span>
+
+    <span class="cm"># Check LIMIT value is reasonable</span>
+    limit_match = re.<span class="fn">search</span>(<span class="str">r"LIMIT\s+(\d+)"</span>, upper)
+    <span class="kw">if</span> limit_match:
+        limit_val = <span class="fn">int</span>(limit_match.<span class="fn">group</span>(<span class="num">1</span>))
+        <span class="kw">if</span> limit_val > <span class="num">100</span>:
+            <span class="kw">return</span> <span class="kw">False</span>, <span class="str">f"LIMIT {limit_val} exceeds maximum of 100"</span>
+
+    <span class="kw">return</span> <span class="kw">True</span>, <span class="str">"OK"</span>
+</pre>
+
+<p data-anchor="ch08-guardrails-integration">
+You&rsquo;d call <code>validate_cypher</code> inside the <code>execute_query</code> node, before running the query. If validation fails, set <code>query_error</code> to the validation message&mdash;the same retry loop handles it just like a Neo4j error. The LLM will then regenerate the query, this time knowing that it needs a LIMIT clause or that MERGE is forbidden.
+</p>
+
+<div class="callout key" data-anchor="ch08-guardrails-defense-callout">
+<span class="callout-title">Defense in Depth</span>
+<p data-anchor="ch08-guardrails-defense-text">
+Think of Cypher safety as three layers: (1) prompt instructions tell the LLM to generate read-only queries, (2) regex validation catches obvious violations before they reach the database, and (3) the read-only database user rejects anything that slips through. No single layer is sufficient. Prompt instructions can be bypassed through injection. Regex validation can miss creative evasion. Only the database-level permission is airtight&mdash;but the other layers reduce unnecessary error-retry cycles and make the system respond faster.
+</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-schema-caching-detail">Schema Caching in Practice</h2>
+
+<p data-anchor="ch08-schema-caching-intro">
+The schema extraction node we wrote earlier fetches the full schema once via <code>@lru_cache</code>. In a real deployment, there are two additional optimizations worth considering.
+</p>
+
+<p data-anchor="ch08-schema-caching-embedding">
+<strong>Embedding-based schema matching.</strong> If your graph has hundreds of node labels and relationship types, the full schema string might exceed what you want to put in a prompt. Instead of sending the full schema to the LLM for extraction, embed each schema element (label name + description) and use vector similarity to retrieve only the top-k most relevant elements for a given question. This turns the schema extractor from an LLM node into a retrieval node&mdash;faster and cheaper.
+</p>
+
+<p data-anchor="ch08-schema-caching-ttl">
+<strong>TTL-based invalidation.</strong> Graph schemas change when new node types or relationship types are added. A stale schema cache means the LLM doesn&rsquo;t know about new entities. Use a time-to-live cache (e.g., 15 minutes) and log a warning when the schema changes between cache refreshes. This way you catch schema drift early without hammering the database on every request.
+</p>
+
+<p class="code-label" data-anchor="ch08-ttl-cache-label">TTL-based schema cache</p>
+<pre data-anchor="ch08-ttl-cache-code"><span class="kw">from</span> cachetools <span class="kw">import</span> TTLCache, cached
+
+schema_cache = <span class="fn">TTLCache</span>(maxsize=<span class="num">1</span>, ttl=<span class="num">900</span>)  <span class="cm"># 15 minutes</span>
+
+
+<span class="cm">@cached</span>(cache=schema_cache)
+<span class="kw">def</span> <span class="fn">get_full_schema_ttl</span>() -> <span class="ty">str</span>:
+    <span class="str">"""Fetch graph schema with 15-minute TTL cache."""</span>
+    <span class="kw">with</span> driver.<span class="fn">session</span>() <span class="kw">as</span> session:
+        labels = session.<span class="fn">run</span>(
+            <span class="str">"CALL db.schema.nodeTypeProperties()"</span>
+        ).<span class="fn">data</span>()
+        rels = session.<span class="fn">run</span>(
+            <span class="str">"CALL db.schema.relTypeProperties()"</span>
+        ).<span class="fn">data</span>()
+    <span class="kw">return</span> <span class="fn">format_schema</span>(labels, rels)
+</pre>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-testing">Testing the Pipeline</h2>
+
+<p data-anchor="ch08-testing-intro">
+Testing a multi-step LLM pipeline requires a different approach than testing deterministic code. You can&rsquo;t assert exact outputs because the LLM&rsquo;s responses vary. Instead, test the structure and the edges.
+</p>
+
+<p data-anchor="ch08-testing-strategies">
+<strong>Unit-test individual nodes</strong> by mocking the LLM and Neo4j driver. Verify that each node reads the correct state keys and writes the correct updates. <strong>Test the routing logic</strong> with hand-crafted state dictionaries&mdash;these are pure functions and fully deterministic. <strong>Integration-test the full pipeline</strong> with a small Neo4j test database (a Docker container with known data). Assert that the answer mentions expected entities or values, not that it matches an exact string.
+</p>
+
+<p class="code-label" data-anchor="ch08-testing-label">Testing the routing logic</p>
+<pre data-anchor="ch08-testing-code"><span class="kw">def</span> <span class="fn">test_route_after_intent_graph_query</span>():
+    state = {<span class="str">"intent"</span>: <span class="str">"graph_query"</span>}
+    <span class="kw">assert</span> <span class="fn">route_after_intent</span>(state) == <span class="str">"extract_schema"</span>
+
+
+<span class="kw">def</span> <span class="fn">test_route_after_intent_direct</span>():
+    state = {<span class="str">"intent"</span>: <span class="str">"direct_answer"</span>}
+    <span class="kw">assert</span> <span class="fn">route_after_intent</span>(state) == <span class="str">"__end__"</span>
+
+
+<span class="kw">def</span> <span class="fn">test_route_after_execution_success</span>():
+    state = {<span class="str">"query_error"</span>: <span class="kw">None</span>, <span class="str">"retry_count"</span>: <span class="num">0</span>}
+    <span class="kw">assert</span> <span class="fn">route_after_execution</span>(state) == <span class="str">"summarize_results"</span>
+
+
+<span class="kw">def</span> <span class="fn">test_route_after_execution_retry</span>():
+    state = {
+        <span class="str">"query_error"</span>: <span class="str">"SyntaxError"</span>,
+        <span class="str">"retry_count"</span>: <span class="num">0</span>,
+        <span class="str">"max_retries"</span>: <span class="num">2</span>,
+    }
+    <span class="kw">assert</span> <span class="fn">route_after_execution</span>(state) == <span class="str">"handle_error"</span>
+
+
+<span class="kw">def</span> <span class="fn">test_route_after_execution_max_retries</span>():
+    state = {
+        <span class="str">"query_error"</span>: <span class="str">"SyntaxError"</span>,
+        <span class="str">"retry_count"</span>: <span class="num">2</span>,
+        <span class="str">"max_retries"</span>: <span class="num">2</span>,
+    }
+    <span class="kw">assert</span> <span class="fn">route_after_execution</span>(state) == <span class="str">"summarize_results"</span>
+</pre>
+
+<p data-anchor="ch08-testing-note">
+These tests are fast, deterministic, and catch real bugs&mdash;like accidentally swapping the retry condition or misspelling a node name in a route return value. The routing logic is where most pipeline bugs hide, and it&rsquo;s the easiest part to test thoroughly.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-production-considerations">Production Considerations</h2>
+
+<p data-anchor="ch08-production-intro">
+Moving this pipeline from a prototype to a production system involves several additional concerns beyond the code we&rsquo;ve written. Here are the most important ones.
+</p>
+
+<h3 data-anchor="ch08-prod-observability">Observability</h3>
+
+<p data-anchor="ch08-prod-observability-text">
+Instrument each node with logging and tracing. LangSmith integrates naturally with LangGraph and gives you visibility into every LLM call, including the prompts, responses, and latencies. At minimum, log the generated Cypher and whether execution succeeded&mdash;this gives you a dataset of query patterns you can use to improve prompts and detect regressions.
+</p>
+
+<h3 data-anchor="ch08-prod-latency">Latency</h3>
+
+<p data-anchor="ch08-prod-latency-text">
+The pipeline makes three sequential LLM calls on the happy path (intent, schema extraction, and Cypher generation) plus one more for summarization. Each adds 1&ndash;3 seconds. Consider whether the intent classifier and schema extractor can be combined into a single LLM call that returns both the intent and the relevant schema elements. This trades prompt complexity for a full round-trip savings.
+</p>
+
+<h3 data-anchor="ch08-prod-concurrent">Concurrent Users</h3>
+
+<p data-anchor="ch08-prod-concurrent-text">
+The <code>MemorySaver</code> checkpointer is not suitable for multi-user deployments&mdash;it stores state in process memory and loses it on restart. Use a persistent checkpointer (PostgreSQL or Redis) and ensure each user gets a unique <code>thread_id</code>. The Neo4j driver&rsquo;s connection pool handles concurrent queries natively, but you should set pool size limits in the driver configuration.
+</p>
+
+<h3 data-anchor="ch08-prod-cost">Cost Control</h3>
+
+<p data-anchor="ch08-prod-cost-text">
+Each pipeline run uses 3&ndash;4 LLM calls. In a high-traffic application, this adds up. Consider caching common question-to-Cypher mappings, using a smaller model for intent classification (which doesn&rsquo;t require the same reasoning capability as Cypher generation), and setting strict retry limits. Two retries is usually sufficient&mdash;if the LLM can&rsquo;t fix the Cypher in two attempts, a third is unlikely to help.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-full-project-structure">Project Structure</h2>
+
+<p data-anchor="ch08-project-intro">
+For reference, here is how the complete project fits together on disk. Keeping the pipeline, models, and Streamlit app in separate modules makes each piece independently testable.
+</p>
+
+<p class="code-label" data-anchor="ch08-project-label">Recommended project layout</p>
+<pre data-anchor="ch08-project-code">kg-qa-agent/
+├── app.py                  <span class="cm"># Streamlit entry point</span>
+├── pipeline.py             <span class="cm"># Graph assembly and compilation</span>
+├── nodes/
+│   ├── intent.py           <span class="cm"># Intent classifier node</span>
+│   ├── schema.py           <span class="cm"># Schema extractor node</span>
+│   ├── cypher.py           <span class="cm"># Cypher generator node</span>
+│   ├── executor.py         <span class="cm"># Query executor node</span>
+│   ├── summarizer.py       <span class="cm"># Summarizer node</span>
+│   └── error_handler.py    <span class="cm"># Error handler node</span>
+├── models/
+│   ├── state.py            <span class="cm"># QAState TypedDict</span>
+│   └── outputs.py          <span class="cm"># Pydantic models for structured output</span>
+├── utils/
+│   ├── neo4j_client.py     <span class="cm"># Driver setup and schema caching</span>
+│   └── validators.py       <span class="cm"># Cypher validation functions</span>
+├── tests/
+│   ├── test_routing.py     <span class="cm"># Routing logic tests</span>
+│   ├── test_validators.py  <span class="cm"># Cypher validation tests</span>
+│   └── test_pipeline.py    <span class="cm"># Integration tests with test DB</span>
+└── requirements.txt
+</pre>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch08-recap">What We Built</h2>
+
+<p data-anchor="ch08-recap-text">
+This chapter took every pattern from the book&mdash;state management, conditional edges, error-retry loops, streaming, checkpointing&mdash;and combined them into a single application. The QA agent is not a toy: it handles intent routing, schema-aware query generation, execution with retry, and transparent presentation through a Streamlit frontend. The key architectural insight is that each node has a single responsibility and communicates through a shared, typed state. This makes the pipeline debuggable (you can inspect state between any two nodes), testable (routing logic is pure functions), and extensible (add a new node without rewriting existing ones).
+</p>
+
+<p data-anchor="ch08-recap-honest">
+Let&rsquo;s be honest about the limits. LLM-generated Cypher is not as reliable as hand-written queries. Ambiguous questions will sometimes produce wrong or irrelevant answers. The retry loop helps, but it&rsquo;s not magic&mdash;if the LLM fundamentally misunderstands the schema, a retry with the error message may not fix the underlying confusion. For production use, invest in prompt engineering with real user questions, build a test suite of known-good query patterns, and monitor the retry rate as a health metric.
+</p>
+
+<p data-anchor="ch08-transition">
+With this end-to-end case study behind you, you&rsquo;ve seen LangGraph used the way it was designed to be used: as the backbone of a multi-step, stateful, error-resilient agent. In the next chapter, we&rsquo;ll zoom out and explore how LangGraph fits into the broader LangChain ecosystem&mdash;how to combine chains, retrievers, and agents in ways that play to each tool&rsquo;s strengths.
+</p>
+
+</article>
+
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch08-nav">
+  <a rel="prev" href="07-production-patterns.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-langchain-plus-langgraph.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>

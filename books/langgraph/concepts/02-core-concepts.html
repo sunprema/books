@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Building Your First Graph — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch03-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch03-head">
+  <span class="chapter-num">03</span>
+  <span class="chapter-kicker">From zero to chatbot</span>
+  <h1 data-anchor="ch03-title">Building Your First Graph</h1>
+</header>
+
+<p class="lede" data-anchor="ch03-lede">
+You have the concepts&mdash;nodes, edges, state, reducers. Now you want something that actually runs. In this chapter we go from a blank file to a working chatbot, then extend it with tool calling so the bot can reach out into the world and loop back with results. By the end you will have built, compiled, and invoked two graphs, and you will understand the concrete mechanics behind every piece of theory from Chapter&nbsp;2.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-setup">Setting Up Your Environment</h2>
+
+<p data-anchor="ch03-setup-intro">
+Before you write a single line of graph code, you need three things: Python&nbsp;3.10 or later, the LangGraph package, and an API key for the language model you want to call. Let&rsquo;s get them all in place.
+</p>
+
+<p class="code-label" data-anchor="ch03-install-label">Install the core packages</p>
+<pre data-anchor="ch03-install-code"><span class="cm"># For OpenAI models</span>
+pip install langgraph langchain-openai
+
+<span class="cm"># — or, for Anthropic models —</span>
+pip install langgraph langchain-anthropic</pre>
+
+<p data-anchor="ch03-install-note">
+The <code>langgraph</code> package pulls in <code>langchain-core</code> automatically. You only need one model provider package&mdash;pick whichever you already have an API key for. Every example in this chapter works with either provider; the only difference is the import name and the environment variable.
+</p>
+
+<p class="code-label" data-anchor="ch03-env-label">Set your API key (choose one)</p>
+<pre data-anchor="ch03-env-code"><span class="cm"># In your shell, or in a .env file</span>
+<span class="kw">export</span> OPENAI_API_KEY=<span class="str">"sk-..."</span>
+
+<span class="cm"># — or —</span>
+<span class="kw">export</span> ANTHROPIC_API_KEY=<span class="str">"sk-ant-..."</span></pre>
+
+<div class="callout warn" data-anchor="ch03-key-warning">
+  <span class="callout-title">Keep keys out of code</span>
+  <p data-anchor="ch03-key-warning-text">
+  Never paste an API key directly into a Python file. Use environment variables or a secrets manager. If you accidentally commit a key, revoke it immediately in the provider&rsquo;s dashboard.
+  </p>
+</div>
+
+<p data-anchor="ch03-verify">
+A quick sanity check: open a Python REPL and run <code>import langgraph; print(langgraph.__version__)</code>. If you see a version number (0.2 or higher), you&rsquo;re ready.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-basic-chatbot">A Bare-Bones Chatbot</h2>
+
+<p data-anchor="ch03-basic-intro">
+The simplest useful graph has one node&mdash;call the language model&mdash;and two edges&mdash;START to that node and that node to END. That&rsquo;s it. Three moving parts. Let&rsquo;s build it piece by piece, then look at the complete listing.
+</p>
+
+<h3 data-anchor="ch03-step-1">Step 1 &mdash; Define the State</h3>
+
+<p data-anchor="ch03-step-1-explain">
+Every graph needs a state schema. For a chatbot, the state is straightforward: a list of messages. LangGraph ships a ready-made schema called <code>MessagesState</code> that does exactly this. It defines a single key&mdash;<code>messages</code>&mdash;with a reducer that <em>appends</em> new messages instead of overwriting the list.
+</p>
+
+<p class="code-label" data-anchor="ch03-step-1-label">Import MessagesState</p>
+<pre data-anchor="ch03-step-1-code"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END, MessagesState</pre>
+
+<p data-anchor="ch03-step-1-note">
+<code>MessagesState</code> is a <code>TypedDict</code> with one key. Behind the scenes it looks roughly like this:
+</p>
+
+<p class="code-label" data-anchor="ch03-messagesstate-equiv-label">What MessagesState provides (you don&rsquo;t need to write this)</p>
+<pre data-anchor="ch03-messagesstate-equiv-code"><span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+
+<span class="kw">class</span> <span class="ty">MessagesState</span>(TypedDict):
+    messages: Annotated[<span class="ty">list</span>, add_messages]</pre>
+
+<div class="callout key" data-anchor="ch03-messagesstate-callout">
+  <span class="callout-title">MessagesState &mdash; your go-to for chat applications</span>
+  <p data-anchor="ch03-messagesstate-callout-text">
+  Whenever you&rsquo;re building a conversational agent, reach for <code>MessagesState</code> first. It pre-configures the <code>add_messages</code> reducer, which handles appending, deduplication by message ID, and proper ordering. You can always extend it later by subclassing, but for most chatbots it&rsquo;s all you need.
+  </p>
+</div>
+
+<h3 data-anchor="ch03-step-2">Step 2 &mdash; Create the Chatbot Node</h3>
+
+<p data-anchor="ch03-step-2-explain">
+A node is a plain Python function that receives the current state and returns a partial update. Our chatbot node takes the messages so far, passes them to the language model, and returns the model&rsquo;s response. The reducer takes care of appending it.
+</p>
+
+<p class="code-label" data-anchor="ch03-step-2-label">Define the chatbot node</p>
+<pre data-anchor="ch03-step-2-code"><span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+
+<span class="cm"># Or: from langchain_anthropic import ChatAnthropic</span>
+
+llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+<span class="cm"># Or: llm = ChatAnthropic(model="claude-sonnet-4-20250514")</span>
+
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: MessagesState):
+    <span class="cm">"""Call the LLM with the full message history."""</span>
+    response = llm.<span class="fn">invoke</span>(state[<span class="str">"messages"</span>])
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}</pre>
+
+<p data-anchor="ch03-step-2-notice">
+Notice three things. First, the function signature: it takes a <code>MessagesState</code> dict and returns a dict with the same shape. Second, we wrap the response in a list because the <code>add_messages</code> reducer expects an iterable. Third, we don&rsquo;t manage conversation history ourselves&mdash;state carries it forward turn after turn.
+</p>
+
+<h3 data-anchor="ch03-step-3">Step 3 &mdash; Wire Up the Graph</h3>
+
+<p data-anchor="ch03-step-3-explain">
+Now we build the graph structure: add the node, connect START to it, and connect it to END.
+</p>
+
+<p class="code-label" data-anchor="ch03-step-3-label">Build and compile the graph</p>
+<pre data-anchor="ch03-step-3-code"><span class="cm"># Create a graph builder with our state schema</span>
+graph_builder = <span class="fn">StateGraph</span>(MessagesState)
+
+<span class="cm"># Add the chatbot node</span>
+graph_builder.<span class="fn">add_node</span>(<span class="str">"chatbot"</span>, chatbot)
+
+<span class="cm"># Wire edges: START -> chatbot -> END</span>
+graph_builder.<span class="fn">add_edge</span>(START, <span class="str">"chatbot"</span>)
+graph_builder.<span class="fn">add_edge</span>(<span class="str">"chatbot"</span>, END)
+
+<span class="cm"># Compile into a runnable graph</span>
+graph = graph_builder.<span class="fn">compile</span>()</pre>
+
+<p data-anchor="ch03-step-3-note">
+The call to <code>compile()</code> freezes the graph&rsquo;s structure and returns a <code>CompiledGraph</code> object. This object is a LangChain <code>Runnable</code>, which means you can call <code>.invoke()</code>, <code>.stream()</code>, or <code>.batch()</code> on it.
+</p>
+
+<h3 data-anchor="ch03-step-4">Step 4 &mdash; Invoke the Graph</h3>
+
+<p data-anchor="ch03-step-4-explain">
+You invoke the graph by passing in an initial state. For a chatbot, that means a dict with a <code>messages</code> key containing the user&rsquo;s input.
+</p>
+
+<p class="code-label" data-anchor="ch03-step-4-label">Send a message and print the response</p>
+<pre data-anchor="ch03-step-4-code"><span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage
+
+result = graph.<span class="fn">invoke</span>({
+    <span class="str">"messages"</span>: [<span class="fn">HumanMessage</span>(content=<span class="str">"What is LangGraph?"</span>)]
+})
+
+<span class="cm"># The result is the full state after execution</span>
+<span class="kw">for</span> msg <span class="kw">in</span> result[<span class="str">"messages"</span>]:
+    <span class="fn">print</span>(f<span class="str">"{msg.type}: {msg.content}"</span>)</pre>
+
+<p class="code-label" data-anchor="ch03-step-4-output-label">Expected output</p>
+<pre data-anchor="ch03-step-4-output">human: What is LangGraph?
+ai: LangGraph is a framework for building stateful, multi-step
+    applications with language models, using a graph-based
+    architecture where nodes represent computation steps and
+    edges define the flow between them.</pre>
+
+<p data-anchor="ch03-step-4-reflection">
+That&rsquo;s a working chatbot. The data flows in a straight line: START hands the initial state to the <code>chatbot</code> node, which calls the LLM and returns an AI message, and then execution reaches END. The full state&mdash;both the human message and the AI response&mdash;comes back as the result.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-complete-basic">Complete Listing: Basic Chatbot</h2>
+
+<p data-anchor="ch03-complete-basic-intro">
+Here is the entire program in one place. Copy it into a file, set your API key, and run it.
+</p>
+
+<p class="code-label" data-anchor="ch03-complete-basic-label">basic_chatbot.py &mdash; a minimal LangGraph chatbot</p>
+<pre data-anchor="ch03-complete-basic-code"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END, MessagesState
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage
+
+<span class="cm"># 1. Set up the LLM</span>
+llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+
+<span class="cm"># 2. Define the chatbot node</span>
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: MessagesState):
+    response = llm.<span class="fn">invoke</span>(state[<span class="str">"messages"</span>])
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}
+
+<span class="cm"># 3. Build the graph</span>
+graph_builder = <span class="fn">StateGraph</span>(MessagesState)
+graph_builder.<span class="fn">add_node</span>(<span class="str">"chatbot"</span>, chatbot)
+graph_builder.<span class="fn">add_edge</span>(START, <span class="str">"chatbot"</span>)
+graph_builder.<span class="fn">add_edge</span>(<span class="str">"chatbot"</span>, END)
+
+<span class="cm"># 4. Compile</span>
+graph = graph_builder.<span class="fn">compile</span>()
+
+<span class="cm"># 5. Run</span>
+result = graph.<span class="fn">invoke</span>({
+    <span class="str">"messages"</span>: [<span class="fn">HumanMessage</span>(content=<span class="str">"What is LangGraph?"</span>)]
+})
+
+<span class="kw">for</span> msg <span class="kw">in</span> result[<span class="str">"messages"</span>]:
+    <span class="fn">print</span>(f<span class="str">"{msg.type}: {msg.content}"</span>)</pre>
+
+<p data-anchor="ch03-complete-basic-wrapup">
+Seventeen lines of meaningful code. That&rsquo;s the minimum viable graph. But a chatbot that can only generate text is limited&mdash;it can&rsquo;t check the weather, query a database, or do arithmetic reliably. For that, we need tools.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-tool-calling">Adding Tool Calling</h2>
+
+<p data-anchor="ch03-tool-intro">
+Tool calling is where graph-based architecture starts to pay for itself. When a language model decides it needs to call a tool, the response doesn&rsquo;t go straight to the user. Instead, execution routes to a <em>tool node</em> that runs the tool, then loops <em>back</em> to the chatbot so the model can incorporate the tool&rsquo;s output. This is the cycle we talked about in Chapter&nbsp;2&mdash;and now you&rsquo;ll build one yourself.
+</p>
+
+<p data-anchor="ch03-tool-overview">
+The plan is straightforward. We will:
+</p>
+
+<ol data-anchor="ch03-tool-steps">
+  <li data-anchor="ch03-tool-step-1">Define one or more tools as Python functions.</li>
+  <li data-anchor="ch03-tool-step-2">Bind those tools to the LLM so it knows they exist.</li>
+  <li data-anchor="ch03-tool-step-3">Add a <code>ToolNode</code> that executes tool calls automatically.</li>
+  <li data-anchor="ch03-tool-step-4">Add a conditional edge that routes based on whether the model wants to call a tool or is ready to respond.</li>
+  <li data-anchor="ch03-tool-step-5">Wire the tool node back to the chatbot&mdash;creating the cycle.</li>
+</ol>
+
+<h3 data-anchor="ch03-define-tools">Step 1 &mdash; Define Tools</h3>
+
+<p data-anchor="ch03-define-tools-explain">
+A tool is a regular Python function decorated with <code>@tool</code> from LangChain. The decorator reads the function&rsquo;s name, docstring, and type hints to generate a schema that the LLM can understand.
+</p>
+
+<p class="code-label" data-anchor="ch03-define-tools-label">Two simple tools</p>
+<pre data-anchor="ch03-define-tools-code"><span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+
+<span class="kw">@tool</span>
+<span class="kw">def</span> <span class="fn">multiply</span>(a: <span class="ty">float</span>, b: <span class="ty">float</span>) -> <span class="ty">float</span>:
+    <span class="str">"""Multiply two numbers together."""</span>
+    <span class="kw">return</span> a * b
+
+<span class="kw">@tool</span>
+<span class="kw">def</span> <span class="fn">get_weather</span>(city: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Get the current weather for a city."""</span>
+    <span class="cm"># In a real app, call a weather API here</span>
+    <span class="kw">return</span> f<span class="str">"It's 72°F and sunny in {city}."</span>
+
+tools = [multiply, get_weather]</pre>
+
+<p data-anchor="ch03-define-tools-note">
+The docstring matters. The LLM reads it to decide when to use the tool, so write something clear and accurate.
+</p>
+
+<h3 data-anchor="ch03-bind-tools">Step 2 &mdash; Bind Tools to the LLM</h3>
+
+<p data-anchor="ch03-bind-tools-explain">
+Before the LLM can call tools, it needs to know about them. The <code>bind_tools</code> method attaches the tool schemas to every request the model makes.
+</p>
+
+<p class="code-label" data-anchor="ch03-bind-tools-label">Create a tool-aware LLM</p>
+<pre data-anchor="ch03-bind-tools-code">llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+llm_with_tools = llm.<span class="fn">bind_tools</span>(tools)</pre>
+
+<p data-anchor="ch03-bind-tools-note">
+Now when we call <code>llm_with_tools.invoke(messages)</code>, the model might return an <code>AIMessage</code> with a <code>tool_calls</code> field instead of plain text content. That&rsquo;s the signal our graph will act on.
+</p>
+
+<h3 data-anchor="ch03-update-node">Step 3 &mdash; Update the Chatbot Node</h3>
+
+<p data-anchor="ch03-update-node-explain">
+The chatbot node changes by exactly one word: we call <code>llm_with_tools</code> instead of <code>llm</code>.
+</p>
+
+<p class="code-label" data-anchor="ch03-update-node-label">Updated chatbot node</p>
+<pre data-anchor="ch03-update-node-code"><span class="kw">def</span> <span class="fn">chatbot</span>(state: MessagesState):
+    response = llm_with_tools.<span class="fn">invoke</span>(state[<span class="str">"messages"</span>])
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}</pre>
+
+<h3 data-anchor="ch03-tool-node">Step 4 &mdash; Add the Tool Node</h3>
+
+<p data-anchor="ch03-tool-node-explain">
+LangGraph provides <code>ToolNode</code> in its <code>prebuilt</code> module. You pass it a list of tools and it handles the rest&mdash;looking at the latest <code>AIMessage</code>, extracting any <code>tool_calls</code>, invoking the right function, and returning the results as <code>ToolMessage</code> objects.
+</p>
+
+<p class="code-label" data-anchor="ch03-tool-node-label">Import and create the ToolNode</p>
+<pre data-anchor="ch03-tool-node-code"><span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> ToolNode
+
+tool_node = <span class="fn">ToolNode</span>(tools=tools)</pre>
+
+<p data-anchor="ch03-tool-node-note">
+<code>ToolNode</code> is just a node&mdash;a callable that takes state and returns a state update. You could write it by hand, but the prebuilt version handles edge cases like parallel tool calls, error messages, and proper message formatting.
+</p>
+
+<h3 data-anchor="ch03-conditional-edge">Step 5 &mdash; Add the Conditional Edge</h3>
+
+<p data-anchor="ch03-conditional-edge-explain">
+Here is the decision point. After the chatbot node runs, we need to ask: did the model request any tool calls? If yes, route to the tool node. If no, the model produced a final answer, so route to END.
+</p>
+
+<p data-anchor="ch03-conditional-edge-explain-2">
+LangGraph provides <code>tools_condition</code> for exactly this check. It looks at the last message in state. If the message has a non-empty <code>tool_calls</code> field, it returns <code>"tools"</code>. Otherwise it returns <code>END</code>.
+</p>
+
+<p class="code-label" data-anchor="ch03-conditional-edge-label">Import the routing function</p>
+<pre data-anchor="ch03-conditional-edge-code"><span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> tools_condition</pre>
+
+<h3 data-anchor="ch03-wire-cycle">Step 6 &mdash; Wire It All Together</h3>
+
+<p data-anchor="ch03-wire-cycle-explain">
+Now we assemble the graph. The key difference from the basic chatbot is the conditional edge after the chatbot node and the edge from the tool node <em>back</em> to the chatbot. That backward edge is what creates the cycle.
+</p>
+
+<p class="code-label" data-anchor="ch03-wire-cycle-label">Build the graph with tool-calling loop</p>
+<pre data-anchor="ch03-wire-cycle-code">graph_builder = <span class="fn">StateGraph</span>(MessagesState)
+
+<span class="cm"># Add nodes</span>
+graph_builder.<span class="fn">add_node</span>(<span class="str">"chatbot"</span>, chatbot)
+graph_builder.<span class="fn">add_node</span>(<span class="str">"tools"</span>, tool_node)
+
+<span class="cm"># Entry edge</span>
+graph_builder.<span class="fn">add_edge</span>(START, <span class="str">"chatbot"</span>)
+
+<span class="cm"># Conditional edge: chatbot decides what happens next</span>
+graph_builder.<span class="fn">add_conditional_edges</span>(
+    <span class="str">"chatbot"</span>,
+    tools_condition,  <span class="cm"># Returns "tools" or END</span>
+)
+
+<span class="cm"># After tools run, always go back to chatbot</span>
+graph_builder.<span class="fn">add_edge</span>(<span class="str">"tools"</span>, <span class="str">"chatbot"</span>)
+
+<span class="cm"># Compile</span>
+graph = graph_builder.<span class="fn">compile</span>()</pre>
+
+<p data-anchor="ch03-wire-cycle-notice">
+Look at the flow: START &rarr; chatbot &rarr; (conditional) &rarr; tools &rarr; chatbot &rarr; (conditional) &rarr; END. The chatbot and tools nodes can bounce back and forth as many times as needed. Each pass through the chatbot node gives the model a chance to either call another tool or produce a final answer.
+</p>
+
+<div class="callout note" data-anchor="ch03-cycle-safety">
+  <span class="callout-title">Won&rsquo;t the cycle run forever?</span>
+  <p data-anchor="ch03-cycle-safety-text">
+  In theory, yes&mdash;a buggy tool or a confused model could loop indefinitely. In practice, LangGraph has a default recursion limit (typically 25 steps). If the graph hits this limit, it raises a <code>GraphRecursionError</code>. You can adjust this with the <code>recursion_limit</code> config parameter when invoking the graph. We&rsquo;ll cover error handling in more detail in Chapter&nbsp;6.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-diagram">Visualizing the Tool-Calling Loop</h2>
+
+<p data-anchor="ch03-diagram-intro">
+Let&rsquo;s see the graph we just built. The diagram below shows the two nodes, the conditional routing from the chatbot, and the backward edge that creates the cycle.
+</p>
+
+<figure class="diagram-fig" data-anchor="ch03-diagram-fig">
+<svg class="diagram" viewBox="0 0 480 420" aria-label="Tool-calling chatbot graph: START to chatbot, conditional edge to tools or END, tools loops back to chatbot" xmlns="http://www.w3.org/2000/svg">
+  <title>Tool-calling chatbot graph</title>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink)" />
+    </marker>
+    <marker id="arrow-hot" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)" />
+    </marker>
+    <marker id="arrow-dash" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink-soft)" />
+    </marker>
+  </defs>
+
+  <!-- START node -->
+  <circle cx="240" cy="36" r="18" class="box-alt" fill="var(--rule)" stroke="var(--ink)" stroke-width="1.5"/>
+  <text x="240" y="40" class="lbl" text-anchor="middle" fill="var(--ink)" font-size="11" font-weight="600">START</text>
+
+  <!-- Arrow: START -> chatbot -->
+  <line x1="240" y1="54" x2="240" y2="100" class="flow" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- chatbot node -->
+  <rect x="150" y="104" width="180" height="48" rx="8" class="box" fill="var(--rule)" stroke="var(--ink)" stroke-width="1.5"/>
+  <text x="240" y="133" class="lbl" text-anchor="middle" fill="var(--ink)" font-size="14" font-weight="600">chatbot</text>
+
+  <!-- Conditional diamond -->
+  <polygon points="240,182 280,212 240,242 200,212" class="box-hot" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="240" y="217" class="lbl-hot" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="600">tool_calls?</text>
+
+  <!-- Arrow: chatbot -> diamond -->
+  <line x1="240" y1="152" x2="240" y2="182" class="flow" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Arrow: diamond -> tools (right branch, "yes") -->
+  <line x1="280" y1="212" x2="370" y2="212" class="flow-hot" stroke="var(--accent)" stroke-width="1.5"/>
+  <line x1="370" y1="212" x2="370" y2="282" class="flow-hot" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow-hot)"/>
+  <text x="320" y="203" class="lbl-hot" text-anchor="middle" fill="var(--accent)" font-size="10">yes</text>
+
+  <!-- tools node -->
+  <rect x="290" y="286" width="160" height="48" rx="8" class="box-hot" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="370" y="315" class="lbl-hot" text-anchor="middle" fill="var(--accent)" font-size="14" font-weight="600">tools</text>
+
+  <!-- Arrow: tools -> chatbot (the cycle!) -->
+  <line x1="290" y1="310" x2="110" y2="310" class="flow-hot" stroke="var(--accent)" stroke-width="1.5"/>
+  <line x1="110" y1="310" x2="110" y2="128" class="flow-hot" stroke="var(--accent)" stroke-width="1.5"/>
+  <line x1="110" y1="128" x2="150" y2="128" class="flow-hot" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow-hot)"/>
+  <text x="88" y="222" class="lbl-hot" text-anchor="middle" fill="var(--accent)" font-size="10" transform="rotate(-90 88 222)">cycle</text>
+
+  <!-- Arrow: diamond -> END (downward, "no") -->
+  <line x1="240" y1="242" x2="240" y2="370" class="flow-dash" stroke="var(--ink-soft)" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arrow-dash)"/>
+  <text x="256" y="268" class="lbl" text-anchor="start" fill="var(--ink-soft)" font-size="10">no</text>
+
+  <!-- END node -->
+  <circle cx="240" cy="390" r="18" class="box-alt" fill="var(--rule)" stroke="var(--ink)" stroke-width="1.5"/>
+  <text x="240" y="394" class="lbl" text-anchor="middle" fill="var(--ink)" font-size="11" font-weight="600">END</text>
+</svg>
+<figcaption data-anchor="ch03-diagram-caption">The tool-calling chatbot graph. The <span style="color:var(--accent)">highlighted cycle</span> shows how tool results flow back to the chatbot for further processing. The dashed edge represents the path taken when no tool calls are requested.</figcaption>
+</figure>
+
+<p data-anchor="ch03-diagram-reading">
+Read the diagram from top to bottom. Every user message enters at START and arrives at the chatbot node. The chatbot calls the LLM. If the LLM&rsquo;s response contains tool calls, the conditional edge routes to the tools node. The tools node executes the requested functions and returns the results as messages. Then the cycle edge sends execution back to the chatbot, where the LLM sees the tool results and decides what to do next&mdash;call more tools or produce a final answer. When there are no tool calls, the dashed edge leads to END.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-complete-tool">Complete Listing: Chatbot with Tools</h2>
+
+<p data-anchor="ch03-complete-tool-intro">
+Here is the full program for the tool-calling chatbot. It combines every piece from the previous sections into one runnable file.
+</p>
+
+<p class="code-label" data-anchor="ch03-complete-tool-label">tool_chatbot.py &mdash; a chatbot that can call tools</p>
+<pre data-anchor="ch03-complete-tool-code"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END, MessagesState
+<span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> ToolNode, tools_condition
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+<span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage
+
+<span class="cm"># ── Tools ──────────────────────────────────────────────</span>
+
+<span class="kw">@tool</span>
+<span class="kw">def</span> <span class="fn">multiply</span>(a: <span class="ty">float</span>, b: <span class="ty">float</span>) -> <span class="ty">float</span>:
+    <span class="str">"""Multiply two numbers together."""</span>
+    <span class="kw">return</span> a * b
+
+<span class="kw">@tool</span>
+<span class="kw">def</span> <span class="fn">get_weather</span>(city: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Get the current weather for a city."""</span>
+    <span class="kw">return</span> f<span class="str">"It's 72°F and sunny in {city}."</span>
+
+tools = [multiply, get_weather]
+
+<span class="cm"># ── LLM with tools bound ──────────────────────────────</span>
+
+llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+llm_with_tools = llm.<span class="fn">bind_tools</span>(tools)
+
+<span class="cm"># ── Nodes ─────────────────────────────────────────────</span>
+
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: MessagesState):
+    response = llm_with_tools.<span class="fn">invoke</span>(state[<span class="str">"messages"</span>])
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}
+
+tool_node = <span class="fn">ToolNode</span>(tools=tools)
+
+<span class="cm"># ── Graph ─────────────────────────────────────────────</span>
+
+graph_builder = <span class="fn">StateGraph</span>(MessagesState)
+
+graph_builder.<span class="fn">add_node</span>(<span class="str">"chatbot"</span>, chatbot)
+graph_builder.<span class="fn">add_node</span>(<span class="str">"tools"</span>, tool_node)
+
+graph_builder.<span class="fn">add_edge</span>(START, <span class="str">"chatbot"</span>)
+graph_builder.<span class="fn">add_conditional_edges</span>(<span class="str">"chatbot"</span>, tools_condition)
+graph_builder.<span class="fn">add_edge</span>(<span class="str">"tools"</span>, <span class="str">"chatbot"</span>)
+
+graph = graph_builder.<span class="fn">compile</span>()
+
+<span class="cm"># ── Run ───────────────────────────────────────────────</span>
+
+result = graph.<span class="fn">invoke</span>({
+    <span class="str">"messages"</span>: [
+        <span class="fn">HumanMessage</span>(content=<span class="str">"What's 17 times 24?"</span>)
+    ]
+})
+
+<span class="kw">for</span> msg <span class="kw">in</span> result[<span class="str">"messages"</span>]:
+    <span class="fn">print</span>(f<span class="str">"{msg.type}: {msg.content}"</span>)</pre>
+
+<p class="code-label" data-anchor="ch03-complete-tool-output-label">Expected output</p>
+<pre data-anchor="ch03-complete-tool-output">human: What's 17 times 24?
+ai:
+tool: 408.0
+ai: 17 times 24 is 408.</pre>
+
+<p data-anchor="ch03-complete-tool-walkthrough">
+Let&rsquo;s walk through what happened. The user asked &ldquo;What&rsquo;s 17 times 24?&rdquo; The chatbot node called the LLM, which recognized the multiply tool and returned an <code>AIMessage</code> with an empty <code>content</code> string and a <code>tool_calls</code> list containing <code>multiply(a=17, b=24)</code>. The conditional edge saw the tool call and routed to the tools node. The tools node executed <code>multiply(17, 24)</code> and returned a <code>ToolMessage</code> with content <code>408.0</code>. The cycle edge sent control back to the chatbot. The LLM saw the tool result, recognized the computation was complete, and produced the final response: &ldquo;17 times 24 is 408.&rdquo; The conditional edge saw no tool calls and routed to END.
+</p>
+
+<p data-anchor="ch03-multi-tool">
+Try a multi-tool query: &ldquo;What&rsquo;s the weather in Paris, and what&rsquo;s 6 times 7?&rdquo; The model will issue both tool calls, the tools node will execute them, and the chatbot will synthesize both results into a single answer. The graph handles multiple tool calls in one pass without any extra code from you.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-execution-trace">Following the Execution Trace</h2>
+
+<p data-anchor="ch03-trace-intro">
+To make the internal mechanics concrete, here is exactly what happens at each step when you run the tool-calling chatbot with the multiply question.
+</p>
+
+<table data-anchor="ch03-trace-table">
+  <caption data-anchor="ch03-trace-caption">Execution trace for &ldquo;What&rsquo;s 17 times 24?&rdquo;</caption>
+  <thead>
+    <tr>
+      <th data-anchor="ch03-trace-th-step">Step</th>
+      <th data-anchor="ch03-trace-th-node">Node</th>
+      <th data-anchor="ch03-trace-th-action">Action</th>
+      <th data-anchor="ch03-trace-th-messages">Messages after</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr data-anchor="ch03-trace-row-1">
+      <td>1</td>
+      <td>START</td>
+      <td>Pass initial state to first node</td>
+      <td>HumanMessage(&ldquo;What&rsquo;s 17 times 24?&rdquo;)</td>
+    </tr>
+    <tr data-anchor="ch03-trace-row-2">
+      <td>2</td>
+      <td>chatbot</td>
+      <td>LLM returns AIMessage with tool_calls=[multiply(17, 24)]</td>
+      <td>HumanMessage, AIMessage(tool_calls)</td>
+    </tr>
+    <tr data-anchor="ch03-trace-row-3">
+      <td>3</td>
+      <td><em>condition</em></td>
+      <td>tool_calls is non-empty &rarr; route to &ldquo;tools&rdquo;</td>
+      <td>&mdash;</td>
+    </tr>
+    <tr data-anchor="ch03-trace-row-4">
+      <td>4</td>
+      <td>tools</td>
+      <td>Execute multiply(17, 24) &rarr; 408.0</td>
+      <td>HumanMessage, AIMessage, ToolMessage(408.0)</td>
+    </tr>
+    <tr data-anchor="ch03-trace-row-5">
+      <td>5</td>
+      <td>chatbot</td>
+      <td>LLM sees tool result, produces final answer</td>
+      <td>HumanMessage, AIMessage, ToolMessage, AIMessage(&ldquo;408&rdquo;)</td>
+    </tr>
+    <tr data-anchor="ch03-trace-row-6">
+      <td>6</td>
+      <td><em>condition</em></td>
+      <td>No tool_calls &rarr; route to END</td>
+      <td>&mdash;</td>
+    </tr>
+    <tr data-anchor="ch03-trace-row-7">
+      <td>7</td>
+      <td>END</td>
+      <td>Return final state</td>
+      <td>All four messages</td>
+    </tr>
+  </tbody>
+</table>
+
+<p data-anchor="ch03-trace-note">
+Notice that the chatbot node ran twice and the conditional check ran twice. The graph managed all of this automatically&mdash;you didn&rsquo;t write a while loop or an if-else chain. The structure of the graph <em>is</em> the control flow.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-streaming">Streaming Responses</h2>
+
+<p data-anchor="ch03-streaming-intro">
+For real applications you rarely want to wait for the entire graph to finish before showing anything to the user. LangGraph supports streaming at two levels: <em>node-level</em> streaming (getting updates as each node completes) and <em>token-level</em> streaming (getting individual tokens as the LLM generates them).
+</p>
+
+<p class="code-label" data-anchor="ch03-streaming-node-label">Node-level streaming with .stream()</p>
+<pre data-anchor="ch03-streaming-node-code"><span class="kw">for</span> event <span class="kw">in</span> graph.<span class="fn">stream</span>({
+    <span class="str">"messages"</span>: [<span class="fn">HumanMessage</span>(content=<span class="str">"What's the weather in Tokyo?"</span>)]
+}):
+    <span class="cm"># Each event is a dict: {node_name: state_update}</span>
+    <span class="kw">for</span> node_name, update <span class="kw">in</span> event.<span class="fn">items</span>():
+        <span class="fn">print</span>(f<span class="str">"── {node_name} ──"</span>)
+        <span class="kw">if</span> <span class="str">"messages"</span> <span class="kw">in</span> update:
+            <span class="kw">for</span> msg <span class="kw">in</span> update[<span class="str">"messages"</span>]:
+                <span class="fn">print</span>(f<span class="str">"  {msg.type}: {msg.content[:80]}"</span>)</pre>
+
+<p data-anchor="ch03-streaming-explain">
+With <code>.stream()</code>, you get a state update dictionary every time a node finishes executing. This lets you show progress in a UI&mdash;for example, displaying &ldquo;Calling tool...&rdquo; while the tools node runs, then showing the final response when the chatbot node runs the second time.
+</p>
+
+<div class="callout note" data-anchor="ch03-streaming-token-callout">
+  <span class="callout-title">Token-level streaming</span>
+  <p data-anchor="ch03-streaming-token-text">
+  For streaming individual tokens as the LLM generates them (the &ldquo;typing&rdquo; effect), use <code>graph.astream_events()</code> with the async API. We&rsquo;ll cover this in detail in Chapter&nbsp;7 when we discuss production deployment patterns.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-visualize">Visualizing Your Graph</h2>
+
+<p data-anchor="ch03-visualize-intro">
+As graphs grow more complex, it helps to see their structure. LangGraph can render your compiled graph as a Mermaid diagram or export it directly to a PNG image. This is invaluable for documentation and debugging.
+</p>
+
+<p class="code-label" data-anchor="ch03-visualize-mermaid-label">Generate a Mermaid diagram</p>
+<pre data-anchor="ch03-visualize-mermaid-code"><span class="cm"># Print the Mermaid diagram markup</span>
+<span class="fn">print</span>(graph.<span class="fn">get_graph</span>().<span class="fn">draw_mermaid</span>())</pre>
+
+<p class="code-label" data-anchor="ch03-visualize-mermaid-output-label">Output: Mermaid diagram syntax</p>
+<pre data-anchor="ch03-visualize-mermaid-output">%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+    __start__([<p>__start__</p>]):::first
+    chatbot(chatbot)
+    tools(tools)
+    __end__([<p>__end__</p>]):::last
+    __start__ --> chatbot;
+    tools --> chatbot;
+    chatbot -.-> tools;
+    chatbot -.-> __end__;</pre>
+
+<p data-anchor="ch03-visualize-mermaid-note">
+You can paste this output into any Mermaid-compatible renderer&mdash;GitHub Markdown, Notion, or the Mermaid Live Editor&mdash;to see a visual diagram of your graph.
+</p>
+
+<p class="code-label" data-anchor="ch03-visualize-png-label">Export directly to PNG (requires additional dependencies)</p>
+<pre data-anchor="ch03-visualize-png-code"><span class="cm"># Requires: pip install grandalf</span>
+png_bytes = graph.<span class="fn">get_graph</span>().<span class="fn">draw_mermaid_png</span>()
+
+<span class="cm"># Save to a file</span>
+<span class="kw">with</span> <span class="fn">open</span>(<span class="str">"graph.png"</span>, <span class="str">"wb"</span>) <span class="kw">as</span> f:
+    f.<span class="fn">write</span>(png_bytes)
+
+<span class="cm"># Or display in a Jupyter notebook</span>
+<span class="kw">from</span> IPython.display <span class="kw">import</span> Image, display
+<span class="fn">display</span>(<span class="fn">Image</span>(png_bytes))</pre>
+
+<p data-anchor="ch03-visualize-habit">
+Make it a habit to visualize your graph after every structural change. It takes one line of code and catches wiring mistakes&mdash;missing edges, unconnected nodes, incorrect routing&mdash;before they become runtime mysteries.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-extending-state">Extending MessagesState</h2>
+
+<p data-anchor="ch03-extending-intro">
+<code>MessagesState</code> is sufficient for many chatbots, but sometimes you need additional fields in your state&mdash;a user&rsquo;s name, a session ID, a running summary. You can subclass <code>MessagesState</code> and add whatever you need.
+</p>
+
+<p class="code-label" data-anchor="ch03-extending-label">Custom state that extends MessagesState</p>
+<pre data-anchor="ch03-extending-code"><span class="kw">class</span> <span class="ty">ChatState</span>(MessagesState):
+    <span class="cm"># Inherits "messages" with add_messages reducer</span>
+    user_name: <span class="ty">str</span>
+    turn_count: <span class="ty">int</span></pre>
+
+<p data-anchor="ch03-extending-explain">
+The <code>messages</code> key keeps its reducer behavior. The new fields (<code>user_name</code> and <code>turn_count</code>) use the default last-write-wins semantics. Your nodes can read and write these additional fields just like they read and write messages.
+</p>
+
+<p data-anchor="ch03-extending-caution">
+Start with <code>MessagesState</code> and extend only when you have a clear reason. Extra state means extra surface area for bugs. We&rsquo;ll explore more sophisticated state patterns in the next chapter.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-anatomy">Anatomy of the Pattern</h2>
+
+<p data-anchor="ch03-anatomy-intro">
+Before moving on, let&rsquo;s name the pattern you just built. The tool-calling chatbot follows what we can call the <strong>ReAct loop</strong>&mdash;the model reasons about what to do, acts by calling a tool, observes the result, and reasons again. This loop is one of the most common agent patterns, and you&rsquo;ve implemented it in about 30 lines of code.
+</p>
+
+<table data-anchor="ch03-anatomy-table">
+  <caption data-anchor="ch03-anatomy-caption">Components of the tool-calling chatbot</caption>
+  <thead>
+    <tr>
+      <th data-anchor="ch03-anatomy-th-component">Component</th>
+      <th data-anchor="ch03-anatomy-th-role">Role</th>
+      <th data-anchor="ch03-anatomy-th-source">Source</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr data-anchor="ch03-anatomy-row-1">
+      <td><code>MessagesState</code></td>
+      <td>State schema with message accumulation</td>
+      <td><code>langgraph.graph</code></td>
+    </tr>
+    <tr data-anchor="ch03-anatomy-row-2">
+      <td><code>StateGraph</code></td>
+      <td>Graph builder</td>
+      <td><code>langgraph.graph</code></td>
+    </tr>
+    <tr data-anchor="ch03-anatomy-row-3">
+      <td><code>START</code>, <code>END</code></td>
+      <td>Special nodes marking entry and exit</td>
+      <td><code>langgraph.graph</code></td>
+    </tr>
+    <tr data-anchor="ch03-anatomy-row-4">
+      <td><code>ToolNode</code></td>
+      <td>Executes tool calls from AIMessage</td>
+      <td><code>langgraph.prebuilt</code></td>
+    </tr>
+    <tr data-anchor="ch03-anatomy-row-5">
+      <td><code>tools_condition</code></td>
+      <td>Routes based on presence of tool_calls</td>
+      <td><code>langgraph.prebuilt</code></td>
+    </tr>
+    <tr data-anchor="ch03-anatomy-row-6">
+      <td><code>bind_tools</code></td>
+      <td>Attaches tool schemas to LLM requests</td>
+      <td>LangChain chat model</td>
+    </tr>
+  </tbody>
+</table>
+
+<p data-anchor="ch03-anatomy-note">
+Every one of these components is swappable. You can replace <code>ToolNode</code> with a custom node that adds logging or retry logic. You can replace <code>tools_condition</code> with a function that considers other factors beyond tool calls. You can even replace the LLM with a different model mid-conversation. That&rsquo;s the advantage of building with a graph: each piece has a clear boundary and a well-defined contract.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-common-mistakes">Common Mistakes and How to Avoid Them</h2>
+
+<p data-anchor="ch03-mistakes-intro">
+When you&rsquo;re first building graphs, a few mistakes come up repeatedly. Here are the ones I see most often, along with their fixes.
+</p>
+
+<h3 data-anchor="ch03-mistake-forget-bind">Forgetting to bind tools</h3>
+
+<p data-anchor="ch03-mistake-forget-bind-text">
+If you add a <code>ToolNode</code> and a conditional edge but forget to call <code>llm.bind_tools(tools)</code>, the LLM will never generate tool calls. The conditional edge will always route to END, and the tools node will never execute. The graph won&rsquo;t error&mdash;it will just act like a basic chatbot. Always verify that you&rsquo;re invoking the <em>tool-bound</em> LLM inside your chatbot node.
+</p>
+
+<h3 data-anchor="ch03-mistake-wrong-edge">Missing the return edge from tools to chatbot</h3>
+
+<p data-anchor="ch03-mistake-wrong-edge-text">
+If you forget <code>graph_builder.add_edge("tools", "chatbot")</code>, the graph has no path forward after executing tools. Compilation may succeed, but invocation will fail or produce incomplete results. The tool results need to flow back to the chatbot so the LLM can interpret them.
+</p>
+
+<h3 data-anchor="ch03-mistake-reducer">Returning a message instead of a list</h3>
+
+<p data-anchor="ch03-mistake-reducer-text">
+The <code>add_messages</code> reducer expects an iterable of messages. If your node returns <code>{"messages": response}</code> instead of <code>{"messages": [response]}</code>, you may get unexpected behavior because the reducer will try to iterate over the message object itself. Always wrap single messages in a list.
+</p>
+
+<h3 data-anchor="ch03-mistake-compile">Forgetting to compile</h3>
+
+<p data-anchor="ch03-mistake-compile-text">
+The <code>StateGraph</code> object is a builder&mdash;it doesn&rsquo;t have <code>.invoke()</code> or <code>.stream()</code> methods. You must call <code>.compile()</code> to get a runnable graph. If you see an <code>AttributeError</code> when trying to invoke, check that you&rsquo;re calling methods on the compiled graph, not the builder.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-exercises">Try It Yourself</h2>
+
+<p data-anchor="ch03-exercises-intro">
+The best way to internalize these patterns is to modify them. Here are a few exercises, roughly in order of difficulty.
+</p>
+
+<ol data-anchor="ch03-exercises-list">
+  <li data-anchor="ch03-exercise-1"><strong>Add a third tool.</strong> Write a <code>divide</code> tool and add it to the tools list. Ask the chatbot a question that requires division. Watch the trace to confirm the tool was called.</li>
+  <li data-anchor="ch03-exercise-2"><strong>Switch providers.</strong> If you used OpenAI, swap in <code>ChatAnthropic</code>. If you used Anthropic, swap in <code>ChatOpenAI</code>. Notice how little changes&mdash;the graph structure is model-agnostic.</li>
+  <li data-anchor="ch03-exercise-3"><strong>Add a system message.</strong> Modify the chatbot node to prepend a <code>SystemMessage</code> that gives the bot a personality. For example: &ldquo;You are a pirate who always responds in pirate speak.&rdquo;</li>
+  <li data-anchor="ch03-exercise-4"><strong>Build a multi-turn conversation.</strong> Write a loop that accepts user input from the terminal, invokes the graph, and prints the response. You&rsquo;ll need to accumulate messages across turns&mdash;hint: pass the full message list from the previous result as input to the next invocation.</li>
+  <li data-anchor="ch03-exercise-5"><strong>Visualize both graphs.</strong> Generate Mermaid diagrams for both the basic chatbot and the tool-calling chatbot. Compare the two structures side by side.</li>
+</ol>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch03-recap">What You Built</h2>
+
+<p data-anchor="ch03-recap-text">
+In this chapter you went from zero to two working chatbots. The first was a straight line&mdash;START, chatbot, END. The second introduced the cycle that makes tool calling possible: chatbot to tools and back again, with a conditional edge controlling the exit. You saw that the graph structure <em>is</em> the program&rsquo;s control flow, and that LangGraph&rsquo;s prebuilt components (<code>ToolNode</code>, <code>tools_condition</code>, <code>MessagesState</code>) handle the common patterns so you can focus on your application&rsquo;s unique logic.
+</p>
+
+<p data-anchor="ch03-transition">
+But these chatbots forget everything between invocations. Ask a question, get an answer, and the slate is wiped clean. In the next chapter&mdash;<em>State and Memory</em>&mdash;we&rsquo;ll add persistence so your graph can remember past conversations, checkpoint mid-execution, and resume exactly where it left off.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch03-nav">
+  <a rel="prev" href="02-core-concepts.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-state-and-memory.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>

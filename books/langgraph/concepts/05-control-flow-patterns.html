@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Control Flow Patterns — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch05-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch05-head">
+  <span class="chapter-num">05</span>
+  <span class="chapter-kicker">Branching, looping, and pausing</span>
+  <h1 data-anchor="ch05-title">Control Flow Patterns</h1>
+</header>
+
+<p class="lede" data-anchor="ch05-lede">
+A straight pipeline gets you surprisingly far&mdash;until the first time your agent needs to choose between two paths, retry a failed API call, or wait for a human to say &ldquo;go ahead.&rdquo; At that point you need real control flow: branches that pick a direction at runtime, loops that circle back to fix mistakes, and pauses that hold the graph mid-stride until someone reviews the work. This chapter hands you those tools one at a time, with code you can run after each section.
+</p>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-conditional-routing">Conditional Routing and Branching</h2>
+
+<p data-anchor="ch05-routing-intro">
+When a node finishes its work, the default behaviour is to follow its single outgoing edge to the next node. But many workflows need a fork in the road. A customer message might be a complaint, a billing question, or a feature request&mdash;and each one should flow to a different handler. LangGraph solves this with <em>conditional edges</em>: edges whose destination is decided at runtime by a plain Python function you write.
+</p>
+
+<h3 data-anchor="ch05-add-conditional-edges">The <code>add_conditional_edges</code> API</h3>
+
+<p data-anchor="ch05-conditional-edges-explain">
+The method signature looks like this: you give it a source node name, a <em>path function</em> that inspects the current state and returns a string key, and (optionally) a dictionary that maps those keys to node names. If you omit the dictionary, LangGraph assumes the returned string is the node name itself.
+</p>
+
+<p class="code-label" data-anchor="ch05-conditional-sig-label">Signature of <code>add_conditional_edges</code></p>
+<pre data-anchor="ch05-conditional-sig-code"><span class="cm"># source:   the node whose output triggers the decision</span>
+<span class="cm"># path_fn:  a callable (state) -&gt; str</span>
+<span class="cm"># path_map: optional dict mapping return values to node names</span>
+
+graph.add_conditional_edges(
+    <span class="str">"classify"</span>,        <span class="cm"># source node</span>
+    route_by_category,   <span class="cm"># path function</span>
+    {                    <span class="cm"># path map</span>
+        <span class="str">"billing"</span>:   <span class="str">"handle_billing"</span>,
+        <span class="str">"complaint"</span>: <span class="str">"handle_complaint"</span>,
+        <span class="str">"general"</span>:   <span class="str">"handle_general"</span>,
+    }
+)</pre>
+
+<p data-anchor="ch05-path-fn-detail">
+The path function receives the full state dictionary (or your typed state object) and must return one of the keys in the path map. If it returns something not in the map, LangGraph raises an error at runtime&mdash;loud and early, which is what you want. Notice that the path function is a pure function of state. It doesn&rsquo;t call an LLM or do I/O; it simply reads fields that an upstream node has already set.
+</p>
+
+<h3 data-anchor="ch05-classification-example">Code Example: Routing by Classification</h3>
+
+<p data-anchor="ch05-classification-intro">
+Let&rsquo;s build a small support-ticket router. A <code>classify</code> node calls an LLM to label the ticket, then a conditional edge sends it to the right handler.
+</p>
+
+<p class="code-label" data-anchor="ch05-classification-code-label">Conditional routing based on ticket classification</p>
+<pre data-anchor="ch05-classification-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Literal
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+
+llm = ChatOpenAI(model=<span class="str">"gpt-4o-mini"</span>)
+
+<span class="kw">class</span> <span class="ty">TicketState</span>(TypedDict):
+    message: <span class="ty">str</span>
+    category: <span class="ty">str</span>
+    response: <span class="ty">str</span>
+
+<span class="kw">def</span> <span class="fn">classify</span>(state: <span class="ty">TicketState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Ask the LLM to label the ticket."""</span>
+    result = llm.invoke(
+        <span class="str">f"Classify this support ticket into exactly one word — "</span>
+        <span class="str">f"billing, complaint, or general:\n\n{state['message']}"</span>
+    )
+    <span class="kw">return</span> {<span class="str">"category"</span>: result.content.strip().lower()}
+
+<span class="kw">def</span> <span class="fn">handle_billing</span>(state: <span class="ty">TicketState</span>) -> <span class="ty">dict</span>:
+    <span class="kw">return</span> {<span class="str">"response"</span>: <span class="str">"Routing to billing team..."</span>}
+
+<span class="kw">def</span> <span class="fn">handle_complaint</span>(state: <span class="ty">TicketState</span>) -> <span class="ty">dict</span>:
+    <span class="kw">return</span> {<span class="str">"response"</span>: <span class="str">"Escalating complaint to supervisor..."</span>}
+
+<span class="kw">def</span> <span class="fn">handle_general</span>(state: <span class="ty">TicketState</span>) -> <span class="ty">dict</span>:
+    <span class="kw">return</span> {<span class="str">"response"</span>: <span class="str">"Sending to FAQ bot..."</span>}
+
+<span class="cm"># --- Build the graph ---</span>
+builder = StateGraph(<span class="ty">TicketState</span>)
+
+builder.add_node(<span class="str">"classify"</span>, classify)
+builder.add_node(<span class="str">"handle_billing"</span>, handle_billing)
+builder.add_node(<span class="str">"handle_complaint"</span>, handle_complaint)
+builder.add_node(<span class="str">"handle_general"</span>, handle_general)
+
+builder.set_entry_point(<span class="str">"classify"</span>)
+
+<span class="cm"># The path function reads state["category"]</span>
+<span class="kw">def</span> <span class="fn">route_ticket</span>(state: <span class="ty">TicketState</span>) -> <span class="ty">str</span>:
+    <span class="kw">return</span> state[<span class="str">"category"</span>]
+
+builder.add_conditional_edges(
+    <span class="str">"classify"</span>,
+    route_ticket,
+    {
+        <span class="str">"billing"</span>:   <span class="str">"handle_billing"</span>,
+        <span class="str">"complaint"</span>: <span class="str">"handle_complaint"</span>,
+        <span class="str">"general"</span>:   <span class="str">"handle_general"</span>,
+    }
+)
+
+<span class="cm"># Every handler leads to END</span>
+builder.add_edge(<span class="str">"handle_billing"</span>, END)
+builder.add_edge(<span class="str">"handle_complaint"</span>, END)
+builder.add_edge(<span class="str">"handle_general"</span>, END)
+
+graph = builder.compile()
+
+<span class="cm"># Run it</span>
+result = graph.invoke({<span class="str">"message"</span>: <span class="str">"I was double-charged last month"</span>})
+<span class="fn">print</span>(result[<span class="str">"category"</span>])   <span class="cm"># "billing"</span>
+<span class="fn">print</span>(result[<span class="str">"response"</span>])  <span class="cm"># "Routing to billing team..."</span></pre>
+
+<p data-anchor="ch05-classification-walkthrough">
+Notice the pattern: the <code>classify</code> node writes a <code>category</code> field into state, and the path function simply reads it back. The LLM call and the routing decision live in separate functions. This keeps each piece testable&mdash;you can unit-test <code>route_ticket</code> without calling any model.
+</p>
+
+<h3 data-anchor="ch05-fan-out">Multiple Conditional Branches (Fan-Out)</h3>
+
+<p data-anchor="ch05-fan-out-explain">
+Sometimes you want a single node to dispatch work to <em>several</em> nodes in parallel. LangGraph supports this: if your path function returns a <em>list</em> of strings instead of a single string, the graph will fan out to all of them simultaneously. Each target node receives the same state snapshot, runs independently, and their state updates are merged when they all finish.
+</p>
+
+<p class="code-label" data-anchor="ch05-fan-out-code-label">Fan-out to multiple nodes</p>
+<pre data-anchor="ch05-fan-out-code"><span class="kw">def</span> <span class="fn">route_multi</span>(state):
+    <span class="str">"""Send to multiple handlers at once."""</span>
+    targets = []
+    <span class="kw">if</span> state[<span class="str">"needs_summary"</span>]:
+        targets.append(<span class="str">"summarize"</span>)
+    <span class="kw">if</span> state[<span class="str">"needs_translation"</span>]:
+        targets.append(<span class="str">"translate"</span>)
+    <span class="kw">return</span> targets  <span class="cm"># list triggers parallel execution</span>
+
+builder.add_conditional_edges(<span class="str">"triage"</span>, route_multi)</pre>
+
+<p data-anchor="ch05-fan-out-merge">
+Fan-out is powerful but requires care: if two parallel branches update the same state key, the last write wins (or you&rsquo;ll need a reducer, as discussed in Chapter 4). Plan your state schema so parallel branches write to different fields whenever possible.
+</p>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-loops-retries">Loops and Retries</h2>
+
+<p data-anchor="ch05-loops-intro">
+Graphs are not trees. LangGraph lets you create cycles&mdash;node A can route back to node B, which routes back to node A. This is essential for agents that check their own work and try again when the result isn&rsquo;t good enough. The key safety rule: <strong>every loop must have an exit condition</strong>, or you&rsquo;ll spin forever.
+</p>
+
+<h3 data-anchor="ch05-creating-cycles">Creating Cycles in the Graph</h3>
+
+<p data-anchor="ch05-cycles-explain">
+A cycle is just an edge that points &ldquo;backwards&rdquo; relative to entry. You build it the same way you build any edge&mdash;the only difference is that you pair it with a conditional edge that eventually breaks out of the loop.
+</p>
+
+<p class="code-label" data-anchor="ch05-cycle-pattern-label">Basic cycle pattern</p>
+<pre data-anchor="ch05-cycle-pattern-code"><span class="cm"># generate produces a draft, evaluate scores it</span>
+builder.add_edge(<span class="str">"generate"</span>, <span class="str">"evaluate"</span>)
+
+<span class="cm"># evaluate either accepts (goes to END) or loops back</span>
+builder.add_conditional_edges(
+    <span class="str">"evaluate"</span>,
+    <span class="kw">lambda</span> s: <span class="str">"accept"</span> <span class="kw">if</span> s[<span class="str">"score"</span>] >= <span class="num">0.8</span> <span class="kw">else</span> <span class="str">"retry"</span>,
+    {<span class="str">"accept"</span>: END, <span class="str">"retry"</span>: <span class="str">"generate"</span>}
+)</pre>
+
+<p data-anchor="ch05-cycle-safety">
+This will loop as long as the score stays below 0.8. But what if the model never produces a good enough draft? You need a counter.
+</p>
+
+<h3 data-anchor="ch05-retry-loop-example">Code Example: Retry Loop with Max Attempts</h3>
+
+<p data-anchor="ch05-retry-intro">
+The pattern below shows a self-correcting loop with a hard limit. The <code>attempts</code> counter lives in state, increments on each pass, and the conditional edge checks it before routing back.
+</p>
+
+<p class="code-label" data-anchor="ch05-retry-code-label">Retry loop with max attempts</p>
+<pre data-anchor="ch05-retry-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+<span class="kw">import</span> operator
+
+<span class="kw">class</span> <span class="ty">CodeState</span>(TypedDict):
+    task: <span class="ty">str</span>
+    code: <span class="ty">str</span>
+    errors: <span class="ty">str</span>
+    attempts: <span class="ty">int</span>
+    passed: <span class="ty">bool</span>
+
+MAX_RETRIES = <span class="num">3</span>
+
+<span class="kw">def</span> <span class="fn">write_code</span>(state: <span class="ty">CodeState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Generate or revise code based on task and any prior errors."""</span>
+    <span class="kw">if</span> state.get(<span class="str">"errors"</span>):
+        prompt = (
+            <span class="str">f"Fix this code:\n{state['code']}\n\n"</span>
+            <span class="str">f"Errors:\n{state['errors']}"</span>
+        )
+    <span class="kw">else</span>:
+        prompt = <span class="str">f"Write Python code for: {state['task']}"</span>
+    code = llm.invoke(prompt).content
+    <span class="kw">return</span> {
+        <span class="str">"code"</span>: code,
+        <span class="str">"attempts"</span>: state.get(<span class="str">"attempts"</span>, <span class="num">0</span>) + <span class="num">1</span>,
+    }
+
+<span class="kw">def</span> <span class="fn">run_tests</span>(state: <span class="ty">CodeState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Execute the code and capture errors (simplified)."""</span>
+    <span class="kw">try</span>:
+        exec(state[<span class="str">"code"</span>])
+        <span class="kw">return</span> {<span class="str">"passed"</span>: <span class="kw">True</span>, <span class="str">"errors"</span>: <span class="str">""</span>}
+    <span class="kw">except</span> <span class="ty">Exception</span> <span class="kw">as</span> e:
+        <span class="kw">return</span> {<span class="str">"passed"</span>: <span class="kw">False</span>, <span class="str">"errors"</span>: <span class="fn">str</span>(e)}
+
+<span class="kw">def</span> <span class="fn">decide_next</span>(state: <span class="ty">CodeState</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Pass if tests pass or we've exhausted retries."""</span>
+    <span class="kw">if</span> state[<span class="str">"passed"</span>]:
+        <span class="kw">return</span> <span class="str">"done"</span>
+    <span class="kw">if</span> state[<span class="str">"attempts"</span>] >= MAX_RETRIES:
+        <span class="kw">return</span> <span class="str">"give_up"</span>
+    <span class="kw">return</span> <span class="str">"retry"</span>
+
+<span class="cm"># Build</span>
+builder = StateGraph(<span class="ty">CodeState</span>)
+builder.add_node(<span class="str">"write_code"</span>, write_code)
+builder.add_node(<span class="str">"run_tests"</span>, run_tests)
+builder.set_entry_point(<span class="str">"write_code"</span>)
+
+builder.add_edge(<span class="str">"write_code"</span>, <span class="str">"run_tests"</span>)
+builder.add_conditional_edges(
+    <span class="str">"run_tests"</span>,
+    decide_next,
+    {
+        <span class="str">"done"</span>:    END,
+        <span class="str">"give_up"</span>: END,
+        <span class="str">"retry"</span>:   <span class="str">"write_code"</span>,  <span class="cm"># &lt;-- the cycle</span>
+    }
+)
+
+graph = builder.compile()
+result = graph.invoke({<span class="str">"task"</span>: <span class="str">"Write a function that reverses a string"</span>})
+<span class="fn">print</span>(<span class="str">f"Passed: {result['passed']}, Attempts: {result['attempts']}"</span>)</pre>
+
+<p data-anchor="ch05-retry-walkthrough">
+Three things to notice. First, the <code>attempts</code> counter is part of state&mdash;it survives across loop iterations because every checkpoint preserves it. Second, the <code>decide_next</code> function has three exits: success, failure after exhausting retries, and retry. Third, the cycle goes from <code>run_tests</code> back to <code>write_code</code>, not to itself. This gives the code-writing node a chance to read the errors and try a different approach each time.
+</p>
+
+<div class="callout note" data-anchor="ch05-callout-recursion-limit">
+  <span class="callout-title">Recursion limit</span>
+  <p data-anchor="ch05-recursion-limit-text">
+  LangGraph enforces a default recursion limit of 25 steps per invocation. If your graph needs more loop iterations, pass <code>{"recursion_limit": 50}</code> (or whatever bound makes sense) as part of the config when you call <code>graph.invoke()</code>. This safety net catches infinite loops during development&mdash;always set it intentionally rather than removing it.
+  </p>
+</div>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-diagram">Visualizing Branching and Looping</h2>
+
+<p data-anchor="ch05-diagram-intro">
+The diagram below shows a graph that combines both patterns from the examples above: a conditional branch after classification, plus a retry loop in one of the branches. Follow the solid arrows for the normal path and the dashed arrow for the retry cycle.
+</p>
+
+<figure class="diagram-fig" data-anchor="ch05-diagram-fig">
+<svg class="diagram" viewBox="0 0 720 520" aria-label="Graph with conditional routing and a retry loop" xmlns="http://www.w3.org/2000/svg">
+  <title>Branching and looping control flow</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+      <polygon points="0 0, 10 3.5, 0 7" fill="var(--ink)"/>
+    </marker>
+    <marker id="arrow-hot" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+      <polygon points="0 0, 10 3.5, 0 7" fill="var(--accent)"/>
+    </marker>
+    <marker id="arrow-dash" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+      <polygon points="0 0, 10 3.5, 0 7" fill="var(--ink-soft)"/>
+    </marker>
+  </defs>
+
+  <!-- START node -->
+  <rect class="box" x="300" y="20" width="120" height="40" rx="8"/>
+  <text class="lbl" x="360" y="45" text-anchor="middle">START</text>
+
+  <!-- classify node -->
+  <rect class="box-alt" x="300" y="100" width="120" height="40" rx="8"/>
+  <text class="lbl" x="360" y="125" text-anchor="middle">classify</text>
+
+  <!-- Edge: START -> classify -->
+  <line class="flow" x1="360" y1="60" x2="360" y2="100" marker-end="url(#arrow)"/>
+
+  <!-- billing handler -->
+  <rect class="box" x="80" y="210" width="150" height="40" rx="8"/>
+  <text class="lbl" x="155" y="235" text-anchor="middle">handle_billing</text>
+
+  <!-- complaint handler (hot) -->
+  <rect class="box-hot" x="285" y="210" width="150" height="40" rx="8"/>
+  <text class="lbl-hot" x="360" y="235" text-anchor="middle">handle_complaint</text>
+
+  <!-- general handler -->
+  <rect class="box" x="490" y="210" width="150" height="40" rx="8"/>
+  <text class="lbl" x="565" y="235" text-anchor="middle">handle_general</text>
+
+  <!-- Conditional edges from classify -->
+  <line class="flow" x1="330" y1="140" x2="155" y2="210" marker-end="url(#arrow)"/>
+  <text class="lbl" x="220" y="172" text-anchor="middle" font-size="11" fill="var(--ink-soft)">billing</text>
+
+  <line class="flow-hot" x1="360" y1="140" x2="360" y2="210" marker-end="url(#arrow-hot)"/>
+  <text class="lbl-hot" x="395" y="180" text-anchor="start" font-size="11">complaint</text>
+
+  <line class="flow" x1="390" y1="140" x2="565" y2="210" marker-end="url(#arrow)"/>
+  <text class="lbl" x="500" y="172" text-anchor="middle" font-size="11" fill="var(--ink-soft)">general</text>
+
+  <!-- Draft response (from complaint) -->
+  <rect class="box-hot" x="285" y="300" width="150" height="40" rx="8"/>
+  <text class="lbl-hot" x="360" y="325" text-anchor="middle">draft_response</text>
+
+  <line class="flow-hot" x1="360" y1="250" x2="360" y2="300" marker-end="url(#arrow-hot)"/>
+
+  <!-- Review response -->
+  <rect class="box-hot" x="285" y="390" width="150" height="40" rx="8"/>
+  <text class="lbl-hot" x="360" y="415" text-anchor="middle">review_quality</text>
+
+  <line class="flow-hot" x1="360" y1="340" x2="360" y2="390" marker-end="url(#arrow-hot)"/>
+
+  <!-- Retry loop (dashed, from review back to draft) -->
+  <path class="flow-dash" d="M 285,410 C 220,410 220,320 285,320" fill="none" marker-end="url(#arrow-dash)"/>
+  <text class="lbl" x="225" y="365" text-anchor="middle" font-size="11" fill="var(--ink-soft)">retry</text>
+
+  <!-- END node -->
+  <rect class="box" x="300" y="470" width="120" height="40" rx="8"/>
+  <text class="lbl" x="360" y="495" text-anchor="middle">END</text>
+
+  <!-- Edges to END -->
+  <line class="flow" x1="155" y1="250" x2="155" y2="475" marker-end="url(#arrow)"/>
+  <line class="flow" x1="155" y1="475" x2="300" y2="490"/>
+
+  <line class="flow-hot" x1="360" y1="430" x2="360" y2="470" marker-end="url(#arrow-hot)"/>
+  <text class="lbl-hot" x="395" y="455" text-anchor="start" font-size="11">pass</text>
+
+  <line class="flow" x1="565" y1="250" x2="565" y2="475" marker-end="url(#arrow)"/>
+  <line class="flow" x1="565" y1="475" x2="420" y2="490"/>
+</svg>
+<figcaption data-anchor="ch05-diagram-caption">A graph combining conditional routing (three branches from <em>classify</em>) with a retry loop (the dashed arrow from <em>review_quality</em> back to <em>draft_response</em>). The highlighted path shows the complaint branch with its quality-check cycle.</figcaption>
+</figure>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-human-in-the-loop">Human-in-the-Loop</h2>
+
+<p data-anchor="ch05-hitl-intro">
+Agents are useful precisely because they can act autonomously. But autonomy without oversight is risky. Sending an email, executing a trade, deleting a database record&mdash;these are actions where you probably want a human to glance at the plan before the graph carries it out. LangGraph gives you three mechanisms for pausing execution and handing control to a person: <code>interrupt_before</code>, <code>interrupt_after</code>, and the <code>interrupt()</code> function.
+</p>
+
+<h3 data-anchor="ch05-interrupt-before-after">Compile-Time Interrupts: <code>interrupt_before</code> and <code>interrupt_after</code></h3>
+
+<p data-anchor="ch05-interrupt-compile-explain">
+When you compile the graph, you can pass lists of node names where execution should pause. <code>interrupt_before</code> pauses <em>before</em> the named node runs&mdash;you get to inspect the state that would flow in. <code>interrupt_after</code> pauses <em>after</em> the node has run, so you can see what it produced before the graph moves on.
+</p>
+
+<p class="code-label" data-anchor="ch05-interrupt-compile-label">Compiling with interrupts</p>
+<pre data-anchor="ch05-interrupt-compile-code"><span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+
+checkpointer = MemorySaver()
+
+graph = builder.compile(
+    checkpointer=checkpointer,
+    interrupt_before=[<span class="str">"send_email"</span>],    <span class="cm"># pause before sending</span>
+    interrupt_after=[<span class="str">"draft_email"</span>],     <span class="cm"># pause after drafting</span>
+)</pre>
+
+<p data-anchor="ch05-interrupt-require-checkpointer">
+A checkpointer is <strong>required</strong> for interrupts. When the graph pauses, the entire state is saved to the checkpoint store. When the human approves, the graph resumes from that checkpoint. Without a checkpointer, there would be nothing to resume from. We covered checkpointers in Chapter 4; here we use the in-memory <code>MemorySaver</code> for simplicity.
+</p>
+
+<h3 data-anchor="ch05-hitl-example">Code Example: Human Approval Flow</h3>
+
+<p data-anchor="ch05-hitl-example-intro">
+Here&rsquo;s a complete example: an agent drafts an email, pauses for human review, and then either sends or revises it.
+</p>
+
+<p class="code-label" data-anchor="ch05-hitl-code-label">Human-in-the-loop approval flow</p>
+<pre data-anchor="ch05-hitl-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+
+<span class="kw">class</span> <span class="ty">EmailState</span>(TypedDict):
+    request: <span class="ty">str</span>
+    draft: <span class="ty">str</span>
+    approved: <span class="ty">bool</span>
+    sent: <span class="ty">bool</span>
+
+<span class="kw">def</span> <span class="fn">draft_email</span>(state: <span class="ty">EmailState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># In production, call an LLM here</span>
+    <span class="kw">return</span> {<span class="str">"draft"</span>: <span class="str">f"Dear customer, regarding: {state['request']}..."</span>}
+
+<span class="kw">def</span> <span class="fn">send_email</span>(state: <span class="ty">EmailState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Actually send the email</span>
+    <span class="fn">print</span>(<span class="str">f"SENT: {state['draft']}"</span>)
+    <span class="kw">return</span> {<span class="str">"sent"</span>: <span class="kw">True</span>}
+
+builder = StateGraph(<span class="ty">EmailState</span>)
+builder.add_node(<span class="str">"draft_email"</span>, draft_email)
+builder.add_node(<span class="str">"send_email"</span>, send_email)
+builder.set_entry_point(<span class="str">"draft_email"</span>)
+builder.add_edge(<span class="str">"draft_email"</span>, <span class="str">"send_email"</span>)
+builder.add_edge(<span class="str">"send_email"</span>, END)
+
+checkpointer = MemorySaver()
+graph = builder.compile(
+    checkpointer=checkpointer,
+    interrupt_before=[<span class="str">"send_email"</span>],  <span class="cm"># pause before sending</span>
+)
+
+<span class="cm"># --- First run: drafts email, then pauses ---</span>
+config = {<span class="str">"configurable"</span>: {<span class="str">"thread_id"</span>: <span class="str">"email-1"</span>}}
+result = graph.invoke({<span class="str">"request"</span>: <span class="str">"refund for order #42"</span>}, config)
+
+<span class="cm"># At this point the graph is paused.</span>
+<span class="cm"># Inspect what the draft node produced:</span>
+state = graph.get_state(config)
+<span class="fn">print</span>(<span class="str">"Draft:"</span>, state.values[<span class="str">"draft"</span>])
+<span class="fn">print</span>(<span class="str">"Next node:"</span>, state.next)  <span class="cm"># ("send_email",)</span>
+
+<span class="cm"># --- Human reviews and approves ---</span>
+<span class="cm"># Option A: resume as-is (approve the draft)</span>
+result = graph.invoke(<span class="kw">None</span>, config)
+<span class="fn">print</span>(<span class="str">"Sent:"</span>, result[<span class="str">"sent"</span>])  <span class="cm"># True</span>
+
+<span class="cm"># Option B: modify the draft before resuming</span>
+<span class="cm"># graph.update_state(config, {"draft": "Revised email body..."})</span>
+<span class="cm"># result = graph.invoke(None, config)</span></pre>
+
+<p data-anchor="ch05-hitl-walkthrough">
+The critical moments: after the first <code>invoke</code>, the graph has stopped just before <code>send_email</code>. The state includes the draft. We call <code>get_state</code> to read it and <code>state.next</code> to see where the graph will resume. When we&rsquo;re satisfied, calling <code>invoke(None, config)</code> with the same config resumes from the checkpoint. Passing <code>None</code> as input means &ldquo;continue with existing state&rdquo;&mdash;but we could also call <code>update_state</code> first to change the draft before resuming.
+</p>
+
+<h3 data-anchor="ch05-interrupt-function">The <code>interrupt()</code> Function for Dynamic Interrupts</h3>
+
+<p data-anchor="ch05-interrupt-fn-explain">
+Compile-time interrupts are declared once when you build the graph. But sometimes you only need to pause under certain conditions&mdash;say, when the amount exceeds a threshold. The <code>interrupt()</code> function lets you pause from <em>inside</em> a node, at runtime.
+</p>
+
+<p class="code-label" data-anchor="ch05-interrupt-fn-label">Using <code>interrupt()</code> inside a node</p>
+<pre data-anchor="ch05-interrupt-fn-code"><span class="kw">from</span> langgraph.types <span class="kw">import</span> interrupt
+
+<span class="kw">def</span> <span class="fn">process_payment</span>(state):
+    amount = state[<span class="str">"amount"</span>]
+
+    <span class="kw">if</span> amount > <span class="num">1000</span>:
+        <span class="cm"># Pause and send the amount to the client for approval.</span>
+        <span class="cm"># When the client resumes, `response` holds their answer.</span>
+        response = interrupt({
+            <span class="str">"question"</span>: <span class="str">f"Approve payment of ${amount}?"</span>,
+            <span class="str">"amount"</span>: amount,
+        })
+
+        <span class="kw">if</span> response != <span class="str">"approved"</span>:
+            <span class="kw">return</span> {<span class="str">"status"</span>: <span class="str">"rejected"</span>}
+
+    <span class="cm"># proceed with payment</span>
+    <span class="kw">return</span> {<span class="str">"status"</span>: <span class="str">"completed"</span>}</pre>
+
+<p data-anchor="ch05-interrupt-fn-mechanics">
+When <code>interrupt()</code> is called, the graph saves its state and returns the value you pass (the dictionary with the question and amount) to the client. The client&mdash;your application code, a web UI, a Slack bot&mdash;receives this value, presents it to the human, and then resumes the graph with the human&rsquo;s answer. That answer becomes the return value of <code>interrupt()</code> inside the node, and execution continues from that exact point.
+</p>
+
+<div class="callout key" data-anchor="ch05-callout-interrupt-compare">
+  <span class="callout-title">interrupt() vs interrupt_before / interrupt_after</span>
+  <p data-anchor="ch05-interrupt-compare-text">
+  Use <code>interrupt_before</code> and <code>interrupt_after</code> when you know at compile time that a specific node always needs human oversight. They are declared once and apply every time the graph runs. Use the <code>interrupt()</code> function when the decision to pause depends on runtime data&mdash;the node itself decides whether to stop. The <code>interrupt()</code> function also lets you send a structured value to the client and receive a response back, making it a two-way communication channel. Compile-time interrupts simply pause; to communicate, you read and modify state externally.
+  </p>
+</div>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-breakpoints-state-editing">Breakpoints and State Editing</h2>
+
+<p data-anchor="ch05-breakpoints-intro">
+Human-in-the-loop is one use of pausing. But LangGraph&rsquo;s checkpoint system enables something broader: the ability to inspect, modify, and even rewind state at any point in the graph&rsquo;s execution. Think of it as a debugger for your agent&rsquo;s thought process.
+</p>
+
+<h3 data-anchor="ch05-inspecting-state">Inspecting State at Any Checkpoint</h3>
+
+<p data-anchor="ch05-inspect-explain">
+Every time a node completes, the checkpointer saves the full state. You can retrieve the current state&mdash;or any past state&mdash;using the graph API.
+</p>
+
+<p class="code-label" data-anchor="ch05-inspect-code-label">Reading current and historical state</p>
+<pre data-anchor="ch05-inspect-code">config = {<span class="str">"configurable"</span>: {<span class="str">"thread_id"</span>: <span class="str">"debug-session-1"</span>}}
+
+<span class="cm"># Get the latest state</span>
+current = graph.get_state(config)
+<span class="fn">print</span>(<span class="str">"Values:"</span>, current.values)
+<span class="fn">print</span>(<span class="str">"Next:"</span>, current.next)          <span class="cm"># which node runs next</span>
+<span class="fn">print</span>(<span class="str">"Config:"</span>, current.config)        <span class="cm"># includes checkpoint_id</span>
+
+<span class="cm"># List all checkpoints (most recent first)</span>
+<span class="kw">for</span> snapshot <span class="kw">in</span> graph.get_state_history(config):
+    <span class="fn">print</span>(
+        snapshot.config[<span class="str">"configurable"</span>][<span class="str">"checkpoint_id"</span>],
+        snapshot.next,
+        snapshot.values.get(<span class="str">"attempts"</span>, <span class="num">0</span>),
+    )</pre>
+
+<p data-anchor="ch05-inspect-detail">
+The <code>get_state_history</code> method returns a generator of <code>StateSnapshot</code> objects, one per checkpoint, newest first. Each snapshot includes the state values at that point, the next node(s) that would run, and the checkpoint&rsquo;s unique ID. This gives you a complete audit trail of the graph&rsquo;s execution.
+</p>
+
+<h3 data-anchor="ch05-modifying-state">Modifying State Before Resuming</h3>
+
+<p data-anchor="ch05-update-state-explain">
+When the graph is paused&mdash;whether by an interrupt or because you&rsquo;re debugging&mdash;you can change the state before letting it continue. The <code>update_state</code> method writes new values into the current checkpoint.
+</p>
+
+<p class="code-label" data-anchor="ch05-update-state-label">Editing state with <code>update_state</code></p>
+<pre data-anchor="ch05-update-state-code"><span class="cm"># The graph paused before "send_email" and the draft has a typo.</span>
+<span class="cm"># Fix it before resuming.</span>
+graph.update_state(
+    config,
+    {<span class="str">"draft"</span>: <span class="str">"Dear customer, we have processed your refund for order #42."</span>}
+)
+
+<span class="cm"># Resume from the corrected state</span>
+result = graph.invoke(<span class="kw">None</span>, config)</pre>
+
+<p data-anchor="ch05-update-state-detail">
+An important subtlety: <code>update_state</code> creates a <em>new</em> checkpoint with your modifications. It doesn&rsquo;t overwrite the old one. This means you can always go back to the pre-modification state if needed. The values you pass are merged into the existing state using the same reducers defined in your state schema.
+</p>
+
+<p data-anchor="ch05-update-state-as-if">
+You can also pass an <code>as_node</code> parameter to <code>update_state</code>. This tells LangGraph to treat the update <em>as if</em> a specific node produced it, which matters for determining which node runs next.
+</p>
+
+<p class="code-label" data-anchor="ch05-update-as-node-label">Updating state as a specific node</p>
+<pre data-anchor="ch05-update-as-node-code"><span class="cm"># Pretend the "draft_email" node produced this revised draft</span>
+graph.update_state(
+    config,
+    {<span class="str">"draft"</span>: <span class="str">"Revised draft..."</span>},
+    as_node=<span class="str">"draft_email"</span>,
+)
+
+<span class="cm"># Now the graph thinks draft_email just ran,</span>
+<span class="cm"># so "send_email" is next.</span></pre>
+
+<h3 data-anchor="ch05-time-travel">Time-Travel Debugging</h3>
+
+<p data-anchor="ch05-time-travel-explain">
+Because every step is checkpointed, you can rewind to any previous point and replay from there&mdash;potentially with modified state. This is &ldquo;time travel&rdquo; debugging, and it is remarkably useful when an agent goes off the rails three steps into a long chain.
+</p>
+
+<p class="code-label" data-anchor="ch05-time-travel-label">Rewinding and replaying from an earlier checkpoint</p>
+<pre data-anchor="ch05-time-travel-code"><span class="cm"># Find the checkpoint where things went wrong</span>
+<span class="kw">for</span> snapshot <span class="kw">in</span> graph.get_state_history(config):
+    <span class="kw">if</span> snapshot.values.get(<span class="str">"attempts"</span>) == <span class="num">1</span>:
+        <span class="cm"># This is the state after the first attempt</span>
+        old_config = snapshot.config
+        <span class="kw">break</span>
+
+<span class="cm"># Option 1: Resume from that exact checkpoint</span>
+result = graph.invoke(<span class="kw">None</span>, old_config)
+
+<span class="cm"># Option 2: Modify state, then resume</span>
+graph.update_state(
+    old_config,
+    {<span class="str">"code"</span>: <span class="str">"def reverse(s): return s[::-1]"</span>},  <span class="cm"># inject a fix</span>
+)
+result = graph.invoke(<span class="kw">None</span>, old_config)</pre>
+
+<p data-anchor="ch05-time-travel-workflow">
+The workflow for time-travel debugging is straightforward: list checkpoints with <code>get_state_history</code>, find the one you want, and either resume from it directly or modify it first with <code>update_state</code>. Each replay forks the checkpoint history&mdash;it doesn&rsquo;t overwrite the original timeline. You can try multiple fixes from the same starting point without losing any history.
+</p>
+
+<div class="callout warn" data-anchor="ch05-callout-production-checkpointer">
+  <span class="callout-title">Checkpointer in production</span>
+  <p data-anchor="ch05-production-checkpointer-text">
+  <code>MemorySaver</code> is fine for development and tests. In production, use a persistent checkpointer like <code>SqliteSaver</code> or <code>PostgresSaver</code> from the <code>langgraph-checkpoint-sqlite</code> or <code>langgraph-checkpoint-postgres</code> packages. Without persistence, all checkpoints vanish when the process restarts&mdash;and with them, any paused human-in-the-loop flows.
+  </p>
+</div>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-patterns-table">Control Flow Patterns at a Glance</h2>
+
+<p data-anchor="ch05-table-intro">
+The table below collects the patterns from this chapter into a quick reference. Each row tells you what problem the pattern solves and points to the API you&rsquo;d reach for.
+</p>
+
+<table data-anchor="ch05-patterns-table-el">
+  <caption data-anchor="ch05-patterns-caption">Control flow patterns and when to use each</caption>
+  <thead data-anchor="ch05-patterns-thead">
+    <tr>
+      <th data-anchor="ch05-th-pattern">Pattern</th>
+      <th data-anchor="ch05-th-api">Key API</th>
+      <th data-anchor="ch05-th-when">When to Use</th>
+      <th data-anchor="ch05-th-example">Example</th>
+    </tr>
+  </thead>
+  <tbody data-anchor="ch05-patterns-tbody">
+    <tr data-anchor="ch05-row-conditional">
+      <td>Conditional routing</td>
+      <td><code>add_conditional_edges(src, fn, map)</code></td>
+      <td>A node&rsquo;s output determines which node runs next</td>
+      <td>Classify a ticket, then route to the right handler</td>
+    </tr>
+    <tr data-anchor="ch05-row-fanout">
+      <td>Fan-out (parallel&nbsp;branches)</td>
+      <td><code>add_conditional_edges</code> with path function returning a list</td>
+      <td>A single decision dispatches work to multiple nodes in parallel</td>
+      <td>Run summarization and translation simultaneously</td>
+    </tr>
+    <tr data-anchor="ch05-row-loop">
+      <td>Retry loop</td>
+      <td>Conditional edge back to an earlier node</td>
+      <td>An agent needs to check its work and try again on failure</td>
+      <td>Generate code, run tests, loop back if tests fail</td>
+    </tr>
+    <tr data-anchor="ch05-row-interrupt-compile">
+      <td>Compile-time interrupt</td>
+      <td><code>compile(interrupt_before=[...], interrupt_after=[...])</code></td>
+      <td>A node always needs human approval before or after running</td>
+      <td>Pause before sending an email every time</td>
+    </tr>
+    <tr data-anchor="ch05-row-interrupt-dynamic">
+      <td>Dynamic interrupt</td>
+      <td><code>interrupt(value)</code> inside a node</td>
+      <td>Pausing depends on runtime conditions; you need two-way communication</td>
+      <td>Ask for approval only when payment exceeds $1,000</td>
+    </tr>
+    <tr data-anchor="ch05-row-state-edit">
+      <td>State editing</td>
+      <td><code>graph.update_state(config, values)</code></td>
+      <td>Correct or override agent state before resuming</td>
+      <td>Fix a typo in a draft during a human review pause</td>
+    </tr>
+    <tr data-anchor="ch05-row-time-travel">
+      <td>Time-travel replay</td>
+      <td><code>graph.get_state_history(config)</code> + replay from checkpoint</td>
+      <td>Debug a past decision or try a different path from an earlier state</td>
+      <td>Rewind to attempt #1 and inject a correct answer</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-composing-patterns">Composing Patterns Together</h2>
+
+<p data-anchor="ch05-composing-intro">
+In practice, you rarely use just one of these patterns. A production agent might branch based on a classifier, loop within one branch to refine its output, and pause for human approval before taking an irreversible action. The beauty of LangGraph&rsquo;s approach is that these patterns compose cleanly: conditional edges, cycles, and interrupts are all just graph primitives. You mix them by adding the right edges and passing the right compile options.
+</p>
+
+<p data-anchor="ch05-composing-example-explain">
+Consider the complaint branch from our earlier diagram. In a real system, you&rsquo;d want the agent to draft a response, review it for quality (looping if it&rsquo;s poor), and then pause for a human supervisor to approve the final version before sending it. That&rsquo;s a conditional branch into a retry loop into a human-in-the-loop interrupt&mdash;three patterns stacked together, each doing its job.
+</p>
+
+<p class="code-label" data-anchor="ch05-composing-code-label">Three patterns composed: branch, loop, and interrupt</p>
+<pre data-anchor="ch05-composing-code"><span class="cm"># After classification routes to "handle_complaint"...</span>
+
+<span class="kw">def</span> <span class="fn">draft_response</span>(state):
+    <span class="cm"># LLM drafts a response to the complaint</span>
+    draft = llm.invoke(<span class="str">f"Write an empathetic response: {state['message']}"</span>)
+    <span class="kw">return</span> {
+        <span class="str">"draft"</span>: draft.content,
+        <span class="str">"draft_attempts"</span>: state.get(<span class="str">"draft_attempts"</span>, <span class="num">0</span>) + <span class="num">1</span>,
+    }
+
+<span class="kw">def</span> <span class="fn">check_quality</span>(state):
+    <span class="cm"># LLM scores the draft</span>
+    score = llm.invoke(<span class="str">f"Rate 0-10: {state['draft']}"</span>)
+    <span class="kw">return</span> {<span class="str">"quality_score"</span>: <span class="fn">int</span>(score.content.strip())}
+
+<span class="kw">def</span> <span class="fn">quality_gate</span>(state):
+    <span class="kw">if</span> state[<span class="str">"quality_score"</span>] >= <span class="num">7</span>:
+        <span class="kw">return</span> <span class="str">"approve"</span>
+    <span class="kw">if</span> state[<span class="str">"draft_attempts"</span>] >= <span class="num">3</span>:
+        <span class="kw">return</span> <span class="str">"approve"</span>   <span class="cm"># best effort after 3 tries</span>
+    <span class="kw">return</span> <span class="str">"retry"</span>
+
+<span class="kw">def</span> <span class="fn">send_response</span>(state):
+    <span class="cm"># Actually send the response</span>
+    <span class="kw">return</span> {<span class="str">"sent"</span>: <span class="kw">True</span>}
+
+<span class="cm"># Wire it up</span>
+builder.add_node(<span class="str">"draft_response"</span>, draft_response)
+builder.add_node(<span class="str">"check_quality"</span>, check_quality)
+builder.add_node(<span class="str">"send_response"</span>, send_response)
+
+builder.add_edge(<span class="str">"handle_complaint"</span>, <span class="str">"draft_response"</span>)
+builder.add_edge(<span class="str">"draft_response"</span>, <span class="str">"check_quality"</span>)
+builder.add_conditional_edges(
+    <span class="str">"check_quality"</span>,
+    quality_gate,
+    {<span class="str">"approve"</span>: <span class="str">"send_response"</span>, <span class="str">"retry"</span>: <span class="str">"draft_response"</span>}
+)
+builder.add_edge(<span class="str">"send_response"</span>, END)
+
+<span class="cm"># Compile with interrupt before the risky action</span>
+graph = builder.compile(
+    checkpointer=checkpointer,
+    interrupt_before=[<span class="str">"send_response"</span>],
+)</pre>
+
+<p data-anchor="ch05-composing-walkthrough">
+The flow: classify routes the complaint to <code>handle_complaint</code>, which hands off to <code>draft_response</code>. The draft is scored by <code>check_quality</code>, and if the score is below 7, the graph loops back for another attempt (up to three times). Once the draft passes or retries are exhausted, the graph moves to <code>send_response</code>&mdash;but because we compiled with <code>interrupt_before=["send_response"]</code>, it pauses there. A human reviewer inspects the draft, optionally edits it with <code>update_state</code>, and then resumes.
+</p>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-practical-tips">Practical Tips</h2>
+
+<h3 data-anchor="ch05-tip-path-coverage">Cover Every Path</h3>
+
+<p data-anchor="ch05-tip-path-explain">
+If your path function can return a value that isn&rsquo;t in the path map, LangGraph will raise a <code>ValueError</code> at runtime. This is good&mdash;it fails fast. But you should still add a fallback or default path. A common pattern is to include a <code>"__default__"</code> key or catch-all node that handles unexpected classifications gracefully.
+</p>
+
+<h3 data-anchor="ch05-tip-loop-counters">Always Use Loop Counters</h3>
+
+<p data-anchor="ch05-tip-loop-explain">
+Even if you believe your exit condition will eventually trigger, add a counter and a maximum. LLMs are stochastic&mdash;what works 99% of the time will fail on the 100th run. A counter in state plus a check in your conditional edge is cheap insurance.
+</p>
+
+<h3 data-anchor="ch05-tip-interrupt-ux">Design the Interrupt Experience</h3>
+
+<p data-anchor="ch05-tip-interrupt-explain">
+When using <code>interrupt()</code>, think about what you send to the client. The value you pass becomes what the human sees. Make it actionable: include the draft text, the proposed action, the amount, the risk level. The more context you provide, the faster the human can decide. Similarly, define clearly what the expected response format is&mdash;a boolean, a string like <code>"approved"</code>, or a freeform edit.
+</p>
+
+<h3 data-anchor="ch05-tip-checkpoint-ids">Save Checkpoint IDs for Critical Points</h3>
+
+<p data-anchor="ch05-tip-checkpoint-explain">
+If you know you might need to rewind to a specific moment&mdash;say, right after initial classification&mdash;save that checkpoint&rsquo;s ID. You can extract it from <code>graph.get_state(config).config["configurable"]["checkpoint_id"]</code>. Having it on hand lets you rewind directly instead of scanning through history.
+</p>
+
+<div class="callout note" data-anchor="ch05-callout-streaming">
+  <span class="callout-title">Streaming and interrupts</span>
+  <p data-anchor="ch05-streaming-text">
+  When using <code>graph.stream()</code> instead of <code>invoke()</code>, an interrupt causes the stream to end. You still resume the same way: call <code>stream(None, config)</code> or <code>invoke(None, config)</code>. The checkpoint doesn&rsquo;t care whether the original run used streaming or not.
+  </p>
+</div>
+
+<!-- ─────────────────────────────────────────────────── -->
+<h2 data-anchor="ch05-summary">What You&rsquo;ve Learned</h2>
+
+<p data-anchor="ch05-summary-text">
+Control flow is what turns a static pipeline into an adaptive agent. You now have four tools in your belt: <strong>conditional edges</strong> that pick a path at runtime, <strong>cycles</strong> that let agents retry and self-correct, <strong>interrupts</strong> that pause for human judgement, and <strong>state editing</strong> that lets you rewrite history and replay from any point. These patterns compose freely&mdash;a single graph can branch, loop, pause, and resume as the situation demands.
+</p>
+
+<p data-anchor="ch05-transition">
+With control flow handled, you&rsquo;re ready to scale up. In the next chapter, we move from single graphs to <strong>multi-agent systems</strong>&mdash;graphs that contain other graphs, agents that delegate to specialists, and patterns for coordinating teams of autonomous workers.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch05-nav">
+  <a rel="prev" href="04-state-and-memory.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-multi-agent-systems.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>

@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · State and Memory — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch04-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch04-head">
+  <span class="chapter-num">04</span>
+  <span class="chapter-kicker">Persistence across turns</span>
+  <h1 data-anchor="ch04-title">State and Memory</h1>
+</header>
+
+<p class="lede" data-anchor="ch04-lede">
+A chatbot that forgets every message the moment it replies is not a conversation partner&mdash;it&rsquo;s a vending machine. You feed it a coin, you get a response, the transaction is over. Real conversations carry context: the customer&rsquo;s name, the last three things they asked, the decision that was deferred two turns ago. In LangGraph, the mechanism that carries that context is <em>state</em>, and the mechanism that preserves it across invocations is <em>memory</em>. This chapter shows you how both work, from the shape of a single state object through checkpointing, cross-thread stores, and strategies for keeping memory from outgrowing the context window.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-defining-state-schemas">Defining State Schemas</h2>
+
+<p data-anchor="ch04-state-intro">
+Every LangGraph graph operates on a state object. When a node runs, it receives the current state, does its work, and returns a dictionary of updates. The graph merges those updates back into state before handing it to the next node. The question is: what shape should that state take?
+</p>
+
+<p data-anchor="ch04-typeddict-approach">
+The simplest approach uses Python&rsquo;s <code>TypedDict</code>. You declare a class whose fields name every piece of data the graph needs to carry, and you annotate each field with its type. LangGraph reads those annotations at compile time to understand what the state contains.
+</p>
+
+<p class="code-label" data-anchor="ch04-typeddict-label">A minimal state schema with TypedDict</p>
+<pre data-anchor="ch04-typeddict-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> MessagesState
+<span class="kw">import</span> operator
+
+<span class="kw">class</span> <span class="ty">ChatState</span>(TypedDict):
+    messages: Annotated[list, operator.add]
+    user_name: str
+    turn_count: int</pre>
+
+<p data-anchor="ch04-typeddict-explain">
+Notice three things. First, <code>messages</code> is annotated with <code>Annotated[list, operator.add]</code>. That second element&mdash;<code>operator.add</code>&mdash;is a <strong>reducer</strong>, and we&rsquo;ll spend the next section on those. Second, <code>user_name</code> and <code>turn_count</code> have no reducer, which means new values simply overwrite old ones. Third, this is an ordinary Python class; there is no magic base class to inherit from (though LangGraph does provide <code>MessagesState</code> as a convenient shortcut when all you need is a message list).
+</p>
+
+<p data-anchor="ch04-pydantic-approach">
+If you prefer runtime validation&mdash;ensuring that <code>turn_count</code> is actually an integer, for instance&mdash;you can define your state with a Pydantic <code>BaseModel</code> instead. LangGraph supports both approaches interchangeably.
+</p>
+
+<p class="code-label" data-anchor="ch04-pydantic-label">State schema with Pydantic validation</p>
+<pre data-anchor="ch04-pydantic-code"><span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel, Field
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">import</span> operator
+
+<span class="kw">class</span> <span class="ty">ValidatedChatState</span>(BaseModel):
+    messages: Annotated[list, operator.add] = Field(default_factory=list)
+    user_name: str = <span class="str">""</span>
+    turn_count: int = <span class="num">0</span>
+    sentiment: str = <span class="str">"neutral"</span></pre>
+
+<p data-anchor="ch04-pydantic-explain">
+With Pydantic you gain defaults, validators, and serialization for free. The cost is a small amount of extra overhead on each state transition. For most applications, either approach works. Pick the one that matches the rest of your codebase.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-reducers-in-depth">Reducers in Depth</h2>
+
+<p data-anchor="ch04-reducer-problem">
+When two nodes both return a value for the same state field, what should happen? Should the second value replace the first? Should both values be combined? This is the problem reducers solve.
+</p>
+
+<p data-anchor="ch04-reducer-definition">
+A reducer is a function that takes the current field value and the update value, then returns the merged result. LangGraph calls it every time a node returns an update for that field. If no reducer is specified, the default behavior is simple overwrite: the new value replaces the old.
+</p>
+
+<h3 data-anchor="ch04-default-overwrite">Default Overwrite Behavior</h3>
+
+<p data-anchor="ch04-overwrite-explain">
+Fields without an <code>Annotated</code> wrapper use overwrite semantics. If a node returns <code>{"user_name": "Alice"}</code> and a later node returns <code>{"user_name": "Bob"}</code>, the final state will contain <code>"Bob"</code>. This is the right choice for fields that represent a single current value: a user&rsquo;s name, a classification label, a boolean flag.
+</p>
+
+<h3 data-anchor="ch04-operator-add">The operator.add Reducer</h3>
+
+<p data-anchor="ch04-add-explain">
+The most common reducer is <code>operator.add</code>, which concatenates lists. When a node returns <code>{"messages": [new_msg]}</code>, the reducer appends <code>new_msg</code> to the existing message list rather than replacing it. This is essential for chat-style applications where every node might add a message.
+</p>
+
+<p data-anchor="ch04-add-caution">
+Be precise about what you return. If the field is a list with an <code>operator.add</code> reducer, your node must return a <em>list</em>, not a bare item. Returning a string where a list is expected will cause <code>operator.add</code> to concatenate characters in unpleasant ways.
+</p>
+
+<h3 data-anchor="ch04-custom-reducers">Custom Reducer Functions</h3>
+
+<p data-anchor="ch04-custom-explain">
+You can write your own reducer for more nuanced merging logic. A reducer is any callable that takes two arguments&mdash;the existing value and the incoming update&mdash;and returns the merged result.
+</p>
+
+<p class="code-label" data-anchor="ch04-custom-reducer-label">Custom state with multiple reducers</p>
+<pre data-anchor="ch04-custom-reducer-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">import</span> operator
+
+<span class="kw">def</span> <span class="fn">keep_max</span>(current: int, update: int) -> int:
+    <span class="cm">"""Always keep the larger value."""</span>
+    <span class="kw">return</span> <span class="fn">max</span>(current, update)
+
+<span class="kw">def</span> <span class="fn">deduplicated_add</span>(current: list, update: list) -> list:
+    <span class="cm">"""Append items, but skip duplicates."""</span>
+    seen = <span class="fn">set</span>(current)
+    <span class="kw">return</span> current + [item <span class="kw">for</span> item <span class="kw">in</span> update <span class="kw">if</span> item <span class="kw">not in</span> seen]
+
+<span class="kw">def</span> <span class="fn">merge_dicts</span>(current: dict, update: dict) -> dict:
+    <span class="cm">"""Shallow-merge two dictionaries."""</span>
+    <span class="kw">return</span> {**current, **update}
+
+<span class="kw">class</span> <span class="ty">ResearchState</span>(TypedDict):
+    <span class="cm"># Messages accumulate in order</span>
+    messages: Annotated[list, operator.add]
+    <span class="cm"># Sources are deduplicated as they arrive</span>
+    sources: Annotated[list, deduplicated_add]
+    <span class="cm"># Confidence tracks the highest score seen</span>
+    confidence: Annotated[int, keep_max]
+    <span class="cm"># Metadata merges across nodes</span>
+    metadata: Annotated[dict, merge_dicts]
+    <span class="cm"># Summary overwrites (no reducer)</span>
+    summary: str</pre>
+
+<p data-anchor="ch04-custom-reducer-explain">
+In this schema, five fields use three different merge strategies. The <code>sources</code> list grows but never contains duplicates. The <code>confidence</code> score only ever goes up. The <code>metadata</code> dictionary accumulates keys from different nodes without clobbering earlier entries. Meanwhile, <code>summary</code> simply overwrites because the latest summary is the only one that matters.
+</p>
+
+<div class="callout key" data-anchor="ch04-reducer-callout">
+  <span class="callout-title">Reducer Rule of Thumb</span>
+  <p data-anchor="ch04-reducer-rule">If a field accumulates data over the life of the graph (messages, tools called, sources found), it needs a reducer. If a field represents a single current value (the current step, a classification, a flag), let it overwrite. Getting this wrong is a common source of bugs: forgetting a reducer on a message list means every node&rsquo;s messages replace the previous node&rsquo;s messages instead of appending.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-short-term-memory">Short-Term Memory: Checkpointing</h2>
+
+<p data-anchor="ch04-checkpoint-problem">
+State carries data within a single invocation of the graph. But what about <em>between</em> invocations? If a user sends &ldquo;My name is Alice&rdquo; in one call to <code>graph.invoke()</code> and &ldquo;What&rsquo;s my name?&rdquo; in a second call, state is rebuilt from scratch each time unless you add a checkpointer.
+</p>
+
+<p data-anchor="ch04-checkpoint-concept">
+A <strong>checkpointer</strong> serializes the entire state at every super-step of the graph&rsquo;s execution and stores it. When you invoke the graph again with the same <code>thread_id</code>, the checkpointer reloads the last saved state, and the conversation continues seamlessly.
+</p>
+
+<h3 data-anchor="ch04-memorysaver">MemorySaver: The In-Memory Checkpointer</h3>
+
+<p data-anchor="ch04-memorysaver-intro">
+For development and prototyping, LangGraph provides <code>MemorySaver</code>, an in-memory checkpointer that stores state in a Python dictionary. It is fast and requires no external dependencies, but it vanishes when the process exits.
+</p>
+
+<p class="code-label" data-anchor="ch04-memorysaver-label">MemorySaver checkpointing with thread_id</p>
+<pre data-anchor="ch04-memorysaver-code"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, MessagesState, START, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+
+model = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: MessagesState):
+    response = model.<span class="fn">invoke</span>(state[<span class="str">"messages"</span>])
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}
+
+<span class="cm"># Build the graph</span>
+builder = <span class="fn">StateGraph</span>(MessagesState)
+builder.<span class="fn">add_node</span>(<span class="str">"chatbot"</span>, chatbot)
+builder.<span class="fn">add_edge</span>(START, <span class="str">"chatbot"</span>)
+builder.<span class="fn">add_edge</span>(<span class="str">"chatbot"</span>, END)
+
+<span class="cm"># Compile with a checkpointer</span>
+checkpointer = <span class="fn">MemorySaver</span>()
+graph = builder.<span class="fn">compile</span>(checkpointer=checkpointer)
+
+<span class="cm"># First invocation: introduce yourself</span>
+config = {<span class="str">"configurable"</span>: {<span class="str">"thread_id"</span>: <span class="str">"user-alice-001"</span>}}
+result = graph.<span class="fn">invoke</span>(
+    {<span class="str">"messages"</span>: [{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Hi, I'm Alice."</span>}]},
+    config=config,
+)
+<span class="fn">print</span>(result[<span class="str">"messages"</span>][-<span class="num">1</span>].content)
+<span class="cm"># "Hello Alice! Nice to meet you."</span>
+
+<span class="cm"># Second invocation: same thread_id, memory persists</span>
+result = graph.<span class="fn">invoke</span>(
+    {<span class="str">"messages"</span>: [{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"What's my name?"</span>}]},
+    config=config,
+)
+<span class="fn">print</span>(result[<span class="str">"messages"</span>][-<span class="num">1</span>].content)
+<span class="cm"># "Your name is Alice!"</span>
+
+<span class="cm"># Different thread_id: a separate conversation</span>
+config_b = {<span class="str">"configurable"</span>: {<span class="str">"thread_id"</span>: <span class="str">"user-bob-002"</span>}}
+result = graph.<span class="fn">invoke</span>(
+    {<span class="str">"messages"</span>: [{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"What's my name?"</span>}]},
+    config=config_b,
+)
+<span class="fn">print</span>(result[<span class="str">"messages"</span>][-<span class="num">1</span>].content)
+<span class="cm"># "I don't know your name yet. What should I call you?"</span></pre>
+
+<p data-anchor="ch04-memorysaver-explain">
+The critical detail is <code>thread_id</code>. It acts as a namespace for checkpoints. Two calls with the same <code>thread_id</code> share state; two calls with different <code>thread_id</code> values are completely isolated. Think of each thread as a separate filing cabinet drawer: the checkpointer stores the graph&rsquo;s full state in that drawer after each super-step, and pulls it back out at the start of the next invocation.
+</p>
+
+<h3 data-anchor="ch04-checkpoint-timeline">How Checkpoints Accumulate</h3>
+
+<p data-anchor="ch04-timeline-explain">
+Checkpoints are not just the &ldquo;latest state.&rdquo; The checkpointer stores a snapshot after every super-step within every invocation. This means you can rewind a conversation to any prior point&mdash;a feature called <strong>time travel</strong> that we&rsquo;ll explore in a later chapter. For now, the important thing to understand is that checkpoints form a timeline.
+</p>
+
+<figure class="diagram-fig" data-anchor="ch04-checkpoint-diagram">
+<svg class="diagram" viewBox="0 0 780 260" aria-label="Checkpoint timeline showing state snapshots across two invocations" xmlns="http://www.w3.org/2000/svg">
+  <title>Checkpoint timeline with state snapshots</title>
+  <defs>
+    <marker id="ch04-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)" />
+    </marker>
+    <marker id="ch04-arrow-soft" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink-soft)" />
+    </marker>
+  </defs>
+
+  <!-- Timeline axis -->
+  <line x1="40" y1="130" x2="740" y2="130" stroke="var(--rule)" stroke-width="2" />
+  <text x="390" y="250" class="lbl" text-anchor="middle" fill="var(--ink-soft)" font-size="13">time &rarr;</text>
+
+  <!-- Invocation 1 bracket -->
+  <line x1="80" y1="20" x2="80" y2="35" stroke="var(--accent)" stroke-width="1.5" />
+  <line x1="80" y1="20" x2="340" y2="20" stroke="var(--accent)" stroke-width="1.5" />
+  <line x1="340" y1="20" x2="340" y2="35" stroke="var(--accent)" stroke-width="1.5" />
+  <text x="210" y="15" class="lbl-hot" text-anchor="middle" font-size="12" fill="var(--accent)">Invocation 1: &ldquo;Hi, I&rsquo;m Alice&rdquo;</text>
+
+  <!-- Invocation 2 bracket -->
+  <line x1="420" y1="20" x2="420" y2="35" stroke="var(--accent)" stroke-width="1.5" />
+  <line x1="420" y1="20" x2="680" y2="20" stroke="var(--accent)" stroke-width="1.5" />
+  <line x1="680" y1="20" x2="680" y2="35" stroke="var(--accent)" stroke-width="1.5" />
+  <text x="550" y="15" class="lbl-hot" text-anchor="middle" font-size="12" fill="var(--accent)">Invocation 2: &ldquo;What&rsquo;s my name?&rdquo;</text>
+
+  <!-- Checkpoint 1 -->
+  <rect x="65" y="45" width="100" height="70" rx="6" class="box" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+  <text x="115" y="65" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink)">Checkpoint 1</text>
+  <text x="115" y="82" text-anchor="middle" font-size="10" fill="var(--ink-soft)">msgs: [user]</text>
+  <text x="115" y="96" text-anchor="middle" font-size="10" fill="var(--ink-soft)">step: START</text>
+  <line x1="115" y1="115" x2="115" y2="130" stroke="var(--rule)" stroke-width="1.5" />
+  <circle cx="115" cy="130" r="5" fill="var(--accent)" />
+
+  <!-- Arrow 1->2 -->
+  <line x1="165" y1="80" x2="200" y2="80" stroke="var(--ink-soft)" stroke-width="1" marker-end="url(#ch04-arrow-soft)" />
+
+  <!-- Checkpoint 2 -->
+  <rect x="210" y="45" width="120" height="70" rx="6" class="box" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+  <text x="270" y="65" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink)">Checkpoint 2</text>
+  <text x="270" y="82" text-anchor="middle" font-size="10" fill="var(--ink-soft)">msgs: [user, ai]</text>
+  <text x="270" y="96" text-anchor="middle" font-size="10" fill="var(--ink-soft)">step: END</text>
+  <line x1="270" y1="115" x2="270" y2="130" stroke="var(--rule)" stroke-width="1.5" />
+  <circle cx="270" cy="130" r="5" fill="var(--accent)" />
+
+  <!-- Gap indicator -->
+  <text x="380" y="135" text-anchor="middle" font-size="16" fill="var(--ink-soft)">&hellip;</text>
+
+  <!-- Checkpoint 3 -->
+  <rect x="405" y="45" width="120" height="70" rx="6" class="box-alt" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+  <text x="465" y="65" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink)">Checkpoint 3</text>
+  <text x="465" y="82" text-anchor="middle" font-size="10" fill="var(--ink-soft)">msgs: [u, a, u]</text>
+  <text x="465" y="96" text-anchor="middle" font-size="10" fill="var(--ink-soft)">step: START</text>
+  <line x1="465" y1="115" x2="465" y2="130" stroke="var(--rule)" stroke-width="1.5" />
+  <circle cx="465" cy="130" r="5" fill="var(--accent)" />
+
+  <!-- Arrow 3->4 -->
+  <line x1="525" y1="80" x2="555" y2="80" stroke="var(--ink-soft)" stroke-width="1" marker-end="url(#ch04-arrow-soft)" />
+
+  <!-- Checkpoint 4 -->
+  <rect x="560" y="45" width="130" height="70" rx="6" class="box-hot" fill="none" stroke="var(--accent)" stroke-width="2" />
+  <text x="625" y="65" class="lbl-hot" text-anchor="middle" font-size="11" fill="var(--accent)">Checkpoint 4</text>
+  <text x="625" y="82" text-anchor="middle" font-size="10" fill="var(--ink-soft)">msgs: [u, a, u, a]</text>
+  <text x="625" y="96" text-anchor="middle" font-size="10" fill="var(--ink-soft)">step: END (latest)</text>
+  <line x1="625" y1="115" x2="625" y2="130" stroke="var(--accent)" stroke-width="1.5" />
+  <circle cx="625" cy="130" r="6" fill="var(--accent)" stroke="var(--accent)" stroke-width="2" />
+
+  <!-- Legend -->
+  <circle cx="80" cy="220" r="4" fill="var(--ink-soft)" />
+  <text x="92" y="224" font-size="11" fill="var(--ink-soft)">past checkpoint</text>
+  <circle cx="250" cy="220" r="5" fill="var(--accent)" stroke="var(--accent)" stroke-width="2" />
+  <text x="264" y="224" font-size="11" fill="var(--ink-soft)">latest checkpoint (restored on next invoke)</text>
+</svg>
+</figure>
+
+<p data-anchor="ch04-timeline-detail">
+Each checkpoint captures the complete state at that moment. When a new invocation arrives with the same <code>thread_id</code>, the checkpointer loads Checkpoint 4 (the most recent), merges in the new input using the state&rsquo;s reducers, and the graph continues from there. The older checkpoints remain available for replay or debugging.
+</p>
+
+<h3 data-anchor="ch04-production-checkpointers">Production Checkpointers</h3>
+
+<p data-anchor="ch04-production-explain">
+<code>MemorySaver</code> is strictly for development. In production, you need checkpoints that survive process restarts. LangGraph offers several options:
+</p>
+
+<ul data-anchor="ch04-production-list">
+  <li data-anchor="ch04-prod-sqlite"><strong>SqliteSaver</strong> &mdash; stores checkpoints in a SQLite database file. Good for single-server deployments and local testing with persistence.</li>
+  <li data-anchor="ch04-prod-postgres"><strong>PostgresSaver</strong> &mdash; stores checkpoints in PostgreSQL. The right choice for multi-server deployments where multiple graph instances need to share checkpoint data.</li>
+  <li data-anchor="ch04-prod-custom"><strong>Custom checkpointers</strong> &mdash; you can implement the <code>BaseCheckpointSaver</code> interface to store checkpoints in Redis, DynamoDB, or any other backend your infrastructure demands.</li>
+</ul>
+
+<p data-anchor="ch04-swap-easy">
+Swapping checkpointers is a one-line change. The graph doesn&rsquo;t know or care where its state is stored:
+</p>
+
+<p class="code-label" data-anchor="ch04-swap-label">Switching from MemorySaver to PostgresSaver</p>
+<pre data-anchor="ch04-swap-code"><span class="cm"># Development</span>
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+checkpointer = <span class="fn">MemorySaver</span>()
+
+<span class="cm"># Production</span>
+<span class="kw">from</span> langgraph.checkpoint.postgres <span class="kw">import</span> PostgresSaver
+checkpointer = <span class="fn">PostgresSaver</span>.from_conn_string(
+    <span class="str">"postgresql://user:pass@localhost:5432/langgraph"</span>
+)
+
+<span class="cm"># Either way, compile identically</span>
+graph = builder.<span class="fn">compile</span>(checkpointer=checkpointer)</pre>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-long-term-memory">Long-Term Memory: The Store</h2>
+
+<p data-anchor="ch04-long-term-problem">
+Checkpoints are scoped to a <code>thread_id</code>. If Alice chats in thread <code>"alice-001"</code> and then starts a new thread <code>"alice-002"</code>, the second thread knows nothing about the first. This is by design&mdash;each thread is an independent conversation. But sometimes you need information that persists across threads: Alice&rsquo;s preferred language, her account tier, the topics she frequently asks about. This is <strong>long-term memory</strong>, and LangGraph implements it through the <code>Store</code>.
+</p>
+
+<div class="callout key" data-anchor="ch04-state-vs-store-callout">
+  <span class="callout-title">State vs. Store: Know the Difference</span>
+  <p data-anchor="ch04-state-vs-store-body"><strong>State</strong> is per-thread. It lives inside checkpoints, is scoped to a single <code>thread_id</code>, and carries the data a conversation needs right now: the message history, the current step, intermediate results. <strong>Store</strong> is cross-thread. It lives outside any single conversation and holds data that should be available everywhere: user profiles, learned preferences, organizational knowledge. State is the notebook you bring to a meeting; Store is the filing cabinet back at the office.</p>
+</div>
+
+<h3 data-anchor="ch04-store-basics">Store Basics: Namespaces, Keys, Values</h3>
+
+<p data-anchor="ch04-store-model">
+A Store is a key-value system organized by namespaces. A namespace is a tuple of strings that creates a hierarchy, similar to a file path. Within a namespace, you store items by key, and each item is a dictionary of arbitrary data.
+</p>
+
+<p class="code-label" data-anchor="ch04-store-usage-label">Using a Store for cross-thread user profiles</p>
+<pre data-anchor="ch04-store-usage-code"><span class="kw">from</span> langgraph.store.memory <span class="kw">import</span> InMemoryStore
+
+store = <span class="fn">InMemoryStore</span>()
+
+<span class="cm"># Save a user profile (accessible from any thread)</span>
+store.<span class="fn">put</span>(
+    namespace=(<span class="str">"users"</span>, <span class="str">"alice"</span>),
+    key=<span class="str">"profile"</span>,
+    value={
+        <span class="str">"name"</span>: <span class="str">"Alice Chen"</span>,
+        <span class="str">"preferred_language"</span>: <span class="str">"English"</span>,
+        <span class="str">"account_tier"</span>: <span class="str">"premium"</span>,
+    },
+)
+
+<span class="cm"># Save learned preferences</span>
+store.<span class="fn">put</span>(
+    namespace=(<span class="str">"users"</span>, <span class="str">"alice"</span>, <span class="str">"preferences"</span>),
+    key=<span class="str">"communication"</span>,
+    value={
+        <span class="str">"style"</span>: <span class="str">"concise"</span>,
+        <span class="str">"likes_examples"</span>: <span class="kw">True</span>,
+        <span class="str">"timezone"</span>: <span class="str">"US/Pacific"</span>,
+    },
+)
+
+<span class="cm"># Retrieve from any thread</span>
+profile = store.<span class="fn">get</span>((<span class="str">"users"</span>, <span class="str">"alice"</span>), <span class="str">"profile"</span>)
+<span class="fn">print</span>(profile.value[<span class="str">"name"</span>])  <span class="cm"># "Alice Chen"</span>
+
+<span class="cm"># List all items in a namespace</span>
+prefs = store.<span class="fn">search</span>((<span class="str">"users"</span>, <span class="str">"alice"</span>, <span class="str">"preferences"</span>))
+<span class="kw">for</span> item <span class="kw">in</span> prefs:
+    <span class="fn">print</span>(item.key, item.value)</pre>
+
+<p data-anchor="ch04-store-in-graph">
+To use a Store inside a graph, pass it at compile time and access it from within your nodes. The store is available through the node&rsquo;s <code>config</code> parameter or can be injected directly.
+</p>
+
+<p class="code-label" data-anchor="ch04-store-graph-label">Accessing the Store from within graph nodes</p>
+<pre data-anchor="ch04-store-graph-code"><span class="kw">from</span> langgraph.store.memory <span class="kw">import</span> InMemoryStore
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, MessagesState, START, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+
+store = <span class="fn">InMemoryStore</span>()
+checkpointer = <span class="fn">MemorySaver</span>()
+
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: MessagesState, config: dict, *, store: InMemoryStore):
+    user_id = config[<span class="str">"configurable"</span>][<span class="str">"user_id"</span>]
+
+    <span class="cm"># Load user profile from the store</span>
+    profile = store.<span class="fn">get</span>((<span class="str">"users"</span>, user_id), <span class="str">"profile"</span>)
+    context = <span class="str">""</span>
+    <span class="kw">if</span> profile:
+        context = <span class="str">f"User preferences: </span>{profile.value}<span class="str">"</span>
+
+    <span class="cm"># Use profile in the prompt</span>
+    messages = state[<span class="str">"messages"</span>]
+    <span class="kw">if</span> context:
+        messages = [{<span class="str">"role"</span>: <span class="str">"system"</span>, <span class="str">"content"</span>: context}] + messages
+
+    response = model.<span class="fn">invoke</span>(messages)
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}
+
+builder = <span class="fn">StateGraph</span>(MessagesState)
+builder.<span class="fn">add_node</span>(<span class="str">"chatbot"</span>, chatbot)
+builder.<span class="fn">add_edge</span>(START, <span class="str">"chatbot"</span>)
+builder.<span class="fn">add_edge</span>(<span class="str">"chatbot"</span>, END)
+
+graph = builder.<span class="fn">compile</span>(checkpointer=checkpointer, store=store)
+
+<span class="cm"># Invoke with both thread_id and user_id</span>
+config = {<span class="str">"configurable"</span>: {
+    <span class="str">"thread_id"</span>: <span class="str">"thread-789"</span>,
+    <span class="str">"user_id"</span>: <span class="str">"alice"</span>,
+}}
+result = graph.<span class="fn">invoke</span>(
+    {<span class="str">"messages"</span>: [{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Hello!"</span>}]},
+    config=config,
+)</pre>
+
+<p data-anchor="ch04-store-pattern">
+This pattern separates concerns cleanly. The checkpointer handles the conversation&rsquo;s message history (short-term, per-thread). The store handles the user&rsquo;s identity and preferences (long-term, cross-thread). A node can read both, using the thread&rsquo;s state for conversational context and the store for persistent knowledge about who it&rsquo;s talking to.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-memory-comparison">Comparing Memory Types</h2>
+
+<p data-anchor="ch04-comparison-intro">
+The distinction between short-term and long-term memory matters for architecture decisions. Here is a side-by-side comparison.
+</p>
+
+<table data-anchor="ch04-memory-table">
+<caption data-anchor="ch04-memory-caption">Short-term vs. long-term memory in LangGraph</caption>
+<thead>
+<tr>
+  <th data-anchor="ch04-th-aspect">Aspect</th>
+  <th data-anchor="ch04-th-shortterm">Short-Term (Checkpointer)</th>
+  <th data-anchor="ch04-th-longterm">Long-Term (Store)</th>
+</tr>
+</thead>
+<tbody>
+<tr data-anchor="ch04-row-scope">
+  <td>Scope</td>
+  <td>Per-thread (one conversation)</td>
+  <td>Cross-thread (all conversations)</td>
+</tr>
+<tr data-anchor="ch04-row-keyed">
+  <td>Keyed by</td>
+  <td><code>thread_id</code></td>
+  <td>Namespace tuple + key</td>
+</tr>
+<tr data-anchor="ch04-row-content">
+  <td>Typical content</td>
+  <td>Message history, intermediate results, current step</td>
+  <td>User profiles, preferences, learned facts</td>
+</tr>
+<tr data-anchor="ch04-row-lifetime">
+  <td>Lifetime</td>
+  <td>Lives as long as the thread is active</td>
+  <td>Lives until explicitly deleted</td>
+</tr>
+<tr data-anchor="ch04-row-access">
+  <td>Access pattern</td>
+  <td>Automatic&mdash;loaded/saved by the checkpointer</td>
+  <td>Explicit&mdash;nodes call <code>store.get()</code> / <code>store.put()</code></td>
+</tr>
+<tr data-anchor="ch04-row-impl">
+  <td>Implementations</td>
+  <td><code>MemorySaver</code>, <code>SqliteSaver</code>, <code>PostgresSaver</code></td>
+  <td><code>InMemoryStore</code>, custom Store backends</td>
+</tr>
+<tr data-anchor="ch04-row-metaphor">
+  <td>Metaphor</td>
+  <td>Notepad on your desk during a meeting</td>
+  <td>Filing cabinet in the office</td>
+</tr>
+</tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-summarization">Managing the Context Window with Summarization</h2>
+
+<p data-anchor="ch04-context-problem">
+There is a practical problem with accumulating messages forever: the context window is finite. A model with a 128K context window sounds generous, but a busy support conversation can reach that limit in a few hundred turns. Before that happens, you need a strategy for compressing older messages without losing the information they carry.
+</p>
+
+<p data-anchor="ch04-summarize-pattern">
+The most common approach is <strong>rolling summarization</strong>. When the message list grows past a threshold, you summarize the older messages into a compact paragraph, keep the most recent messages verbatim, and store the summary alongside the live messages in state.
+</p>
+
+<p class="code-label" data-anchor="ch04-summarize-label">Summarization pattern for long conversations</p>
+<pre data-anchor="ch04-summarize-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">import</span> operator
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage, SystemMessage
+
+model = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+SUMMARY_THRESHOLD = <span class="num">10</span>  <span class="cm"># Summarize when message count exceeds this</span>
+KEEP_RECENT = <span class="num">4</span>          <span class="cm"># Always keep the N most recent messages</span>
+
+<span class="kw">class</span> <span class="ty">ConversationState</span>(TypedDict):
+    messages: Annotated[list, operator.add]
+    summary: str  <span class="cm"># Rolling summary of older messages</span>
+
+
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: ConversationState):
+    <span class="cm">"""Generate a response, including the summary as context."""</span>
+    messages = state[<span class="str">"messages"</span>]
+    summary = state.get(<span class="str">"summary"</span>, <span class="str">""</span>)
+
+    <span class="cm"># Prepend summary as a system message if one exists</span>
+    prompt_messages = []
+    <span class="kw">if</span> summary:
+        prompt_messages.append(
+            <span class="fn">SystemMessage</span>(content=
+                <span class="str">f"Summary of earlier conversation:\n</span>{summary}<span class="str">"</span>
+            )
+        )
+    prompt_messages.extend(messages)
+
+    response = model.<span class="fn">invoke</span>(prompt_messages)
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}
+
+
+<span class="kw">def</span> <span class="fn">maybe_summarize</span>(state: ConversationState):
+    <span class="cm">"""If the message list is too long, summarize older messages."""</span>
+    messages = state[<span class="str">"messages"</span>]
+
+    <span class="kw">if</span> <span class="fn">len</span>(messages) <= SUMMARY_THRESHOLD:
+        <span class="kw">return</span> {}  <span class="cm"># No changes needed</span>
+
+    <span class="cm"># Split: older messages to summarize, recent to keep</span>
+    older = messages[:-KEEP_RECENT]
+    recent = messages[-KEEP_RECENT:]
+
+    <span class="cm"># Build a summarization prompt</span>
+    existing_summary = state.get(<span class="str">"summary"</span>, <span class="str">""</span>)
+    summary_prompt = <span class="str">"Summarize the following conversation."</span>
+    <span class="kw">if</span> existing_summary:
+        summary_prompt += (
+            <span class="str">f"\n\nPrevious summary:\n</span>{existing_summary}<span class="str">"</span>
+            <span class="str">"\n\nExtend the summary with these new messages:"</span>
+        )
+
+    summarize_messages = [
+        <span class="fn">HumanMessage</span>(content=summary_prompt),
+        *older,
+        <span class="fn">HumanMessage</span>(content=<span class="str">"Provide a concise summary."</span>),
+    ]
+    summary_response = model.<span class="fn">invoke</span>(summarize_messages)
+
+    <span class="cm"># Return the trimmed messages and updated summary</span>
+    <span class="cm"># We delete the old messages by returning only recent ones</span>
+    <span class="kw">return</span> {
+        <span class="str">"summary"</span>: summary_response.content,
+        <span class="str">"messages"</span>: recent,  <span class="cm"># This overwrites via a special "delete + add" pattern</span>
+    }
+
+
+<span class="kw">def</span> <span class="fn">should_summarize</span>(state: ConversationState):
+    <span class="cm">"""Route to summarization if messages are getting long."""</span>
+    <span class="kw">if</span> <span class="fn">len</span>(state[<span class="str">"messages"</span>]) > SUMMARY_THRESHOLD:
+        <span class="kw">return</span> <span class="str">"summarize"</span>
+    <span class="kw">return</span> <span class="str">"end"</span>
+
+
+<span class="cm"># Build the graph</span>
+builder = <span class="fn">StateGraph</span>(ConversationState)
+builder.<span class="fn">add_node</span>(<span class="str">"chatbot"</span>, chatbot)
+builder.<span class="fn">add_node</span>(<span class="str">"summarize"</span>, maybe_summarize)
+builder.<span class="fn">add_edge</span>(START, <span class="str">"chatbot"</span>)
+builder.<span class="fn">add_conditional_edges</span>(
+    <span class="str">"chatbot"</span>,
+    should_summarize,
+    {<span class="str">"summarize"</span>: <span class="str">"summarize"</span>, <span class="str">"end"</span>: END},
+)
+builder.<span class="fn">add_edge</span>(<span class="str">"summarize"</span>, END)
+
+checkpointer = <span class="fn">MemorySaver</span>()
+graph = builder.<span class="fn">compile</span>(checkpointer=checkpointer)</pre>
+
+<p data-anchor="ch04-summarize-explain">
+Study the flow. After the chatbot generates its response, a conditional edge checks whether the message list has grown past the threshold. If it has, the <code>maybe_summarize</code> node takes the older messages, asks the model to summarize them, and returns only the recent messages plus the updated summary. On the next turn, the chatbot will see the summary as a system message followed by the recent messages&mdash;a much smaller payload that still captures the essential context.
+</p>
+
+<div class="callout note" data-anchor="ch04-summarize-note">
+  <span class="callout-title">Summarization Tradeoffs</span>
+  <p data-anchor="ch04-summarize-tradeoffs">Summarization introduces a small cost: an extra LLM call per summarization step, and the inherent lossy nature of compression. Specific details (exact numbers, verbatim quotes) may not survive summarization. Tune the threshold and the summarization prompt to balance cost against fidelity for your use case. Some applications keep a separate &ldquo;key facts&rdquo; list alongside the summary to preserve critical details that the summary might gloss over.</p>
+</div>
+
+<h3 data-anchor="ch04-alternative-strategies">Alternative Trimming Strategies</h3>
+
+<p data-anchor="ch04-alternatives-intro">
+Summarization is the most sophisticated approach, but simpler strategies sometimes suffice:
+</p>
+
+<ul data-anchor="ch04-alternatives-list">
+  <li data-anchor="ch04-alt-truncate"><strong>Truncation</strong> &mdash; simply drop messages beyond a fixed window. Fast and predictable, but loses all context from older messages. Works for stateless Q&amp;A where earlier exchanges are rarely relevant.</li>
+  <li data-anchor="ch04-alt-token"><strong>Token-based trimming</strong> &mdash; count tokens instead of messages and trim from the front when the count exceeds a threshold. More precise than message-count trimming because a single message might be very long.</li>
+  <li data-anchor="ch04-alt-hybrid"><strong>Hybrid</strong> &mdash; summarize messages older than <em>N</em> turns, but also drop messages older than <em>M</em> turns entirely. This caps both the summary&rsquo;s staleness and the total token budget.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-external-memory">External Memory: Vector Stores and Databases</h2>
+
+<p data-anchor="ch04-external-intro">
+State and Store handle conversational memory&mdash;what happened in this or previous chats. But many applications need access to <em>knowledge</em> that didn&rsquo;t originate in a conversation: product catalogs, documentation, policy documents, historical records. This is where external memory comes in.
+</p>
+
+<p data-anchor="ch04-external-pattern">
+The pattern is straightforward. A node in your graph queries an external system&mdash;a vector store, a SQL database, an API&mdash;and places the results into state for downstream nodes to use. This is the &ldquo;retrieval&rdquo; in Retrieval-Augmented Generation (RAG), and LangGraph makes it a first-class node in the graph rather than an implicit preprocessing step.
+</p>
+
+<p class="code-label" data-anchor="ch04-external-label">Connecting a vector store as external memory</p>
+<pre data-anchor="ch04-external-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">import</span> operator
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> OpenAIEmbeddings
+<span class="kw">from</span> langchain_chroma <span class="kw">import</span> Chroma
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="cm"># Initialize the vector store</span>
+embeddings = <span class="fn">OpenAIEmbeddings</span>()
+vectorstore = <span class="fn">Chroma</span>(
+    collection_name=<span class="str">"product_docs"</span>,
+    embedding_function=embeddings,
+)
+retriever = vectorstore.<span class="fn">as_retriever</span>(search_kwargs={<span class="str">"k"</span>: <span class="num">3</span>})
+
+<span class="kw">class</span> <span class="ty">RAGState</span>(TypedDict):
+    messages: Annotated[list, operator.add]
+    retrieved_docs: list  <span class="cm"># Overwrites each turn</span>
+    answer: str
+
+<span class="kw">def</span> <span class="fn">retrieve</span>(state: RAGState):
+    <span class="cm">"""Fetch relevant documents based on the latest user query."""</span>
+    last_message = state[<span class="str">"messages"</span>][-<span class="num">1</span>]
+    docs = retriever.<span class="fn">invoke</span>(last_message.content)
+    <span class="kw">return</span> {<span class="str">"retrieved_docs"</span>: docs}
+
+<span class="kw">def</span> <span class="fn">generate</span>(state: RAGState):
+    <span class="cm">"""Generate a response using retrieved documents as context."""</span>
+    docs = state[<span class="str">"retrieved_docs"</span>]
+    context = <span class="str">"\n\n"</span>.<span class="fn">join</span>(doc.page_content <span class="kw">for</span> doc <span class="kw">in</span> docs)
+    messages = state[<span class="str">"messages"</span>]
+
+    prompt = [
+        {<span class="str">"role"</span>: <span class="str">"system"</span>, <span class="str">"content"</span>: <span class="str">f"Use this context:\n</span>{context}<span class="str">"</span>},
+        *messages,
+    ]
+    response = model.<span class="fn">invoke</span>(prompt)
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response], <span class="str">"answer"</span>: response.content}
+
+builder = <span class="fn">StateGraph</span>(RAGState)
+builder.<span class="fn">add_node</span>(<span class="str">"retrieve"</span>, retrieve)
+builder.<span class="fn">add_node</span>(<span class="str">"generate"</span>, generate)
+builder.<span class="fn">add_edge</span>(START, <span class="str">"retrieve"</span>)
+builder.<span class="fn">add_edge</span>(<span class="str">"retrieve"</span>, <span class="str">"generate"</span>)
+builder.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, END)
+
+graph = builder.<span class="fn">compile</span>()</pre>
+
+<p data-anchor="ch04-external-explain">
+Notice that <code>retrieved_docs</code> uses overwrite semantics (no reducer). Each turn replaces the previous set of documents with freshly retrieved ones. The message list, on the other hand, accumulates via <code>operator.add</code>. This is a typical pattern: ephemeral retrieval results overwrite, while the conversation history appends.
+</p>
+
+<h3 data-anchor="ch04-external-databases">SQL Databases and APIs</h3>
+
+<p data-anchor="ch04-databases-explain">
+The same pattern applies to any external data source. A node can query a SQL database, call a REST API, or read from a cache. The key insight is that the node&rsquo;s job is to <em>fetch</em> data and place it into state; downstream nodes then <em>use</em> that data without knowing where it came from. This separation makes it easy to swap data sources without rewiring your graph.
+</p>
+
+<p class="code-label" data-anchor="ch04-sql-label">A database-backed retrieval node</p>
+<pre data-anchor="ch04-sql-code"><span class="kw">import</span> sqlite3
+
+<span class="kw">def</span> <span class="fn">lookup_order</span>(state: dict):
+    <span class="cm">"""Fetch order details from a database."""</span>
+    order_id = state.get(<span class="str">"order_id"</span>)
+    <span class="kw">if not</span> order_id:
+        <span class="kw">return</span> {<span class="str">"order_details"</span>: <span class="kw">None</span>}
+
+    conn = sqlite3.<span class="fn">connect</span>(<span class="str">"orders.db"</span>)
+    cursor = conn.<span class="fn">execute</span>(
+        <span class="str">"SELECT * FROM orders WHERE id = ?"</span>,
+        (order_id,),
+    )
+    row = cursor.<span class="fn">fetchone</span>()
+    conn.<span class="fn">close</span>()
+
+    <span class="kw">return</span> {<span class="str">"order_details"</span>: dict(row) <span class="kw">if</span> row <span class="kw">else</span> <span class="kw">None</span>}</pre>
+
+<div class="callout warn" data-anchor="ch04-external-caution">
+  <span class="callout-title">External Memory Is Not Checkpointed</span>
+  <p data-anchor="ch04-external-caution-body">Data fetched from external sources and placed into state <em>is</em> captured in checkpoints. But the external source itself is not managed by LangGraph. If the underlying database changes between invocations, the checkpointed state and the live database may disagree. Design your nodes to re-fetch when freshness matters, and rely on checkpointed data only when you need historical consistency.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-memory-architecture">Putting It All Together: A Memory Architecture</h2>
+
+<p data-anchor="ch04-architecture-intro">
+A production chatbot typically uses all three layers of memory simultaneously. Here is how they fit together:
+</p>
+
+<ol data-anchor="ch04-architecture-layers">
+  <li data-anchor="ch04-arch-state"><strong>State</strong> (with reducers) carries the live data within each graph invocation: the current message list, tool call results, intermediate computations. Reducers control how node outputs merge.</li>
+  <li data-anchor="ch04-arch-checkpoint"><strong>Checkpointer</strong> persists state between invocations for the same thread. Swap <code>MemorySaver</code> for <code>PostgresSaver</code> when you go to production.</li>
+  <li data-anchor="ch04-arch-store"><strong>Store</strong> holds cross-thread knowledge: user profiles, preferences, organizational facts. Nodes explicitly read from and write to the store.</li>
+  <li data-anchor="ch04-arch-external"><strong>External memory</strong> (vector stores, databases, APIs) provides domain knowledge that didn&rsquo;t originate in conversations. Nodes fetch this data on demand and place it into state.</li>
+  <li data-anchor="ch04-arch-summarization"><strong>Summarization</strong> keeps the message list from growing unbounded. Older messages are compressed into a summary that preserves essential context without consuming the entire context window.</li>
+</ol>
+
+<p data-anchor="ch04-architecture-diagram-intro">
+Each layer operates at a different scope and timescale. State is per-invocation. Checkpoints span invocations within a thread. The store spans threads. External memory spans the entire application. The summarization pattern bridges between state and the context window, ensuring that long-running conversations remain practical.
+</p>
+
+<div class="callout note" data-anchor="ch04-design-callout">
+  <span class="callout-title">Design Principle: Start Simple</span>
+  <p data-anchor="ch04-design-body">You do not need all five layers from day one. Start with state and a checkpointer. Add a store when you have a clear cross-thread use case (like user profiles). Add external memory when you need RAG. Add summarization when conversations actually grow long enough to hit context limits. Each layer is independent and can be added without restructuring the others.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-advanced-patterns">Advanced Patterns</h2>
+
+<h3 data-anchor="ch04-input-output-schemas">Separate Input and Output Schemas</h3>
+
+<p data-anchor="ch04-io-explain">
+Sometimes you want to expose a clean API: the caller sends in a specific shape, and the graph returns a different shape, while internally the state carries additional fields that neither the caller nor the consumer should see. LangGraph supports this with separate input and output schemas.
+</p>
+
+<p class="code-label" data-anchor="ch04-io-label">Input, output, and internal state schemas</p>
+<pre data-anchor="ch04-io-code"><span class="kw">class</span> <span class="ty">InputState</span>(TypedDict):
+    question: str
+
+<span class="kw">class</span> <span class="ty">OutputState</span>(TypedDict):
+    answer: str
+    sources: list[str]
+
+<span class="kw">class</span> <span class="ty">InternalState</span>(InputState, OutputState):
+    <span class="cm"># Fields only used inside the graph</span>
+    retrieved_docs: list
+    search_queries: Annotated[list, operator.add]
+    confidence: float
+
+builder = <span class="fn">StateGraph</span>(
+    InternalState,
+    input=InputState,
+    output=OutputState,
+)</pre>
+
+<p data-anchor="ch04-io-benefit">
+The caller sends <code>{"question": "..."}</code>. The graph returns <code>{"answer": "...", "sources": [...]}</code>. Internally, the graph can use <code>retrieved_docs</code>, <code>search_queries</code>, and <code>confidence</code> freely. This is especially useful when your graph is deployed as a service and you want a stable API that doesn&rsquo;t leak implementation details.
+</p>
+
+<h3 data-anchor="ch04-private-state">Private State Between Nodes</h3>
+
+<p data-anchor="ch04-private-explain">
+A related pattern uses typed node inputs to pass data directly between two nodes without it appearing in the global state. This is useful when an intermediate value is needed by exactly one downstream node and cluttering global state with it would be confusing. Consult the LangGraph documentation for the <code>Command</code> pattern, which enables this kind of targeted state passing.
+</p>
+
+<h3 data-anchor="ch04-message-trimming">Token-Aware Message Trimming</h3>
+
+<p data-anchor="ch04-trimming-explain">
+LangChain provides a <code>trim_messages</code> utility that can be used inside a node to cap the token count before calling the model. This is lighter-weight than full summarization and can be combined with it: trim to stay within the context window, but also summarize periodically so that the trimmed messages don&rsquo;t lose too much context.
+</p>
+
+<p class="code-label" data-anchor="ch04-trimming-label">Token-aware trimming before model calls</p>
+<pre data-anchor="ch04-trimming-code"><span class="kw">from</span> langchain_core.messages <span class="kw">import</span> trim_messages
+
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: ConversationState):
+    messages = state[<span class="str">"messages"</span>]
+
+    <span class="cm"># Trim to fit within the model's context window</span>
+    trimmed = <span class="fn">trim_messages</span>(
+        messages,
+        max_tokens=<span class="num">4000</span>,
+        strategy=<span class="str">"last"</span>,  <span class="cm"># Keep the most recent messages</span>
+        token_counter=model,
+    )
+
+    response = model.<span class="fn">invoke</span>(trimmed)
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [response]}</pre>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-common-mistakes">Common Mistakes and How to Avoid Them</h2>
+
+<p data-anchor="ch04-mistakes-intro">
+Memory in LangGraph is conceptually simple but has a few sharp edges that are worth calling out explicitly.
+</p>
+
+<ul data-anchor="ch04-mistakes-list">
+  <li data-anchor="ch04-mistake-reducer"><strong>Forgetting the reducer on a message list.</strong> Without <code>Annotated[list, operator.add]</code>, each node&rsquo;s messages replace the previous node&rsquo;s messages. You end up with only the last node&rsquo;s output. Always annotate accumulating fields.</li>
+  <li data-anchor="ch04-mistake-thread"><strong>Reusing thread IDs across unrelated conversations.</strong> If two different users share a <code>thread_id</code>, they share a conversation. Generate unique thread IDs per conversation, typically by combining a user identifier with a session or conversation identifier.</li>
+  <li data-anchor="ch04-mistake-memorysaver"><strong>Using MemorySaver in production.</strong> It lives in-process memory. A server restart, a deployment, or a worker crash wipes all checkpoints. Switch to <code>SqliteSaver</code> or <code>PostgresSaver</code> before deploying.</li>
+  <li data-anchor="ch04-mistake-state-size"><strong>Storing large objects in state.</strong> Everything in state gets serialized into checkpoints. Storing entire documents or large binary data in state inflates checkpoint size and slows down serialization. Keep state lean; store bulky data externally and reference it by ID.</li>
+  <li data-anchor="ch04-mistake-store-scope"><strong>Confusing state and store.</strong> State is for this conversation. Store is for cross-conversation facts. Putting user preferences in state means they&rsquo;re lost when the thread ends. Putting conversation-specific data in the store means it leaks into other threads.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch04-recap">What We Built</h2>
+
+<p data-anchor="ch04-recap-body">
+This chapter covered the entire memory stack in LangGraph. You learned to define state schemas with <code>TypedDict</code> or Pydantic, control how fields merge with reducers, persist conversations across invocations using checkpointers, share knowledge across threads with the Store, manage growing context windows through summarization, and connect external data sources as graph nodes. The central insight is that memory in LangGraph is not a single mechanism but a set of complementary layers, each operating at a different scope. State carries data through the current invocation. Checkpoints carry it across invocations. The Store carries it across threads. External memory reaches beyond conversations entirely.
+</p>
+
+<p data-anchor="ch04-next">
+With state and memory in place, your graphs can hold real conversations and remember what matters. In the next chapter, we turn to <strong>control flow patterns</strong>&mdash;conditional edges, branching, parallel execution, and the routing logic that lets a graph make decisions about what to do next.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch04-nav">
+  <a rel="prev" href="03-building-your-first-graph.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-control-flow-patterns.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>

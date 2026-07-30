@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Multi-Agent Systems — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch06-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch06-head">
+  <span class="chapter-num">06</span>
+  <span class="chapter-kicker">Collaboration at scale</span>
+  <h1 data-anchor="ch06-title">Multi-Agent Systems</h1>
+</header>
+
+<p class="lede" data-anchor="ch06-lede">
+A single agent can only carry so much weight. Ask one LLM to research a topic, draft an article,
+and then critique its own writing, and you will watch it lose the thread&mdash;context bloats,
+instructions blur, quality drops. The solution is the same one that works in any workshop:
+give each person a defined job and a clear way to hand work to the next station. In LangGraph
+that means composing multiple agents&mdash;each with its own graph, state, and tools&mdash;into a
+coordinated system. This chapter shows you how to nest graphs inside graphs, wire agents together
+with well-known collaboration patterns, fan work out in parallel, and bring it all together in a
+practical research-assistant that researches, writes, and reviews.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-subgraphs">Subgraphs: Nesting Graphs Inside Graphs</h2>
+
+<p data-anchor="ch06-subgraphs-intro">
+You already know how to build a <code>StateGraph</code>, compile it, and invoke it. A subgraph is
+nothing more than taking one of those compiled graphs and using it as a node inside a larger
+graph. The outer graph treats the subgraph the same way it treats any function node&mdash;it passes
+state in and gets state back&mdash;but inside, the subgraph runs its own full cycle of nodes and
+edges, oblivious to the world outside.
+</p>
+
+<p data-anchor="ch06-subgraphs-why">
+Why bother? Three reasons come up over and over. First, <strong>encapsulation</strong>: the subgraph
+owns its own state schema, so you can develop and test it independently. Second,
+<strong>reuse</strong>: the same subgraph can appear in multiple parent graphs without duplication.
+Third, <strong>clarity</strong>: a node named <code>research_agent</code> is easier to reason about
+than twenty nodes inlined into the parent.
+</p>
+
+<h3 data-anchor="ch06-compiled-as-node">Compiled Graphs as Nodes</h3>
+
+<p data-anchor="ch06-compiled-as-node-intro">
+The mechanics are straightforward. You compile a <code>StateGraph</code> into a
+<code>CompiledGraph</code>, then call <code>add_node</code> on the parent graph with that compiled
+object. LangGraph handles invocation, state marshalling, and error propagation automatically.
+</p>
+
+<p class="code-label" data-anchor="ch06-subgraph-example-label">A subgraph as a node in a parent graph</p>
+<pre data-anchor="ch06-subgraph-example"><code><span class="kw">from</span> typing <span class="kw">import</span> TypedDict
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="cm"># ── Child graph: a small summariser ──</span>
+
+<span class="kw">class</span> <span class="ty">SummaryState</span>(TypedDict):
+    text: <span class="ty">str</span>
+    summary: <span class="ty">str</span>
+
+<span class="kw">def</span> <span class="fn">summarise</span>(state: <span class="ty">SummaryState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># In practice, call an LLM here</span>
+    <span class="kw">return</span> {<span class="str">"summary"</span>: state[<span class="str">"text"</span>][:<span class="num">80</span>] + <span class="str">"..."</span>}
+
+summary_graph = StateGraph(<span class="ty">SummaryState</span>)
+summary_graph.<span class="fn">add_node</span>(<span class="str">"summarise"</span>, summarise)
+summary_graph.<span class="fn">add_edge</span>(START, <span class="str">"summarise"</span>)
+summary_graph.<span class="fn">add_edge</span>(<span class="str">"summarise"</span>, END)
+compiled_summary = summary_graph.<span class="fn">compile</span>()
+
+<span class="cm"># ── Parent graph ──</span>
+
+<span class="kw">class</span> <span class="ty">ParentState</span>(TypedDict):
+    text: <span class="ty">str</span>
+    summary: <span class="ty">str</span>
+    final_output: <span class="ty">str</span>
+
+<span class="kw">def</span> <span class="fn">format_output</span>(state: <span class="ty">ParentState</span>) -> <span class="ty">dict</span>:
+    <span class="kw">return</span> {<span class="str">"final_output"</span>: <span class="str">f"Summary: </span>{state[<span class="str">'summary'</span>]}<span class="str">"</span>}
+
+parent_graph = StateGraph(<span class="ty">ParentState</span>)
+parent_graph.<span class="fn">add_node</span>(<span class="str">"summariser"</span>, compiled_summary)  <span class="cm"># compiled graph as a node</span>
+parent_graph.<span class="fn">add_node</span>(<span class="str">"formatter"</span>, format_output)
+parent_graph.<span class="fn">add_edge</span>(START, <span class="str">"summariser"</span>)
+parent_graph.<span class="fn">add_edge</span>(<span class="str">"summariser"</span>, <span class="str">"formatter"</span>)
+parent_graph.<span class="fn">add_edge</span>(<span class="str">"formatter"</span>, END)
+
+app = parent_graph.<span class="fn">compile</span>()
+
+result = app.<span class="fn">invoke</span>({<span class="str">"text"</span>: <span class="str">"LangGraph lets you build stateful agents..."</span>})
+<span class="fn">print</span>(result[<span class="str">"final_output"</span>])</code></pre>
+
+<p data-anchor="ch06-compiled-as-node-notice">
+Notice two things. The parent graph and the child graph share some field names
+(<code>text</code> and <code>summary</code>), which lets LangGraph automatically map state
+between them. And the compiled graph is passed directly to <code>add_node</code>&mdash;no wrapper
+function needed.
+</p>
+
+<h3 data-anchor="ch06-state-mapping">State Mapping Between Parent and Child</h3>
+
+<p data-anchor="ch06-state-mapping-intro">
+When the parent and child state schemas share field names, LangGraph passes matching fields
+into the subgraph and merges results back automatically. But what if the schemas diverge?
+You have two options. You can write a thin wrapper function that transforms the parent&rsquo;s
+state into the shape the child expects, invokes the compiled subgraph manually, and maps
+the result back. Or you can align your schemas deliberately&mdash;which is almost always the
+better choice, because explicit shared contracts make your system easier to debug.
+</p>
+
+<p data-anchor="ch06-state-mapping-detail">
+When LangGraph invokes a subgraph node, it extracts the fields from the parent state that
+match the child&rsquo;s schema by name and type. After the subgraph finishes, any fields in
+its output that also exist in the parent schema are written back. Fields that exist only in
+the child stay private&mdash;the parent never sees them.
+</p>
+
+<div class="callout key" data-anchor="ch06-callout-isolation">
+  <span class="callout-title">State isolation in subgraphs</span>
+  <p data-anchor="ch06-callout-isolation-text">
+    Each subgraph has its own state schema, and fields that do not appear in the parent&rsquo;s
+    schema are invisible to the parent. This is not a bug&mdash;it is the mechanism that gives
+    you encapsulation. A research agent can track its own <code>search_queries</code> list
+    internally without polluting the parent&rsquo;s state. If you ever find yourself dumping
+    every field into a giant shared schema, step back: you are losing the benefit of subgraphs.
+    Keep shared state narrow and intentional.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-collab-patterns">Agent Collaboration Patterns</h2>
+
+<p data-anchor="ch06-collab-patterns-intro">
+Once you can nest agents as subgraphs, the question becomes: how should they talk to each other?
+Three patterns appear repeatedly in production systems, and each makes a different trade-off
+between control and flexibility.
+</p>
+
+<h3 data-anchor="ch06-supervisor-pattern">Supervisor Pattern</h3>
+
+<p data-anchor="ch06-supervisor-pattern-intro">
+The supervisor pattern is the most common starting point. One agent&mdash;the supervisor&mdash;receives
+the user&rsquo;s request and decides which specialist agent should handle it. The supervisor does not
+do the work itself; it routes. Think of a project manager who assigns tasks to the team and checks
+the results.
+</p>
+
+<p data-anchor="ch06-supervisor-pattern-mechanism">
+In LangGraph the supervisor is typically an LLM node that uses tool calling to delegate. Each
+specialist is exposed as a &ldquo;tool&rdquo; the supervisor can invoke. When the supervisor calls
+the <code>research</code> tool, the graph routes to the research subgraph. When it calls the
+<code>write</code> tool, the graph routes to the writer subgraph. The supervisor inspects the
+returned state and decides whether to delegate again or finish.
+</p>
+
+<figure class="diagram-fig" data-anchor="ch06-supervisor-diagram">
+<svg class="diagram" viewBox="0 0 600 340" aria-label="Supervisor architecture: supervisor node delegates to specialist agents" xmlns="http://www.w3.org/2000/svg">
+  <title>Supervisor delegates to specialist agents</title>
+  <defs>
+    <marker id="arr06" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--accent, #e07020)"/>
+    </marker>
+    <marker id="arr06s" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink-soft, #888)"/>
+    </marker>
+  </defs>
+
+  <!-- User -->
+  <rect class="box" x="240" y="10" width="120" height="40" rx="6" stroke="var(--ink, #333)" fill="none" stroke-width="1.5"/>
+  <text class="lbl" x="300" y="35" text-anchor="middle" fill="var(--ink, #333)" font-size="14">User</text>
+
+  <!-- Arrow User -> Supervisor -->
+  <line class="flow-hot" x1="300" y1="50" x2="300" y2="90" stroke="var(--accent, #e07020)" stroke-width="1.5" marker-end="url(#arr06)"/>
+
+  <!-- Supervisor -->
+  <rect class="box-hot" x="210" y="95" width="180" height="48" rx="8" stroke="var(--accent, #e07020)" fill="none" stroke-width="2"/>
+  <text class="lbl-hot" x="300" y="124" text-anchor="middle" fill="var(--accent, #e07020)" font-size="15" font-weight="bold">Supervisor</text>
+
+  <!-- Arrows Supervisor -> Specialists -->
+  <line class="flow-hot" x1="240" y1="143" x2="100" y2="200" stroke="var(--accent, #e07020)" stroke-width="1.5" marker-end="url(#arr06)"/>
+  <line class="flow-hot" x1="300" y1="143" x2="300" y2="200" stroke="var(--accent, #e07020)" stroke-width="1.5" marker-end="url(#arr06)"/>
+  <line class="flow-hot" x1="360" y1="143" x2="500" y2="200" stroke="var(--accent, #e07020)" stroke-width="1.5" marker-end="url(#arr06)"/>
+
+  <!-- Researcher -->
+  <rect class="box-alt" x="30" y="205" width="140" height="44" rx="6" stroke="var(--ink-soft, #888)" fill="none" stroke-width="1.5"/>
+  <text class="lbl" x="100" y="232" text-anchor="middle" fill="var(--ink, #333)" font-size="13">Researcher</text>
+
+  <!-- Writer -->
+  <rect class="box-alt" x="230" y="205" width="140" height="44" rx="6" stroke="var(--ink-soft, #888)" fill="none" stroke-width="1.5"/>
+  <text class="lbl" x="300" y="232" text-anchor="middle" fill="var(--ink, #333)" font-size="13">Writer</text>
+
+  <!-- Reviewer -->
+  <rect class="box-alt" x="430" y="205" width="140" height="44" rx="6" stroke="var(--ink-soft, #888)" fill="none" stroke-width="1.5"/>
+  <text class="lbl" x="500" y="232" text-anchor="middle" fill="var(--ink, #333)" font-size="13">Reviewer</text>
+
+  <!-- Return arrows (dashed) -->
+  <line class="flow-dash" x1="100" y1="249" x2="100" y2="285" stroke="var(--ink-soft, #888)" stroke-width="1" stroke-dasharray="4,3"/>
+  <line class="flow-dash" x1="300" y1="249" x2="300" y2="285" stroke="var(--ink-soft, #888)" stroke-width="1" stroke-dasharray="4,3"/>
+  <line class="flow-dash" x1="500" y1="249" x2="500" y2="285" stroke="var(--ink-soft, #888)" stroke-width="1" stroke-dasharray="4,3"/>
+
+  <!-- Tools row -->
+  <rect class="box" x="38" y="285" width="124" height="32" rx="4" stroke="var(--rule, #ccc)" fill="none" stroke-width="1"/>
+  <text class="lbl" x="100" y="306" text-anchor="middle" fill="var(--ink-soft, #888)" font-size="11">search, fetch</text>
+
+  <rect class="box" x="238" y="285" width="124" height="32" rx="4" stroke="var(--rule, #ccc)" fill="none" stroke-width="1"/>
+  <text class="lbl" x="300" y="306" text-anchor="middle" fill="var(--ink-soft, #888)" font-size="11">draft, edit</text>
+
+  <rect class="box" x="438" y="285" width="124" height="32" rx="4" stroke="var(--rule, #ccc)" fill="none" stroke-width="1"/>
+  <text class="lbl" x="500" y="306" text-anchor="middle" fill="var(--ink-soft, #888)" font-size="11">critique, score</text>
+</svg>
+<figcaption data-anchor="ch06-supervisor-diagram-caption">The supervisor receives every request and routes to the appropriate specialist. Each specialist has its own tools and returns results to the supervisor for the next decision.</figcaption>
+</figure>
+
+<p class="code-label" data-anchor="ch06-supervisor-code-label">Supervisor pattern with tool-based delegation</p>
+<pre data-anchor="ch06-supervisor-code"><code><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated, Literal
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+<span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+<span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage
+
+llm = ChatOpenAI(<span class="str">"gpt-4o-mini"</span>)
+
+<span class="cm"># ── Specialist tools ──</span>
+
+@tool
+<span class="kw">def</span> <span class="fn">web_search</span>(query: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Search the web for information."""</span>
+    <span class="kw">return</span> <span class="str">f"Results for: {query}..."</span>
+
+@tool
+<span class="kw">def</span> <span class="fn">write_section</span>(topic: <span class="ty">str</span>, notes: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Write a section given a topic and research notes."""</span>
+    <span class="kw">return</span> <span class="str">f"Draft section on {topic}..."</span>
+
+<span class="cm"># ── Build specialist agents as compiled subgraphs ──</span>
+
+researcher = create_react_agent(llm, tools=[web_search])
+writer = create_react_agent(llm, tools=[write_section])
+
+<span class="cm"># ── Supervisor state ──</span>
+
+<span class="kw">class</span> <span class="ty">SupervisorState</span>(TypedDict):
+    messages: Annotated[<span class="ty">list</span>, add_messages]
+    next_agent: <span class="ty">str</span>
+
+<span class="cm"># ── Supervisor node: decides who works next ──</span>
+
+<span class="kw">def</span> <span class="fn">supervisor</span>(state: <span class="ty">SupervisorState</span>) -> <span class="ty">dict</span>:
+    system_prompt = (
+        <span class="str">"You are a supervisor. Given the conversation, decide "</span>
+        <span class="str">"which agent should act next: 'researcher', 'writer', "</span>
+        <span class="str">"or 'FINISH' if the task is complete."</span>
+    )
+    response = llm.<span class="fn">invoke</span>([
+        {<span class="str">"role"</span>: <span class="str">"system"</span>, <span class="str">"content"</span>: system_prompt},
+        *state[<span class="str">"messages"</span>]
+    ])
+    <span class="cm"># Parse the decision from the LLM's response</span>
+    content = response.content.strip().lower()
+    <span class="kw">if</span> <span class="str">"researcher"</span> <span class="kw">in</span> content:
+        <span class="kw">return</span> {<span class="str">"next_agent"</span>: <span class="str">"researcher"</span>}
+    <span class="kw">elif</span> <span class="str">"writer"</span> <span class="kw">in</span> content:
+        <span class="kw">return</span> {<span class="str">"next_agent"</span>: <span class="str">"writer"</span>}
+    <span class="kw">else</span>:
+        <span class="kw">return</span> {<span class="str">"next_agent"</span>: <span class="str">"FINISH"</span>}
+
+<span class="cm"># ── Routing function ──</span>
+
+<span class="kw">def</span> <span class="fn">route_next</span>(state: <span class="ty">SupervisorState</span>) -> Literal[<span class="str">"researcher"</span>, <span class="str">"writer"</span>, <span class="str">"__end__"</span>]:
+    <span class="kw">if</span> state[<span class="str">"next_agent"</span>] == <span class="str">"FINISH"</span>:
+        <span class="kw">return</span> <span class="str">"__end__"</span>
+    <span class="kw">return</span> state[<span class="str">"next_agent"</span>]
+
+<span class="cm"># ── Assemble the graph ──</span>
+
+graph = StateGraph(<span class="ty">SupervisorState</span>)
+graph.<span class="fn">add_node</span>(<span class="str">"supervisor"</span>, supervisor)
+graph.<span class="fn">add_node</span>(<span class="str">"researcher"</span>, researcher)
+graph.<span class="fn">add_node</span>(<span class="str">"writer"</span>, writer)
+
+graph.<span class="fn">add_edge</span>(START, <span class="str">"supervisor"</span>)
+graph.<span class="fn">add_conditional_edges</span>(<span class="str">"supervisor"</span>, route_next)
+graph.<span class="fn">add_edge</span>(<span class="str">"researcher"</span>, <span class="str">"supervisor"</span>)  <span class="cm"># report back</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"writer"</span>, <span class="str">"supervisor"</span>)      <span class="cm"># report back</span>
+
+app = graph.<span class="fn">compile</span>()</code></pre>
+
+<p data-anchor="ch06-supervisor-pattern-walkthrough">
+Walk through the flow. The user sends a message; the supervisor node reads it and decides
+<code>"researcher"</code> should go first. The conditional edge routes to the researcher subgraph,
+which runs its own ReAct loop&mdash;calling <code>web_search</code> as needed. When the researcher
+finishes, the edge leads back to the supervisor. The supervisor sees the research results in
+the message history and now routes to the writer. The writer drafts content, returns to the
+supervisor, and this time the supervisor decides <code>"FINISH"</code>. The conditional edge
+maps that to <code>END</code>, and the graph completes.
+</p>
+
+<h3 data-anchor="ch06-peer-pattern">Peer-to-Peer Pattern</h3>
+
+<p data-anchor="ch06-peer-pattern-intro">
+In the peer-to-peer pattern there is no central coordinator. Agents communicate through
+shared state&mdash;one agent writes its output into a field that the next agent reads. This works
+well when you have a fixed pipeline: agent A always passes to agent B, who passes to agent C.
+</p>
+
+<p data-anchor="ch06-peer-pattern-detail">
+You implement this with straightforward edges. Each agent node reads from and writes to the
+shared state. There is no routing logic because the sequence is predetermined. The advantage
+is simplicity; the disadvantage is rigidity. If agent B discovers that agent A&rsquo;s output is
+insufficient, it has no mechanism to ask for a redo unless you build one.
+</p>
+
+<p data-anchor="ch06-peer-pattern-when">
+Use peer-to-peer when your workflow is a conveyor belt: each station does its job and
+passes the workpiece forward. Use the supervisor pattern when decisions about routing
+need to happen at runtime.
+</p>
+
+<h3 data-anchor="ch06-hierarchical-pattern">Hierarchical Pattern</h3>
+
+<p data-anchor="ch06-hierarchical-pattern-intro">
+The hierarchical pattern extends the supervisor idea to multiple levels. A top-level supervisor
+delegates to mid-level supervisors, each of whom manages their own specialists. Think of a
+large organisation: the CEO assigns a project to a department head, who assigns sub-tasks
+to individual contributors.
+</p>
+
+<p data-anchor="ch06-hierarchical-pattern-impl">
+In LangGraph this is straightforward because subgraphs nest. A mid-level supervisor is itself
+a compiled graph that contains specialist nodes. The top-level supervisor adds these mid-level
+graphs as nodes. Each level makes routing decisions independently and maintains its own state.
+</p>
+
+<p data-anchor="ch06-hierarchical-pattern-tradeoff">
+The trade-off is latency and token cost. Every supervisory decision is an LLM call.
+Two layers of supervision means at least two extra LLM invocations per task. Use hierarchical
+patterns when your problem genuinely has that many dimensions&mdash;for example, a system that
+handles both customer support and internal operations, where each domain has its own set of
+specialists.
+</p>
+
+<h3 data-anchor="ch06-comparison-table-intro">Comparing the Patterns</h3>
+
+<table data-anchor="ch06-comparison-table">
+<caption data-anchor="ch06-comparison-table-caption">Multi-agent architecture comparison</caption>
+<thead data-anchor="ch06-comparison-table-head">
+<tr>
+  <th data-anchor="ch06-th-dimension">Dimension</th>
+  <th data-anchor="ch06-th-supervisor">Supervisor</th>
+  <th data-anchor="ch06-th-peer">Peer-to-Peer</th>
+  <th data-anchor="ch06-th-hierarchical">Hierarchical</th>
+</tr>
+</thead>
+<tbody data-anchor="ch06-comparison-table-body">
+<tr data-anchor="ch06-tr-routing">
+  <td>Routing</td>
+  <td>Central LLM decides at each step</td>
+  <td>Fixed edges, no runtime routing</td>
+  <td>Multi-level LLM decisions</td>
+</tr>
+<tr data-anchor="ch06-tr-flexibility">
+  <td>Flexibility</td>
+  <td>High&mdash;agents invoked on demand</td>
+  <td>Low&mdash;pipeline is static</td>
+  <td>Very high&mdash;nested delegation</td>
+</tr>
+<tr data-anchor="ch06-tr-complexity">
+  <td>Complexity</td>
+  <td>Moderate</td>
+  <td>Low</td>
+  <td>High</td>
+</tr>
+<tr data-anchor="ch06-tr-latency">
+  <td>Latency overhead</td>
+  <td>One supervisor call per routing step</td>
+  <td>No overhead</td>
+  <td>Multiple supervisor calls per level</td>
+</tr>
+<tr data-anchor="ch06-tr-best-for">
+  <td>Best for</td>
+  <td>Dynamic task decomposition</td>
+  <td>Sequential pipelines with known stages</td>
+  <td>Complex domains with sub-domains</td>
+</tr>
+<tr data-anchor="ch06-tr-debugging">
+  <td>Debugging</td>
+  <td>Trace the supervisor&rsquo;s decisions</td>
+  <td>Straightforward linear trace</td>
+  <td>Requires tracing at each level</td>
+</tr>
+</tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-parallel">Map-Reduce and Parallelisation</h2>
+
+<p data-anchor="ch06-parallel-intro">
+So far every pattern has been sequential: one agent works, then the next. But many real tasks
+are embarrassingly parallel. If you need to research five sub-topics, there is no reason to
+research them one at a time. LangGraph gives you the <code>Send()</code> API for exactly this:
+dynamic fan-out to parallel node executions, followed by aggregation.
+</p>
+
+<h3 data-anchor="ch06-send-api">The Send() API</h3>
+
+<p data-anchor="ch06-send-api-intro">
+<code>Send</code> lives in <code>langgraph.types</code>. You use it inside a conditional-edge
+function: instead of returning a string (the name of the next node), you return a list of
+<code>Send</code> objects. Each <code>Send</code> specifies a target node and a state update to
+pass to that node. LangGraph launches all of them in parallel, waits for every branch to
+complete, and then merges the results back into the parent state.
+</p>
+
+<p data-anchor="ch06-send-api-signature">
+The signature is simple: <code>Send(node_name, state_update)</code>. The <code>node_name</code>
+is a string naming a node in your graph. The <code>state_update</code> is a dictionary of values
+that will be the input state for that particular branch. Each branch gets its own copy of the
+state, so branches do not interfere with each other.
+</p>
+
+<p class="code-label" data-anchor="ch06-send-example-label">Using Send() for parallel fan-out</p>
+<pre data-anchor="ch06-send-example"><code><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.types <span class="kw">import</span> Send
+<span class="kw">import</span> operator
+
+<span class="cm"># ── State: topics to research and collected results ──</span>
+
+<span class="kw">class</span> <span class="ty">ResearchState</span>(TypedDict):
+    topics: <span class="ty">list</span>[<span class="ty">str</span>]
+    results: Annotated[<span class="ty">list</span>[<span class="ty">str</span>], operator.add]  <span class="cm"># merge via concatenation</span>
+
+<span class="cm"># ── Node: research a single topic ──</span>
+
+<span class="kw">def</span> <span class="fn">research_topic</span>(state: <span class="ty">ResearchState</span>) -> <span class="ty">dict</span>:
+    topic = state[<span class="str">"topics"</span>][<span class="num">0</span>]  <span class="cm"># each branch gets exactly one topic</span>
+    <span class="cm"># In practice, call an LLM or search API here</span>
+    finding = <span class="str">f"Findings on {topic}: ..."</span>
+    <span class="kw">return</span> {<span class="str">"results"</span>: [finding]}
+
+<span class="cm"># ── Node: aggregate all results ──</span>
+
+<span class="kw">def</span> <span class="fn">aggregate</span>(state: <span class="ty">ResearchState</span>) -> <span class="ty">dict</span>:
+    combined = <span class="str">"\n\n"</span>.<span class="fn">join</span>(state[<span class="str">"results"</span>])
+    <span class="kw">return</span> {<span class="str">"results"</span>: [<span class="str">f"=== Aggregated Report ===\n{combined}"</span>]}
+
+<span class="cm"># ── Fan-out function: returns a list of Send() objects ──</span>
+
+<span class="kw">def</span> <span class="fn">fan_out</span>(state: <span class="ty">ResearchState</span>) -> <span class="ty">list</span>[Send]:
+    <span class="kw">return</span> [
+        Send(<span class="str">"research_topic"</span>, {<span class="str">"topics"</span>: [topic], <span class="str">"results"</span>: []})
+        <span class="kw">for</span> topic <span class="kw">in</span> state[<span class="str">"topics"</span>]
+    ]
+
+<span class="cm"># ── Build the graph ──</span>
+
+graph = StateGraph(<span class="ty">ResearchState</span>)
+graph.<span class="fn">add_node</span>(<span class="str">"research_topic"</span>, research_topic)
+graph.<span class="fn">add_node</span>(<span class="str">"aggregate"</span>, aggregate)
+
+graph.<span class="fn">add_conditional_edges</span>(START, fan_out)     <span class="cm"># dynamic fan-out</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"research_topic"</span>, <span class="str">"aggregate"</span>)   <span class="cm"># all branches converge</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"aggregate"</span>, END)
+
+app = graph.<span class="fn">compile</span>()
+
+result = app.<span class="fn">invoke</span>({
+    <span class="str">"topics"</span>: [<span class="str">"quantum computing"</span>, <span class="str">"gene editing"</span>, <span class="str">"fusion energy"</span>],
+    <span class="str">"results"</span>: []
+})
+<span class="fn">print</span>(result[<span class="str">"results"</span>])</code></pre>
+
+<p data-anchor="ch06-send-walkthrough">
+Here is what happens when you invoke the graph. The <code>fan_out</code> function inspects the
+list of topics and creates one <code>Send</code> per topic. LangGraph launches three parallel
+instances of <code>research_topic</code>, each with its own single-element topics list. When
+all three finish, their results are merged using <code>operator.add</code> (list concatenation)
+into the parent state. The <code>aggregate</code> node then sees all three findings and combines
+them into a final report.
+</p>
+
+<h3 data-anchor="ch06-map-reduce">The Map-Reduce Pattern</h3>
+
+<p data-anchor="ch06-map-reduce-intro">
+The code above is a textbook map-reduce. The &ldquo;map&rdquo; phase fans out to parallel
+workers. The &ldquo;reduce&rdquo; phase aggregates their results. You can chain multiple
+map-reduce stages: the output of one aggregation becomes the input for the next fan-out.
+</p>
+
+<p data-anchor="ch06-map-reduce-tips">
+A few practical tips. First, keep the state passed to each branch small&mdash;you are serialising
+it for every branch, and large states multiply memory usage. Second, use <code>Annotated</code>
+with a reducer function (like <code>operator.add</code>) on any field that multiple branches
+will write to; without a reducer, branches will overwrite each other. Third, think about error
+handling: if one branch fails, the default behaviour is to fail the entire graph. In production
+you may want to catch exceptions inside the node and return a sentinel value instead.
+</p>
+
+<div class="callout note" data-anchor="ch06-callout-send-dynamic">
+  <span class="callout-title">Send() is dynamic</span>
+  <p data-anchor="ch06-callout-send-dynamic-text">
+    Unlike static edges, <code>Send()</code> determines the number of parallel branches at
+    runtime based on the current state. If the user provides ten topics, ten branches launch.
+    If they provide one, only one runs. This makes it ideal for workloads where the fan-out
+    factor is not known at graph-definition time.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-research-assistant">Building a Research Assistant Agent</h2>
+
+<p data-anchor="ch06-research-assistant-intro">
+Let us bring everything together. We will build a research assistant that takes a question,
+researches it, writes a structured answer, and reviews the answer for quality. Three specialist
+agents, one supervisor to coordinate them, and a fan-out step for parallel research.
+</p>
+
+<h3 data-anchor="ch06-ra-architecture">Architecture Overview</h3>
+
+<p data-anchor="ch06-ra-architecture-detail">
+The system has four logical components:
+</p>
+
+<ol data-anchor="ch06-ra-architecture-list">
+  <li data-anchor="ch06-ra-arch-supervisor"><strong>Supervisor</strong> &mdash; receives the user&rsquo;s question, decomposes it into sub-questions, routes to specialists, and decides when the output is good enough.</li>
+  <li data-anchor="ch06-ra-arch-researcher"><strong>Researcher</strong> &mdash; takes a list of sub-questions, fans out in parallel to gather information on each, and aggregates the findings.</li>
+  <li data-anchor="ch06-ra-arch-writer"><strong>Writer</strong> &mdash; takes the research findings and produces a structured, readable answer.</li>
+  <li data-anchor="ch06-ra-arch-reviewer"><strong>Reviewer</strong> &mdash; reads the draft, scores it on completeness and accuracy, and either approves or sends feedback that triggers another revision cycle.</li>
+</ol>
+
+<h3 data-anchor="ch06-ra-state">Defining the State</h3>
+
+<p data-anchor="ch06-ra-state-intro">
+We need a state schema that every component can work with. We will keep it lean: the original
+question, a list of sub-questions, research findings, the current draft, and a review verdict.
+</p>
+
+<p class="code-label" data-anchor="ch06-ra-state-label">State schema for the research assistant</p>
+<pre data-anchor="ch06-ra-state-code"><code><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated, Literal
+<span class="kw">import</span> operator
+
+<span class="kw">class</span> <span class="ty">ResearchAssistantState</span>(TypedDict):
+    question: <span class="ty">str</span>                                      <span class="cm"># original user question</span>
+    sub_questions: <span class="ty">list</span>[<span class="ty">str</span>]                             <span class="cm"># decomposed sub-questions</span>
+    findings: Annotated[<span class="ty">list</span>[<span class="ty">str</span>], operator.add]       <span class="cm"># parallel-merge field</span>
+    draft: <span class="ty">str</span>                                          <span class="cm"># current written draft</span>
+    review: <span class="ty">str</span>                                         <span class="cm"># reviewer feedback</span>
+    status: <span class="ty">str</span>                                         <span class="cm"># "research" | "write" | "review" | "done"</span>
+    revision_count: <span class="ty">int</span>                                  <span class="cm"># how many times we have revised</span></code></pre>
+
+<p data-anchor="ch06-ra-state-note">
+Notice that <code>findings</code> uses an <code>operator.add</code> reducer. When the researcher
+fans out to parallel sub-question nodes, each branch appends its findings to the list. Without
+the reducer, the last branch to finish would overwrite results from earlier branches.
+</p>
+
+<h3 data-anchor="ch06-ra-specialist-agents">Building the Specialist Agents</h3>
+
+<p data-anchor="ch06-ra-researcher-intro">
+The researcher agent receives a single sub-question and returns findings. In production you
+would wire this to a search API, a retrieval-augmented generation pipeline, or a database
+query tool. Here we use a simplified version that shows the structure.
+</p>
+
+<p class="code-label" data-anchor="ch06-ra-researcher-label">Researcher node with parallel fan-out</p>
+<pre data-anchor="ch06-ra-researcher-code"><code><span class="kw">from</span> langgraph.types <span class="kw">import</span> Send
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+
+llm = ChatOpenAI(<span class="str">"gpt-4o-mini"</span>)
+
+<span class="kw">def</span> <span class="fn">decompose</span>(state: <span class="ty">ResearchAssistantState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Supervisor decomposes the question into sub-questions."""</span>
+    response = llm.<span class="fn">invoke</span>([
+        {<span class="str">"role"</span>: <span class="str">"system"</span>, <span class="str">"content"</span>: <span class="str">"Break this question into 2-4 sub-questions. Return one per line."</span>},
+        {<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: state[<span class="str">"question"</span>]}
+    ])
+    subs = [q.<span class="fn">strip</span>() <span class="kw">for</span> q <span class="kw">in</span> response.content.<span class="fn">split</span>(<span class="str">"\n"</span>) <span class="kw">if</span> q.<span class="fn">strip</span>()]
+    <span class="kw">return</span> {<span class="str">"sub_questions"</span>: subs, <span class="str">"status"</span>: <span class="str">"research"</span>}
+
+<span class="kw">def</span> <span class="fn">fan_out_research</span>(state: <span class="ty">ResearchAssistantState</span>) -> <span class="ty">list</span>[Send]:
+    <span class="str">"""Create one parallel branch per sub-question."""</span>
+    <span class="kw">return</span> [
+        Send(<span class="str">"research_one"</span>, {**state, <span class="str">"sub_questions"</span>: [sq], <span class="str">"findings"</span>: []})
+        <span class="kw">for</span> sq <span class="kw">in</span> state[<span class="str">"sub_questions"</span>]
+    ]
+
+<span class="kw">def</span> <span class="fn">research_one</span>(state: <span class="ty">ResearchAssistantState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Research a single sub-question."""</span>
+    sq = state[<span class="str">"sub_questions"</span>][<span class="num">0</span>]
+    response = llm.<span class="fn">invoke</span>([
+        {<span class="str">"role"</span>: <span class="str">"system"</span>, <span class="str">"content"</span>: <span class="str">"You are a research assistant. Provide key facts."</span>},
+        {<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: sq}
+    ])
+    <span class="kw">return</span> {<span class="str">"findings"</span>: [<span class="str">f"[{sq}]: {response.content}"</span>]}</code></pre>
+
+<p data-anchor="ch06-ra-writer-intro">
+The writer agent receives the accumulated findings and produces a coherent draft.
+</p>
+
+<p class="code-label" data-anchor="ch06-ra-writer-label">Writer node</p>
+<pre data-anchor="ch06-ra-writer-code"><code><span class="kw">def</span> <span class="fn">write_draft</span>(state: <span class="ty">ResearchAssistantState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Write a structured answer from research findings."""</span>
+    findings_text = <span class="str">"\n"</span>.<span class="fn">join</span>(state[<span class="str">"findings"</span>])
+    response = llm.<span class="fn">invoke</span>([
+        {<span class="str">"role"</span>: <span class="str">"system"</span>,
+         <span class="str">"content"</span>: <span class="str">"Write a clear, structured answer using these research findings. "</span>
+                    <span class="str">"Use sections with headings. Be thorough but concise."</span>},
+        {<span class="str">"role"</span>: <span class="str">"user"</span>,
+         <span class="str">"content"</span>: <span class="str">f"Question: {state['question']}\n\nFindings:\n{findings_text}"</span>}
+    ])
+    <span class="kw">return</span> {<span class="str">"draft"</span>: response.content, <span class="str">"status"</span>: <span class="str">"review"</span>}</code></pre>
+
+<p data-anchor="ch06-ra-reviewer-intro">
+The reviewer reads the draft and either approves or returns feedback. We cap revisions
+at two to prevent infinite loops.
+</p>
+
+<p class="code-label" data-anchor="ch06-ra-reviewer-label">Reviewer node</p>
+<pre data-anchor="ch06-ra-reviewer-code"><code><span class="kw">def</span> <span class="fn">review_draft</span>(state: <span class="ty">ResearchAssistantState</span>) -> <span class="ty">dict</span>:
+    <span class="str">"""Review the draft for completeness and accuracy."""</span>
+    response = llm.<span class="fn">invoke</span>([
+        {<span class="str">"role"</span>: <span class="str">"system"</span>,
+         <span class="str">"content"</span>: <span class="str">"Review this draft. If it is good, respond with 'APPROVED'. "</span>
+                    <span class="str">"Otherwise, provide specific feedback for improvement."</span>},
+        {<span class="str">"role"</span>: <span class="str">"user"</span>,
+         <span class="str">"content"</span>: <span class="str">f"Question: {state['question']}\n\nDraft:\n{state['draft']}"</span>}
+    ])
+    content = response.content
+    new_count = state.<span class="fn">get</span>(<span class="str">"revision_count"</span>, <span class="num">0</span>) + <span class="num">1</span>
+
+    <span class="kw">if</span> <span class="str">"APPROVED"</span> <span class="kw">in</span> content <span class="kw">or</span> new_count >= <span class="num">2</span>:
+        <span class="kw">return</span> {<span class="str">"review"</span>: content, <span class="str">"status"</span>: <span class="str">"done"</span>, <span class="str">"revision_count"</span>: new_count}
+    <span class="kw">else</span>:
+        <span class="kw">return</span> {<span class="str">"review"</span>: content, <span class="str">"status"</span>: <span class="str">"write"</span>, <span class="str">"revision_count"</span>: new_count}</code></pre>
+
+<h3 data-anchor="ch06-ra-assembly">Assembling the Full Graph</h3>
+
+<p data-anchor="ch06-ra-assembly-intro">
+Now we wire everything together. The supervisor logic lives in the routing function, which
+inspects <code>status</code> to decide where to go next.
+</p>
+
+<p class="code-label" data-anchor="ch06-ra-assembly-label">Full research assistant graph assembly</p>
+<pre data-anchor="ch06-ra-assembly-code"><code><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.types <span class="kw">import</span> Send
+
+<span class="kw">def</span> <span class="fn">route_after_review</span>(state: <span class="ty">ResearchAssistantState</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Route based on review status."""</span>
+    <span class="kw">if</span> state[<span class="str">"status"</span>] == <span class="str">"done"</span>:
+        <span class="kw">return</span> <span class="str">"__end__"</span>
+    <span class="kw">return</span> <span class="str">"write_draft"</span>  <span class="cm"># revise</span>
+
+graph = StateGraph(<span class="ty">ResearchAssistantState</span>)
+
+<span class="cm"># Add nodes</span>
+graph.<span class="fn">add_node</span>(<span class="str">"decompose"</span>, decompose)
+graph.<span class="fn">add_node</span>(<span class="str">"research_one"</span>, research_one)
+graph.<span class="fn">add_node</span>(<span class="str">"write_draft"</span>, write_draft)
+graph.<span class="fn">add_node</span>(<span class="str">"review_draft"</span>, review_draft)
+
+<span class="cm"># Edges</span>
+graph.<span class="fn">add_edge</span>(START, <span class="str">"decompose"</span>)
+graph.<span class="fn">add_conditional_edges</span>(<span class="str">"decompose"</span>, fan_out_research)  <span class="cm"># parallel</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"research_one"</span>, <span class="str">"write_draft"</span>)                <span class="cm"># converge</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"write_draft"</span>, <span class="str">"review_draft"</span>)
+graph.<span class="fn">add_conditional_edges</span>(<span class="str">"review_draft"</span>, route_after_review)
+
+app = graph.<span class="fn">compile</span>()
+
+<span class="cm"># ── Run it ──</span>
+
+result = app.<span class="fn">invoke</span>({
+    <span class="str">"question"</span>: <span class="str">"What are the main approaches to carbon capture?"</span>,
+    <span class="str">"sub_questions"</span>: [],
+    <span class="str">"findings"</span>: [],
+    <span class="str">"draft"</span>: <span class="str">""</span>,
+    <span class="str">"review"</span>: <span class="str">""</span>,
+    <span class="str">"status"</span>: <span class="str">""</span>,
+    <span class="str">"revision_count"</span>: <span class="num">0</span>
+})
+
+<span class="fn">print</span>(result[<span class="str">"draft"</span>])</code></pre>
+
+<p data-anchor="ch06-ra-walkthrough">
+Trace the execution. The user&rsquo;s question enters at <code>START</code> and flows to
+<code>decompose</code>, which breaks it into sub-questions like &ldquo;What is direct air capture?&rdquo;
+and &ldquo;What are ocean-based approaches?&rdquo; The conditional edge from <code>decompose</code>
+calls <code>fan_out_research</code>, which creates a <code>Send</code> for each sub-question. These
+run in parallel through <code>research_one</code>, and their findings merge via the
+<code>operator.add</code> reducer. Once all branches complete, execution flows to
+<code>write_draft</code>, which synthesises the findings. The draft moves to
+<code>review_draft</code>. If the reviewer approves (or the revision cap is reached), we go to
+<code>END</code>. Otherwise, we loop back to <code>write_draft</code> for another revision attempt.
+</p>
+
+<div class="callout warn" data-anchor="ch06-callout-loops">
+  <span class="callout-title">Guard against infinite loops</span>
+  <p data-anchor="ch06-callout-loops-text">
+    Any cycle in your graph&mdash;like the write-review-revise loop above&mdash;can potentially
+    run forever. Always include an escape hatch: a revision counter, a maximum iteration count,
+    or a <code>recursion_limit</code> parameter when compiling the graph
+    (<code>graph.compile(recursion_limit=25)</code>). In production, combine both: a soft limit
+    in your logic and a hard limit in the graph configuration. When the limit triggers, make sure
+    you return whatever partial result you have, not an empty response.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-design-decisions">Design Decisions for Multi-Agent Systems</h2>
+
+<p data-anchor="ch06-design-decisions-intro">
+Building multi-agent systems raises questions that single-agent graphs do not. Let us address
+the most common ones.
+</p>
+
+<h3 data-anchor="ch06-when-multi-agent">When to Use Multiple Agents</h3>
+
+<p data-anchor="ch06-when-multi-agent-detail">
+A single agent with many tools is simpler and often sufficient. Reach for multi-agent
+architectures when you see one of these signals: the context window is getting crowded
+(each agent can operate with a focused system prompt); different parts of the task need
+different models (a cheap model for classification, a strong model for writing); or the
+task naturally decomposes into independent sub-problems that benefit from parallel execution.
+</p>
+
+<p data-anchor="ch06-when-single-agent">
+If your task is a linear pipeline with clear stages, peer-to-peer nodes may be enough&mdash;you
+do not always need the overhead of a supervisor. If the task requires real-time dynamic routing,
+the supervisor pattern is your friend. And if you find yourself building supervisors for your
+supervisors, pause and ask whether the problem really demands that complexity, or whether you
+are over-engineering.
+</p>
+
+<h3 data-anchor="ch06-state-design">State Schema Design</h3>
+
+<p data-anchor="ch06-state-design-detail">
+In multi-agent systems, state design is critical. Keep the shared state schema
+minimal&mdash;include only what agents genuinely need to communicate. Use subgraph-private state
+for internal bookkeeping. If two agents both write to the same field, you must define a reducer
+(via <code>Annotated</code>) or you will get unpredictable overwrites.
+</p>
+
+<p data-anchor="ch06-state-design-messages">
+A common pattern is to use a <code>messages</code> field with the <code>add_messages</code> reducer
+as the primary communication channel. This works well for conversational agents but can become
+unwieldy for data-processing pipelines. For the latter, typed fields like <code>findings</code>,
+<code>draft</code>, and <code>review</code> give you more control and make the state self-documenting.
+</p>
+
+<h3 data-anchor="ch06-error-handling">Error Handling in Multi-Agent Systems</h3>
+
+<p data-anchor="ch06-error-handling-detail">
+When one agent fails in a multi-agent system, the default behaviour is for the entire graph
+to fail. For production systems, consider these strategies. First, catch exceptions inside
+node functions and write error information into the state so the supervisor can decide what
+to do. Second, use <code>retry_policy</code> on nodes that call external APIs to handle
+transient failures. Third, design your supervisor to be resilient: if the researcher fails,
+can the writer still produce a useful (if less informed) draft?
+</p>
+
+<div class="callout key" data-anchor="ch06-callout-create-react">
+  <span class="callout-title">create_react_agent for quick specialists</span>
+  <p data-anchor="ch06-callout-create-react-text">
+    When you need a specialist agent quickly, <code>create_react_agent</code> from
+    <code>langgraph.prebuilt</code> gives you a fully functional ReAct agent in one call.
+    Pass it an LLM and a list of tools, and it returns a compiled graph that you can drop
+    straight into a parent graph as a node. This is often the fastest way to prototype
+    a multi-agent system&mdash;build each specialist with <code>create_react_agent</code>,
+    wire them together with a supervisor, and iterate from there.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-debugging">Debugging Multi-Agent Graphs</h2>
+
+<p data-anchor="ch06-debugging-intro">
+Multi-agent systems are harder to debug than single-agent graphs because the execution path
+is determined at runtime. Here are the techniques that help most.
+</p>
+
+<p data-anchor="ch06-debugging-tracing">
+<strong>Tracing.</strong> Use LangSmith or another tracing tool to visualise the full execution
+graph, including which agents ran, in what order, and what they returned. LangGraph integrates
+with LangSmith natively&mdash;every node invocation appears as a span in the trace.
+</p>
+
+<p data-anchor="ch06-debugging-state">
+<strong>State inspection.</strong> After each node runs, print or log the full state. In
+development, you can use the <code>stream</code> method to watch state changes in real time:
+</p>
+
+<p class="code-label" data-anchor="ch06-stream-label">Streaming state updates for debugging</p>
+<pre data-anchor="ch06-stream-code"><code><span class="kw">for</span> event <span class="kw">in</span> app.<span class="fn">stream</span>(initial_state):
+    <span class="kw">for</span> node_name, state_update <span class="kw">in</span> event.<span class="fn">items</span>():
+        <span class="fn">print</span>(<span class="str">f"--- {node_name} ---"</span>)
+        <span class="fn">print</span>(state_update)
+        <span class="fn">print</span>()</code></pre>
+
+<p data-anchor="ch06-debugging-isolation">
+<strong>Isolation testing.</strong> Because each subgraph is independently compiled, you can test
+it in isolation. Invoke the researcher subgraph directly with test inputs. Verify it returns the
+expected state shape. Only after each specialist works in isolation do you wire them together.
+</p>
+
+<p data-anchor="ch06-debugging-recursion">
+<strong>Recursion limits.</strong> If your graph seems to hang, it is probably stuck in a cycle.
+Set a low <code>recursion_limit</code> during development (e.g., 10) so failures surface quickly.
+Raise it once you have confirmed the graph terminates correctly.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-patterns-summary">Patterns at a Glance</h2>
+
+<p data-anchor="ch06-patterns-summary-intro">
+Let us condense the chapter into a decision framework.
+</p>
+
+<ul data-anchor="ch06-patterns-summary-list">
+  <li data-anchor="ch06-ps-subgraph"><strong>Subgraphs</strong> give you encapsulation and reuse. Use them whenever a group of nodes logically belongs together and has its own internal state.</li>
+  <li data-anchor="ch06-ps-supervisor"><strong>Supervisor pattern</strong> gives you runtime flexibility. Use it when the task requires dynamic routing based on intermediate results.</li>
+  <li data-anchor="ch06-ps-peer"><strong>Peer-to-peer</strong> gives you simplicity. Use it for fixed-sequence pipelines where every input follows the same path.</li>
+  <li data-anchor="ch06-ps-hierarchical"><strong>Hierarchical</strong> gives you scale. Use it for complex domains where sub-domains each need their own routing logic.</li>
+  <li data-anchor="ch06-ps-mapreduce"><strong>Map-reduce</strong> gives you parallelism. Use it whenever you can decompose work into independent units and aggregate the results.</li>
+</ul>
+
+<p data-anchor="ch06-patterns-summary-closing">
+These patterns compose. The research assistant combined supervisor routing with map-reduce
+parallelism and subgraph encapsulation. That is typical of real systems: you pick the patterns
+that fit your problem and layer them together.
+</p>
+
+<!-- ============================================================ -->
+<h2 data-anchor="ch06-limits">Honest Limits</h2>
+
+<p data-anchor="ch06-limits-intro">
+Multi-agent systems are powerful, but they come with real costs. Every agent invocation burns
+tokens. Every supervisor decision adds latency. Every state merge is a potential source of bugs.
+The more agents you add, the harder the system is to reason about.
+</p>
+
+<p data-anchor="ch06-limits-advice">
+Start with the simplest architecture that solves your problem. A single agent with good tools
+handles a surprising range of tasks. Add a second agent only when you can articulate why the
+first cannot do the job alone. Add a supervisor only when you need runtime routing. Add
+parallelism only when sequential execution is genuinely too slow. Each layer of complexity
+should earn its place.
+</p>
+
+<!-- ============================================================ -->
+<p data-anchor="ch06-transition">
+You now know how to compose agents into systems&mdash;nesting graphs as subgraphs, routing with
+supervisors, and fanning out work in parallel. The core insight is that LangGraph treats
+multi-agent coordination as a graph-design problem: the same nodes-and-edges abstraction that
+structures a single agent also structures teams of agents. In the next chapter, we turn to
+production concerns: persistence, deployment, monitoring, and the patterns that keep multi-agent
+systems reliable in the real world.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch06-nav">
+  <a rel="prev" href="05-control-flow-patterns.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-production-patterns.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>
