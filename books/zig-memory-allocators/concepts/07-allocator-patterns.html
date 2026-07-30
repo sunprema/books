@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>07 · Allocator Patterns in Practice — Zig Memory Allocators</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="zig-memory-allocators">
+
+<header class="topbar">
+  <span class="brand">Zig Memory Allocators</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="ch07-head">
+      <span class="chapter-num">07</span>
+      <span class="chapter-kicker">Composition over configuration</span>
+      <h1>Allocator Patterns in Practice</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch07-lede">
+      You know how allocators work. You have built one from scratch.
+      Now comes the interesting part: how real Zig programs compose
+      allocators to get clarity, performance, and safety all at once.
+    </p>
+
+    <!-- ============================================================ s1 -->
+    <h2 data-anchor="ch07-aware-containers">Allocator-Aware Containers</h2>
+
+    <p data-anchor="ch07-aware-p1">
+      Every growable container in the standard library&mdash;<code>ArrayList</code>,
+      <code>HashMap</code>, <code>BufMap</code>, <code>BoundedArray</code>&mdash;takes
+      an <code>Allocator</code> in its <code>init</code> call. The container never
+      decides <em>where</em> memory comes from. You do.
+    </p>
+
+    <p data-anchor="ch07-aware-p2">
+      This is the same dependency-injection idea we saw in Chapter&nbsp;1, scaled
+      up to data structures. A hash map does not care whether it is backed by an
+      arena, a general-purpose allocator, or a fixed buffer. It only calls
+      <code>alloc</code>, <code>resize</code>, and <code>free</code> through
+      the interface. That separation of concerns is what makes the patterns
+      in this chapter possible.
+    </p>
+
+    <p class="code-label" data-anchor="ch07-arraylist-label">arraylist with an explicit allocator</p>
+    <pre data-anchor="ch07-arraylist-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">main</span>() !<span class="ty">void</span> {
+    <span class="kw">var</span> gpa = std.heap.<span class="ty">GeneralPurposeAllocator</span>(.{}){};
+    <span class="kw">defer</span> _ = gpa.<span class="fn">deinit</span>();
+    <span class="kw">const</span> allocator = gpa.<span class="fn">allocator</span>();
+
+    <span class="cm">// The ArrayList does not choose its allocator &mdash; we do.</span>
+    <span class="kw">var</span> list = std.<span class="ty">ArrayList</span>(<span class="ty">u32</span>).<span class="fn">init</span>(allocator);
+    <span class="kw">defer</span> list.<span class="fn">deinit</span>();
+
+    <span class="kw">try</span> list.<span class="fn">append</span>(<span class="num">42</span>);
+    <span class="kw">try</span> list.<span class="fn">append</span>(<span class="num">99</span>);
+
+    <span class="kw">for</span> (list.items) |val| {
+        std.debug.<span class="fn">print</span>(<span class="str">"{d} "</span>, .{val});
+    }
+}</pre>
+
+    <div class="callout key" data-anchor="ch07-callout-rule">
+      <span class="callout-title">The API design rule</span>
+      <p>
+        If your function allocates, accept an <code>Allocator</code> parameter.
+        If it does not allocate, do not accept one. This single convention makes
+        allocation visible at every call site and lets callers choose their
+        strategy. Never embed a hard-coded allocator inside a library.
+      </p>
+    </div>
+
+    <!-- ============================================================ s2 -->
+    <h2 data-anchor="ch07-composition">Wrapper and Composition Allocators</h2>
+
+    <p data-anchor="ch07-composition-p1">
+      Because every allocator implements the same interface, you can
+      <em>wrap</em> one allocator with another. The wrapper intercepts
+      <code>alloc</code>, <code>resize</code>, and <code>free</code> calls,
+      does something useful, then forwards to the inner allocator. This is
+      composition, not inheritance&mdash;and it is extraordinarily powerful.
+    </p>
+
+    <p data-anchor="ch07-composition-p2">
+      The standard library ships two wrappers out of the box:
+    </p>
+
+    <ul data-anchor="ch07-composition-list">
+      <li>
+        <strong><code>std.heap.LoggingAllocator</code></strong>&mdash;logs every
+        <code>alloc</code>, <code>resize</code>, and <code>free</code> to
+        <code>std.log</code>. Invaluable for understanding allocation patterns
+        before optimizing.
+      </li>
+      <li>
+        <strong><code>std.testing.FailingAllocator</code></strong>&mdash;deliberately
+        fails after a configurable number of allocations. Use it to stress-test
+        error paths that are otherwise hard to exercise.
+      </li>
+    </ul>
+
+    <p data-anchor="ch07-composition-p3">
+      You can write your own wrappers for metrics, quotas, tracing, or
+      memory tagging. The pattern is always the same: store a reference to the
+      inner allocator, implement the VTable, and delegate.
+    </p>
+
+    <p class="code-label" data-anchor="ch07-logging-label">wrapping with loggingallocator</p>
+    <pre data-anchor="ch07-logging-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">main</span>() !<span class="ty">void</span> {
+    <span class="kw">var</span> gpa = std.heap.<span class="ty">GeneralPurposeAllocator</span>(.{}){};
+    <span class="kw">defer</span> _ = gpa.<span class="fn">deinit</span>();
+
+    <span class="cm">// Wrap the GPA with a logging layer.</span>
+    <span class="kw">var</span> logging = std.heap.<span class="fn">loggingAllocator</span>(gpa.<span class="fn">allocator</span>());
+    <span class="kw">const</span> allocator = logging.<span class="fn">allocator</span>();
+
+    <span class="cm">// Every alloc/free through `allocator` is now logged.</span>
+    <span class="kw">const</span> buf = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">256</span>);
+    <span class="kw">defer</span> allocator.<span class="fn">free</span>(buf);
+}</pre>
+
+    <!-- ============================================================ s3 -->
+    <h2 data-anchor="ch07-per-subsystem">Per-Subsystem Allocators</h2>
+
+    <p data-anchor="ch07-per-subsystem-p1">
+      In a larger program, handing a different allocator to each subsystem
+      gives you two powers for free:
+    </p>
+
+    <ul data-anchor="ch07-per-subsystem-list">
+      <li>
+        <strong>Tracking.</strong> You can measure how much memory the network
+        layer, the parser, or the renderer uses&mdash;independently.
+      </li>
+      <li>
+        <strong>Teardown.</strong> When a subsystem shuts down, you can free
+        <em>all</em> of its memory at once by destroying its allocator,
+        without hunting for individual allocations.
+      </li>
+    </ul>
+
+    <p data-anchor="ch07-per-subsystem-p2">
+      A common shape: give each subsystem an <code>ArenaAllocator</code> backed
+      by a shared <code>page_allocator</code>. The subsystem allocates freely,
+      and teardown is a single <code>arena.deinit()</code>.
+    </p>
+
+    <!-- ============================================================ s4 -->
+    <h2 data-anchor="ch07-temp-perm">The &ldquo;Temporary + Permanent&rdquo; Pattern</h2>
+
+    <p data-anchor="ch07-temp-perm-p1">
+      Many real programs need two kinds of memory. Scratch memory that lives
+      only for the duration of one request, frame, or computation&mdash;and
+      long-lived memory that persists across the program&rsquo;s lifetime.
+    </p>
+
+    <p data-anchor="ch07-temp-perm-p2">
+      The idiomatic solution: use an <strong>arena</strong> for scratch work
+      and a <strong>GeneralPurposeAllocator</strong> for the permanent state.
+      The arena is fast (bump allocation, no per-object free), and you reset
+      or destroy it at the end of each unit of work.
+    </p>
+
+    <p class="code-label" data-anchor="ch07-server-label">per-request arena in a server loop</p>
+    <pre data-anchor="ch07-server-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">main</span>() !<span class="ty">void</span> {
+    <span class="cm">// Long-lived allocator for program state.</span>
+    <span class="kw">var</span> gpa = std.heap.<span class="ty">GeneralPurposeAllocator</span>(.{}){};
+    <span class="kw">defer</span> _ = gpa.<span class="fn">deinit</span>();
+    <span class="kw">const</span> perm = gpa.<span class="fn">allocator</span>();
+
+    <span class="cm">// Program-lifetime config loaded once.</span>
+    <span class="kw">const</span> config = <span class="kw">try</span> <span class="fn">loadConfig</span>(perm);
+    _ = config;
+
+    <span class="cm">// Each request gets a fresh arena.</span>
+    <span class="kw">while</span> (<span class="kw">true</span>) {
+        <span class="kw">var</span> arena = std.heap.<span class="ty">ArenaAllocator</span>.<span class="fn">init</span>(std.heap.page_allocator);
+        <span class="kw">defer</span> arena.<span class="fn">deinit</span>();  <span class="cm">// frees ALL request memory at once</span>
+
+        <span class="kw">const</span> scratch = arena.<span class="fn">allocator</span>();
+
+        <span class="cm">// All parsing, formatting, and temp buffers use `scratch`.</span>
+        <span class="kw">try</span> <span class="fn">handleRequest</span>(scratch);
+    }
+}</pre>
+
+    <div class="callout" data-anchor="ch07-callout-arena">
+      <span class="callout-title">Why this works so well</span>
+      <p>
+        Arenas make allocation nearly free (just bump a pointer) and
+        deallocation instant (reset the pointer). You never worry about
+        forgetting to free a temporary buffer&mdash;the arena takes care
+        of everything when it is destroyed.
+      </p>
+    </div>
+
+    <!-- ============================================================ s5 -->
+    <h2 data-anchor="ch07-c-interop">C Interop: Bridging Two Worlds</h2>
+
+    <p data-anchor="ch07-c-interop-p1">
+      When you call C libraries from Zig, memory ownership gets interesting.
+      If the C library allocates memory that you must free with <code>free()</code>,
+      or if you must pass memory to a C function that will free it, you need
+      to use <code>std.heap.c_allocator</code>. This allocator wraps libc&rsquo;s
+      <code>malloc</code> and <code>free</code>.
+    </p>
+
+    <div class="callout warn" data-anchor="ch07-callout-mix">
+      <span class="callout-title">Never mix allocators</span>
+      <p>
+        Memory allocated by one allocator must be freed by the same allocator.
+        If a C library calls <code>free()</code>, you must have used
+        <code>c_allocator</code> to allocate that memory. Mixing allocators
+        is undefined behavior&mdash;corrupted heaps, silent data loss,
+        crashes that only appear in production.
+      </p>
+    </div>
+
+    <p data-anchor="ch07-c-interop-p2">
+      The rule is straightforward: <strong>use <code>c_allocator</code> for
+      memory that crosses the Zig/C boundary</strong>. For everything else,
+      use whichever Zig allocator suits the job.
+    </p>
+
+    <!-- ============================================================ s6 -->
+    <h2 data-anchor="ch07-diagram">The Composition Stack</h2>
+
+    <p data-anchor="ch07-diagram-p1">
+      All of these patterns share a common shape: allocators layered on top
+      of each other, each adding a concern. Here is what a typical composition
+      looks like.
+    </p>
+
+    <figure class="diagram-fig" data-anchor="ch07-diagram-composition">
+      <svg class="diagram" viewBox="0 0 480 340" aria-label="Layered allocator composition diagram showing your code at top flowing through arena, then page_allocator, then the OS at the bottom">
+        <title>Allocator composition: your code to OS</title>
+        <defs>
+          <marker id="arr07" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7" fill="none" stroke="var(--ink)" stroke-width="1" />
+          </marker>
+          <marker id="arr07r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7" fill="none" stroke="var(--accent)" stroke-width="1.2" />
+          </marker>
+        </defs>
+
+        <!-- Layer 1: Your Code -->
+        <rect x="120" y="16" width="240" height="44" class="box-hot" />
+        <text x="240" y="35" text-anchor="middle" class="lbl-hot">Your code</text>
+        <text x="240" y="49" text-anchor="middle" font-size="10">list.append(item)</text>
+
+        <line x1="240" y1="60" x2="240" y2="80" class="flow-hot" marker-end="url(#arr07r)" />
+
+        <!-- Layer 2: LoggingAllocator (optional wrapper) -->
+        <rect x="100" y="82" width="280" height="44" class="box" />
+        <text x="240" y="100" text-anchor="middle" class="lbl">Optional wrapper</text>
+        <text x="240" y="116" text-anchor="middle" font-size="10">LoggingAllocator</text>
+
+        <line x1="240" y1="126" x2="240" y2="146" class="flow" marker-end="url(#arr07)" />
+
+        <!-- Layer 3: ArenaAllocator -->
+        <rect x="100" y="148" width="280" height="44" class="box-hot" />
+        <text x="240" y="166" text-anchor="middle" class="lbl-hot">Strategy</text>
+        <text x="240" y="182" text-anchor="middle" font-size="10">ArenaAllocator</text>
+
+        <line x1="240" y1="192" x2="240" y2="212" class="flow" marker-end="url(#arr07)" />
+
+        <!-- Layer 4: page_allocator -->
+        <rect x="100" y="214" width="280" height="44" class="box" />
+        <text x="240" y="232" text-anchor="middle" class="lbl">Backing allocator</text>
+        <text x="240" y="248" text-anchor="middle" font-size="10">page_allocator</text>
+
+        <line x1="240" y1="258" x2="240" y2="278" class="flow" marker-end="url(#arr07)" />
+
+        <!-- Layer 5: OS -->
+        <rect x="120" y="280" width="240" height="40" class="fill-ink" />
+        <text x="240" y="305" text-anchor="middle" class="on-ink" font-size="10" style="fill:var(--bg);">Operating System (mmap / VirtualAlloc)</text>
+
+        <!-- Side labels -->
+        <text x="70" y="42" text-anchor="end" class="lbl" style="font-size:8px;">caller</text>
+        <text x="70" y="170" text-anchor="end" class="lbl" style="font-size:8px;">bump ptr</text>
+        <text x="70" y="236" text-anchor="end" class="lbl" style="font-size:8px;">syscall</text>
+        <text x="70" y="304" text-anchor="end" class="lbl" style="font-size:8px;">kernel</text>
+      </svg>
+      <figcaption>
+        Allocators compose in layers. Your code talks to the topmost allocator;
+        each layer delegates down until the OS actually maps physical memory.
+      </figcaption>
+    </figure>
+
+    <!-- ============================================================ s7 -->
+    <h2 data-anchor="ch07-summary">Putting It All Together</h2>
+
+    <p data-anchor="ch07-summary-p1">
+      These patterns are not theoretical. They are how idiomatic Zig programs
+      are structured:
+    </p>
+
+    <ul data-anchor="ch07-summary-list">
+      <li>Containers accept allocators&mdash;they never embed one.</li>
+      <li>Functions that allocate declare it in their signature.</li>
+      <li>Wrappers add logging, metrics, or failure injection without
+          modifying the allocator they wrap.</li>
+      <li>Subsystems get their own allocators for isolation and teardown.</li>
+      <li>Scratch work goes through arenas; long-lived state goes through
+          a GPA or similar.</li>
+      <li>C interop uses <code>c_allocator</code>&mdash;never anything else.</li>
+    </ul>
+
+    <p data-anchor="ch07-summary-p2">
+      Each of these is a direct consequence of the allocator interface design.
+      Because every allocator looks the same from the outside, you can mix,
+      layer, and swap them freely. That is composition over configuration,
+      applied to memory management.
+    </p>
+
+    <hr data-anchor="ch07-divider" />
+
+    <p data-anchor="ch07-closing">
+      You now have a toolkit of patterns for structuring memory in real programs.
+      The last question is: <em>which allocator should I actually pick?</em>
+      The next chapter answers that with measurements, a decision framework,
+      and an honest look at the trade-offs.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-writing-a-custom-allocator.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-performance-and-choosing.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>02 · Memory Foundations — Zig Memory Allocators</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="zig-memory-allocators">
+
+<header class="topbar">
+  <span class="brand">Zig Memory Allocators</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="ch02-head">
+      <span class="chapter-num">02</span>
+      <span class="chapter-kicker">Stack, heap, and everything between</span>
+      <h1>Memory Foundations</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch02-lede">
+      Before we can talk about allocators in detail, we need a shared
+      vocabulary. This chapter covers the ground rules: where memory lives,
+      how alignment works, what happens when allocation fails, and how
+      <code>defer</code> and <code>errdefer</code> keep cleanup correct.
+    </p>
+
+    <!-- ============================================================ s1 -->
+    <h2 data-anchor="ch02-stack-heap">Stack vs. Heap</h2>
+
+    <p data-anchor="ch02-stack-heap-p1">
+      Every running Zig program has two broad regions of memory to work with.
+      The <strong>stack</strong> is fast, automatic, and limited in size.
+      The <strong>heap</strong> is flexible, manually managed, and requires
+      an allocator. Understanding the boundary between them is the first step
+      to writing correct Zig code.
+    </p>
+
+    <h3 data-anchor="ch02-stack">The stack</h3>
+
+    <p data-anchor="ch02-stack-p1">
+      Local variables live on the stack. When a function is called, the
+      runtime pushes a <em>stack frame</em> containing its locals, parameters,
+      and a return address. When the function returns, the frame is popped
+      and the memory is gone&mdash;instantly, with zero cost.
+    </p>
+
+    <p data-anchor="ch02-stack-p2">
+      The trade-off is that stack memory is fixed at compile time. You cannot
+      return a pointer to a local variable (the frame vanishes), and you cannot
+      allocate a variable-sized array on the stack based on runtime input.
+      Stack sizes are typically a few megabytes&mdash;enough for call chains,
+      not for data sets.
+    </p>
+
+    <h3 data-anchor="ch02-heap">The heap</h3>
+
+    <p data-anchor="ch02-heap-p1">
+      When you need memory that outlives a function call, or whose size is
+      only known at runtime, you reach for the heap. In Zig, that always
+      means calling an allocator:
+    </p>
+
+    <pre data-anchor="ch02-heap-code"><span class="cm">// Stack allocation: size known at compile time, automatic cleanup</span>
+<span class="kw">var</span> buffer: [<span class="num">256</span>]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+
+<span class="cm">// Heap allocation: size from runtime, requires an allocator</span>
+<span class="kw">const</span> data = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, runtime_size);
+<span class="kw">defer</span> allocator.<span class="fn">free</span>(data);</pre>
+
+    <p data-anchor="ch02-heap-p2">
+      The stack allocation is a single instruction&mdash;just a pointer
+      adjustment. The heap allocation involves bookkeeping, possible system
+      calls, and can fail. That cost is why Zig makes you opt into it
+      explicitly.
+    </p>
+
+    <figure class="diagram-fig" data-anchor="ch02-diagram-stack-heap">
+      <svg class="diagram" viewBox="0 0 560 260" aria-label="Diagram showing stack frame layout versus heap allocation through an allocator">
+        <title>Stack vs heap memory layout</title>
+
+        <defs>
+          <marker id="arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7" fill="none" stroke="var(--ink)" stroke-width="1" />
+          </marker>
+          <marker id="arr-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7" fill="none" stroke="var(--accent)" stroke-width="1.2" />
+          </marker>
+        </defs>
+
+        <!-- Stack side -->
+        <text x="100" y="16" text-anchor="middle" class="lbl">Stack</text>
+
+        <!-- Stack frames, growing downward -->
+        <rect x="30" y="24" width="140" height="36" class="box-alt" />
+        <text x="100" y="47" text-anchor="middle" style="font-size:9px;" class="lbl">main() frame</text>
+
+        <rect x="30" y="62" width="140" height="36" class="box-alt" />
+        <text x="100" y="85" text-anchor="middle" style="font-size:9px;" class="lbl">processData() frame</text>
+
+        <rect x="30" y="100" width="140" height="50" class="box" />
+        <text x="44" y="118" style="font-size:8px;" class="lbl">local: buf[256]</text>
+        <text x="44" y="131" style="font-size:8px;" class="lbl">local: index</text>
+        <text x="44" y="144" style="font-size:8px;" class="lbl">return addr</text>
+
+        <text x="100" y="168" text-anchor="middle" style="font-size:8px; fill:var(--cm);">grows downward</text>
+        <line x1="100" y1="172" x2="100" y2="192" class="flow-dash" marker-end="url(#arr)" />
+
+        <text x="100" y="216" text-anchor="middle" class="lbl" style="fill:var(--cm);">fixed size</text>
+        <text x="100" y="230" text-anchor="middle" class="lbl" style="fill:var(--cm);">automatic cleanup</text>
+        <text x="100" y="244" text-anchor="middle" class="lbl" style="fill:var(--cm);">cannot outlive frame</text>
+
+        <!-- Divider -->
+        <line x1="220" y1="20" x2="220" y2="250" class="flow-dash" />
+
+        <!-- Heap side -->
+        <text x="400" y="16" text-anchor="middle" class="lbl-hot">Heap</text>
+
+        <rect x="290" y="24" width="100" height="28" class="box-hot" />
+        <text x="340" y="43" text-anchor="middle" class="lbl-hot">Allocator</text>
+
+        <line x1="340" y1="52" x2="340" y2="72" class="flow-hot" marker-end="url(#arr-r)" />
+
+        <!-- Heap blocks -->
+        <rect x="270" y="74" width="70" height="28" class="box-hot" />
+        <text x="305" y="92" text-anchor="middle" style="font-size:8px;" class="lbl-hot">Block A</text>
+
+        <rect x="345" y="74" width="50" height="28" class="box" />
+        <text x="370" y="92" text-anchor="middle" style="font-size:8px;" class="lbl">free</text>
+
+        <rect x="400" y="74" width="90" height="28" class="box-hot" />
+        <text x="445" y="92" text-anchor="middle" style="font-size:8px;" class="lbl-hot">Block B</text>
+
+        <rect x="270" y="106" width="50" height="28" class="box" />
+        <text x="295" y="124" text-anchor="middle" style="font-size:8px;" class="lbl">free</text>
+
+        <rect x="325" y="106" width="80" height="28" class="box-hot" />
+        <text x="365" y="124" text-anchor="middle" style="font-size:8px;" class="lbl-hot">Block C</text>
+
+        <rect x="410" y="106" width="80" height="28" class="box" />
+        <text x="450" y="124" text-anchor="middle" style="font-size:8px;" class="lbl">free</text>
+
+        <!-- OS pages label -->
+        <line x1="270" y1="150" x2="490" y2="150" class="flow-dash" />
+        <text x="380" y="166" text-anchor="middle" style="font-size:8px;" class="lbl">OS pages (mmap / VirtualAlloc)</text>
+
+        <text x="380" y="216" text-anchor="middle" class="lbl-hot">dynamic size</text>
+        <text x="380" y="230" text-anchor="middle" class="lbl-hot">manual cleanup</text>
+        <text x="380" y="244" text-anchor="middle" class="lbl-hot">outlives any frame</text>
+      </svg>
+      <figcaption>
+        Stack frames are pushed and popped automatically. Heap blocks are
+        managed by an allocator and backed by OS pages.
+      </figcaption>
+    </figure>
+
+    <!-- ============================================================ s2 -->
+    <h2 data-anchor="ch02-alignment">Alignment</h2>
+
+    <p data-anchor="ch02-alignment-p1">
+      Every type has an <em>alignment requirement</em>&mdash;the address of
+      a value must be evenly divisible by its alignment. This is not a Zig
+      invention; CPUs enforce it. An unaligned load on many architectures
+      either traps or runs slowly.
+    </p>
+
+    <p data-anchor="ch02-alignment-p2">
+      What makes Zig unusual is that alignment is <strong>a first-class part
+      of the type system</strong>. A pointer does not just carry a type&mdash;it
+      carries an alignment guarantee:
+    </p>
+
+    <pre data-anchor="ch02-alignment-code"><span class="cm">// A pointer to u32 with the default alignment of 4</span>
+<span class="kw">var</span> p: *<span class="ty">u32</span> = &amp;value;
+
+<span class="cm">// A pointer to u8 with explicit 16-byte alignment (for SIMD)</span>
+<span class="kw">var</span> q: *<span class="kw">align</span>(<span class="num">16</span>) <span class="ty">u8</span> = <span class="mac">@alignCast</span>(raw_ptr);</pre>
+
+    <p data-anchor="ch02-alignment-p3">
+      When you ask an allocator for memory, it respects the alignment of the
+      type you are allocating. If you request <code>alloc(u32, 10)</code>,
+      the returned pointer is guaranteed to be 4-byte aligned. If you request
+      <code>alloc(u8, n)</code> with a custom alignment, the allocator handles
+      that too.
+    </p>
+
+    <table data-anchor="ch02-alignment-table">
+      <caption>Common alignments in Zig</caption>
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Size (bytes)</th>
+          <th>Alignment</th>
+          <th>Typical use</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>u8</code>, <code>bool</code></td>
+          <td>1</td>
+          <td>1</td>
+          <td>Byte buffers, flags</td>
+        </tr>
+        <tr>
+          <td><code>u16</code></td>
+          <td>2</td>
+          <td>2</td>
+          <td>Unicode code units, short fields</td>
+        </tr>
+        <tr>
+          <td><code>u32</code>, <code>f32</code></td>
+          <td>4</td>
+          <td>4</td>
+          <td>Integers, floats, hash values</td>
+        </tr>
+        <tr>
+          <td><code>u64</code>, <code>f64</code>, <code>usize</code></td>
+          <td>8</td>
+          <td>8</td>
+          <td>Pointers (on 64-bit), sizes, timestamps</td>
+        </tr>
+        <tr>
+          <td>SIMD vectors</td>
+          <td>16&ndash;64</td>
+          <td>16&ndash;64</td>
+          <td>Vectorised math, crypto</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout" data-anchor="ch02-callout-anyopaque">
+      <span class="callout-title">anyopaque and usize</span>
+      <p>
+        Zig uses <code>*anyopaque</code> where C uses <code>void*</code>&mdash;a
+        type-erased pointer. The allocator interface stores its internal
+        context this way. Sizes and counts are always <code>usize</code>,
+        matching the pointer width of the target architecture.
+      </p>
+    </div>
+
+    <!-- ============================================================ s3 -->
+    <h2 data-anchor="ch02-errors">Allocation Can Fail</h2>
+
+    <p data-anchor="ch02-errors-p1">
+      In C, <code>malloc</code> returns <code>NULL</code> on failure&mdash;and
+      most programs never check. In Zig, allocation returns an
+      <strong>error union</strong>: <code>![]T</code>. That exclamation mark is
+      not decoration. It means the compiler will not let you ignore the failure
+      case.
+    </p>
+
+    <pre data-anchor="ch02-errors-code"><span class="cm">// allocator.alloc returns Allocator.Error![]u8</span>
+<span class="cm">// You must handle the error with try, catch, or an explicit check.</span>
+
+<span class="kw">const</span> buf = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">4096</span>);
+<span class="cm">// If alloc fails, `try` returns the error to the caller.</span>
+<span class="cm">// If it succeeds, `buf` is a valid []u8 slice.</span></pre>
+
+    <p data-anchor="ch02-errors-p2">
+      This is critical for the environments Zig targets. On an embedded system
+      with 32 KB of RAM, allocation failure is not an edge case&mdash;it is
+      Tuesday. Zig forces you to have a plan.
+    </p>
+
+    <div class="callout warn" data-anchor="ch02-callout-oom">
+      <span class="callout-title">Out of memory is not a panic</span>
+      <p>
+        Unlike some languages that abort on OOM, Zig allocators return
+        <code>error.OutOfMemory</code>. Your code can catch it, try a smaller
+        allocation, switch to a fallback path, or propagate the error cleanly.
+        The choice is yours, and the compiler ensures you make one.
+      </p>
+    </div>
+
+    <!-- ============================================================ s4 -->
+    <h2 data-anchor="ch02-defer">The <code>defer</code> and <code>errdefer</code> Pattern</h2>
+
+    <p data-anchor="ch02-defer-p1">
+      Manual memory management is notoriously error-prone in C: every early
+      return, every error branch, every <code>goto cleanup</code> is a chance
+      to forget a <code>free</code>. Zig solves this with <code>defer</code>
+      and <code>errdefer</code>&mdash;two keywords that schedule cleanup to
+      run when the current scope exits.
+    </p>
+
+    <h3 data-anchor="ch02-defer-basic"><code>defer</code>: always runs</h3>
+
+    <p data-anchor="ch02-defer-basic-p1">
+      A <code>defer</code> statement runs its expression when execution leaves
+      the enclosing block, regardless of whether the exit is normal or due to
+      an error:
+    </p>
+
+    <pre data-anchor="ch02-defer-basic-code"><span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">processFile</span>(allocator: std.mem.<span class="ty">Allocator</span>, path: []<span class="kw">const</span> <span class="ty">u8</span>) !<span class="ty">void</span> {
+    <span class="kw">const</span> file = <span class="kw">try</span> std.fs.cwd().<span class="fn">openFile</span>(path, .{});
+    <span class="kw">defer</span> file.<span class="fn">close</span>();  <span class="cm">// Runs no matter how we exit</span>
+
+    <span class="kw">const</span> data = <span class="kw">try</span> file.reader().<span class="fn">readAllAlloc</span>(allocator, <span class="num">1</span> &lt;&lt; <span class="num">20</span>);
+    <span class="kw">defer</span> allocator.<span class="fn">free</span>(data);  <span class="cm">// Runs no matter how we exit</span>
+
+    <span class="kw">try</span> <span class="fn">validate</span>(data);  <span class="cm">// If this fails, both defers still run</span>
+    <span class="kw">try</span> <span class="fn">transform</span>(data);
+}</pre>
+
+    <p data-anchor="ch02-defer-basic-p2">
+      Without <code>defer</code>, you would need to free <code>data</code>
+      and close <code>file</code> in every error path. With <code>defer</code>,
+      you write the cleanup once, right next to the acquisition.
+    </p>
+
+    <h3 data-anchor="ch02-errdefer-section"><code>errdefer</code>: runs only on error</h3>
+
+    <p data-anchor="ch02-errdefer-p1">
+      Sometimes you allocate something that you intend to <em>return</em> to
+      the caller. You do not want to free it on success&mdash;only on error.
+      That is what <code>errdefer</code> is for:
+    </p>
+
+    <pre data-anchor="ch02-errdefer-code"><span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">createBuffer</span>(allocator: std.mem.<span class="ty">Allocator</span>, size: <span class="ty">usize</span>) ![]<span class="ty">u8</span> {
+    <span class="kw">const</span> buf = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, size);
+    <span class="kw">errdefer</span> allocator.<span class="fn">free</span>(buf);  <span class="cm">// Only if we return an error</span>
+
+    <span class="kw">try</span> <span class="fn">initializeBuffer</span>(buf);   <span class="cm">// If this fails, buf is freed</span>
+
+    <span class="kw">return</span> buf;  <span class="cm">// Success: caller now owns buf, errdefer does NOT run</span>
+}</pre>
+
+    <div class="callout key" data-anchor="ch02-callout-pattern">
+      <span class="callout-title">The golden pattern</span>
+      <p>
+        Allocate, then immediately <code>defer</code> or <code>errdefer</code>
+        the corresponding free. Keep acquisition and release adjacent in the
+        source code. This is the single most important idiom for correct memory
+        management in Zig.
+      </p>
+    </div>
+
+    <p data-anchor="ch02-errdefer-p2">
+      The combination of <code>try</code>, <code>defer</code>, and
+      <code>errdefer</code> means Zig programs handle errors and clean up
+      resources without the tangled <code>goto</code> chains of C or the
+      invisible destructors of C++. The control flow is explicit, the cleanup
+      is visible, and the compiler enforces that error unions are handled.
+    </p>
+
+    <!-- ============================================================ s5 -->
+    <h2 data-anchor="ch02-putting-together">Putting It Together</h2>
+
+    <p data-anchor="ch02-putting-together-p1">
+      Here is a slightly larger example that combines everything from this
+      chapter: stack locals, heap allocation, alignment, error handling, and
+      <code>defer</code>/<code>errdefer</code>.
+    </p>
+
+    <pre data-anchor="ch02-putting-together-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">const</span> <span class="ty">Header</span> = <span class="kw">struct</span> {
+    magic: <span class="ty">u32</span>,        <span class="cm">// alignment: 4</span>
+    version: <span class="ty">u16</span>,      <span class="cm">// alignment: 2</span>
+    payload_len: <span class="ty">u32</span>,  <span class="cm">// alignment: 4</span>
+};
+
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">parseMessage</span>(
+    allocator: std.mem.<span class="ty">Allocator</span>,
+    raw: []<span class="kw">const</span> <span class="ty">u8</span>,
+) !<span class="kw">struct</span> { header: <span class="ty">Header</span>, payload: []<span class="ty">u8</span> } {
+    <span class="cm">// Stack: header is a local, fixed-size</span>
+    <span class="kw">const</span> header = std.mem.<span class="fn">bytesAsValue</span>(
+        <span class="ty">Header</span>,
+        raw[<span class="num">0</span>..<span class="mac">@sizeOf</span>(<span class="ty">Header</span>)],
+    );
+
+    <span class="cm">// Heap: payload size is dynamic</span>
+    <span class="kw">const</span> payload = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, header.payload_len);
+    <span class="kw">errdefer</span> allocator.<span class="fn">free</span>(payload);
+
+    <span class="cm">// Copy and validate; errdefer frees payload if this fails</span>
+    <span class="mac">@memcpy</span>(payload, raw[<span class="mac">@sizeOf</span>(<span class="ty">Header</span>)..][<span class="num">0</span>..header.payload_len]);
+    <span class="kw">try</span> <span class="fn">validateChecksum</span>(payload);
+
+    <span class="kw">return</span> .{ .header = header.*, .payload = payload };
+}
+
+<span class="kw">fn</span> <span class="fn">validateChecksum</span>(data: []<span class="kw">const</span> <span class="ty">u8</span>) !<span class="ty">void</span> {
+    _ = data;
+    <span class="cm">// ... checksum logic ...</span>
+}</pre>
+
+    <p data-anchor="ch02-putting-together-p2">
+      The <code>Header</code> struct lives on the stack&mdash;its size is known
+      at compile time. The payload is heap-allocated because its length comes
+      from the parsed header. The <code>errdefer</code> ensures the payload
+      is freed if <code>validateChecksum</code> fails, but on success the
+      caller receives ownership of the memory.
+    </p>
+
+    <hr data-anchor="ch02-divider" />
+
+    <p data-anchor="ch02-closing">
+      With stack, heap, alignment, error unions, and <code>defer</code>/<code>errdefer</code>
+      in your toolkit, you have the vocabulary for everything that follows.
+      The next chapter opens the hood on the allocator itself: the
+      <code>std.mem.Allocator</code> interface, its vtable, and the three
+      operations every allocator must support.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-why-allocators-matter.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-the-allocator-interface.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

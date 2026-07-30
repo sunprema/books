@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>05 · Arena and Fixed-Buffer Allocators — Zig Memory Allocators</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="zig-memory-allocators">
+<header class="topbar">
+  <span class="brand">Zig Memory Allocators</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="ch05-head">
+      <span class="chapter-num">05</span>
+      <span class="chapter-kicker">Allocate many, free once</span>
+      <h1>Arena and Fixed-Buffer Allocators</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch05-lede">Not every allocation needs its own
+    funeral. Sometimes you allocate a hundred things during a phase of work, and
+    when the phase is over, you tear them all down at once. That pattern is so
+    common&mdash;and so profitable&mdash;that Zig&rsquo;s standard library ships
+    two allocators built specifically around it.</p>
+
+    <!-- ============================================================ ARENA -->
+
+    <h2 data-anchor="arena-overview">ArenaAllocator: the bulk eraser</h2>
+
+    <p>An <code>ArenaAllocator</code> wraps a <em>child allocator</em>&mdash;any
+    <code>std.mem.Allocator</code>&mdash;and uses it to grab large pages of
+    memory behind the scenes. When you ask the arena for memory, it
+    <strong>bump-allocates</strong> within the current page: it advances an
+    offset pointer forward, hands you the slice, and moves on. No bookkeeping
+    per allocation. No free-list. No headers.</p>
+
+    <p>The crucial trick: calling <code>free()</code> on an individual allocation
+    is a <strong>no-op</strong>. The arena simply ignores it. All the memory is
+    released in one shot when you call <code>deinit()</code>. This is what makes
+    arenas fast&mdash;you pay almost nothing for each allocation, and you pay
+    for cleanup exactly once.</p>
+
+    <div class="callout key" data-anchor="arena-key-idea">
+      <span class="callout-title">The key idea</span>
+      <p>An arena turns many small allocations into a single large lifecycle.
+      You allocate freely during a phase of work, then call <code>deinit()</code>
+      and everything goes away. Individual <code>free()</code> calls are silently
+      ignored&mdash;by design.</p>
+    </div>
+
+    <h3 data-anchor="arena-setup">Setting up an arena</h3>
+
+    <p>The most common pattern in real Zig code is wrapping
+    <code>std.heap.page_allocator</code>:</p>
+
+    <p class="code-label">Arena setup with defer</p>
+    <pre data-anchor="arena-setup-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">processRequest</span>(request: Request) !Response {
+    <span class="kw">var</span> arena = std.heap.ArenaAllocator.<span class="fn">init</span>(std.heap.page_allocator);
+    <span class="kw">defer</span> arena.<span class="fn">deinit</span>(); <span class="cm">// everything freed here, no matter what</span>
+
+    <span class="kw">const</span> allocator = arena.<span class="fn">allocator</span>();
+
+    <span class="cm">// Allocate as many things as you need&mdash;</span>
+    <span class="cm">// no individual free() calls required.</span>
+    <span class="kw">const</span> parsed = <span class="kw">try</span> <span class="fn">parseHeaders</span>(allocator, request.raw);
+    <span class="kw">const</span> body = <span class="kw">try</span> <span class="fn">decodeBody</span>(allocator, request.payload);
+    <span class="kw">const</span> result = <span class="kw">try</span> <span class="fn">buildResponse</span>(allocator, parsed, body);
+
+    <span class="kw">return</span> result;
+    <span class="cm">// defer fires: arena.deinit() releases all pages at once</span>
+}</pre>
+
+    <p>Notice the shape: create the arena, immediately <code>defer</code> its
+    <code>deinit()</code>, extract the <code>allocator()</code> interface, and
+    pass that interface to everything that needs memory. When the function
+    returns&mdash;normally or via <code>error</code>&mdash;the defer fires and
+    every allocation disappears. No leak possible.</p>
+
+    <h3 data-anchor="arena-internals">How it works internally</h3>
+
+    <p>Under the hood, the arena maintains a linked list of <em>pages</em>
+    obtained from the child allocator. Each page is a contiguous block of
+    memory. The arena keeps a pointer to the current position within the
+    active page. When you call <code>alloc()</code>, it advances that pointer
+    (aligning as needed) and returns the slice. When the current page is
+    exhausted, it requests a new page from the child allocator and chains it
+    onto the list.</p>
+
+    <figure class="diagram-fig" data-anchor="arena-diagram">
+      <svg class="diagram" viewBox="0 0 620 260" role="img"
+           aria-label="Arena allocator: a chain of pages with a bump pointer, showing how free is a no-op and deinit releases all">
+
+        <!-- Page 1 (full) -->
+        <rect x="20" y="40" width="180" height="50" class="box-alt" />
+        <rect x="20" y="40" width="45" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <rect x="65" y="40" width="60" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <rect x="125" y="40" width="75" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <text x="100" y="30" text-anchor="middle" class="lbl">Page 1 (full)</text>
+        <text x="42" y="70" text-anchor="middle" class="lbl" style="font-size:7px">alloc A</text>
+        <text x="95" y="70" text-anchor="middle" class="lbl" style="font-size:7px">alloc B</text>
+        <text x="162" y="70" text-anchor="middle" class="lbl" style="font-size:7px">alloc C</text>
+
+        <!-- Arrow between pages -->
+        <line x1="200" y1="65" x2="230" y2="65" class="flow" />
+        <polygon points="230,65 222,60 222,70" class="fill-ink" />
+
+        <!-- Page 2 (partially used) -->
+        <rect x="240" y="40" width="180" height="50" class="box" />
+        <rect x="240" y="40" width="55" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <rect x="295" y="40" width="40" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <text x="330" y="30" text-anchor="middle" class="lbl">Page 2 (active)</text>
+        <text x="267" y="70" text-anchor="middle" class="lbl" style="font-size:7px">alloc D</text>
+        <text x="315" y="70" text-anchor="middle" class="lbl" style="font-size:7px">alloc E</text>
+
+        <!-- Bump pointer -->
+        <line x1="335" y1="42" x2="335" y2="88" class="flow-hot" />
+        <polygon points="335,42 330,50 340,50" class="fill-red" />
+        <text x="345" y="102" class="lbl-hot" style="font-size:8px">offset (next alloc here)</text>
+
+        <!-- Free region in page 2 -->
+        <text x="380" y="70" text-anchor="middle" class="lbl" style="fill:var(--cm)">free space</text>
+
+        <!-- free() is a no-op -->
+        <rect x="20" y="130" width="200" height="36" rx="0" class="box" style="stroke-dasharray:4 3" />
+        <text x="120" y="152" text-anchor="middle" class="lbl" style="font-size:8.5px">free(alloc B) &rarr; no-op</text>
+
+        <!-- deinit releases all -->
+        <rect x="240" y="130" width="200" height="36" rx="0" class="box-hot" />
+        <text x="340" y="152" text-anchor="middle" class="lbl-hot" style="font-size:8.5px">deinit() &rarr; release all pages</text>
+
+        <!-- deinit arrows to child allocator -->
+        <line x1="340" y1="166" x2="340" y2="200" class="flow-hot" />
+        <polygon points="340,200 335,192 345,192" class="fill-red" />
+        <rect x="260" y="205" width="160" height="30" class="box" />
+        <text x="340" y="224" text-anchor="middle" class="lbl">child allocator (page_allocator)</text>
+      </svg>
+      <figcaption>The arena chains pages from the child allocator and bump-allocates
+      within them. Individual <code>free()</code> calls are no-ops;
+      <code>deinit()</code> returns every page to the child at once.</figcaption>
+    </figure>
+
+    <h3 data-anchor="arena-use-cases">Where arenas shine</h3>
+
+    <p>Arenas are ideal whenever your program has <strong>phase-scoped
+    memory</strong>&mdash;a burst of allocations that share a natural
+    lifetime:</p>
+
+    <ul>
+      <li><strong>Per-request in a web server.</strong> Parse the request,
+      build the response, send it, tear down. Every allocation lives and
+      dies with the request.</li>
+      <li><strong>Per-frame in a game.</strong> Each frame allocates scratch
+      data&mdash;particle lists, collision results, render commands&mdash;that
+      is discarded at the end of the frame.</li>
+      <li><strong>Per-pass in a compiler.</strong> Tokenizing, parsing, and
+      code generation each produce intermediate data that the next pass
+      does not need.</li>
+    </ul>
+
+    <p>In all three cases, the arena lets you allocate at near-zero cost
+    during the hot path and pay for cleanup once at the boundary.</p>
+
+    <h3 data-anchor="arena-reset">Resetting instead of destroying</h3>
+
+    <p>Sometimes you don&rsquo;t want to destroy the arena&mdash;you want to
+    <em>reuse</em> it. A game loop, for example, wants to clear the scratch
+    arena every frame without releasing and re-acquiring pages from the OS.
+    The <code>reset()</code> method handles this, and it takes a mode:</p>
+
+    <table data-anchor="arena-reset-table">
+      <caption>Arena reset modes</caption>
+      <thead>
+        <tr><th>Mode</th><th>Behavior</th><th>Use when</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>.retain_capacity</code></td>
+          <td>Keeps all pages allocated; resets the bump pointer to the start</td>
+          <td>You will allocate roughly the same amount next time (game frames, request loops)</td>
+        </tr>
+        <tr>
+          <td><code>.free_all</code></td>
+          <td>Returns every page to the child allocator</td>
+          <td>Next phase may be much smaller; you want to release memory back to the system</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p class="code-label">Arena reset in a loop</p>
+    <pre data-anchor="arena-reset-code"><span class="kw">var</span> arena = std.heap.ArenaAllocator.<span class="fn">init</span>(std.heap.page_allocator);
+<span class="kw">defer</span> arena.<span class="fn">deinit</span>();
+
+<span class="kw">while</span> (game.<span class="fn">isRunning</span>()) {
+    <span class="kw">const</span> allocator = arena.<span class="fn">allocator</span>();
+
+    <span class="kw">const</span> particles = <span class="kw">try</span> <span class="fn">simulateParticles</span>(allocator);
+    <span class="kw">const</span> collisions = <span class="kw">try</span> <span class="fn">detectCollisions</span>(allocator, particles);
+    <span class="fn">renderFrame</span>(particles, collisions);
+
+    <span class="cm">// Reset for next frame; keep pages for reuse</span>
+    arena.<span class="fn">reset</span>(.retain_capacity);
+}</pre>
+
+    <hr />
+
+    <!-- ============================================ FIXED BUFFER ALLOCATOR -->
+
+    <h2 data-anchor="fba-overview">FixedBufferAllocator: no heap at all</h2>
+
+    <p>If an arena says &ldquo;allocate many, free once,&rdquo; a
+    <code>FixedBufferAllocator</code> says &ldquo;allocate from this exact
+    slice of bytes, and nothing else.&rdquo; You give it a <code>[]<span
+    class="ty">u8</span></code>&mdash;which can be a stack-local array, a
+    static buffer, or a slice you obtained from somewhere&mdash;and it
+    bump-allocates within that slice. When the slice is exhausted, the next
+    allocation returns <code>error.OutOfMemory</code>. That&rsquo;s it. No
+    heap involvement whatsoever.</p>
+
+    <p>Unlike the arena, <code>FixedBufferAllocator</code> <em>does</em>
+    support <code>free()</code> in a limited way: if you free the most
+    recently allocated block, the bump pointer rewinds so that space can be
+    reused. This makes it behave well with standard-library containers that
+    free and reallocate as they grow.</p>
+
+    <p class="code-label">FixedBufferAllocator with a stack buffer</p>
+    <pre data-anchor="fba-stack-code"><span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">formatMessage</span>(id: <span class="ty">u32</span>) ![]<span class="kw">const</span> <span class="ty">u8</span> {
+    <span class="cm">// 4 KB on the stack&mdash;no heap, no OS calls</span>
+    <span class="kw">var</span> buf: [<span class="num">4096</span>]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+    <span class="kw">var</span> fba = std.heap.FixedBufferAllocator.<span class="fn">init</span>(&amp;buf);
+    <span class="kw">const</span> allocator = fba.<span class="fn">allocator</span>();
+
+    <span class="kw">var</span> list = std.ArrayList(<span class="ty">u8</span>).<span class="fn">init</span>(allocator);
+    <span class="kw">try</span> std.fmt.<span class="fn">format</span>(list.<span class="fn">writer</span>(), <span class="str">"event-{d}"</span>, .{id});
+
+    <span class="kw">return</span> list.<span class="fn">toOwnedSlice</span>();
+}</pre>
+
+    <div class="callout spec" data-anchor="fba-when">
+      <span class="callout-title">When to reach for FixedBufferAllocator</span>
+      <p><strong>Embedded systems</strong> and <strong>kernel code</strong>
+      where heap allocation is forbidden or unavailable. <strong>Hot
+      paths</strong> where you know the maximum size and want zero syscall
+      overhead. <strong>Tests</strong> that need a deterministic, bounded
+      allocator. Any time you can answer &ldquo;how much memory do I
+      need?&rdquo; with a known upper bound.</p>
+    </div>
+
+    <h3 data-anchor="fba-reset">Resetting a FixedBufferAllocator</h3>
+
+    <p>Just like the arena, a <code>FixedBufferAllocator</code> can be reset
+    to reuse its buffer from the beginning:</p>
+
+    <pre data-anchor="fba-reset-code">fba.<span class="fn">reset</span>();  <span class="cm">// bump pointer goes back to zero</span></pre>
+
+    <p>This is useful in loops where you format or compute into a fixed buffer
+    on each iteration.</p>
+
+    <hr />
+
+    <!-- ============================================================ COMPOSITION -->
+
+    <h2 data-anchor="composition">Composition: arenas all the way down</h2>
+
+    <p>Here is where Zig&rsquo;s allocator design really pays off. Because
+    every allocator speaks the same <code>std.mem.Allocator</code> interface,
+    you can <strong>compose</strong> them. The most common composition is the
+    one you&rsquo;ve already seen:</p>
+
+    <p class="code-label">The classic pattern</p>
+    <pre data-anchor="composition-classic-code"><span class="cm">// Arena backed by the OS page allocator</span>
+<span class="kw">var</span> arena = std.heap.ArenaAllocator.<span class="fn">init</span>(std.heap.page_allocator);</pre>
+
+    <p>But you can go further. Want an arena that is <em>bounded</em>&mdash;one
+    that will never request more memory from the OS, and will return
+    <code>error.OutOfMemory</code> if you exceed a fixed budget? Stack a
+    <code>FixedBufferAllocator</code> underneath:</p>
+
+    <p class="code-label">Bounded arena: ArenaAllocator over FixedBufferAllocator</p>
+    <pre data-anchor="composition-bounded-code"><span class="cm">// A 64 KB ceiling&mdash;the arena will bump-allocate within this,</span>
+<span class="cm">// but can never exceed it.</span>
+<span class="kw">var</span> backing_buf: [<span class="num">64</span> * <span class="num">1024</span>]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+<span class="kw">var</span> fba = std.heap.FixedBufferAllocator.<span class="fn">init</span>(&amp;backing_buf);
+
+<span class="kw">var</span> arena = std.heap.ArenaAllocator.<span class="fn">init</span>(fba.<span class="fn">allocator</span>());
+<span class="kw">defer</span> arena.<span class="fn">deinit</span>();
+
+<span class="kw">const</span> allocator = arena.<span class="fn">allocator</span>();
+
+<span class="cm">// Use 'allocator' freely. If total usage exceeds 64 KB,</span>
+<span class="cm">// you get error.OutOfMemory instead of unbounded growth.</span></pre>
+
+    <p>This is a powerful defensive pattern. In a server, it prevents a
+    single malformed request from consuming unbounded memory. In a game, it
+    ensures a frame&rsquo;s scratch allocation stays within its budget. The
+    arena gives you fast bump allocation; the fixed buffer gives you a hard
+    ceiling.</p>
+
+    <div class="callout key" data-anchor="composition-key">
+      <span class="callout-title">Composition is the design</span>
+      <p>Zig does not give you a &ldquo;bounded arena&rdquo; as a special type.
+      Instead, it gives you composable building blocks&mdash;arena, fixed buffer,
+      page allocator, GPA&mdash;and lets you snap them together. Any allocator
+      can wrap any other allocator. This is why the interface exists.</p>
+    </div>
+
+    <h3 data-anchor="composition-table">Common compositions</h3>
+
+    <table data-anchor="composition-table-data">
+      <caption>Allocator compositions you will see in real code</caption>
+      <thead>
+        <tr><th>Composition</th><th>What it gives you</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ArenaAllocator(page_allocator)</code></td>
+          <td>Fast phase-scoped allocation with OS-backed pages; the most common pattern</td>
+        </tr>
+        <tr>
+          <td><code>ArenaAllocator(FixedBufferAllocator)</code></td>
+          <td>Bounded arena; fast bump allocation with a hard memory ceiling</td>
+        </tr>
+        <tr>
+          <td><code>ArenaAllocator(GeneralPurposeAllocator)</code></td>
+          <td>Arena with safety checks on the child; useful during development to catch bugs in page management</td>
+        </tr>
+        <tr>
+          <td><code>FixedBufferAllocator</code> alone</td>
+          <td>Zero-overhead allocation from a stack or static buffer; for embedded, kernel, or known-size work</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <hr />
+
+    <!-- ============================================================ MENTAL MODEL -->
+
+    <h2 data-anchor="mental-model">The mental model</h2>
+
+    <p>Think of memory allocation strategies as a spectrum:</p>
+
+    <ul>
+      <li>At one end, <strong>general-purpose allocators</strong> (like GPA)
+      track every allocation individually. Maximum flexibility, maximum
+      bookkeeping.</li>
+      <li>At the other end, <strong>FixedBufferAllocator</strong> is nearly
+      zero bookkeeping&mdash;just an offset into a fixed slice&mdash;but
+      no flexibility at all.</li>
+      <li><strong>ArenaAllocator</strong> sits in the sweet spot: you get the
+      convenience of allocating many objects with different sizes and lifetimes,
+      but the cleanup simplicity of &ldquo;free everything at once.&rdquo;</li>
+    </ul>
+
+    <p>The art is choosing where on this spectrum each part of your program
+    should live. A web server&rsquo;s request handler? Arena. A fixed-format
+    packet parser in an embedded device? FixedBufferAllocator. A long-lived
+    data structure that outlives any single phase? GPA or page_allocator.
+    The next chapter takes the idea further: you will build your own allocator
+    from scratch.</p>
+
+    <div class="callout warn" data-anchor="arena-gotcha">
+      <span class="callout-title">Watch out</span>
+      <p>Arenas are not free lunch. Because individual <code>free()</code> is a
+      no-op, memory usage grows monotonically within a phase. If your phase
+      processes a million items and each allocates temporary buffers, those
+      buffers accumulate until <code>deinit()</code> or <code>reset()</code>.
+      If that&rsquo;s a problem, break the work into sub-phases with their own
+      arenas, or use a different allocator for the temporaries.</p>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="04-standard-allocators.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-writing-a-custom-allocator.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
