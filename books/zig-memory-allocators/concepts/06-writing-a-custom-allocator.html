@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>06 · Writing a Custom Allocator — Zig Memory Allocators</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="zig-memory-allocators">
+<header class="topbar">
+  <span class="brand">Zig Memory Allocators</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="ch06-head">
+      <span class="chapter-num">06</span>
+      <span class="chapter-kicker">From interface to implementation</span>
+      <h1>Writing a Custom Allocator</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch06-lede">You have used allocators. You have
+    composed them. Now it is time to build one from scratch. By the end of this
+    chapter, you will have a working bump allocator that satisfies the
+    <code>std.mem.Allocator</code> interface, and a clear picture of how to
+    extend the same technique to pool allocators, logging wrappers, and anything
+    else you can imagine.</p>
+
+    <!-- ============================================================ WHY CUSTOM -->
+
+    <h2 data-anchor="why-custom">When you need your own</h2>
+
+    <p>The standard library covers the common cases&mdash;general-purpose, arena,
+    fixed-buffer. But sometimes you need something it does not offer:</p>
+
+    <ul>
+      <li><strong>A pool allocator</strong> for fixed-size objects (network
+      packets, AST nodes, ECS components) where every allocation and free is
+      O(1).</li>
+      <li><strong>A logging or counting wrapper</strong> that records every
+      allocation for profiling, without changing the underlying strategy.</li>
+      <li><strong>A special-alignment allocator</strong> for SIMD data that
+      needs 32-byte or 64-byte alignment.</li>
+      <li><strong>A fail-injecting allocator</strong> for stress-testing error
+      paths. (Zig ships <code>std.testing.FailingAllocator</code> for exactly
+      this, but understanding how to build one teaches you the interface.)</li>
+    </ul>
+
+    <p>The good news: the interface is small. Four functions. One struct. Let us
+    walk through it.</p>
+
+    <!-- ============================================================ THE VTABLE -->
+
+    <h2 data-anchor="vtable-anatomy">The VTable, step by step</h2>
+
+    <p>Recall from Chapter 3 that <code>std.mem.Allocator</code> is a thin
+    wrapper around a pointer to a <code>VTable</code>. The VTable has four
+    function pointers:</p>
+
+    <table data-anchor="vtable-table">
+      <caption>The four VTable functions</caption>
+      <thead>
+        <tr><th>Function</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>alloc</code></td>
+          <td>Allocate a block of <code>n</code> bytes with a given alignment. Return the slice, or <code>null</code> on failure.</td>
+        </tr>
+        <tr>
+          <td><code>resize</code></td>
+          <td>Attempt to grow or shrink an existing allocation in place. Return <code>true</code> if successful, <code>false</code> if the allocator cannot resize without moving.</td>
+        </tr>
+        <tr>
+          <td><code>remap</code></td>
+          <td>Attempt to remap an existing allocation to a new size, possibly moving it. May return <code>null</code> if not supported.</td>
+        </tr>
+        <tr>
+          <td><code>free</code></td>
+          <td>Release a previously allocated block.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>To build a custom allocator, you:</p>
+
+    <ol>
+      <li>Define a <code>struct</code> that holds your allocator&rsquo;s
+      state.</li>
+      <li>Implement the four VTable functions as methods or namespace
+      functions.</li>
+      <li>Create a <code>const vtable</code> of type
+      <code>std.mem.Allocator.VTable</code> pointing to those functions.</li>
+      <li>Expose an <code>allocator()</code> method that returns an
+      <code>std.mem.Allocator</code> using your vtable and a pointer to your
+      state.</li>
+    </ol>
+
+    <div class="callout key" data-anchor="vtable-key">
+      <span class="callout-title">The key idea</span>
+      <p>A custom allocator is just a struct with state and a VTable. The
+      VTable bridges your struct&rsquo;s methods to the universal
+      <code>std.mem.Allocator</code> interface. Every caller sees the same
+      <code>.alloc()</code>, <code>.free()</code>, <code>.create()</code>,
+      <code>.destroy()</code> API&mdash;they never know (or care) what is
+      underneath.</p>
+    </div>
+
+    <hr />
+
+    <!-- ============================================================ BUMP ALLOCATOR -->
+
+    <h2 data-anchor="bump-overview">Building a bump allocator</h2>
+
+    <p>A bump allocator (also called a linear allocator) is the simplest
+    allocator that does real work. It maintains a buffer and an offset. Each
+    allocation advances the offset forward, aligning as needed. Freeing
+    individual allocations is a no-op&mdash;you reset the whole thing at
+    once, or you let it go out of scope.</p>
+
+    <p>This is exactly what <code>FixedBufferAllocator</code> does internally,
+    but building one yourself is the best way to understand how the VTable
+    fits together.</p>
+
+    <figure class="diagram-fig" data-anchor="bump-diagram">
+      <svg class="diagram" viewBox="0 0 620 220" role="img"
+           aria-label="Bump allocator state: a buffer with an offset pointer advancing, showing aligned and unaligned slots">
+
+        <!-- Buffer outline -->
+        <rect x="30" y="50" width="540" height="60" class="box" />
+        <text x="300" y="40" text-anchor="middle" class="lbl">backing buffer (e.g. 1024 bytes)</text>
+
+        <!-- Allocation A: 12 bytes -->
+        <rect x="30" y="50" width="72" height="60" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <text x="66" y="84" text-anchor="middle" class="lbl" style="font-size:8px">A (12 bytes)</text>
+
+        <!-- Alignment padding -->
+        <rect x="102" y="50" width="18" height="60" fill="var(--rule)" stroke="var(--ink)" stroke-width="0.6" stroke-dasharray="3 2" />
+        <text x="111" y="84" text-anchor="middle" class="lbl" style="font-size:6.5px">pad</text>
+
+        <!-- Allocation B: 32 bytes, aligned to 8 -->
+        <rect x="120" y="50" width="120" height="60" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.15" />
+        <text x="180" y="78" text-anchor="middle" class="lbl" style="font-size:8px">B (32 bytes)</text>
+        <text x="180" y="90" text-anchor="middle" class="lbl" style="font-size:6.5px">aligned to 8</text>
+
+        <!-- Allocation C: 8 bytes -->
+        <rect x="240" y="50" width="48" height="60" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.25" />
+        <text x="264" y="84" text-anchor="middle" class="lbl" style="font-size:8px">C (8 bytes)</text>
+
+        <!-- Offset pointer -->
+        <line x1="288" y1="50" x2="288" y2="110" class="flow-hot" stroke-width="2" />
+        <polygon points="288,50 283,58 293,58" class="fill-red" />
+        <text x="298" y="126" class="lbl-hot" style="font-size:9px">offset = 288</text>
+
+        <!-- Free space -->
+        <text x="430" y="84" text-anchor="middle" class="lbl" style="fill:var(--cm)">free space</text>
+
+        <!-- Annotations -->
+        <line x1="30" y1="145" x2="288" y2="145" class="flow-dash" />
+        <text x="159" y="160" text-anchor="middle" class="lbl" style="font-size:7.5px">allocated region</text>
+
+        <line x1="288" y1="145" x2="570" y2="145" class="stroke-soft" />
+        <text x="429" y="160" text-anchor="middle" class="lbl" style="font-size:7.5px; fill:var(--cm)">available region</text>
+
+        <!-- Alloc direction arrow -->
+        <line x1="60" y1="185" x2="520" y2="185" class="flow" />
+        <polygon points="520,185 512,180 512,190" class="fill-ink" />
+        <text x="300" y="200" text-anchor="middle" class="lbl" style="font-size:8px">allocation direction &rarr;</text>
+      </svg>
+      <figcaption>A bump allocator advances an offset through a fixed buffer.
+      Alignment padding is inserted as needed between allocations. The unused
+      region is always contiguous at the end.</figcaption>
+    </figure>
+
+    <h3 data-anchor="bump-struct">Step 1: the struct</h3>
+
+    <p>Our bump allocator needs two pieces of state: the buffer it allocates
+    from, and the current offset within that buffer.</p>
+
+    <pre data-anchor="bump-struct-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">const</span> BumpAllocator = <span class="kw">struct</span> {
+    buf: []<span class="ty">u8</span>,
+    offset: <span class="ty">usize</span>,
+
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">init</span>(buf: []<span class="ty">u8</span>) BumpAllocator {
+        <span class="kw">return</span> .{
+            .buf = buf,
+            .offset = <span class="num">0</span>,
+        };
+    }
+
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">reset</span>(self: *BumpAllocator) <span class="ty">void</span> {
+        self.offset = <span class="num">0</span>;
+    }
+};</pre>
+
+    <h3 data-anchor="bump-alloc">Step 2: the alloc function</h3>
+
+    <p>The <code>alloc</code> function is where the real work happens. It must
+    align the current offset to the requested alignment, check that there is
+    enough room, and return the slice. The <code>ret_addr</code> parameter
+    captures the caller&rsquo;s return address for debug stack traces&mdash;we
+    will not use it in this simple allocator, but we must accept it.</p>
+
+    <pre data-anchor="bump-alloc-code"><span class="kw">fn</span> <span class="fn">bump_alloc</span>(
+    ctx: *<span class="ty">anyopaque</span>,
+    n: <span class="ty">usize</span>,
+    alignment: <span class="ty">u8</span>,
+    ret_addr: <span class="ty">usize</span>,
+) ?[*]<span class="ty">u8</span> {
+    _ = ret_addr;
+    <span class="kw">const</span> self: *BumpAllocator = <span class="mac">@ptrCast</span>(<span class="mac">@alignCast</span>(ctx));
+    <span class="kw">const</span> align = <span class="mac">@as</span>(<span class="ty">usize</span>, <span class="num">1</span>) &lt;&lt; <span class="mac">@intCast</span>(alignment);
+
+    <span class="cm">// Align the offset forward</span>
+    <span class="kw">const</span> aligned_offset = std.mem.<span class="fn">alignForward</span>(<span class="ty">usize</span>, self.offset, align);
+
+    <span class="cm">// Check for overflow</span>
+    <span class="kw">if</span> (aligned_offset + n &gt; self.buf.len) {
+        <span class="kw">return</span> <span class="kw">null</span>; <span class="cm">// out of memory</span>
+    }
+
+    <span class="kw">const</span> result = self.buf[aligned_offset..][<span class="num">0</span>..n];
+    self.offset = aligned_offset + n;
+
+    <span class="kw">return</span> result.ptr;
+}</pre>
+
+    <div class="callout spec" data-anchor="ret-addr-note">
+      <span class="callout-title">The ret_addr parameter</span>
+      <p>Every VTable function receives a <code>ret_addr:
+      <span class="ty">usize</span></code>. This is the return address of the
+      caller&mdash;captured via <code><span class="mac">@returnAddress</span>()</code>&mdash;so
+      that debug allocators can record a stack trace of <em>who</em> performed
+      each allocation. If your allocator does not need tracing, you can ignore
+      it (assign to <code>_</code>). If you wrap another allocator, pass it
+      through so the inner allocator&rsquo;s traces stay accurate.</p>
+    </div>
+
+    <h3 data-anchor="bump-free-resize">Step 3: free, resize, and remap</h3>
+
+    <p>Our bump allocator does not support freeing individual blocks or
+    resizing them. That is a legitimate design choice&mdash;just return
+    the &ldquo;not supported&rdquo; values:</p>
+
+    <pre data-anchor="bump-free-resize-code"><span class="kw">fn</span> <span class="fn">bump_resize</span>(
+    ctx: *<span class="ty">anyopaque</span>,
+    buf: []<span class="ty">u8</span>,
+    buf_align: <span class="ty">u8</span>,
+    new_len: <span class="ty">usize</span>,
+    ret_addr: <span class="ty">usize</span>,
+) ?<span class="ty">usize</span> {
+    _ = ctx; _ = buf; _ = buf_align; _ = new_len; _ = ret_addr;
+    <span class="kw">return</span> <span class="kw">null</span>; <span class="cm">// resize not supported</span>
+}
+
+<span class="kw">fn</span> <span class="fn">bump_remap</span>(
+    ctx: *<span class="ty">anyopaque</span>,
+    buf: []<span class="ty">u8</span>,
+    buf_align: <span class="ty">u8</span>,
+    new_len: <span class="ty">usize</span>,
+    ret_addr: <span class="ty">usize</span>,
+) ?[*]<span class="ty">u8</span> {
+    _ = ctx; _ = buf; _ = buf_align; _ = new_len; _ = ret_addr;
+    <span class="kw">return</span> <span class="kw">null</span>; <span class="cm">// remap not supported</span>
+}
+
+<span class="kw">fn</span> <span class="fn">bump_free</span>(
+    ctx: *<span class="ty">anyopaque</span>,
+    buf: []<span class="ty">u8</span>,
+    buf_align: <span class="ty">u8</span>,
+    ret_addr: <span class="ty">usize</span>,
+) <span class="ty">void</span> {
+    _ = ctx; _ = buf; _ = buf_align; _ = ret_addr;
+    <span class="cm">// no-op: reset the whole allocator to reclaim memory</span>
+}</pre>
+
+    <h3 data-anchor="bump-vtable">Step 4: the VTable and allocator() method</h3>
+
+    <p>Now we tie it all together. We declare a <code>const vtable</code> and
+    add an <code>allocator()</code> method that builds the
+    <code>std.mem.Allocator</code> wrapper:</p>
+
+    <pre data-anchor="bump-vtable-code"><span class="kw">const</span> BumpAllocator = <span class="kw">struct</span> {
+    buf: []<span class="ty">u8</span>,
+    offset: <span class="ty">usize</span>,
+
+    <span class="cm">// ... init, reset as before ...</span>
+
+    <span class="kw">const</span> vtable: std.mem.Allocator.VTable = .{
+        .alloc  = bump_alloc,
+        .resize = bump_resize,
+        .remap  = bump_remap,
+        .free   = bump_free,
+    };
+
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">allocator</span>(self: *BumpAllocator) std.mem.Allocator {
+        <span class="kw">return</span> .{
+            .ptr = <span class="mac">@ptrCast</span>(self),
+            .vtable = &amp;vtable,
+        };
+    }
+};</pre>
+
+    <p>And that is a complete custom allocator. You can pass
+    <code>bump.allocator()</code> to any function that accepts an
+    <code>std.mem.Allocator</code>&mdash;containers, parsers, serializers&mdash;and
+    it will bump-allocate from your buffer.</p>
+
+    <p class="code-label">Using the bump allocator</p>
+    <pre data-anchor="bump-usage-code"><span class="kw">var</span> backing: [<span class="num">8192</span>]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+<span class="kw">var</span> bump = BumpAllocator.<span class="fn">init</span>(&amp;backing);
+<span class="kw">const</span> alloc = bump.<span class="fn">allocator</span>();
+
+<span class="cm">// Use it like any allocator</span>
+<span class="kw">const</span> slice = <span class="kw">try</span> alloc.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">256</span>);
+_ = slice;
+
+<span class="cm">// When done, reset to reuse the buffer</span>
+bump.<span class="fn">reset</span>();</pre>
+
+    <hr />
+
+    <!-- ============================================================ POOL ALLOCATOR -->
+
+    <h2 data-anchor="pool-overview">Pool allocator: the concept</h2>
+
+    <p>A bump allocator is great when you never free individual objects. But
+    what if you need to allocate and free many objects of the <em>same
+    size</em>&mdash;say, AST nodes in a compiler, or connection structs in a
+    server? That is the job of a <strong>pool allocator</strong> (sometimes
+    called a slab allocator).</p>
+
+    <p>The idea:</p>
+
+    <ol>
+      <li>Pre-divide a buffer into fixed-size <strong>blocks</strong>, each
+      large enough to hold one object.</li>
+      <li>Maintain a <strong>free list</strong>&mdash;a linked list of
+      available blocks. Initially, every block is on the free list.</li>
+      <li>To allocate, pop the head of the free list. O(1).</li>
+      <li>To free, push the block back onto the free list. O(1).</li>
+    </ol>
+
+    <p>The trick that makes this space-efficient: store the free-list&rsquo;s
+    <code>next</code> pointer <em>inside the unused block itself</em>. A free
+    block is not holding user data, so you can reuse its bytes for the
+    linked-list node. No extra metadata overhead.</p>
+
+    <figure class="diagram-fig" data-anchor="pool-diagram">
+      <svg class="diagram" viewBox="0 0 620 240" role="img"
+           aria-label="Pool allocator: pre-divided blocks with a free list linking unused blocks">
+
+        <!-- Title -->
+        <text x="310" y="20" text-anchor="middle" class="lbl" style="font-size:9px">pool of 8 blocks (each 64 bytes)</text>
+
+        <!-- Blocks row -->
+        <rect x="30" y="35" width="68" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <text x="64" y="64" text-anchor="middle" class="lbl" style="font-size:7px">in use</text>
+
+        <rect x="100" y="35" width="68" height="50" class="box" />
+        <text x="134" y="64" text-anchor="middle" class="lbl" style="font-size:7px; fill:var(--en)">free</text>
+
+        <rect x="170" y="35" width="68" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <text x="204" y="64" text-anchor="middle" class="lbl" style="font-size:7px">in use</text>
+
+        <rect x="240" y="35" width="68" height="50" class="box" />
+        <text x="274" y="64" text-anchor="middle" class="lbl" style="font-size:7px; fill:var(--en)">free</text>
+
+        <rect x="310" y="35" width="68" height="50" class="box" />
+        <text x="344" y="64" text-anchor="middle" class="lbl" style="font-size:7px; fill:var(--en)">free</text>
+
+        <rect x="380" y="35" width="68" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <text x="414" y="64" text-anchor="middle" class="lbl" style="font-size:7px">in use</text>
+
+        <rect x="450" y="35" width="68" height="50" class="box" />
+        <text x="484" y="64" text-anchor="middle" class="lbl" style="font-size:7px; fill:var(--en)">free</text>
+
+        <rect x="520" y="35" width="68" height="50" class="fill-red" stroke="var(--ink)" stroke-width="1.2" opacity="0.2" />
+        <text x="554" y="64" text-anchor="middle" class="lbl" style="font-size:7px">in use</text>
+
+        <!-- Free list head pointer -->
+        <text x="30" y="115" class="lbl-hot" style="font-size:9px">free_head</text>
+        <line x1="82" y1="112" x2="130" y2="88" class="flow-hot" />
+        <polygon points="130,88 122,90 125,97" class="fill-red" />
+
+        <!-- Free list links (inside blocks) -->
+        <path d="M 140,85 Q 160,110 200,85 Q 230,60 270,85" class="flow-dash" style="stroke:var(--en)" />
+        <polygon points="270,85 262,80 264,88" style="fill:var(--en)" />
+
+        <path d="M 280,85 Q 300,110 340,85" class="flow-dash" style="stroke:var(--en)" />
+        <polygon points="340,85 332,80 334,88" style="fill:var(--en)" />
+
+        <path d="M 350,85 Q 390,110 480,85" class="flow-dash" style="stroke:var(--en)" />
+        <polygon points="480,85 472,80 474,88" style="fill:var(--en)" />
+
+        <!-- Null terminator -->
+        <text x="492" y="104" class="lbl" style="font-size:7px; fill:var(--cm)">null</text>
+
+        <!-- Legend -->
+        <rect x="30" y="145" width="14" height="14" class="fill-red" stroke="var(--ink)" stroke-width="1" opacity="0.2" />
+        <text x="50" y="156" class="lbl" style="font-size:8px">allocated block</text>
+
+        <rect x="160" y="145" width="14" height="14" class="box" />
+        <text x="180" y="156" class="lbl" style="font-size:8px">free block (next pointer stored inside)</text>
+
+        <!-- Operations -->
+        <rect x="30" y="178" width="260" height="44" class="box" style="stroke-dasharray:4 3" />
+        <text x="40" y="195" class="lbl" style="font-size:8px">alloc() &rarr; pop free_head &rarr; O(1)</text>
+        <text x="40" y="212" class="lbl" style="font-size:8px">free(ptr) &rarr; push onto free_head &rarr; O(1)</text>
+
+        <rect x="310" y="178" width="280" height="44" class="box" style="stroke-dasharray:4 3" />
+        <text x="320" y="195" class="lbl" style="font-size:8px">zero fragmentation (all blocks same size)</text>
+        <text x="320" y="212" class="lbl" style="font-size:8px">zero metadata overhead (next ptr in free block)</text>
+      </svg>
+      <figcaption>A pool allocator divides memory into fixed-size blocks. The
+      free list threads through unused blocks, storing the <code>next</code>
+      pointer inside each free block&rsquo;s own bytes. Alloc and free are
+      both O(1).</figcaption>
+    </figure>
+
+    <p>We will not build a full pool allocator here&mdash;the alignment and
+    VTable plumbing follow the same pattern as the bump allocator above. The
+    key insight is the data structure: a singly-linked free list whose nodes
+    live inside the free blocks themselves.</p>
+
+    <p class="code-label">Pool allocator: the free-list node trick</p>
+    <pre data-anchor="pool-node-code"><span class="kw">const</span> FreeNode = <span class="kw">struct</span> {
+    next: ?*FreeNode,
+};
+
+<span class="kw">const</span> PoolAllocator = <span class="kw">struct</span> {
+    buf: []<span class="ty">u8</span>,
+    block_size: <span class="ty">usize</span>,
+    free_head: ?*FreeNode,
+
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">init</span>(buf: []<span class="ty">u8</span>, <span class="kw">comptime</span> block_size: <span class="ty">usize</span>) PoolAllocator {
+        <span class="cm">// Block must be large enough to hold a FreeNode</span>
+        <span class="kw">comptime</span> std.debug.<span class="fn">assert</span>(block_size &gt;= <span class="mac">@sizeOf</span>(FreeNode));
+
+        <span class="kw">var</span> self = PoolAllocator{
+            .buf = buf,
+            .block_size = block_size,
+            .free_head = <span class="kw">null</span>,
+        };
+
+        <span class="cm">// Thread all blocks onto the free list</span>
+        <span class="kw">var</span> offset: <span class="ty">usize</span> = <span class="num">0</span>;
+        <span class="kw">while</span> (offset + block_size &lt;= buf.len) : (offset += block_size) {
+            <span class="kw">const</span> node: *FreeNode = <span class="mac">@ptrCast</span>(<span class="mac">@alignCast</span>(buf[offset..].ptr));
+            node.next = self.free_head;
+            self.free_head = node;
+        }
+
+        <span class="kw">return</span> self;
+    }
+};</pre>
+
+    <hr />
+
+    <!-- ============================================================ TESTING -->
+
+    <h2 data-anchor="testing">Testing your allocator</h2>
+
+    <p>Zig&rsquo;s standard library includes tools purpose-built for testing
+    allocators:</p>
+
+    <ul>
+      <li><code>std.testing.allocator</code> &mdash; a
+      <code>GeneralPurposeAllocator</code> that detects leaks and
+      double-frees. Use it as a <em>reference</em>: if your allocator&rsquo;s
+      behavior matches this one on the same sequence of operations, you are
+      on solid ground.</li>
+      <li><code>std.testing.FailingAllocator</code> &mdash; wraps any
+      allocator and makes the <em>n</em>-th allocation fail. Use it to verify
+      that code using your allocator handles <code>error.OutOfMemory</code>
+      correctly.</li>
+    </ul>
+
+    <p class="code-label">Testing the bump allocator</p>
+    <pre data-anchor="testing-code"><span class="kw">const</span> testing = <span class="mac">@import</span>(<span class="str">"std"</span>).testing;
+
+<span class="kw">test</span> <span class="str">"bump allocator basic usage"</span> {
+    <span class="kw">var</span> backing: [<span class="num">1024</span>]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+    <span class="kw">var</span> bump = BumpAllocator.<span class="fn">init</span>(&amp;backing);
+    <span class="kw">const</span> alloc = bump.<span class="fn">allocator</span>();
+
+    <span class="cm">// Allocate a few slices</span>
+    <span class="kw">const</span> a = <span class="kw">try</span> alloc.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">100</span>);
+    <span class="kw">const</span> b = <span class="kw">try</span> alloc.<span class="fn">alloc</span>(<span class="ty">u32</span>, <span class="num">10</span>);
+
+    <span class="cm">// Verify they don't overlap</span>
+    <span class="kw">try</span> testing.<span class="fn">expect</span>(<span class="mac">@intFromPtr</span>(a.ptr) + a.len &lt;= <span class="mac">@intFromPtr</span>(b.ptr));
+
+    <span class="cm">// Verify out-of-memory when exhausted</span>
+    <span class="kw">const</span> too_big = alloc.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">2048</span>);
+    <span class="kw">try</span> testing.<span class="fn">expectError</span>(<span class="kw">error</span>.OutOfMemory, too_big);
+}
+
+<span class="kw">test</span> <span class="str">"bump allocator reset"</span> {
+    <span class="kw">var</span> backing: [<span class="num">256</span>]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+    <span class="kw">var</span> bump = BumpAllocator.<span class="fn">init</span>(&amp;backing);
+    <span class="kw">const</span> alloc = bump.<span class="fn">allocator</span>();
+
+    _ = <span class="kw">try</span> alloc.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">200</span>);
+    bump.<span class="fn">reset</span>(); <span class="cm">// reclaim everything</span>
+
+    <span class="cm">// After reset, we can allocate again from the beginning</span>
+    <span class="kw">const</span> c = <span class="kw">try</span> alloc.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">200</span>);
+    <span class="kw">try</span> testing.<span class="fn">expect</span>(c.len == <span class="num">200</span>);
+}</pre>
+
+    <div class="callout warn" data-anchor="testing-warn">
+      <span class="callout-title">A word of caution</span>
+      <p>A custom allocator that passes its own tests is not necessarily
+      correct. The real test is running it under code that <em>uses</em> it
+      heavily&mdash;containers, parsers, concurrent tasks. Start by using
+      <code>std.testing.allocator</code> (which catches leaks and misuse) as
+      the baseline, then swap in your custom allocator and verify identical
+      behavior.</p>
+    </div>
+
+    <hr />
+
+    <!-- ============================================================ PUTTING IT TOGETHER -->
+
+    <h2 data-anchor="putting-together">Putting it all together</h2>
+
+    <p>Here is the complete recipe for writing any custom allocator in Zig:</p>
+
+    <ol>
+      <li><strong>Define a struct</strong> with whatever state your strategy
+      needs (buffer + offset for bump, buffer + free list for pool, wrapped
+      allocator + counters for logging).</li>
+      <li><strong>Implement four functions</strong> matching the VTable
+      signatures: <code>alloc</code>, <code>resize</code>, <code>remap</code>,
+      <code>free</code>. Functions you do not support return <code>null</code>
+      (or do nothing for <code>free</code>).</li>
+      <li><strong>Declare a <code>const vtable</code></strong> of type
+      <code>std.mem.Allocator.VTable</code> pointing to your four
+      functions.</li>
+      <li><strong>Expose <code>allocator()</code></strong> returning
+      <code>std.mem.Allocator{ .ptr = @ptrCast(self), .vtable = &amp;vtable }</code>.</li>
+      <li><strong>Test</strong> with <code>std.testing.allocator</code> as a
+      reference and <code>FailingAllocator</code> for error-path
+      coverage.</li>
+    </ol>
+
+    <p>That is the whole pattern. Every allocator in Zig&rsquo;s standard
+    library&mdash;ArenaAllocator, GeneralPurposeAllocator,
+    FixedBufferAllocator&mdash;follows exactly these steps. The interface is
+    small by design: four functions, one vtable, and every allocator in the
+    ecosystem becomes interchangeable. In the next chapter, we will see how
+    to use that interchangeability to build allocator-aware APIs, compose
+    allocators in production, and bridge Zig allocators with C code.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="05-arena-and-fixed-buffer.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-allocator-patterns.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

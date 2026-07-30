@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>08 · Performance and Choosing the Right Allocator — Zig Memory Allocators</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="zig-memory-allocators">
+
+<header class="topbar">
+  <span class="brand">Zig Memory Allocators</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="ch08-head">
+      <span class="chapter-num">08</span>
+      <span class="chapter-kicker">Measure, then decide</span>
+      <h1>Performance and Choosing the Right Allocator</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch08-lede">
+      There is no &ldquo;best&rdquo; allocator. There is only the best allocator
+      for <em>your</em> workload. This chapter gives you the numbers, the trade-offs,
+      and a decision framework so you can choose with confidence.
+    </p>
+
+    <!-- ============================================================ s1 -->
+    <h2 data-anchor="ch08-speed">Speed Varies by Orders of Magnitude</h2>
+
+    <p data-anchor="ch08-speed-p1">
+      Not all allocations are equal. A call to <code>page_allocator</code>
+      triggers a system call&mdash;microseconds. The <code>GeneralPurposeAllocator</code>
+      manages buckets in user space&mdash;hundreds of nanoseconds. An arena just
+      bumps a pointer&mdash;single-digit nanoseconds. A <code>FixedBufferAllocator</code>
+      does the same bump with no possibility of a syscall at all.
+    </p>
+
+    <p data-anchor="ch08-speed-p2">
+      Those differences compound. In a hot loop that allocates thousands of
+      small objects, the choice between a GPA and an arena can be the difference
+      between milliseconds and microseconds&mdash;a 1000x gap.
+    </p>
+
+    <div class="callout key" data-anchor="ch08-callout-measure">
+      <span class="callout-title">Measure first</span>
+      <p>
+        Before you optimize, know what you are optimizing. Use
+        <code>LoggingAllocator</code> or custom instrumentation to answer
+        three questions: <em>How many allocations?</em>
+        <em>What sizes?</em> <em>How long does each live?</em> The answers
+        point directly at the right allocator.
+      </p>
+    </div>
+
+    <!-- ============================================================ s2 -->
+    <h2 data-anchor="ch08-comparison">Allocator Comparison</h2>
+
+    <p data-anchor="ch08-comparison-p1">
+      Here is the landscape at a glance. Every row is a trade-off&mdash;there
+      is no allocator that wins on every axis.
+    </p>
+
+    <table data-anchor="ch08-comparison-table">
+      <caption>Allocator trade-off matrix</caption>
+      <thead>
+        <tr>
+          <th>Allocator</th>
+          <th>Speed</th>
+          <th>Fragmentation</th>
+          <th>Thread-safe</th>
+          <th>Best for</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>page_allocator</code></td>
+          <td>Slow (~&mu;s, syscall)</td>
+          <td>None (whole pages)</td>
+          <td>Yes (OS handles it)</td>
+          <td>Backing allocator, large buffers</td>
+        </tr>
+        <tr>
+          <td><code>GeneralPurposeAllocator</code></td>
+          <td>Medium (~100s ns)</td>
+          <td>Can fragment over time</td>
+          <td>No</td>
+          <td>Default choice, safety checks, leak detection</td>
+        </tr>
+        <tr>
+          <td><code>ArenaAllocator</code></td>
+          <td>Fast (~ns, bump)</td>
+          <td>None within phase</td>
+          <td>No</td>
+          <td>Request handling, parsers, compilers, scratch work</td>
+        </tr>
+        <tr>
+          <td><code>FixedBufferAllocator</code></td>
+          <td>Fast (~ns, no syscall)</td>
+          <td>None (bounded)</td>
+          <td>No</td>
+          <td>Embedded, kernel, stack-backed buffers</td>
+        </tr>
+        <tr>
+          <td><code>c_allocator</code></td>
+          <td>Varies (libc malloc)</td>
+          <td>Depends on libc</td>
+          <td>Yes (libc handles it)</td>
+          <td>C interop only</td>
+        </tr>
+        <tr>
+          <td><code>testing.allocator</code></td>
+          <td>Slow (instrumented)</td>
+          <td>N/A</td>
+          <td>No</td>
+          <td>Tests&mdash;detects leaks and double-frees</td>
+        </tr>
+        <tr>
+          <td>Pool allocator (custom)</td>
+          <td>Fast (~ns)</td>
+          <td>None for fixed-size</td>
+          <td>No (by default)</td>
+          <td>Many objects of the same size</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ============================================================ s3 -->
+    <h2 data-anchor="ch08-fragmentation">Fragmentation: The Silent Cost</h2>
+
+    <p data-anchor="ch08-fragmentation-p1">
+      Fragmentation means your allocator has free memory it cannot use because
+      it is broken into pieces too small for the next request. Some allocators
+      are immune to this:
+    </p>
+
+    <ul data-anchor="ch08-fragmentation-list">
+      <li>
+        <strong><code>page_allocator</code></strong>&mdash;always allocates
+        whole pages. No internal fragmentation. External fragmentation is
+        the OS&rsquo;s problem.
+      </li>
+      <li>
+        <strong><code>ArenaAllocator</code></strong>&mdash;never frees
+        individual objects, so fragmentation does not accumulate within a
+        phase. When you reset or destroy the arena, all memory is reclaimed
+        cleanly.
+      </li>
+      <li>
+        <strong>Pool allocators</strong>&mdash;every slot is the same size.
+        No fragmentation by construction.
+      </li>
+      <li>
+        <strong><code>GeneralPurposeAllocator</code></strong>&mdash;uses
+        bucket sizes that reduce fragmentation, but in long-running programs
+        with mixed allocation sizes, it can fragment over time.
+      </li>
+    </ul>
+
+    <!-- ============================================================ s4 -->
+    <h2 data-anchor="ch08-embedded">Embedded and Kernel Targets</h2>
+
+    <p data-anchor="ch08-embedded-p1">
+      On a microcontroller or inside an OS kernel, you cannot call
+      <code>mmap</code>. You might not even have a heap. This is where
+      <code>FixedBufferAllocator</code> shines: back it with a
+      <code>comptime</code>-sized static array, and you get a deterministic
+      allocator with bounded memory use and zero syscalls.
+    </p>
+
+    <p data-anchor="ch08-embedded-p2">
+      For workloads that need many objects of the same type&mdash;network
+      packet buffers, interrupt descriptors, timer entries&mdash;a pool
+      allocator gives you constant-time allocation and deallocation with
+      zero fragmentation.
+    </p>
+
+    <div class="callout" data-anchor="ch08-callout-determinism">
+      <span class="callout-title">Determinism matters</span>
+      <p>
+        In safety-critical or real-time code, the <em>worst-case</em>
+        allocation time matters more than the average. Fixed-buffer and
+        pool allocators have O(1) worst-case behavior. General-purpose
+        allocators do not.
+      </p>
+    </div>
+
+    <!-- ============================================================ s5 -->
+    <h2 data-anchor="ch08-threads">Thread Safety</h2>
+
+    <p data-anchor="ch08-threads-p1">
+      Most Zig allocators are <strong>not thread-safe by default</strong>.
+      This is deliberate: synchronization has a cost, and you should not pay
+      it when you do not need it.
+    </p>
+
+    <p data-anchor="ch08-threads-p2">
+      When you do need thread safety, you have two options:
+    </p>
+
+    <ul data-anchor="ch08-threads-list">
+      <li>
+        <strong>Wrap with <code>ThreadSafeAllocator</code>.</strong>
+        This adds a mutex around the inner allocator&rsquo;s operations.
+        Simple, correct, but serializes all allocations.
+      </li>
+      <li>
+        <strong>Per-thread allocators.</strong> Give each thread its own
+        arena or GPA. No contention, no locking, maximum throughput.
+        This is the preferred pattern in high-performance concurrent code.
+      </li>
+    </ul>
+
+    <p data-anchor="ch08-threads-p3">
+      The exceptions are <code>page_allocator</code> and <code>c_allocator</code>,
+      which delegate to the OS or libc and inherit their thread safety.
+    </p>
+
+    <!-- ============================================================ s6 -->
+    <h2 data-anchor="ch08-decision">The Decision Framework</h2>
+
+    <p data-anchor="ch08-decision-p1">
+      When you are staring at a new module and wondering which allocator to
+      reach for, walk through these questions:
+    </p>
+
+    <ol data-anchor="ch08-decision-list">
+      <li>
+        <strong>Is this test code?</strong>
+        Use <code>std.testing.allocator</code>. It catches leaks and
+        double-frees automatically.
+      </li>
+      <li>
+        <strong>Does the memory cross a C boundary?</strong>
+        Use <code>c_allocator</code>. No exceptions.
+      </li>
+      <li>
+        <strong>Is all memory freed at once?</strong>
+        (A request, a parse, a frame.) Use an <code>ArenaAllocator</code>.
+      </li>
+      <li>
+        <strong>Is the total memory bounded and known at compile time?</strong>
+        Use a <code>FixedBufferAllocator</code>.
+      </li>
+      <li>
+        <strong>Are you allocating many objects of the same size?</strong>
+        Use a pool allocator.
+      </li>
+      <li>
+        <strong>None of the above?</strong>
+        Start with <code>GeneralPurposeAllocator</code>. It is safe,
+        it detects leaks, and it is good enough for most workloads.
+        Optimize later if measurements say you must.
+      </li>
+    </ol>
+
+    <!-- ============================================================ s7 -->
+    <h2 data-anchor="ch08-flowchart">Decision Tree</h2>
+
+    <p data-anchor="ch08-flowchart-p1">
+      The same framework, as a picture you can pin to your wall.
+    </p>
+
+    <figure class="diagram-fig" data-anchor="ch08-diagram-decision">
+      <svg class="diagram" viewBox="0 0 520 420" aria-label="Decision tree flowchart for choosing the right Zig allocator">
+        <title>Allocator decision tree</title>
+        <defs>
+          <marker id="arr08" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7" fill="none" stroke="var(--ink)" stroke-width="1" />
+          </marker>
+          <marker id="arr08r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7" fill="none" stroke="var(--accent)" stroke-width="1.2" />
+          </marker>
+        </defs>
+
+        <!-- Q1: Test code? -->
+        <rect x="170" y="10" width="180" height="34" rx="0" class="box" />
+        <text x="260" y="32" text-anchor="middle" font-size="10">Test code?</text>
+
+        <!-- Yes -> testing.allocator -->
+        <line x1="350" y1="27" x2="440" y2="27" class="flow" marker-end="url(#arr08)" />
+        <text x="390" y="22" text-anchor="middle" class="lbl" style="font-size:7.5px;">yes</text>
+        <rect x="442" y="12" width="70" height="30" class="box-hot" />
+        <text x="477" y="32" text-anchor="middle" class="lbl-hot" style="font-size:8px;">testing</text>
+
+        <!-- No -> Q2 -->
+        <line x1="260" y1="44" x2="260" y2="68" class="flow" marker-end="url(#arr08)" />
+        <text x="270" y="58" class="lbl" style="font-size:7.5px;">no</text>
+
+        <!-- Q2: C boundary? -->
+        <rect x="170" y="70" width="180" height="34" rx="0" class="box" />
+        <text x="260" y="92" text-anchor="middle" font-size="10">C boundary?</text>
+
+        <line x1="350" y1="87" x2="440" y2="87" class="flow" marker-end="url(#arr08)" />
+        <text x="390" y="82" text-anchor="middle" class="lbl" style="font-size:7.5px;">yes</text>
+        <rect x="442" y="72" width="70" height="30" class="box-hot" />
+        <text x="477" y="92" text-anchor="middle" class="lbl-hot" style="font-size:8px;">c_allocator</text>
+
+        <line x1="260" y1="104" x2="260" y2="128" class="flow" marker-end="url(#arr08)" />
+        <text x="270" y="118" class="lbl" style="font-size:7.5px;">no</text>
+
+        <!-- Q3: Bulk free? -->
+        <rect x="170" y="130" width="180" height="34" rx="0" class="box" />
+        <text x="260" y="152" text-anchor="middle" font-size="10">All freed at once?</text>
+
+        <line x1="350" y1="147" x2="440" y2="147" class="flow" marker-end="url(#arr08)" />
+        <text x="390" y="142" text-anchor="middle" class="lbl" style="font-size:7.5px;">yes</text>
+        <rect x="442" y="132" width="70" height="30" class="box-hot" />
+        <text x="477" y="152" text-anchor="middle" class="lbl-hot" style="font-size:8px;">Arena</text>
+
+        <line x1="260" y1="164" x2="260" y2="188" class="flow" marker-end="url(#arr08)" />
+        <text x="270" y="178" class="lbl" style="font-size:7.5px;">no</text>
+
+        <!-- Q4: Bounded? -->
+        <rect x="170" y="190" width="180" height="34" rx="0" class="box" />
+        <text x="260" y="212" text-anchor="middle" font-size="10">Bounded + compile-time?</text>
+
+        <line x1="350" y1="207" x2="440" y2="207" class="flow" marker-end="url(#arr08)" />
+        <text x="390" y="202" text-anchor="middle" class="lbl" style="font-size:7.5px;">yes</text>
+        <rect x="442" y="192" width="70" height="30" class="box-hot" />
+        <text x="477" y="212" text-anchor="middle" class="lbl-hot" style="font-size:8px;">FixedBuffer</text>
+
+        <line x1="260" y1="224" x2="260" y2="248" class="flow" marker-end="url(#arr08)" />
+        <text x="270" y="238" class="lbl" style="font-size:7.5px;">no</text>
+
+        <!-- Q5: Same-size objects? -->
+        <rect x="170" y="250" width="180" height="34" rx="0" class="box" />
+        <text x="260" y="272" text-anchor="middle" font-size="10">Same-size objects?</text>
+
+        <line x1="350" y1="267" x2="440" y2="267" class="flow" marker-end="url(#arr08)" />
+        <text x="390" y="262" text-anchor="middle" class="lbl" style="font-size:7.5px;">yes</text>
+        <rect x="442" y="252" width="70" height="30" class="box-hot" />
+        <text x="477" y="272" text-anchor="middle" class="lbl-hot" style="font-size:8px;">Pool</text>
+
+        <line x1="260" y1="284" x2="260" y2="308" class="flow" marker-end="url(#arr08)" />
+        <text x="270" y="298" class="lbl" style="font-size:7.5px;">no</text>
+
+        <!-- Default: GPA -->
+        <rect x="170" y="310" width="180" height="40" class="box-hot" />
+        <text x="260" y="328" text-anchor="middle" class="lbl-hot" style="font-size:9px;">GeneralPurpose</text>
+        <text x="260" y="342" text-anchor="middle" class="lbl-hot" style="font-size:9px;">Allocator</text>
+
+        <!-- Left annotation -->
+        <text x="10" y="330" class="lbl" style="font-size:8px;" transform="rotate(-90 10 330)">safe default</text>
+      </svg>
+      <figcaption>
+        Walk the tree from top to bottom. The first &ldquo;yes&rdquo; picks your allocator.
+        If nothing matches, the GeneralPurposeAllocator is your safe default.
+      </figcaption>
+    </figure>
+
+    <!-- ============================================================ s8 -->
+    <h2 data-anchor="ch08-summary">The Short Version</h2>
+
+    <p data-anchor="ch08-summary-p1">
+      Start with the <code>GeneralPurposeAllocator</code>. It catches mistakes.
+      When your profiler tells you allocation is a bottleneck, measure your
+      pattern (many small short-lived? same size? bounded total?) and switch
+      to the specialized allocator that fits. Do not optimize what you have
+      not measured.
+    </p>
+
+    <div class="callout key" data-anchor="ch08-callout-final">
+      <span class="callout-title">The golden rule</span>
+      <p>
+        Correctness first, performance second. The GPA&rsquo;s safety checks
+        have caught more bugs than arena allocation has saved cycles.
+        Start safe, measure, then specialize.
+      </p>
+    </div>
+
+    <hr data-anchor="ch08-divider" />
+
+    <p data-anchor="ch08-closing">
+      That is the complete picture. Eight chapters: from why allocators exist,
+      through the interface, the standard implementations, building your own,
+      composing them in real code, and finally choosing the right one. The
+      cheatsheet on the next page puts everything on a single reference sheet
+      you can come back to whenever you need a quick answer.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-allocator-patterns.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

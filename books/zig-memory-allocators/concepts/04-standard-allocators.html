@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>04 &middot; The Standard Allocators &mdash; Zig Memory Allocators</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="zig-memory-allocators">
+
+<header class="topbar">
+  <span class="brand">Zig Memory Allocators</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch04-head">
+      <span class="chapter-num">04</span>
+      <span class="chapter-kicker">The toolbox in std.heap</span>
+      <h1>The Standard Allocators</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch04-lede">
+      You know the interface now&thinsp;&mdash;&thinsp;two fields, four operations, a handful of
+      convenience methods. But an interface is only useful if there are good implementations
+      behind it. The Zig standard library ships several, each tuned for a different job. This
+      chapter opens the toolbox and examines every tool inside.
+    </p>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="toolbox-overview">The Toolbox at a Glance</h2>
+
+    <p data-anchor="toolbox-intro">
+      Think of <code>std.heap</code> as a drawer of specialized instruments. No single allocator
+      is best for everything, but together they cover the full spectrum from &ldquo;give me raw
+      OS pages&rdquo; to &ldquo;fail my test if I leak a single byte.&rdquo;
+    </p>
+
+    <figure class="diagram-fig" data-anchor="toolbox-diagram">
+      <svg class="diagram" viewBox="0 0 520 340" aria-label="Diagram showing five standard allocators as labeled boxes with their key traits">
+        <title>Standard allocators toolbox: page_allocator, GPA, c_allocator, testing_allocator, LoggingAllocator</title>
+
+        <defs>
+          <marker id="arr-red" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)" />
+          </marker>
+        </defs>
+
+        <!-- Title -->
+        <text class="lbl-hot" x="20" y="20">std.heap allocators</text>
+
+        <!-- page_allocator -->
+        <rect class="box" x="20" y="35" width="230" height="52" />
+        <text class="big" x="32" y="56"><tspan style="fill:var(--fn)">page_allocator</tspan></text>
+        <text class="lbl" x="32" y="76">Wraps OS pages (mmap / VirtualAlloc)</text>
+
+        <!-- GPA -->
+        <rect class="box-hot" x="20" y="100" width="230" height="68" />
+        <text class="big" x="32" y="122"><tspan style="fill:var(--accent)">GeneralPurposeAllocator</tspan></text>
+        <text class="lbl" x="32" y="138">Safety-first: detects leaks,</text>
+        <text class="lbl" x="32" y="154">double-free, use-after-free</text>
+
+        <!-- c_allocator -->
+        <rect class="box" x="20" y="182" width="230" height="52" />
+        <text class="big" x="32" y="203"><tspan style="fill:var(--fn)">c_allocator</tspan></text>
+        <text class="lbl" x="32" y="223">Wraps libc malloc/free</text>
+
+        <!-- testing_allocator -->
+        <rect class="box" x="270" y="35" width="230" height="52" />
+        <text class="big" x="282" y="56"><tspan style="fill:var(--fn)">testing.allocator</tspan></text>
+        <text class="lbl" x="282" y="76">GPA-backed, fails test on leak</text>
+
+        <!-- LoggingAllocator -->
+        <rect class="box" x="270" y="100" width="230" height="52" />
+        <text class="big" x="282" y="122"><tspan style="fill:var(--fn)">LoggingAllocator</tspan></text>
+        <text class="lbl" x="282" y="140">Wraps any allocator, logs ops</text>
+
+        <!-- Relationship arrows -->
+        <line class="flow-dash" x1="250" y1="134" x2="270" y2="134" />
+
+        <!-- Legend bar at bottom -->
+        <rect class="fill-soft" x="20" y="260" width="480" height="70" />
+        <rect style="fill:var(--accent); opacity:0.15" x="20" y="260" width="480" height="2" />
+        <text class="lbl" x="32" y="282">When to use what</text>
+
+        <circle style="fill:var(--accent)" cx="38" cy="297" r="3.5" />
+        <text x="48" y="301" style="font-size:9px; fill:var(--ink)">GPA for development + debug builds</text>
+
+        <circle style="fill:var(--fn)" cx="38" cy="315" r="3.5" />
+        <text x="48" y="319" style="font-size:9px; fill:var(--ink)">page_allocator for large blocks; c_allocator for C interop</text>
+
+        <circle style="fill:var(--str)" cx="300" cy="297" r="3.5" />
+        <text x="310" y="301" style="font-size:9px; fill:var(--ink)">testing.allocator in every unit test</text>
+
+        <circle style="fill:var(--ink-soft)" cx="300" cy="315" r="3.5" />
+        <text x="310" y="319" style="font-size:9px; fill:var(--ink)">LoggingAllocator to diagnose patterns</text>
+      </svg>
+      <figcaption>
+        The standard allocators form a small, focused toolkit. The
+        <code>GeneralPurposeAllocator</code> (highlighted) is the one you will reach for most
+        often during development.
+      </figcaption>
+    </figure>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="page-allocator">page_allocator</h2>
+
+    <p data-anchor="page-alloc-intro">
+      The simplest allocator in the standard library is also the lowest level.
+      <code>std.heap.page_allocator</code> is a pre-built <code>Allocator</code> that talks
+      directly to the operating system&thinsp;&mdash;&thinsp;<code>mmap</code> on Linux/macOS,
+      <code>VirtualAlloc</code> on Windows. Every call to <code>alloc</code> reserves whole
+      pages (typically 4&thinsp;KiB each), even if you only asked for 16 bytes.
+    </p>
+
+    <pre data-anchor="page-alloc-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub fn</span> <span class="fn">main</span>() !<span class="ty">void</span> {
+    <span class="kw">const</span> allocator = std.heap.page_allocator;
+
+    <span class="cm">// Allocates at least one full OS page (~4 KiB) even though</span>
+    <span class="cm">// we only asked for 64 bytes.</span>
+    <span class="kw">const</span> buf = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">64</span>);
+    <span class="kw">defer</span> allocator.<span class="fn">free</span>(buf);
+
+    std.debug.<span class="fn">print</span>(<span class="str">"got {d} bytes at {*}\n"</span>, .{ buf.len, buf.ptr });
+}</pre>
+
+    <div class="callout" data-anchor="callout-page-waste">
+      <span class="callout-title">When to use it</span>
+      <p>
+        <code>page_allocator</code> is perfect when you need a large, long-lived buffer or when
+        you are building a higher-level allocator on top of it (arenas, pools). It is wasteful
+        for small, frequent allocations because every request rounds up to a full page.
+      </p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="gpa">GeneralPurposeAllocator</h2>
+
+    <p data-anchor="gpa-intro">
+      The <code>GeneralPurposeAllocator</code> (often abbreviated GPA, historically known as
+      <code>DebugAllocator</code>) is the workhorse for development and debug builds. It is a
+      full-featured allocator with <strong>safety instrumentation</strong> that catches the bugs
+      that ruin your week: double-free, use-after-free, and memory leaks.
+    </p>
+
+    <h3 data-anchor="gpa-setup">Basic Setup with Leak Checking</h3>
+
+    <p data-anchor="gpa-setup-intro">
+      The canonical pattern is to create a GPA, defer its <code>deinit()</code>, and extract an
+      <code>Allocator</code> handle. When <code>deinit()</code> runs, it checks for leaks:
+    </p>
+
+    <pre data-anchor="gpa-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub fn</span> <span class="fn">main</span>() !<span class="ty">void</span> {
+    <span class="cm">// Create the GPA with default safety options.</span>
+    <span class="kw">var</span> gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    <span class="kw">defer</span> {
+        <span class="kw">const</span> check = gpa.<span class="fn">deinit</span>();
+        <span class="kw">if</span> (check == .leak) {
+            std.debug.<span class="fn">print</span>(<span class="str">"Memory leak detected!\n"</span>, .{});
+        }
+    }
+
+    <span class="cm">// Obtain the Allocator interface.</span>
+    <span class="kw">const</span> allocator = gpa.<span class="fn">allocator</span>();
+
+    <span class="cm">// Use it like any other allocator.</span>
+    <span class="kw">const</span> list = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u32</span>, <span class="num">100</span>);
+    <span class="kw">defer</span> allocator.<span class="fn">free</span>(list);
+
+    <span class="cm">// If we forgot the defer above, deinit() would report the leak.</span>
+}</pre>
+
+    <h3 data-anchor="gpa-config">Configuration Options</h3>
+
+    <p data-anchor="gpa-config-intro">
+      The <code>.{}</code> in <code>GeneralPurposeAllocator(.{})</code> is a configuration
+      struct. The defaults are tuned for safety, but you can adjust them:
+    </p>
+
+    <table data-anchor="gpa-config-table">
+      <caption>GPA configuration fields</caption>
+      <thead>
+        <tr>
+          <th>Field</th>
+          <th>Default</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>.safety</code></td>
+          <td><code>true</code></td>
+          <td>Enable safety checks (double-free, use-after-free detection)</td>
+        </tr>
+        <tr>
+          <td><code>.never_unmap</code></td>
+          <td><code>false</code></td>
+          <td>Keep freed pages mapped to catch use-after-free via segfaults</td>
+        </tr>
+        <tr>
+          <td><code>.stack_trace_frames</code></td>
+          <td><code>6</code></td>
+          <td>Number of stack frames captured per allocation (for leak reports)</td>
+        </tr>
+        <tr>
+          <td><code>.thread_safe</code></td>
+          <td><code>true</code></td>
+          <td>Protect internal state with a mutex for multi-threaded use</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <pre data-anchor="gpa-config-code"><span class="cm">// A GPA tuned for aggressive debugging:</span>
+<span class="kw">var</span> gpa = std.heap.GeneralPurposeAllocator(.{
+    .safety = <span class="kw">true</span>,
+    .never_unmap = <span class="kw">true</span>,       <span class="cm">// keep pages mapped after free</span>
+    .stack_trace_frames = <span class="num">12</span>,  <span class="cm">// deeper traces in leak reports</span>
+}){};
+</pre>
+
+    <div class="callout key" data-anchor="callout-gpa-leak">
+      <span class="callout-title">Key insight</span>
+      <p>
+        The GPA&rsquo;s <code>deinit()</code> returns <code>.leak</code> or <code>.ok</code>.
+        In debug builds this means you get leak reports <em>at program exit</em> with stack
+        traces pointing to the allocation site. This is Zig&rsquo;s answer to Valgrind and
+        AddressSanitizer, built right into the standard library.
+      </p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="c-allocator">c_allocator</h2>
+
+    <p data-anchor="c-alloc-intro">
+      When you are linking against libc&thinsp;&mdash;&thinsp;for C interop, calling into C
+      libraries, or running on a platform where <code>mmap</code> is not directly
+      available&thinsp;&mdash;&thinsp;<code>std.heap.c_allocator</code> wraps
+      <code>malloc</code>, <code>realloc</code>, and <code>free</code> behind the standard
+      <code>Allocator</code> interface.
+    </p>
+
+    <pre data-anchor="c-alloc-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub fn</span> <span class="fn">main</span>() !<span class="ty">void</span> {
+    <span class="cm">// Only available when linking libc (zig build with -lc).</span>
+    <span class="kw">const</span> allocator = std.heap.c_allocator;
+
+    <span class="kw">const</span> msg = <span class="kw">try</span> allocator.<span class="fn">dupeZ</span>(<span class="ty">u8</span>, <span class="str">"Hello from malloc!"</span>);
+    <span class="kw">defer</span> allocator.<span class="fn">free</span>(msg);
+
+    <span class="cm">// msg is a [:0]u8, safe to pass to any C function expecting</span>
+    <span class="cm">// a null-terminated string.</span>
+    _ = std.c.<span class="fn">printf</span>(<span class="str">"%s\n"</span>, msg.ptr);
+}</pre>
+
+    <div class="callout warn" data-anchor="callout-c-alloc-safety">
+      <span class="callout-title">Warning</span>
+      <p>
+        <code>c_allocator</code> provides <strong>no safety checks</strong>. It does not detect
+        leaks, double-free, or use-after-free. Use it only when you must, and prefer wrapping it
+        with a <code>LoggingAllocator</code> during development to trace what it does.
+      </p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="testing-allocator">testing.allocator</h2>
+
+    <p data-anchor="testing-intro">
+      Every Zig test file gives you <code>std.testing.allocator</code> for free. It is backed by
+      a GPA and is pre-configured to <strong>fail the test</strong> if any allocation is not
+      freed by the time the test finishes. This is your first line of defense against leaks in
+      library code.
+    </p>
+
+    <pre data-anchor="testing-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+<span class="kw">const</span> testing = std.testing;
+
+<span class="kw">test</span> <span class="str">"dynamic array does not leak"</span> {
+    <span class="kw">var</span> list = std.ArrayList(<span class="ty">u32</span>).<span class="fn">init</span>(testing.allocator);
+    <span class="kw">defer</span> list.<span class="fn">deinit</span>();
+
+    <span class="kw">try</span> list.<span class="fn">append</span>(<span class="num">42</span>);
+    <span class="kw">try</span> testing.<span class="fn">expectEqual</span>(<span class="mac">@as</span>(<span class="ty">u32</span>, <span class="num">42</span>), list.items[<span class="num">0</span>]);
+
+    <span class="cm">// If we omit the defer list.deinit(), this test FAILS.</span>
+}</pre>
+
+    <div class="callout spec" data-anchor="callout-testing-rule">
+      <span class="callout-title">Rule of thumb</span>
+      <p>
+        If your function takes an <code>Allocator</code>, your test should pass it
+        <code>testing.allocator</code>. This catches leaks at the unit-test level, before they
+        reach production. It is one of the most valuable patterns in the Zig ecosystem.
+      </p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="logging-allocator">LoggingAllocator</h2>
+
+    <p data-anchor="logging-intro">
+      Sometimes you do not need to catch bugs&thinsp;&mdash;&thinsp;you need to <em>see</em>
+      what is happening. The <code>LoggingAllocator</code> wraps any other allocator and logs
+      every operation (alloc, resize, free) to the standard error stream. It is the
+      <code>strace</code> for memory.
+    </p>
+
+    <pre data-anchor="logging-code"><span class="kw">const</span> std = <span class="mac">@import</span>(<span class="str">"std"</span>);
+
+<span class="kw">pub fn</span> <span class="fn">main</span>() !<span class="ty">void</span> {
+    <span class="kw">var</span> gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    <span class="kw">defer</span> _ = gpa.<span class="fn">deinit</span>();
+
+    <span class="cm">// Wrap the GPA in a LoggingAllocator.</span>
+    <span class="kw">var</span> logging = std.heap.<span class="fn">loggingAllocator</span>(gpa.<span class="fn">allocator</span>());
+    <span class="kw">const</span> allocator = logging.<span class="fn">allocator</span>();
+
+    <span class="cm">// Every operation below is logged to stderr.</span>
+    <span class="kw">const</span> buf = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, <span class="num">256</span>);
+    <span class="kw">defer</span> allocator.<span class="fn">free</span>(buf);
+
+    <span class="cm">// stderr output (example):</span>
+    <span class="cm">//   alloc: 256 bytes at 0x7f...  alignment=1</span>
+    <span class="cm">//   free:  256 bytes at 0x7f...</span>
+}</pre>
+
+    <p data-anchor="logging-note">
+      Because it satisfies the same <code>Allocator</code> interface, you can drop a
+      <code>LoggingAllocator</code> into any code path without changing a single line of business
+      logic. Swap it in, see the pattern of allocations, swap it out.
+    </p>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="comparison">Side-by-Side Comparison</h2>
+
+    <table data-anchor="comparison-table">
+      <caption>Standard allocators compared</caption>
+      <thead>
+        <tr>
+          <th>Allocator</th>
+          <th>Backing</th>
+          <th>Safety</th>
+          <th>Speed</th>
+          <th>Best For</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>page_allocator</code></td>
+          <td>OS pages</td>
+          <td>None</td>
+          <td>Slow (syscall)</td>
+          <td>Large buffers, backing other allocators</td>
+        </tr>
+        <tr>
+          <td><code>GeneralPurposeAllocator</code></td>
+          <td>OS pages</td>
+          <td>Full</td>
+          <td>Moderate</td>
+          <td>Development, debug builds</td>
+        </tr>
+        <tr>
+          <td><code>c_allocator</code></td>
+          <td>libc malloc</td>
+          <td>None</td>
+          <td>Fast</td>
+          <td>C interop</td>
+        </tr>
+        <tr>
+          <td><code>testing.allocator</code></td>
+          <td>GPA</td>
+          <td>Full + test fail</td>
+          <td>Moderate</td>
+          <td>Unit tests</td>
+        </tr>
+        <tr>
+          <td><code>LoggingAllocator</code></td>
+          <td>Any (wrapper)</td>
+          <td>Inherited</td>
+          <td>Inherited + I/O</td>
+          <td>Diagnosing allocation patterns</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 data-anchor="choosing">Choosing the Right One</h2>
+
+    <p data-anchor="choosing-p1">
+      During development, start with the <code>GeneralPurposeAllocator</code>. Its safety checks
+      will catch the mistakes you will inevitably make. In tests, always use
+      <code>testing.allocator</code>&thinsp;&mdash;&thinsp;it is free and catches leaks
+      automatically.
+    </p>
+
+    <p data-anchor="choosing-p2">
+      When you need raw performance or are building higher-level allocators, drop down to
+      <code>page_allocator</code>. When you are calling into C libraries that expect
+      <code>malloc</code>-compatible memory, use <code>c_allocator</code>. And when you cannot
+      figure out why your program is allocating so much, wrap your allocator in a
+      <code>LoggingAllocator</code> and read the output.
+    </p>
+
+    <div class="callout key" data-anchor="callout-composition">
+      <span class="callout-title">Key insight</span>
+      <p>
+        These allocators <em>compose</em>. A <code>LoggingAllocator</code> can wrap a GPA.
+        An arena (Chapter&nbsp;5) can draw pages from <code>page_allocator</code>. A pool
+        allocator (Chapter&nbsp;6) can use a GPA as its backing store. The uniform interface
+        makes every combination possible and every swap trivial.
+      </p>
+    </div>
+
+    <hr data-anchor="ch04-divider" />
+
+    <p data-anchor="ch04-wrapup">
+      You have now met every allocator that ships in <code>std.heap</code>. The next chapter
+      narrows the focus to two of the most useful patterns in the toolkit: the
+      <strong>arena allocator</strong>, which lets you allocate many things and free them all at
+      once, and the <strong>fixed-buffer allocator</strong>, which lets you work without the heap
+      entirely.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-the-allocator-interface.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-arena-and-fixed-buffer.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
