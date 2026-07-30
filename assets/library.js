@@ -48,7 +48,7 @@
   function setUI(btn, state, pct) {
     var bytes = +btn.getAttribute('data-bytes');
     var size = bytes > 0 ? ' (' + (bytes / 1048576).toFixed(1) + ' MB)' : '';
-    btn.classList.remove('is-busy', 'is-done');
+    btn.classList.remove('is-busy', 'is-done', 'is-failed');
     if (state === 'busy') {
       btn.classList.add('is-busy');
       btn.textContent = pct + '%';
@@ -56,6 +56,11 @@
       btn.classList.add('is-done');
       btn.textContent = '✓ Offline';
       btn.title = 'Saved for offline reading — click to remove the download';
+    } else if (state === 'failed') {
+      // Never fail silently back to the idle label: a button that visibly
+      // does nothing on click reads as broken with no way to report it.
+      btn.classList.add('is-failed');
+      btn.textContent = '⚠ Retry';
     } else {
       btn.textContent = '⤓ Offline';
       btn.title = 'Download this book for offline reading' + size;
@@ -109,7 +114,7 @@
         localStorage.setItem(key, '1');
         setUI(btn, 'done');
       }).catch(function (err) {
-        setUI(btn, 'idle');
+        setUI(btn, 'failed');
         btn.title = 'Download failed (' + err.message + ') — click to retry';
       });
     });
