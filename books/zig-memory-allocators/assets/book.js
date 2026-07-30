@@ -21,7 +21,9 @@
       relayout();
       return;
     }
-    var W = vp.clientWidth, gap = Math.round(W * 0.08), colW = (W - gap) / 2;
+    var cs = getComputedStyle(leaf);
+    var padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+    var W = vp.clientWidth - padX, gap = Math.round(W * 0.08), colW = (W - gap) / 2;
     leaf.style.columnGap = gap + 'px';
     leaf.style.columnWidth = colW + 'px';
     spread = 2 * (colW + gap);
@@ -60,6 +62,8 @@
   layout();
   document.addEventListener('keydown', function(e){
     if(window.__bookbankNav || e.metaKey || e.ctrlKey || e.altKey) return;
+    var t = e.target;
+    if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
     if(e.key === 'ArrowRight'){ bookbankPager.next(); e.preventDefault(); }
     else if(e.key === 'ArrowLeft'){ bookbankPager.prev(); e.preventDefault(); }
     else if(e.key === 'ArrowUp'){ bookbankPager.home(); e.preventDefault(); }
