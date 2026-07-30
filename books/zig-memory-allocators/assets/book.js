@@ -12,13 +12,16 @@
     }
     return right;
   }
+  function relayoutSignal(){
+    window.dispatchEvent(new CustomEvent('bookbank:relayout'));
+  }
   function layout(){
     if(mobile()){
       leaf.style.columnGap = ''; leaf.style.columnWidth = ''; leaf.style.transform = '';
       total = 1; i = 0;
       var n0 = document.querySelector('.book-pageno');
       if(n0) n0.textContent = '';
-      relayout();
+      relayoutSignal();
       return;
     }
     var cs = getComputedStyle(leaf);
@@ -31,15 +34,14 @@
     total = Math.max(1, Math.ceil(cols / 2));
     i = Math.min(i, total - 1);
     render();
-    relayout();
   }
-  function relayout(){ window.dispatchEvent(new CustomEvent('bookbank:relayout')); }
   function render(){
     if(mobile()) return;
     leaf.style.transform = 'translateX(' + (-i * spread) + 'px)';
     var n = document.querySelector('.book-pageno');
     if(n) n.textContent = (i + 1) + ' / ' + total;
     window.dispatchEvent(new CustomEvent('bookbank:spread', { detail: { i: i, total: total } }));
+    relayoutSignal();
   }
   function href(rel){ var a = document.querySelector('a[rel~="' + rel + '"]'); return a && a.getAttribute('href'); }
   window.bookbankPager = {
