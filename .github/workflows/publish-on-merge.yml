@@ -6,9 +6,10 @@ name: Publish on book merge
 # it's ever live it's already complete — no prompt placeholders, ever, in
 # anyone's cache. This job just regenerates the generated front door.
 #
-# Loop-safety: the regen only writes index.html / catalog.json / assets/**,
-# never books/**, so the `paths` filter below means the publish commit can't
-# re-trigger this workflow.
+# Loop-safety: the regen DOES write under books/** (see the commit step), so
+# the publish commit re-matches the `paths` filter below. The `if:` guard on
+# the job skips our own commits — that is what breaks the loop, NOT committing
+# less than the generator wrote.
 on:
   push:
     branches: [main]
@@ -24,6 +25,11 @@ permissions:
 
 jobs:
   publish:
+    # The publish commit touches books/**, so it re-matches the paths filter.
+    # Skip our own commits rather than under-committing to avoid the loop. The
+    # regen is idempotent anyway (chip/OG injection use idempotency markers,
+    # offline.json is content-hashed), so this only saves a wasted run.
+    if: github.event.head_commit.author.name != 'bookbank-bot'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -39,7 +45,7 @@ jobs:
         run: |
           git clone --filter=blob:none --sparse https://github.com/sunprema/kit /tmp/kit
           git -C /tmp/kit sparse-checkout set bookbank/library bookbank/defaults
-          git -C /tmp/kit checkout 576f8522bedb1d9c8cc5e7fc8660813c9800c432
+          git -C /tmp/kit checkout aa647853e55ea3d411cabfbb37f8e75a8a09075d
 
       - uses: actions/setup-python@v5
         with:
@@ -56,15 +62,27 @@ jobs:
           python3 /tmp/kit/bookbank/library/build-library.py \
             --out . --root . --repo "${{ github.repository }}"
 
-      - name: Commit regenerated front door
+      - name: Commit regenerated output
         run: |
           git config user.name  "bookbank-bot"
           git config user.email "bookbank-bot@users.noreply.github.com"
-          git add index.html catalog.json assets
+          # `git add -A`, never a narrow add. build-library.py writes generated
+          # output into books/** as well as the front door:
+          #   books/*/offline.json        the shelf's ⤓ Offline button fetches this
+          #   books/*/**.html             ⌂ Library chip + share-preview <meta> tags
+          #   books/*/assets/img/og-share.jpg
+          # Adding only index.html/catalog.json/assets ships a working-LOOKING
+          # site: catalog.json carries each book's offline_bytes (computed in
+          # memory, so the button renders a correct-looking size) while the
+          # offline.json it fetches was never pushed. That is how what-is-oauth,
+          # jwts-promises-and-betrayals, entire-io and zig-memory-allocators
+          # shipped with dead Offline buttons. Loop-safety is the job-level
+          # `if:` guard above, not a narrow add.
+          git add -A
           if git diff --cached --quiet; then
-            echo "::notice::Shelf already current — nothing to publish."
+            echo "::notice::Library already current — nothing to publish."
             exit 0
           fi
-          git commit -m "Publish: rebuild shelf after ${{ github.sha }}"
+          git commit -m "Publish: rebuild library after ${{ github.sha }}"
           git push origin main
       # GitHub Pages auto-deploys the push to main.
