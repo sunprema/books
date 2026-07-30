@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Why LangGraph? — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch01-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch01-head">
+  <span class="chapter-num">01</span>
+  <span class="chapter-kicker">Beyond linear chains</span>
+  <h1 data-anchor="ch01-title">Why LangGraph?</h1>
+</header>
+
+<p class="lede" data-anchor="ch01-lede">
+You have built a chain. Prompt goes in, response comes out. Maybe you strung a few steps together&mdash;retrieve
+some documents, stuff them into context, ask the model, parse the answer. It works. Then a stakeholder asks:
+&ldquo;Can it retry when the output is bad?&rdquo; You hack in a <code>while</code> loop. &ldquo;Can it ask a
+human for approval before acting?&rdquo; You add a flag and a callback. &ldquo;Can two agents collaborate on this?&rdquo;
+You stare at the ceiling. The linear chain that served you so well has become a straitjacket, and you are looking
+for a way out.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-linear-chain-problem">The Linear Chain Problem</h2>
+
+<p data-anchor="ch01-assembly-line">
+Think of a linear chain as an assembly line in a factory. A workpiece moves from Station&nbsp;A to
+Station&nbsp;B to Station&nbsp;C, and at the end you get a finished product. Assembly lines are brilliant
+when every product follows the same path. But what happens when a quality inspector at Station&nbsp;C
+discovers a defect? The workpiece needs to go <em>back</em> to Station&nbsp;A. An assembly line
+can&rsquo;t do that&mdash;not without stopping the belt, reversing the motor, and confusing every other
+workpiece on the line.
+</p>
+
+<p data-anchor="ch01-sequential-model">
+The earliest LLM applications followed exactly this pattern. You sent a prompt to a model, got a
+completion back, maybe post-processed it, and returned it to the user. Frameworks like LangChain
+made this composable: you could snap together a <code>PromptTemplate</code>, an <code>LLM</code>, and
+an <code>OutputParser</code> into a <em>chain</em> that flowed in one direction. The LCEL (LangChain
+Expression Language) syntax made it elegant&mdash;pipe operators, streaming out of the box, batch
+support. For retrieval-augmented generation, summarisation, or single-shot classification, sequential
+chains remain the right tool.
+</p>
+
+<p data-anchor="ch01-where-linear-fails">
+But real-world AI applications are rarely single-shot. Consider what happens when you need any of the following:
+</p>
+
+<ul data-anchor="ch01-linear-fails-list">
+  <li data-anchor="ch01-fail-retry"><strong>Retry on failure.</strong> The model produces malformed JSON. You want to feed the error message back
+      and ask it to try again&mdash;up to three times. That&rsquo;s a loop, not a line.</li>
+  <li data-anchor="ch01-fail-branch"><strong>Conditional branching that reconverges.</strong> Based on a classification step, you route to one of
+      four specialist prompts, then merge the results. A linear chain can branch, but merging cleanly
+      is awkward.</li>
+  <li data-anchor="ch01-fail-human"><strong>Human-in-the-loop.</strong> Before the agent executes a tool call, a human must approve it.
+      The system needs to <em>pause</em>, persist its state, wait (possibly for hours), then resume
+      exactly where it left off.</li>
+  <li data-anchor="ch01-fail-multiagent"><strong>Multi-agent collaboration.</strong> A &ldquo;researcher&rdquo; agent gathers information, passes it to a
+      &ldquo;writer&rdquo; agent, whose draft goes to a &ldquo;critic&rdquo; agent, whose feedback loops
+      back to the writer. This is cyclic by nature.</li>
+  <li data-anchor="ch01-fail-state"><strong>Long-running state.</strong> A customer-support bot needs to remember what happened three turns ago,
+      track which tools it has already called, and know which sub-tasks are complete. That state must
+      survive across multiple LLM invocations and possibly across process restarts.</li>
+</ul>
+
+<p data-anchor="ch01-not-shortcoming">
+None of these are exotic requirements. They are the bread and butter of production AI systems. The
+issue is not that LangChain is flawed&mdash;it is that sequential chains are the wrong abstraction
+for problems that are inherently <em>cyclic</em> and <em>stateful</em>. You need a different shape.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-shape-of-work">The Shape of Real AI Work</h2>
+
+<p data-anchor="ch01-dag-vs-graph">
+If you have worked with data pipelines, you have likely encountered DAGs&mdash;directed acyclic
+graphs. Tools like Apache Airflow let you express complex dependencies: task&nbsp;C waits for
+both task&nbsp;A and task&nbsp;B to finish. But notice the word <em>acyclic</em>. A DAG cannot
+contain loops. An edge can never point backward. For data pipelines that run once per schedule,
+this is fine. For an AI agent that needs to iterate, reflect, and retry, it is a fundamental
+limitation.
+</p>
+
+<p data-anchor="ch01-need-cycles">
+What you need is a <em>directed graph that allows cycles</em>. In such a graph, a node can send
+control back to a node that already ran. A &ldquo;reflect&rdquo; node can route back to a
+&ldquo;generate&rdquo; node. A &ldquo;validate&rdquo; node can loop back to &ldquo;fix&rdquo;
+until the output passes. The graph terminates not because it ran out of edges, but because a
+node explicitly says &ldquo;we&rsquo;re done&rdquo;&mdash;or because a configurable recursion
+limit prevents infinite loops.
+</p>
+
+<p data-anchor="ch01-state-matters">
+Cycles alone are not enough. Each time control passes through a node, the system&rsquo;s state
+may change: a new message has been appended, a tool result has been recorded, a counter has
+been incremented. You need a <em>shared, mutable state object</em> that every node can read and
+write, and that persists across the entire execution&mdash;including across cycles. This is the
+core insight that separates LangGraph from its predecessors.
+</p>
+
+<div class="callout key" data-anchor="ch01-callout-key-insight">
+  <span class="callout-title">Key Insight</span>
+  <p data-anchor="ch01-callout-key-text">
+    <strong>Graphs are control flow for AI.</strong> Just as <code>if</code>, <code>while</code>,
+    and <code>for</code> give you control flow in a programming language, a graph with conditional
+    edges and cycles gives you control flow for multi-step AI systems. Nodes are the operations.
+    Edges are the decisions. State is the memory. LangGraph makes this pattern a first-class
+    abstraction rather than something you hack together with ad-hoc Python loops and global variables.
+  </p>
+</div>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-enter-langgraph">Enter LangGraph</h2>
+
+<p data-anchor="ch01-langgraph-intro">
+LangGraph is a low-level orchestration framework built by LangChain&nbsp;Inc. It is open-source
+under the MIT license, currently at version&nbsp;1.2.x, and considered production-stable. You
+install it with a single command:
+</p>
+
+<p class="code-label" data-anchor="ch01-install-label">Installing LangGraph</p>
+<pre data-anchor="ch01-install-code"><span class="cm"># Requires Python &gt;= 3.10</span>
+<span class="fn">pip</span> <span class="str">install</span> langgraph</pre>
+
+<p data-anchor="ch01-standalone">
+Despite sharing the &ldquo;Lang&rdquo; prefix, LangGraph is a standalone package. You do
+<em>not</em> need LangChain to use it. Your nodes can be plain Python functions that accept
+and return dictionaries. That said, LangGraph integrates seamlessly with LangChain components&mdash;chat
+models, tools, retrievers, output parsers&mdash;when you want them. Think of LangGraph as the
+<em>control plane</em> and LangChain as one possible <em>component library</em> you can plug into it.
+</p>
+
+<p data-anchor="ch01-three-pillars">
+LangGraph&rsquo;s value proposition rests on three pillars:
+</p>
+
+<ol data-anchor="ch01-pillars-list">
+  <li data-anchor="ch01-pillar-stateful"><strong>Stateful execution.</strong> A <code>TypedDict</code> (or Pydantic model) defines the shape of your
+      state. Every node receives the current state and returns updates to it. The framework merges
+      those updates for you, using reducers you can customise (append to a list, overwrite a value,
+      increment a counter).</li>
+  <li data-anchor="ch01-pillar-cyclic"><strong>Cyclic graphs.</strong> Edges can point backward, creating loops. Conditional edges let you route
+      dynamically based on the current state. A built-in recursion limit (default&nbsp;25) prevents
+      runaway loops, and you can tune it per invocation.</li>
+  <li data-anchor="ch01-pillar-multi"><strong>Multi-actor orchestration.</strong> Each node is an independent actor. Nodes can represent
+      different agents, tools, human checkpoints, or sub-graphs. You compose them into a single
+      graph that the framework executes, handling the state passing and edge routing for you.</li>
+</ol>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-diagram-comparison">Linear Chain vs. Cyclic Graph</h2>
+
+<p data-anchor="ch01-diagram-intro">
+The following diagram contrasts the two paradigms. On the left, a linear chain: three steps in
+a row, no way to go back. On the right, a LangGraph-style cyclic graph with shared state, a
+conditional edge, and a loop that allows the system to retry until the output is valid.
+</p>
+
+<figure class="diagram-fig" data-anchor="ch01-fig-comparison">
+<svg class="diagram" viewBox="0 0 820 340" aria-label="Comparison of a linear chain and a cyclic graph with state" xmlns="http://www.w3.org/2000/svg">
+  <title>Linear chain (left) versus cyclic graph with state (right)</title>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink-soft, #666)"/>
+    </marker>
+    <marker id="arrow-hot" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--accent, #e04e1d)"/>
+    </marker>
+  </defs>
+
+  <!-- Left side: Linear Chain -->
+  <text x="150" y="24" class="lbl" text-anchor="middle" font-size="15" font-weight="bold">Linear Chain</text>
+
+  <rect class="box" x="70" y="44" width="160" height="44" rx="6"/>
+  <text class="lbl" x="150" y="72" text-anchor="middle" font-size="13">Prompt Template</text>
+
+  <line class="flow" x1="150" y1="88" x2="150" y2="118" marker-end="url(#arrow)"/>
+
+  <rect class="box" x="70" y="120" width="160" height="44" rx="6"/>
+  <text class="lbl" x="150" y="148" text-anchor="middle" font-size="13">LLM Call</text>
+
+  <line class="flow" x1="150" y1="164" x2="150" y2="194" marker-end="url(#arrow)"/>
+
+  <rect class="box" x="70" y="196" width="160" height="44" rx="6"/>
+  <text class="lbl" x="150" y="224" text-anchor="middle" font-size="13">Output Parser</text>
+
+  <line class="flow" x1="150" y1="240" x2="150" y2="270" marker-end="url(#arrow)"/>
+
+  <rect class="box" x="105" y="272" width="90" height="34" rx="6"/>
+  <text class="lbl" x="150" y="294" text-anchor="middle" font-size="12">Result</text>
+
+  <text x="150" y="330" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink-soft, #999)">No way to loop back</text>
+
+  <!-- Divider -->
+  <line x1="370" y1="10" x2="370" y2="330" stroke="var(--rule, #ccc)" stroke-dasharray="4,4"/>
+
+  <!-- Right side: Cyclic Graph -->
+  <text x="600" y="24" class="lbl-hot" text-anchor="middle" font-size="15" font-weight="bold">LangGraph &mdash; Cyclic Graph</text>
+
+  <!-- State box spanning top -->
+  <rect x="430" y="36" width="340" height="30" rx="4" fill="var(--accent, #e04e1d)" opacity="0.12" stroke="var(--accent, #e04e1d)" stroke-width="1"/>
+  <text x="600" y="56" text-anchor="middle" font-size="11" fill="var(--accent, #e04e1d)" font-weight="600">Shared State (TypedDict)</text>
+
+  <rect class="box-hot" x="520" y="80" width="160" height="44" rx="6"/>
+  <text class="lbl-hot" x="600" y="108" text-anchor="middle" font-size="13">Generate</text>
+
+  <line class="flow-hot" x1="600" y1="124" x2="600" y2="154" marker-end="url(#arrow-hot)"/>
+
+  <rect class="box-hot" x="520" y="156" width="160" height="44" rx="6"/>
+  <text class="lbl-hot" x="600" y="184" text-anchor="middle" font-size="13">Validate</text>
+
+  <!-- Conditional diamond -->
+  <polygon class="box-alt" points="600,218 640,242 600,266 560,242"/>
+  <text class="lbl" x="600" y="247" text-anchor="middle" font-size="11">OK?</text>
+
+  <!-- Yes path down -->
+  <line class="flow-hot" x1="600" y1="266" x2="600" y2="296" marker-end="url(#arrow-hot)"/>
+  <text class="lbl-hot" x="612" y="286" font-size="10">yes</text>
+
+  <rect class="box-hot" x="555" y="298" width="90" height="34" rx="6"/>
+  <text class="lbl-hot" x="600" y="320" text-anchor="middle" font-size="12">END</text>
+
+  <!-- No path: loop back -->
+  <line class="flow-hot" x1="560" y1="242" x2="470" y2="242" marker-end="url(#arrow-hot)"/>
+  <text class="lbl-hot" x="510" y="236" font-size="10">no</text>
+  <line class="flow-hot" x1="470" y1="242" x2="470" y2="102"/>
+  <line class="flow-hot" x1="470" y1="102" x2="518" y2="102" marker-end="url(#arrow-hot)"/>
+  <text class="lbl" x="460" y="170" font-size="10" text-anchor="end" fill="var(--ink-soft, #999)">retry</text>
+
+</svg>
+<figcaption data-anchor="ch01-fig-comparison-caption">A linear chain (left) has no mechanism for looping back. A LangGraph cyclic graph (right) can route control from a &ldquo;Validate&rdquo; node back to &ldquo;Generate&rdquo; via a conditional edge, with shared state tracking each attempt.</figcaption>
+</figure>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-comparison-table">LangChain Chains vs. LangGraph Graphs</h2>
+
+<p data-anchor="ch01-table-intro">
+The table below summarises the key differences. This is not a competition&mdash;chains and graphs solve
+different problems. Use chains when you can; reach for graphs when you must.
+</p>
+
+<table data-anchor="ch01-table-comparison">
+  <caption data-anchor="ch01-table-caption">Comparing LangChain sequential chains with LangGraph stateful graphs</caption>
+  <thead data-anchor="ch01-table-head">
+    <tr>
+      <th data-anchor="ch01-th-dimension">Dimension</th>
+      <th data-anchor="ch01-th-langchain">LangChain Chains (LCEL)</th>
+      <th data-anchor="ch01-th-langgraph">LangGraph Graphs</th>
+    </tr>
+  </thead>
+  <tbody data-anchor="ch01-table-body">
+    <tr data-anchor="ch01-row-topology">
+      <td>Topology</td>
+      <td>Linear or branching DAG</td>
+      <td>Arbitrary directed graph, cycles allowed</td>
+    </tr>
+    <tr data-anchor="ch01-row-state">
+      <td>State management</td>
+      <td>Output of one step is input to the next; no shared mutable state</td>
+      <td>Explicit shared state (TypedDict/Pydantic) with configurable reducers</td>
+    </tr>
+    <tr data-anchor="ch01-row-control">
+      <td>Control flow</td>
+      <td>Fixed at definition time; <code>RunnableBranch</code> for static routing</td>
+      <td>Dynamic conditional edges evaluated at runtime against current state</td>
+    </tr>
+    <tr data-anchor="ch01-row-persistence">
+      <td>Persistence</td>
+      <td>Not built in; you manage externally</td>
+      <td>Built-in checkpointing; pause, resume, time-travel, replay</td>
+    </tr>
+    <tr data-anchor="ch01-row-hitl">
+      <td>Human-in-the-loop</td>
+      <td>Manual; callback-based workarounds</td>
+      <td>First-class <code>interrupt()</code> and <code>Command(resume=...)</code> primitives</td>
+    </tr>
+    <tr data-anchor="ch01-row-streaming">
+      <td>Streaming</td>
+      <td>Token-level streaming of final output</td>
+      <td>Token-level + node-level event streaming with <code>stream_mode</code></td>
+    </tr>
+    <tr data-anchor="ch01-row-multiagent">
+      <td>Multi-agent</td>
+      <td>Not a native concept</td>
+      <td>Sub-graphs, handoffs, and supervisor patterns built in</td>
+    </tr>
+    <tr data-anchor="ch01-row-debugging">
+      <td>Debugging</td>
+      <td>Tracing via LangSmith</td>
+      <td>Tracing via LangSmith + step-by-step state inspection + time-travel replay</td>
+    </tr>
+    <tr data-anchor="ch01-row-complexity">
+      <td>Complexity</td>
+      <td>Low; great for straightforward pipelines</td>
+      <td>Higher; justified when the workflow demands it</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-when-to-choose">When to Choose LangGraph</h2>
+
+<p data-anchor="ch01-choose-intro">
+Not every project needs a graph. If your workflow is &ldquo;prompt in, response out,&rdquo; a
+LangChain chain or even a raw API call is simpler and easier to reason about. Reach for
+LangGraph when you recognise one or more of these signals:
+</p>
+
+<ul data-anchor="ch01-signals-list">
+  <li data-anchor="ch01-signal-loops"><strong>You need loops.</strong> Retry logic, iterative refinement, reflection patterns&mdash;any time
+      the output of a step feeds back into an earlier step.</li>
+  <li data-anchor="ch01-signal-state"><strong>You need persistent state.</strong> The system must remember what has happened across multiple
+      LLM calls, and that state must survive process restarts or long pauses (e.g., waiting for
+      a human).</li>
+  <li data-anchor="ch01-signal-agents"><strong>You have multiple agents.</strong> A supervisor delegates to specialists, or peers
+      collaborate in a round-robin. Each agent is a subgraph or a node, and the framework manages
+      the hand-offs.</li>
+  <li data-anchor="ch01-signal-human"><strong>You need human checkpoints.</strong> A person must review, approve, edit, or inject data
+      at certain points in the workflow. The system pauses, persists, and resumes without losing
+      context.</li>
+  <li data-anchor="ch01-signal-branching"><strong>You have complex conditional routing.</strong> Based on the current state&mdash;not just the
+      last step&rsquo;s output&mdash;different paths should be taken, and those paths may reconverge
+      or loop.</li>
+</ul>
+
+<p data-anchor="ch01-choose-honest">
+If none of those apply, you probably don&rsquo;t need LangGraph yet. And that&rsquo;s fine. The
+best tool is the simplest one that solves your problem. We&rsquo;ll be honest throughout this book
+about when a graph adds value and when it adds only ceremony.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-concrete-example">A Concrete Example: The Retry Loop</h2>
+
+<p data-anchor="ch01-example-intro">
+Let&rsquo;s make this concrete. Suppose you ask an LLM to produce a JSON object with specific
+fields. Sometimes the model gets it right; sometimes it doesn&rsquo;t. You want to validate the
+output, and if it fails validation, feed the error back and ask the model to try again&mdash;up
+to three attempts.
+</p>
+
+<p data-anchor="ch01-example-langchain-problem">
+In a plain LangChain chain, there is no built-in way to express &ldquo;go back to step&nbsp;1.&rdquo;
+You would need to wrap the chain in a Python <code>for</code> loop, manage a counter yourself,
+catch exceptions, and re-invoke the chain from scratch. The chain itself has no memory of previous
+attempts; you would need to manually accumulate the conversation history.
+</p>
+
+<p data-anchor="ch01-example-langgraph-solution">
+In LangGraph, this is a natural graph shape. Here is a minimal implementation:
+</p>
+
+<p class="code-label" data-anchor="ch01-retry-code-label">A retry loop in LangGraph</p>
+<pre data-anchor="ch01-retry-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">import</span> json
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="cm"># 1. Define the state shape</span>
+<span class="kw">class</span> <span class="ty">RetryState</span>(TypedDict):
+    prompt: <span class="ty">str</span>
+    raw_output: <span class="ty">str</span>
+    parsed: <span class="ty">dict</span> | <span class="kw">None</span>
+    error: <span class="ty">str</span> | <span class="kw">None</span>
+    attempts: <span class="ty">int</span>
+
+<span class="cm"># 2. Define the nodes (plain functions)</span>
+<span class="kw">def</span> <span class="fn">generate</span>(state: <span class="ty">RetryState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># In a real app, call your LLM here.</span>
+    <span class="cm"># For this example, we simulate a response.</span>
+    <span class="kw">if</span> state[<span class="str">"attempts"</span>] < <span class="num">2</span>:
+        raw = <span class="str">'{"name": "Alice", missing_quote}'</span>  <span class="cm"># bad JSON</span>
+    <span class="kw">else</span>:
+        raw = <span class="str">'{"name": "Alice", "age": 30}'</span>     <span class="cm"># valid JSON</span>
+    <span class="kw">return</span> {<span class="str">"raw_output"</span>: raw, <span class="str">"attempts"</span>: state[<span class="str">"attempts"</span>] + <span class="num">1</span>}
+
+<span class="kw">def</span> <span class="fn">validate</span>(state: <span class="ty">RetryState</span>) -> <span class="ty">dict</span>:
+    <span class="kw">try</span>:
+        parsed = json.<span class="fn">loads</span>(state[<span class="str">"raw_output"</span>])
+        <span class="kw">return</span> {<span class="str">"parsed"</span>: parsed, <span class="str">"error"</span>: <span class="kw">None</span>}
+    <span class="kw">except</span> json.<span class="ty">JSONDecodeError</span> <span class="kw">as</span> e:
+        <span class="kw">return</span> {<span class="str">"parsed"</span>: <span class="kw">None</span>, <span class="str">"error"</span>: <span class="fn">str</span>(e)}
+
+<span class="cm"># 3. Define the conditional edge</span>
+<span class="kw">def</span> <span class="fn">should_retry</span>(state: <span class="ty">RetryState</span>) -> <span class="ty">str</span>:
+    <span class="kw">if</span> state[<span class="str">"error"</span>] <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> <span class="str">"done"</span>
+    <span class="kw">if</span> state[<span class="str">"attempts"</span>] >= <span class="num">3</span>:
+        <span class="kw">return</span> <span class="str">"done"</span>       <span class="cm"># give up after 3 tries</span>
+    <span class="kw">return</span> <span class="str">"retry"</span>
+
+<span class="cm"># 4. Build the graph</span>
+builder = <span class="ty">StateGraph</span>(<span class="ty">RetryState</span>)
+builder.<span class="fn">add_node</span>(<span class="str">"generate"</span>, generate)
+builder.<span class="fn">add_node</span>(<span class="str">"validate"</span>, validate)
+
+builder.<span class="fn">add_edge</span>(START, <span class="str">"generate"</span>)
+builder.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, <span class="str">"validate"</span>)
+builder.<span class="fn">add_conditional_edges</span>(
+    <span class="str">"validate"</span>,
+    should_retry,
+    {<span class="str">"retry"</span>: <span class="str">"generate"</span>, <span class="str">"done"</span>: END},
+)
+
+<span class="cm"># 5. Compile and run</span>
+graph = builder.<span class="fn">compile</span>()
+result = graph.<span class="fn">invoke</span>({
+    <span class="str">"prompt"</span>: <span class="str">"Generate a JSON person object"</span>,
+    <span class="str">"raw_output"</span>: <span class="str">""</span>,
+    <span class="str">"parsed"</span>: <span class="kw">None</span>,
+    <span class="str">"error"</span>: <span class="kw">None</span>,
+    <span class="str">"attempts"</span>: <span class="num">0</span>,
+})
+
+<span class="fn">print</span>(result[<span class="str">"parsed"</span>])    <span class="cm"># {"name": "Alice", "age": 30}</span>
+<span class="fn">print</span>(result[<span class="str">"attempts"</span>])  <span class="cm"># 3</span></pre>
+
+<p data-anchor="ch01-example-notice">
+Notice a few things about this code:
+</p>
+
+<ol data-anchor="ch01-notice-list">
+  <li data-anchor="ch01-notice-state"><strong>State is explicit.</strong> <code>RetryState</code> is a <code>TypedDict</code>. Every field is
+      declared up front. There are no hidden globals, no closures capturing mutable variables.</li>
+  <li data-anchor="ch01-notice-nodes"><strong>Nodes are plain functions.</strong> <code>generate</code> and <code>validate</code> each take the
+      current state and return a dictionary of updates. They do not need to know about the graph
+      structure.</li>
+  <li data-anchor="ch01-notice-edges"><strong>Edges define control flow.</strong> The <code>add_conditional_edges</code> call is where the
+      retry logic lives. The function <code>should_retry</code> inspects the state and returns a
+      string that maps to the next node.</li>
+  <li data-anchor="ch01-notice-cycle"><strong>The cycle is explicit.</strong> The mapping <code>{&quot;retry&quot;: &quot;generate&quot;, &quot;done&quot;: END}</code>
+      creates a backward edge from <code>validate</code> to <code>generate</code>. LangGraph
+      knows about this cycle and will enforce the recursion limit.</li>
+  <li data-anchor="ch01-notice-compile"><strong>Compile, then invoke.</strong> The <code>compile()</code> step validates the graph structure
+      (no orphan nodes, all edges resolve) and returns a runnable object. You invoke it like any
+      other LangChain runnable.</li>
+</ol>
+
+<div class="callout note" data-anchor="ch01-callout-compile">
+  <span class="callout-title">Note</span>
+  <p data-anchor="ch01-callout-compile-text">
+    The compiled graph is a <code>CompiledStateGraph</code> object that implements the LangChain
+    <code>Runnable</code> interface. This means you get <code>.invoke()</code>,
+    <code>.stream()</code>, <code>.batch()</code>, and <code>async</code> variants for free.
+    If you are already using LCEL, the compiled graph can be composed into larger chains.
+  </p>
+</div>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-same-loop-langchain">What the Same Loop Looks Like Without LangGraph</h2>
+
+<p data-anchor="ch01-compare-without-intro">
+To appreciate what LangGraph gives you, consider how you would implement the same retry loop using
+only LangChain and plain Python. This is not a contrived strawman&mdash;it is what many teams actually
+write before they discover LangGraph:
+</p>
+
+<p class="code-label" data-anchor="ch01-vanilla-retry-label">A retry loop without LangGraph</p>
+<pre data-anchor="ch01-vanilla-retry-code"><span class="kw">import</span> json
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+
+llm = <span class="ty">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+prompt = <span class="str">"Generate a JSON object with name and age fields."</span>
+
+max_attempts = <span class="num">3</span>
+parsed = <span class="kw">None</span>
+last_error = <span class="kw">None</span>
+
+<span class="kw">for</span> attempt <span class="kw">in</span> <span class="fn">range</span>(max_attempts):
+    <span class="kw">if</span> last_error:
+        full_prompt = (
+            <span class="str">f"</span>{prompt}<span class="str">\n\nYour previous attempt failed: "</span>
+            <span class="str">f"</span>{last_error}<span class="str">. Try again."</span>
+        )
+    <span class="kw">else</span>:
+        full_prompt = prompt
+
+    response = llm.<span class="fn">invoke</span>(full_prompt)
+    <span class="kw">try</span>:
+        parsed = json.<span class="fn">loads</span>(response.content)
+        <span class="kw">break</span>  <span class="cm"># success</span>
+    <span class="kw">except</span> json.<span class="ty">JSONDecodeError</span> <span class="kw">as</span> e:
+        last_error = <span class="fn">str</span>(e)
+
+<span class="fn">print</span>(parsed)</pre>
+
+<p data-anchor="ch01-compare-without-analysis">
+This works for a simple case. But look at what you lose:
+</p>
+
+<ul data-anchor="ch01-compare-without-list">
+  <li data-anchor="ch01-lose-persistence"><strong>No persistence.</strong> If the process crashes on attempt&nbsp;2, you start over from scratch.
+      There is no checkpoint to resume from.</li>
+  <li data-anchor="ch01-lose-visibility"><strong>No visibility.</strong> You cannot inspect the state between attempts without adding print
+      statements. There is no structured trace of which attempts failed and why.</li>
+  <li data-anchor="ch01-lose-composition"><strong>No composability.</strong> If you later want to add a &ldquo;human review&rdquo; step before
+      accepting the output, you are back to restructuring the loop. The control flow is tangled
+      with the business logic.</li>
+  <li data-anchor="ch01-lose-testing"><strong>Harder testing.</strong> Testing the retry logic means running the entire loop. With LangGraph,
+      you can test each node in isolation and verify edge conditions with unit tests on the
+      routing function.</li>
+</ul>
+
+<p data-anchor="ch01-compare-without-conclusion">
+The LangGraph version separates concerns cleanly. The <em>what</em> (generate, validate) lives in
+nodes. The <em>when</em> (retry or stop) lives in edges. The <em>memory</em> (attempts, errors,
+parsed output) lives in state. Each piece can be understood, tested, and modified independently.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-pregel-heritage">The Pregel Heritage</h2>
+
+<p data-anchor="ch01-pregel-intro">
+LangGraph&rsquo;s internal execution model draws inspiration from two systems in distributed
+computing: Google&rsquo;s <strong>Pregel</strong> paper (2010) and <strong>Apache Beam</strong>.
+Understanding this lineage is not required to use LangGraph, but it explains certain design
+choices that might otherwise seem surprising.
+</p>
+
+<p data-anchor="ch01-pregel-explained">
+Pregel was designed for processing large-scale graphs&mdash;think billions of web pages linked
+by hyperlinks. Its model is simple: computation proceeds in a series of &ldquo;supersteps.&rdquo;
+In each superstep, every vertex in the graph runs a user-defined function, reads messages sent
+to it in the previous superstep, and can send messages to other vertices for the next superstep.
+Vertices can also vote to halt. When all vertices have halted and no messages are in transit,
+the computation terminates.
+</p>
+
+<p data-anchor="ch01-pregel-langgraph-parallel">
+LangGraph borrows several ideas from this model:
+</p>
+
+<ul data-anchor="ch01-pregel-ideas-list">
+  <li data-anchor="ch01-pregel-supersteps"><strong>Superstep-like execution.</strong> LangGraph executes one node (or a set of parallel nodes)
+      per step. After each step, state updates are merged, and the next node is determined by
+      evaluating edges. This sequential-step model makes debugging straightforward: you can
+      inspect the state after every single step.</li>
+  <li data-anchor="ch01-pregel-messages"><strong>State as shared messages.</strong> Instead of vertices sending messages to each other, nodes
+      in LangGraph read from and write to a shared state object. The effect is similar&mdash;nodes
+      communicate through data&mdash;but the single shared state is simpler for most AI
+      orchestration use cases.</li>
+  <li data-anchor="ch01-pregel-halt"><strong>Explicit termination.</strong> A LangGraph execution ends when a node routes to the
+      special <code>END</code> node, analogous to all Pregel vertices voting to halt. The
+      recursion limit acts as a safety net to prevent infinite loops.</li>
+</ul>
+
+<p data-anchor="ch01-beam-connection">
+From Apache Beam, LangGraph takes the idea of <em>reducers</em>&mdash;functions that define
+how multiple updates to the same state key should be combined. For instance, a list of messages
+might use an &ldquo;append&rdquo; reducer (new messages are added to the end) rather than an
+&ldquo;overwrite&rdquo; reducer (the last value wins). We&rsquo;ll explore reducers in depth
+in Chapter&nbsp;2.
+</p>
+
+<div class="callout warn" data-anchor="ch01-callout-pregel-warn">
+  <span class="callout-title">Don&rsquo;t Over-Analogise</span>
+  <p data-anchor="ch01-callout-pregel-warn-text">
+    Pregel was built for massive distributed graph processing&mdash;PageRank over billions of
+    nodes, shortest paths across the entire web. LangGraph solves a very different problem:
+    orchestrating a handful of AI steps with rich state. The inspirations are real, but
+    LangGraph is not a distributed computing framework. It runs in a single process (or
+    via a deployment server), and its graphs typically have five to fifty nodes, not five billion.
+  </p>
+</div>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-ecosystem-fit">Where LangGraph Fits in the Ecosystem</h2>
+
+<p data-anchor="ch01-ecosystem-intro">
+The LangChain ecosystem has grown into a family of complementary packages. Understanding where
+each piece fits will save you from importing the wrong thing or reinventing functionality that
+already exists.
+</p>
+
+<ul data-anchor="ch01-ecosystem-list">
+  <li data-anchor="ch01-eco-langchain-core"><strong>langchain-core.</strong> The foundational abstractions: <code>Runnable</code>,
+      <code>BaseMessage</code>, <code>BaseTool</code>, <code>ChatPromptTemplate</code>. This
+      is the thin layer that defines interfaces. LangGraph uses some of these types (especially
+      messages) but does not depend on the full <code>langchain</code> package.</li>
+  <li data-anchor="ch01-eco-langchain"><strong>langchain.</strong> The high-level framework with chains, agents, and retrieval helpers.
+      Built on <code>langchain-core</code>. Great for linear workflows, RAG pipelines, and
+      quick prototypes.</li>
+  <li data-anchor="ch01-eco-langgraph"><strong>langgraph.</strong> The orchestration framework you are learning in this book. It provides
+      the <code>StateGraph</code> class, conditional edges, checkpointing, and multi-agent
+      primitives. It depends on <code>langchain-core</code> for shared types but not on
+      <code>langchain</code> itself.</li>
+  <li data-anchor="ch01-eco-langsmith"><strong>LangSmith.</strong> The observability platform. It traces LLM calls, chain executions,
+      and&mdash;crucially&mdash;LangGraph steps. Each node invocation, state snapshot, and
+      edge decision is logged as a trace span. Not required, but highly recommended for
+      debugging and evaluation.</li>
+  <li data-anchor="ch01-eco-platform"><strong>LangGraph Platform.</strong> A deployment solution that lets you deploy your compiled graph
+      as a production API with built-in persistence, streaming, cron-triggered runs, and a task
+      queue. Available as a cloud-hosted or self-hosted service.</li>
+</ul>
+
+<p data-anchor="ch01-ecosystem-diagram-intro">
+The relationship looks like this:
+</p>
+
+<figure class="diagram-fig" data-anchor="ch01-fig-ecosystem">
+<svg class="diagram" viewBox="0 0 700 220" aria-label="LangGraph ecosystem diagram showing package relationships" xmlns="http://www.w3.org/2000/svg">
+  <title>LangGraph ecosystem: langchain-core at the base, langchain and langgraph side by side above it, LangSmith and LangGraph Platform at the top</title>
+  <defs>
+    <marker id="arrow2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink-soft, #666)"/>
+    </marker>
+  </defs>
+
+  <!-- Bottom: langchain-core -->
+  <rect class="box" x="220" y="170" width="260" height="40" rx="6"/>
+  <text class="lbl" x="350" y="196" text-anchor="middle" font-size="13">langchain-core</text>
+
+  <!-- Middle left: langchain -->
+  <rect class="box" x="120" y="100" width="180" height="40" rx="6"/>
+  <text class="lbl" x="210" y="126" text-anchor="middle" font-size="13">langchain</text>
+
+  <!-- Middle right: langgraph -->
+  <rect class="box-hot" x="400" y="100" width="180" height="40" rx="6"/>
+  <text class="lbl-hot" x="490" y="126" text-anchor="middle" font-size="13">langgraph</text>
+
+  <!-- Arrows from middle to bottom -->
+  <line class="flow" x1="210" y1="140" x2="300" y2="170" marker-end="url(#arrow2)"/>
+  <line class="flow" x1="490" y1="140" x2="400" y2="170" marker-end="url(#arrow2)"/>
+  <text class="lbl" x="240" y="160" font-size="10" fill="var(--ink-soft, #999)">depends on</text>
+  <text class="lbl" x="440" y="160" font-size="10" fill="var(--ink-soft, #999)">depends on</text>
+
+  <!-- Top left: LangSmith -->
+  <rect class="box" x="60" y="24" width="170" height="40" rx="6"/>
+  <text class="lbl" x="145" y="50" text-anchor="middle" font-size="13">LangSmith</text>
+
+  <!-- Top right: LangGraph Platform -->
+  <rect class="box" x="440" y="24" width="210" height="40" rx="6"/>
+  <text class="lbl" x="545" y="50" text-anchor="middle" font-size="13">LangGraph Platform</text>
+
+  <!-- Dashed arrows (integrates with) -->
+  <line class="flow-dash" x1="145" y1="64" x2="210" y2="100" marker-end="url(#arrow2)"/>
+  <line class="flow-dash" x1="145" y1="64" x2="350" y2="95" marker-end="url(#arrow2)"/>
+  <line class="flow-dash" x1="545" y1="64" x2="490" y2="100" marker-end="url(#arrow2)"/>
+
+  <text class="lbl" x="350" y="14" text-anchor="middle" font-size="11" fill="var(--ink-soft, #999)">observes / deploys</text>
+</svg>
+<figcaption data-anchor="ch01-fig-ecosystem-caption">The LangChain ecosystem. Both <code>langchain</code> and <code>langgraph</code> depend on <code>langchain-core</code> for shared types. LangSmith observes both; LangGraph Platform deploys compiled graphs.</figcaption>
+</figure>
+
+<p data-anchor="ch01-ecosystem-takeaway">
+The key takeaway: LangGraph is not a replacement for LangChain. It is a sibling that
+addresses a different class of problems. You can use LangGraph without ever importing
+<code>langchain</code>. You can also use both together, with LangChain components as the
+building blocks inside LangGraph nodes. Throughout this book, we will note when a LangChain
+integration is optional and when it is the recommended approach.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-mental-model">Building Your Mental Model</h2>
+
+<p data-anchor="ch01-mental-model-intro">
+Before we move on, let&rsquo;s crystallise the mental model you&rsquo;ll carry through the rest
+of this book. A LangGraph application has four fundamental ingredients:
+</p>
+
+<ol data-anchor="ch01-ingredients-list">
+  <li data-anchor="ch01-ingredient-state"><strong>State.</strong> A typed dictionary (or Pydantic model) that represents everything the
+      system knows at any point in time. Messages, intermediate results, counters, flags&mdash;they
+      all live here.</li>
+  <li data-anchor="ch01-ingredient-nodes"><strong>Nodes.</strong> Functions that do work. Each node receives the current state and returns
+      a partial update. A node might call an LLM, run a tool, query a database, or simply
+      compute a value. Nodes are deliberately simple&mdash;the complexity lives in the graph
+      structure, not in any single node.</li>
+  <li data-anchor="ch01-ingredient-edges"><strong>Edges.</strong> Connections between nodes that define the flow. An edge can be unconditional
+      (&ldquo;after A, always go to B&rdquo;) or conditional (&ldquo;after A, go to B if the
+      state says X, go to C if the state says Y&rdquo;). Conditional edges are where your
+      control logic lives.</li>
+  <li data-anchor="ch01-ingredient-graph"><strong>The Graph.</strong> The container that holds nodes and edges, compiles them into an
+      executable, and manages the execution loop. After compilation, the graph is a
+      <code>Runnable</code> that you invoke, stream, or batch&mdash;just like any other
+      component in the LangChain ecosystem.</li>
+</ol>
+
+<p data-anchor="ch01-mental-model-summary">
+If you can hold these four concepts in your head, you have the foundation for everything
+that follows. Chapters&nbsp;2 and 3 will go deep on each one. For now, the important thing
+is the <em>shape</em>: state flows through a graph of nodes connected by edges, and that graph
+can loop.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-what-langgraph-is-not">What LangGraph Is Not</h2>
+
+<p data-anchor="ch01-not-intro">
+It helps to be clear about boundaries. LangGraph is not:
+</p>
+
+<ul data-anchor="ch01-not-list">
+  <li data-anchor="ch01-not-model"><strong>A model.</strong> LangGraph does not contain or wrap an LLM. It orchestrates calls to
+      models&mdash;any model, from any provider&mdash;but the model itself is always an external
+      dependency.</li>
+  <li data-anchor="ch01-not-nocode"><strong>A no-code builder.</strong> LangGraph is a Python (and JavaScript/TypeScript) library.
+      You write code. LangGraph Studio provides a visual debugger, but you still define
+      graphs in code.</li>
+  <li data-anchor="ch01-not-autogen"><strong>An &ldquo;AutoGPT&rdquo; framework.</strong> LangGraph does not try to be an autonomous
+      agent that figures out its own workflow. You define the graph; the framework executes it.
+      The AI decides what to do <em>within</em> each node, but the overall flow is your design.</li>
+  <li data-anchor="ch01-not-distributed"><strong>A distributed computing framework.</strong> Despite its Pregel inspiration, LangGraph
+      runs in a single process. The LangGraph Platform can scale deployments, but the graph
+      execution model is single-threaded (with support for parallel node execution within a
+      single superstep).</li>
+</ul>
+
+<p data-anchor="ch01-not-summary">
+These boundaries are features, not limitations. By staying focused on orchestration, LangGraph
+avoids the complexity bloat that plagues more ambitious frameworks. It does one thing well:
+it gives you control flow for multi-step AI systems, with state management built in.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-getting-ready">Getting Ready</h2>
+
+<p data-anchor="ch01-getting-ready-intro">
+For the rest of this book, you will need:
+</p>
+
+<ul data-anchor="ch01-prerequisites-list">
+  <li data-anchor="ch01-prereq-python"><strong>Python 3.10 or later.</strong> LangGraph uses modern Python features including
+      <code>TypedDict</code>, <code>Annotated</code> types, and the <code>X | Y</code> union
+      syntax introduced in 3.10.</li>
+  <li data-anchor="ch01-prereq-install"><strong>LangGraph installed.</strong> <code>pip install langgraph</code>. We&rsquo;ll add
+      complementary packages (like <code>langchain-openai</code> or <code>langchain-anthropic</code>)
+      as needed in specific chapters.</li>
+  <li data-anchor="ch01-prereq-api"><strong>An LLM API key.</strong> Most examples use a chat model. Any provider works&mdash;OpenAI,
+      Anthropic, Google, or a local model via Ollama. We&rsquo;ll show setup instructions when
+      we first use each provider.</li>
+  <li data-anchor="ch01-prereq-editor"><strong>A code editor and terminal.</strong> Nothing fancy. The examples are designed to run
+      as standalone scripts or in Jupyter notebooks.</li>
+</ul>
+
+<p data-anchor="ch01-quick-verify">
+To verify your installation, run this in a Python shell:
+</p>
+
+<p class="code-label" data-anchor="ch01-verify-label">Verifying your LangGraph installation</p>
+<pre data-anchor="ch01-verify-code"><span class="kw">import</span> langgraph
+<span class="fn">print</span>(langgraph.<span class="fn">__version__</span>)  <span class="cm"># Should print 1.2.x or later</span></pre>
+
+<p data-anchor="ch01-verify-note">
+If that prints a version number without errors, you&rsquo;re ready to go.
+</p>
+
+<!-- ====================================================== -->
+<h2 data-anchor="ch01-looking-ahead">Looking Ahead</h2>
+
+<p data-anchor="ch01-looking-ahead-text">
+In this chapter, we established <em>why</em> LangGraph exists: linear chains break
+down when your AI workflow needs cycles, persistent state, human checkpoints, or multi-agent
+collaboration. We saw the core abstraction&mdash;a stateful, cyclic graph where nodes
+are functions, edges are control flow, and a shared <code>TypedDict</code> carries everything the
+system knows. We built a concrete retry loop that would be awkward in a sequential chain
+but falls naturally out of LangGraph&rsquo;s graph model.
+</p>
+
+<p data-anchor="ch01-transition">
+In <strong>Chapter&nbsp;2: Core Concepts</strong>, we&rsquo;ll roll up our sleeves and study each
+ingredient in detail. You&rsquo;ll learn how state reducers work, how to define conditional edges,
+how the execution loop processes one superstep at a time, and how checkpointing lets you pause
+and resume a graph mid-flight. The retry loop was a taste; the next chapter is the full meal.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch01-nav">
+  <a rel="prev" href="../index.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="02-core-concepts.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>

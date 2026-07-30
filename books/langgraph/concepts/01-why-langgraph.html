@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Core Concepts — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch02-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch02-head">
+  <span class="chapter-num">02</span>
+  <span class="chapter-kicker">Nodes, edges, and state</span>
+  <h1 data-anchor="ch02-title">Core Concepts</h1>
+</header>
+
+<p class="lede" data-anchor="ch02-lede">
+Before you can build anything useful with LangGraph, you need a shared vocabulary&mdash;a small set of interlocking parts whose behavior you can predict. This chapter hands you that vocabulary. By the end you&rsquo;ll know exactly what a node does, how edges decide where execution goes next, why state travels through the graph instead of living inside any single node, and how reducers give you fine-grained control over how state updates merge together. Everything that follows in this book rests on these ideas, so we&rsquo;ll take the time to get them right.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-mental-model">The Mental Model: A Workshop Assembly Line</h2>
+
+<p data-anchor="ch02-mental-model-p1">
+Imagine a workshop where a single workpiece&mdash;a block of wood, say&mdash;moves along a series of stations. At each station, a craftsperson inspects the workpiece, performs one specific operation (cutting, sanding, staining), and sends it onward. The workpiece carries the accumulated results of every previous station. No craftsperson needs to know what happened upstream; they only need to look at the workpiece, do their job, and pass it along.
+</p>
+
+<p data-anchor="ch02-mental-model-p2">
+A LangGraph graph works the same way. The workpiece is <strong>state</strong>&mdash;a typed dictionary that flows through the graph. Each station is a <strong>node</strong>&mdash;a Python function that reads state, does work, and returns updates. The conveyor belts between stations are <strong>edges</strong>&mdash;some fixed, some switching dynamically based on what the workpiece looks like at that moment. That&rsquo;s really all there is. Let&rsquo;s look at each piece.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-state">State: The Shared Workpiece</h2>
+
+<p data-anchor="ch02-state-p1">
+State is the single most important concept in LangGraph. It is the data structure that every node reads from and writes to. There is exactly one state object per graph execution, and it lives for the duration of that execution. You define its shape before you build the graph, typically using Python&rsquo;s <code>TypedDict</code> or Pydantic&rsquo;s <code>BaseModel</code>.
+</p>
+
+<p class="code-label" data-anchor="ch02-state-typedef-label">Defining state with TypedDict:</p>
+<pre data-anchor="ch02-state-typedef-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict
+
+<span class="kw">class</span> <span class="ty">AgentState</span>(TypedDict):
+    <span class="cm"># The user&rsquo;s original question</span>
+    query: <span class="ty">str</span>
+    <span class="cm"># The LLM&rsquo;s generated response</span>
+    response: <span class="ty">str</span>
+    <span class="cm"># Whether the response passed a quality check</span>
+    approved: <span class="ty">bool</span></pre>
+
+<p data-anchor="ch02-state-p2">
+Notice what&rsquo;s happening here. We&rsquo;re declaring three fields with explicit types. Every node in the graph will receive an instance of this <code>AgentState</code> and can read any field. When a node finishes its work, it returns a plain dictionary containing only the fields it wants to update&mdash;not the entire state. LangGraph merges that partial dictionary back into the full state automatically.
+</p>
+
+<div class="callout key" data-anchor="ch02-callout-partial-updates">
+  <span class="callout-title">Key insight</span>
+  <p data-anchor="ch02-callout-partial-updates-p1">Every node sees the full state, returns only what changed. A node that sets <code>response</code> doesn&rsquo;t need to echo back <code>query</code> or <code>approved</code>. This keeps nodes focused: each one is responsible for exactly the fields it owns.</p>
+</div>
+
+<p data-anchor="ch02-state-pydantic-p1">
+You can also define state with Pydantic if you want runtime validation:
+</p>
+
+<p class="code-label" data-anchor="ch02-state-pydantic-label">Defining state with Pydantic BaseModel:</p>
+<pre data-anchor="ch02-state-pydantic-code"><span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel
+
+<span class="kw">class</span> <span class="ty">AgentState</span>(BaseModel):
+    query: <span class="ty">str</span> = <span class="str">""</span>
+    response: <span class="ty">str</span> = <span class="str">""</span>
+    approved: <span class="ty">bool</span> = <span class="kw">False</span></pre>
+
+<p data-anchor="ch02-state-pydantic-p2">
+The Pydantic approach gives you default values and automatic type coercion. Use whichever feels right for your project; the graph doesn&rsquo;t care which you choose. Throughout this book, we&rsquo;ll mostly use <code>TypedDict</code> because it&rsquo;s lighter and appears more frequently in the LangGraph documentation.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-nodes">Nodes: The Workers</h2>
+
+<p data-anchor="ch02-nodes-p1">
+A node is a Python function. That&rsquo;s it. No special base class, no decorator magic, no framework superstructure. A node takes the current state as its argument and returns a dictionary of updates. It can be synchronous or asynchronous&mdash;LangGraph handles both transparently.
+</p>
+
+<p class="code-label" data-anchor="ch02-nodes-sync-label">A synchronous node function:</p>
+<pre data-anchor="ch02-nodes-sync-code"><span class="kw">def</span> <span class="fn">generate_response</span>(state: <span class="ty">AgentState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Call an LLM (simplified for illustration)</span>
+    result = llm.<span class="fn">invoke</span>(state[<span class="str">"query"</span>])
+    <span class="kw">return</span> {<span class="str">"response"</span>: result.content}</pre>
+
+<p data-anchor="ch02-nodes-p2">
+Look at what this function does. It reads <code>state["query"]</code> to get the input, calls an LLM, and returns a dictionary with a single key: <code>"response"</code>. It doesn&rsquo;t touch <code>approved</code>. It doesn&rsquo;t return the full state. It returns only the delta&mdash;the part that changed.
+</p>
+
+<p class="code-label" data-anchor="ch02-nodes-async-label">An asynchronous node function:</p>
+<pre data-anchor="ch02-nodes-async-code"><span class="kw">async def</span> <span class="fn">check_quality</span>(state: <span class="ty">AgentState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Run a quality check on the response</span>
+    is_good = <span class="kw">await</span> quality_checker.<span class="fn">acheck</span>(
+        query=state[<span class="str">"query"</span>],
+        response=state[<span class="str">"response"</span>]
+    )
+    <span class="kw">return</span> {<span class="str">"approved"</span>: is_good}</pre>
+
+<p data-anchor="ch02-nodes-p3">
+This second node reads two fields (<code>query</code> and <code>response</code>) and writes one (<code>approved</code>). It doesn&rsquo;t need to know which node set <code>response</code>&mdash;it just trusts that the field will be there by the time this node runs. The graph&rsquo;s edges guarantee ordering.
+</p>
+
+<p data-anchor="ch02-nodes-p4">
+Nodes can do anything a normal Python function can: call APIs, query databases, run sub-chains, perform computations, even invoke other LangGraph graphs. The only contract is the signature: take state in, return a dictionary out.
+</p>
+
+<div class="callout note" data-anchor="ch02-callout-node-names">
+  <span class="callout-title">Node naming</span>
+  <p data-anchor="ch02-callout-node-names-p1">When you register a node with <code>add_node("generate", generate_response)</code>, the first argument is the node&rsquo;s name in the graph. This name appears in logs, traces, and streaming output. Choose descriptive names&mdash;you&rsquo;ll thank yourself when debugging at 2 a.m.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-edges">Edges: The Routing</h2>
+
+<p data-anchor="ch02-edges-p1">
+Edges connect nodes. They answer the question: &ldquo;After this node finishes, where does execution go next?&rdquo; LangGraph provides two kinds of edges, and understanding the difference is crucial.
+</p>
+
+<h3 data-anchor="ch02-normal-edges">Normal Edges (Fixed Routing)</h3>
+
+<p data-anchor="ch02-normal-edges-p1">
+A normal edge is unconditional. After node A finishes, execution always goes to node B. No questions asked.
+</p>
+
+<p class="code-label" data-anchor="ch02-normal-edges-label">Adding a fixed edge:</p>
+<pre data-anchor="ch02-normal-edges-code">graph.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, <span class="str">"check_quality"</span>)</pre>
+
+<p data-anchor="ch02-normal-edges-p2">
+This says: &ldquo;When <code>generate</code> finishes, run <code>check_quality</code>.&rdquo; Always. Every time. It&rsquo;s the conveyor belt bolted to the floor.
+</p>
+
+<h3 data-anchor="ch02-conditional-edges">Conditional Edges (Dynamic Routing)</h3>
+
+<p data-anchor="ch02-conditional-edges-p1">
+This is where LangGraph gets interesting. A conditional edge inspects the current state and decides where to go based on what it finds. You provide a routing function that reads the state and returns a string indicating which node should run next.
+</p>
+
+<p class="code-label" data-anchor="ch02-conditional-edges-label">Adding a conditional edge:</p>
+<pre data-anchor="ch02-conditional-edges-code"><span class="kw">def</span> <span class="fn">route_after_check</span>(state: <span class="ty">AgentState</span>) -> <span class="ty">str</span>:
+    <span class="cm"># If the quality check passed, we&rsquo;re done</span>
+    <span class="kw">if</span> state[<span class="str">"approved"</span>]:
+        <span class="kw">return</span> <span class="str">"end"</span>
+    <span class="cm"># Otherwise, regenerate</span>
+    <span class="kw">return</span> <span class="str">"regenerate"</span>
+
+graph.<span class="fn">add_conditional_edges</span>(
+    <span class="str">"check_quality"</span>,       <span class="cm"># source node</span>
+    route_after_check,        <span class="cm"># routing function</span>
+    {                         <span class="cm"># path map: return value &rarr; node name</span>
+        <span class="str">"end"</span>: END,
+        <span class="str">"regenerate"</span>: <span class="str">"generate"</span>,
+    }
+)</pre>
+
+<p data-anchor="ch02-conditional-edges-p2">
+The <code>add_conditional_edges</code> method takes three arguments. First, the source node&mdash;the node whose output triggers the routing decision. Second, a function that examines state and returns a string. Third, a path map that translates those return strings into actual node names (or the special <code>END</code> constant).
+</p>
+
+<p data-anchor="ch02-conditional-edges-p3">
+This is how you build loops, retries, branching logic, and agent decision-making. The routing function is just Python, so you can use any logic you want: check a boolean, count iterations, compare scores, parse structured output from an LLM. The graph doesn&rsquo;t prescribe what your decision logic looks like.
+</p>
+
+<div class="callout warn" data-anchor="ch02-callout-path-map">
+  <span class="callout-title">Watch out</span>
+  <p data-anchor="ch02-callout-path-map-p1">The path map must cover every possible return value from your routing function. If <code>route_after_check</code> returns <code>"regenerate"</code> but the path map doesn&rsquo;t include that key, LangGraph will raise an error at runtime. Be exhaustive.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-start-end">START and END: Entry and Exit</h2>
+
+<p data-anchor="ch02-start-end-p1">
+Every graph needs to know where to begin and where to stop. LangGraph provides two special constants for this: <code>START</code> and <code>END</code>.
+</p>
+
+<p class="code-label" data-anchor="ch02-start-end-import-label">Importing the constants:</p>
+<pre data-anchor="ch02-start-end-import-code"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END</pre>
+
+<p data-anchor="ch02-start-end-p2">
+<code>START</code> is a virtual node that represents the entry point of your graph. You connect it to your first real node with a normal edge:
+</p>
+
+<pre data-anchor="ch02-start-end-entry-code">graph.<span class="fn">add_edge</span>(START, <span class="str">"generate"</span>)</pre>
+
+<p data-anchor="ch02-start-end-p3">
+<code>END</code> is a virtual node that signals completion. When execution reaches <code>END</code>, the graph stops and returns the final state. You can route to <code>END</code> from any edge:
+</p>
+
+<pre data-anchor="ch02-start-end-exit-code">graph.<span class="fn">add_edge</span>(<span class="str">"check_quality"</span>, END)
+<span class="cm"># or via a conditional edge as shown above</span></pre>
+
+<p data-anchor="ch02-start-end-p4">
+Think of <code>START</code> and <code>END</code> as the doors of the workshop. Work enters through <code>START</code>, passes through your nodes, and exits through <code>END</code>. A graph without an edge from <code>START</code> will never execute. A graph that never reaches <code>END</code> will run forever (or until your patience runs out).
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-diagram">Seeing the Whole Picture</h2>
+
+<p data-anchor="ch02-diagram-p1">
+Let&rsquo;s put these pieces together visually. Here&rsquo;s what a simple generate-and-check graph looks like, with state flowing through it:
+</p>
+
+<figure class="diagram-fig" data-anchor="ch02-diagram-fig">
+<svg class="diagram" viewBox="0 0 680 420" aria-label="State graph showing nodes, edges, and state flow with a conditional loop" xmlns="http://www.w3.org/2000/svg">
+  <title>LangGraph core concepts: nodes, edges, state flow, and conditional routing</title>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="var(--ink)" />
+    </marker>
+    <marker id="arrow-hot" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="var(--accent)" />
+    </marker>
+    <marker id="arrow-dash" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="var(--ink-soft)" />
+    </marker>
+  </defs>
+
+  <!-- START node -->
+  <circle cx="340" cy="40" r="22" class="box-alt" fill="var(--rule)" stroke="var(--ink)" stroke-width="1.5"/>
+  <text x="340" y="45" text-anchor="middle" class="lbl" fill="var(--ink)" font-size="13" font-weight="600">START</text>
+
+  <!-- Edge: START -> generate -->
+  <line x1="340" y1="62" x2="340" y2="108" class="flow" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- generate node -->
+  <rect x="230" y="110" width="220" height="52" rx="8" class="box" fill="var(--rule)" stroke="var(--ink)" stroke-width="1.5"/>
+  <text x="340" y="141" text-anchor="middle" class="lbl" fill="var(--ink)" font-size="14" font-weight="600">generate</text>
+
+  <!-- State annotation for generate -->
+  <rect x="490" y="110" width="175" height="52" rx="6" fill="none" stroke="var(--ink-soft)" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="500" y="130" class="lbl" fill="var(--ink-soft)" font-size="11">reads: query</text>
+  <text x="500" y="148" class="lbl" fill="var(--ink-soft)" font-size="11">writes: response</text>
+
+  <!-- Edge: generate -> check_quality -->
+  <line x1="340" y1="162" x2="340" y2="218" class="flow" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- State badge on edge -->
+  <rect x="348" y="178" width="118" height="22" rx="4" fill="var(--accent)" opacity="0.15"/>
+  <text x="407" y="193" text-anchor="middle" class="lbl-hot" fill="var(--accent)" font-size="11" font-weight="600">state flows down</text>
+
+  <!-- check_quality node -->
+  <rect x="230" y="220" width="220" height="52" rx="8" class="box" fill="var(--rule)" stroke="var(--ink)" stroke-width="1.5"/>
+  <text x="340" y="251" text-anchor="middle" class="lbl" fill="var(--ink)" font-size="14" font-weight="600">check_quality</text>
+
+  <!-- State annotation for check_quality -->
+  <rect x="490" y="220" width="175" height="52" rx="6" fill="none" stroke="var(--ink-soft)" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="500" y="240" class="lbl" fill="var(--ink-soft)" font-size="11">reads: query, response</text>
+  <text x="500" y="258" class="lbl" fill="var(--ink-soft)" font-size="11">writes: approved</text>
+
+  <!-- Conditional diamond -->
+  <polygon points="340,295 380,325 340,355 300,325" class="box-hot" fill="var(--accent)" opacity="0.2" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="340" y="330" text-anchor="middle" class="lbl-hot" fill="var(--accent)" font-size="11" font-weight="600">approved?</text>
+
+  <!-- Edge: check_quality -> diamond -->
+  <line x1="340" y1="272" x2="340" y2="295" class="flow-hot" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arrow-hot)"/>
+
+  <!-- Edge: diamond -> END (approved=true) -->
+  <line x1="340" y1="355" x2="340" y2="388" class="flow" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="355" y="376" class="lbl" fill="var(--ink)" font-size="11">yes</text>
+
+  <!-- END node -->
+  <circle cx="340" cy="400" r="18" class="box-alt" fill="var(--ink)" stroke="var(--ink)" stroke-width="1.5"/>
+  <circle cx="340" cy="400" r="14" fill="none" stroke="var(--rule)" stroke-width="1.5"/>
+  <text x="340" y="405" text-anchor="middle" class="lbl" fill="var(--rule)" font-size="12" font-weight="600">END</text>
+
+  <!-- Edge: diamond -> generate (approved=false, loop back) -->
+  <line x1="300" y1="325" x2="160" y2="325" class="flow-dash" stroke="var(--ink-soft)" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <line x1="160" y1="325" x2="160" y2="136" class="flow-dash" stroke="var(--ink-soft)" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <line x1="160" y1="136" x2="228" y2="136" class="flow-dash" stroke="var(--ink-soft)" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow-dash)"/>
+  <text x="115" y="240" class="lbl" fill="var(--ink-soft)" font-size="11" transform="rotate(-90, 115, 240)">no &mdash; retry</text>
+
+  <!-- Legend -->
+  <rect x="14" y="370" width="130" height="44" rx="6" fill="none" stroke="var(--rule)" stroke-width="1"/>
+  <line x1="22" y1="384" x2="50" y2="384" stroke="var(--ink)" stroke-width="1.5"/>
+  <text x="55" y="388" class="lbl" fill="var(--ink-soft)" font-size="10">normal edge</text>
+  <line x1="22" y1="402" x2="50" y2="402" stroke="var(--ink-soft)" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="55" y="406" class="lbl" fill="var(--ink-soft)" font-size="10">conditional edge</text>
+</svg>
+<figcaption data-anchor="ch02-diagram-caption">A generate-and-check graph with a conditional retry loop. State flows through every node; the diamond represents a routing decision based on the <code>approved</code> field.</figcaption>
+</figure>
+
+<p data-anchor="ch02-diagram-p2">
+Study this diagram. You can trace the flow: execution starts at <code>START</code>, moves to <code>generate</code> (which sets <code>response</code>), continues to <code>check_quality</code> (which sets <code>approved</code>), hits the conditional check, and either exits through <code>END</code> or loops back to <code>generate</code> for another attempt. The state object carries all accumulated values throughout.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-stategraph">StateGraph: The Builder</h2>
+
+<p data-anchor="ch02-stategraph-p1">
+Now that you understand the individual pieces, let&rsquo;s see how they come together. The <code>StateGraph</code> class is your builder. You create one, pass it your state type, add nodes and edges, then compile it into an executable graph.
+</p>
+
+<p class="code-label" data-anchor="ch02-stategraph-full-label">A complete StateGraph definition:</p>
+<pre data-anchor="ch02-stategraph-full-code"><span class="kw">from</span> typing <span class="kw">import</span> TypedDict
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="cm"># 1. Define state</span>
+<span class="kw">class</span> <span class="ty">AgentState</span>(TypedDict):
+    query: <span class="ty">str</span>
+    response: <span class="ty">str</span>
+    approved: <span class="ty">bool</span>
+    attempt_count: <span class="ty">int</span>
+
+<span class="cm"># 2. Define nodes</span>
+<span class="kw">def</span> <span class="fn">generate</span>(state: <span class="ty">AgentState</span>) -> <span class="ty">dict</span>:
+    result = llm.<span class="fn">invoke</span>(state[<span class="str">"query"</span>])
+    count = state.<span class="fn">get</span>(<span class="str">"attempt_count"</span>, <span class="num">0</span>)
+    <span class="kw">return</span> {
+        <span class="str">"response"</span>: result.content,
+        <span class="str">"attempt_count"</span>: count + <span class="num">1</span>,
+    }
+
+<span class="kw">def</span> <span class="fn">check_quality</span>(state: <span class="ty">AgentState</span>) -> <span class="ty">dict</span>:
+    is_good = quality_checker.<span class="fn">check</span>(
+        query=state[<span class="str">"query"</span>],
+        response=state[<span class="str">"response"</span>],
+    )
+    <span class="kw">return</span> {<span class="str">"approved"</span>: is_good}
+
+<span class="cm"># 3. Define routing logic</span>
+<span class="kw">def</span> <span class="fn">should_retry</span>(state: <span class="ty">AgentState</span>) -> <span class="ty">str</span>:
+    <span class="kw">if</span> state[<span class="str">"approved"</span>]:
+        <span class="kw">return</span> <span class="str">"done"</span>
+    <span class="kw">if</span> state[<span class="str">"attempt_count"</span>] >= <span class="num">3</span>:
+        <span class="kw">return</span> <span class="str">"done"</span>  <span class="cm"># give up after 3 tries</span>
+    <span class="kw">return</span> <span class="str">"retry"</span>
+
+<span class="cm"># 4. Build the graph</span>
+graph = <span class="fn">StateGraph</span>(<span class="ty">AgentState</span>)
+
+graph.<span class="fn">add_node</span>(<span class="str">"generate"</span>, generate)
+graph.<span class="fn">add_node</span>(<span class="str">"check_quality"</span>, check_quality)
+
+graph.<span class="fn">add_edge</span>(START, <span class="str">"generate"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, <span class="str">"check_quality"</span>)
+
+graph.<span class="fn">add_conditional_edges</span>(
+    <span class="str">"check_quality"</span>,
+    should_retry,
+    {<span class="str">"done"</span>: END, <span class="str">"retry"</span>: <span class="str">"generate"</span>},
+)
+
+<span class="cm"># 5. Compile</span>
+app = graph.<span class="fn">compile</span>()</pre>
+
+<p data-anchor="ch02-stategraph-p2">
+Let&rsquo;s walk through this step by step. First, we define the state shape with four fields. Second, we write two node functions&mdash;each takes <code>AgentState</code> and returns a partial dictionary. Third, we write a routing function that returns one of two strings. Fourth, we create a <code>StateGraph</code> instance, register our nodes and edges, and add a conditional edge with a path map. Fifth, we call <code>compile()</code> to produce the final executable.
+</p>
+
+<p data-anchor="ch02-stategraph-p3">
+The builder pattern&mdash;<code>add_node</code>, <code>add_edge</code>, <code>add_conditional_edges</code>, <code>compile</code>&mdash;is the API you&rsquo;ll use every time you build a LangGraph application. It might feel ceremonial at first, but the explicitness pays off: you can look at any graph definition and understand the entire flow without running it.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-compilation">Graph Compilation: From Blueprint to Machine</h2>
+
+<p data-anchor="ch02-compilation-p1">
+The <code>.compile()</code> call is where LangGraph validates your graph and transforms it into a <code>CompiledStateGraph</code>&mdash;an object that implements LangChain&rsquo;s <code>Runnable</code> interface. This means you get a standard set of methods for execution:
+</p>
+
+<ul data-anchor="ch02-compilation-methods">
+  <li data-anchor="ch02-compilation-invoke"><code>invoke(input)</code> &mdash; Run the graph synchronously, return the final state</li>
+  <li data-anchor="ch02-compilation-ainvoke"><code>ainvoke(input)</code> &mdash; Run the graph asynchronously</li>
+  <li data-anchor="ch02-compilation-stream"><code>stream(input)</code> &mdash; Yield state updates as each node completes</li>
+  <li data-anchor="ch02-compilation-astream"><code>astream(input)</code> &mdash; Async streaming</li>
+</ul>
+
+<p class="code-label" data-anchor="ch02-compilation-invoke-label">Running a compiled graph:</p>
+<pre data-anchor="ch02-compilation-invoke-code"><span class="cm"># Synchronous execution</span>
+result = app.<span class="fn">invoke</span>({<span class="str">"query"</span>: <span class="str">"What is LangGraph?"</span>})
+<span class="fn">print</span>(result[<span class="str">"response"</span>])
+
+<span class="cm"># Streaming execution</span>
+<span class="kw">for</span> event <span class="kw">in</span> app.<span class="fn">stream</span>({<span class="str">"query"</span>: <span class="str">"What is LangGraph?"</span>}):
+    <span class="fn">print</span>(event)</pre>
+
+<p data-anchor="ch02-compilation-p2">
+During compilation, LangGraph checks that your graph is well-formed: every node referenced by an edge actually exists, there&rsquo;s a path from <code>START</code> to at least one node, and all conditional edge path maps have valid targets. If anything is wrong, you get a clear error at compile time rather than a mysterious failure at runtime.
+</p>
+
+<div class="callout note" data-anchor="ch02-callout-compilation">
+  <span class="callout-title">When does compilation happen?</span>
+  <p data-anchor="ch02-callout-compilation-p1">Compilation is a one-time step. You build and compile the graph once, then call <code>invoke()</code> or <code>stream()</code> as many times as you want. Each invocation gets a fresh state object. The compiled graph itself is stateless and thread-safe.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-reducers">Reducers: Controlling How State Merges</h2>
+
+<p data-anchor="ch02-reducers-p1">
+So far, every state update has been a simple replacement: if node A sets <code>response</code> to <code>"Hello"</code> and node B later sets <code>response</code> to <code>"Goodbye"</code>, the final value is <code>"Goodbye"</code>. The new value replaces the old one. This is the default behavior, and it works well for most fields.
+</p>
+
+<p data-anchor="ch02-reducers-p2">
+But what about fields where you want to <em>accumulate</em> values? Imagine a list of messages in a conversation, or a list of tool calls, or a running log of decisions. You don&rsquo;t want each node to replace the entire list&mdash;you want each node to <em>append</em> to it. That&rsquo;s what reducers are for.
+</p>
+
+<p data-anchor="ch02-reducers-p3">
+A reducer is a function that takes the current value of a field and a new value, and combines them. You declare reducers using Python&rsquo;s <code>Annotated</code> type:
+</p>
+
+<p class="code-label" data-anchor="ch02-reducers-annotated-label">Defining state with reducers using Annotated:</p>
+<pre data-anchor="ch02-reducers-annotated-code"><span class="kw">import</span> operator
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated, TypedDict
+
+<span class="kw">class</span> <span class="ty">ChatState</span>(TypedDict):
+    <span class="cm"># Messages accumulate &mdash; each node appends, never replaces</span>
+    messages: Annotated[<span class="ty">list</span>[<span class="ty">str</span>], operator.add]
+    <span class="cm"># Summary is replaced &mdash; default behavior, no reducer needed</span>
+    summary: <span class="ty">str</span>
+    <span class="cm"># Tool calls accumulate too</span>
+    tool_calls: Annotated[<span class="ty">list</span>[<span class="ty">dict</span>], operator.add]
+    <span class="cm"># Turn counter uses a custom reducer</span>
+    turn_count: Annotated[<span class="ty">int</span>, <span class="kw">lambda</span> current, new: current + new]</pre>
+
+<p data-anchor="ch02-reducers-p4">
+The syntax <code>Annotated[list[str], operator.add]</code> says: &ldquo;This field is a list of strings, and when a node returns an update for this field, concatenate the new list onto the existing one.&rdquo; So if the current value is <code>["Hello"]</code> and a node returns <code>{"messages": ["How are you?"]}</code>, the result is <code>["Hello", "How are you?"]</code>.
+</p>
+
+<p class="code-label" data-anchor="ch02-reducers-usage-label">Nodes using accumulating state:</p>
+<pre data-anchor="ch02-reducers-usage-code"><span class="kw">def</span> <span class="fn">user_input</span>(state: <span class="ty">ChatState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Append one message to the list</span>
+    <span class="kw">return</span> {<span class="str">"messages"</span>: [<span class="str">"User: What is the weather?"</span>]}
+
+<span class="kw">def</span> <span class="fn">assistant_response</span>(state: <span class="ty">ChatState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Append another message &mdash; the existing ones are preserved</span>
+    <span class="kw">return</span> {
+        <span class="str">"messages"</span>: [<span class="str">"Assistant: It&rsquo;s sunny today!"</span>],
+        <span class="str">"turn_count"</span>: <span class="num">1</span>,  <span class="cm"># adds 1 to existing count</span>
+    }</pre>
+
+<p data-anchor="ch02-reducers-p5">
+Without the reducer annotation, the second node&rsquo;s return would <em>replace</em> the messages list entirely, wiping out the user&rsquo;s input. With the reducer, each node contributes items to a growing list. This is the pattern that makes multi-turn chat, tool-calling agents, and ReAct loops possible in LangGraph.
+</p>
+
+<table data-anchor="ch02-reducer-table">
+<caption data-anchor="ch02-reducer-table-caption">Reducer behavior comparison</caption>
+<thead data-anchor="ch02-reducer-table-head">
+<tr>
+  <th data-anchor="ch02-reducer-table-th-field">Field declaration</th>
+  <th data-anchor="ch02-reducer-table-th-behavior">Merge behavior</th>
+  <th data-anchor="ch02-reducer-table-th-example">Example</th>
+</tr>
+</thead>
+<tbody data-anchor="ch02-reducer-table-body">
+<tr data-anchor="ch02-reducer-table-row-default">
+  <td><code>response: str</code></td>
+  <td>Replace (default)</td>
+  <td>Old: <code>"A"</code> &rarr; Update: <code>"B"</code> &rarr; Result: <code>"B"</code></td>
+</tr>
+<tr data-anchor="ch02-reducer-table-row-add">
+  <td><code>Annotated[list, operator.add]</code></td>
+  <td>Concatenate lists</td>
+  <td>Old: <code>["A"]</code> &rarr; Update: <code>["B"]</code> &rarr; Result: <code>["A", "B"]</code></td>
+</tr>
+<tr data-anchor="ch02-reducer-table-row-lambda-int">
+  <td><code>Annotated[int, lambda a, b: a + b]</code></td>
+  <td>Sum integers</td>
+  <td>Old: <code>3</code> &rarr; Update: <code>1</code> &rarr; Result: <code>4</code></td>
+</tr>
+<tr data-anchor="ch02-reducer-table-row-lambda-set">
+  <td><code>Annotated[set, lambda a, b: a | b]</code></td>
+  <td>Union of sets</td>
+  <td>Old: <code>{"x"}</code> &rarr; Update: <code>{"y"}</code> &rarr; Result: <code>{"x", "y"}</code></td>
+</tr>
+<tr data-anchor="ch02-reducer-table-row-custom">
+  <td><code>Annotated[T, custom_fn]</code></td>
+  <td>Your function decides</td>
+  <td>Any logic: pick max, merge dicts, deduplicate, etc.</td>
+</tr>
+</tbody>
+</table>
+
+<p data-anchor="ch02-reducers-p6">
+The key takeaway: without a reducer, the last write wins. With a reducer, you control exactly how concurrent or sequential updates combine. Choose the right reducer for each field, and your state management becomes trivially correct.
+</p>
+
+<div class="callout key" data-anchor="ch02-callout-messages-reducer">
+  <span class="callout-title">The messages pattern</span>
+  <p data-anchor="ch02-callout-messages-reducer-p1">The most common reducer in LangGraph applications is <code>Annotated[list[BaseMessage], operator.add]</code> for the <code>messages</code> field. LangGraph even provides a pre-built <code>MessagesState</code> class that includes this pattern. You&rsquo;ll see it extensively starting in Chapter 3.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-channels">Channels: The Machinery Under the Hood</h2>
+
+<p data-anchor="ch02-channels-p1">
+You may encounter the term &ldquo;channels&rdquo; in LangGraph documentation or error messages. Channels are the internal mechanism that manages state updates. Each field in your state type gets its own channel, and each channel knows its reducer (if any).
+</p>
+
+<p data-anchor="ch02-channels-p2">
+When a node returns <code>{"response": "Hello"}</code>, LangGraph doesn&rsquo;t just do a dictionary merge. It routes the update to the <code>response</code> channel, which applies the appropriate reducer (default replace, or your custom function), validates the type, and stores the result. The next node that runs will see the updated value when it accesses <code>state["response"]</code>.
+</p>
+
+<p data-anchor="ch02-channels-p3">
+You rarely interact with channels directly. They&rsquo;re an implementation detail that you can safely ignore until you need to debug a tricky state update or build something unusual like a custom channel type. For now, just know they exist and that they&rsquo;re the reason state updates are reliable and predictable.
+</p>
+
+<div class="callout note" data-anchor="ch02-callout-channels">
+  <span class="callout-title">Channels in practice</span>
+  <p data-anchor="ch02-callout-channels-p1">If you see an error message mentioning &ldquo;channel&rdquo; or &ldquo;InvalidUpdateError,&rdquo; it usually means a node returned a value for a state field with an incompatible type&mdash;for example, returning a string for a field that expects a list. The channel caught the mismatch before it could cause subtle bugs downstream.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-builder-api">The Builder API at a Glance</h2>
+
+<p data-anchor="ch02-builder-api-p1">
+Let&rsquo;s consolidate everything into a reference of the <code>StateGraph</code> methods you&rsquo;ll use most often:
+</p>
+
+<table data-anchor="ch02-builder-table">
+<caption data-anchor="ch02-builder-table-caption">StateGraph builder methods</caption>
+<thead data-anchor="ch02-builder-table-head">
+<tr>
+  <th data-anchor="ch02-builder-table-th-method">Method</th>
+  <th data-anchor="ch02-builder-table-th-signature">Signature</th>
+  <th data-anchor="ch02-builder-table-th-purpose">Purpose</th>
+</tr>
+</thead>
+<tbody data-anchor="ch02-builder-table-body">
+<tr data-anchor="ch02-builder-table-row-constructor">
+  <td><code>StateGraph(state_type)</code></td>
+  <td><code>StateGraph(AgentState)</code></td>
+  <td>Create a new graph builder with the given state schema</td>
+</tr>
+<tr data-anchor="ch02-builder-table-row-add-node">
+  <td><code>add_node</code></td>
+  <td><code>(name: str, fn: Callable)</code></td>
+  <td>Register a named node with its function</td>
+</tr>
+<tr data-anchor="ch02-builder-table-row-add-edge">
+  <td><code>add_edge</code></td>
+  <td><code>(from: str, to: str)</code></td>
+  <td>Add a fixed (unconditional) edge between nodes</td>
+</tr>
+<tr data-anchor="ch02-builder-table-row-cond-edges">
+  <td><code>add_conditional_edges</code></td>
+  <td><code>(source: str, path: Callable, path_map: dict)</code></td>
+  <td>Add a dynamic routing edge with a path function and map</td>
+</tr>
+<tr data-anchor="ch02-builder-table-row-compile">
+  <td><code>compile</code></td>
+  <td><code>(**kwargs) -&gt; CompiledStateGraph</code></td>
+  <td>Validate and produce an executable graph</td>
+</tr>
+</tbody>
+</table>
+
+<p data-anchor="ch02-builder-api-p2">
+The <code>compile</code> method also accepts optional keyword arguments for advanced features like checkpointing (for persistence and time-travel) and interrupts (for human-in-the-loop workflows). We&rsquo;ll cover these in later chapters. For now, a bare <code>.compile()</code> is all you need.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-putting-it-together">Putting It All Together</h2>
+
+<p data-anchor="ch02-putting-it-together-p1">
+Let&rsquo;s build one more example that uses everything from this chapter&mdash;state with reducers, multiple nodes, both edge types, and compilation:
+</p>
+
+<p class="code-label" data-anchor="ch02-full-example-label">A research assistant graph with accumulating results:</p>
+<pre data-anchor="ch02-full-example-code"><span class="kw">import</span> operator
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated, TypedDict
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="kw">class</span> <span class="ty">ResearchState</span>(TypedDict):
+    topic: <span class="ty">str</span>
+    <span class="cm"># Each source node appends its findings</span>
+    findings: Annotated[<span class="ty">list</span>[<span class="ty">str</span>], operator.add]
+    <span class="cm"># Final synthesized answer (replaced, not accumulated)</span>
+    answer: <span class="ty">str</span>
+    <span class="cm"># Count of sources consulted</span>
+    sources_checked: Annotated[<span class="ty">int</span>, <span class="kw">lambda</span> a, b: a + b]
+
+<span class="kw">def</span> <span class="fn">search_web</span>(state: <span class="ty">ResearchState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Simulate a web search</span>
+    <span class="kw">return</span> {
+        <span class="str">"findings"</span>: [<span class="str">f"Web result for </span>{state[<span class="str">'topic'</span>]}<span class="str">"</span>],
+        <span class="str">"sources_checked"</span>: <span class="num">1</span>,
+    }
+
+<span class="kw">def</span> <span class="fn">search_docs</span>(state: <span class="ty">ResearchState</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Simulate searching internal documents</span>
+    <span class="kw">return</span> {
+        <span class="str">"findings"</span>: [<span class="str">f"Doc result for </span>{state[<span class="str">'topic'</span>]}<span class="str">"</span>],
+        <span class="str">"sources_checked"</span>: <span class="num">1</span>,
+    }
+
+<span class="kw">def</span> <span class="fn">synthesize</span>(state: <span class="ty">ResearchState</span>) -> <span class="ty">dict</span>:
+    all_findings = <span class="str">"\n"</span>.<span class="fn">join</span>(state[<span class="str">"findings"</span>])
+    <span class="kw">return</span> {<span class="str">"answer"</span>: <span class="str">f"Based on </span>{state[<span class="str">'sources_checked'</span>]}<span class="str"> sources: </span>{all_findings}<span class="str">"</span>}
+
+<span class="cm"># Build the graph</span>
+graph = <span class="fn">StateGraph</span>(<span class="ty">ResearchState</span>)
+
+graph.<span class="fn">add_node</span>(<span class="str">"search_web"</span>, search_web)
+graph.<span class="fn">add_node</span>(<span class="str">"search_docs"</span>, search_docs)
+graph.<span class="fn">add_node</span>(<span class="str">"synthesize"</span>, synthesize)
+
+<span class="cm"># Fan out from START to both search nodes</span>
+graph.<span class="fn">add_edge</span>(START, <span class="str">"search_web"</span>)
+graph.<span class="fn">add_edge</span>(START, <span class="str">"search_docs"</span>)
+
+<span class="cm"># Both feed into synthesize</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"search_web"</span>, <span class="str">"synthesize"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"search_docs"</span>, <span class="str">"synthesize"</span>)
+
+<span class="cm"># Synthesize leads to END</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"synthesize"</span>, END)
+
+app = graph.<span class="fn">compile</span>()
+
+<span class="cm"># Run it</span>
+result = app.<span class="fn">invoke</span>({<span class="str">"topic"</span>: <span class="str">"quantum computing"</span>})
+<span class="fn">print</span>(result[<span class="str">"answer"</span>])
+<span class="cm"># sources_checked will be 2 (1 + 1 via the reducer)</span>
+<span class="cm"># findings will have 2 items (concatenated via operator.add)</span></pre>
+
+<p data-anchor="ch02-putting-it-together-p2">
+This example shows something new: fan-out. Both <code>search_web</code> and <code>search_docs</code> have edges from <code>START</code>, so LangGraph runs them in parallel. Both nodes append to the <code>findings</code> list and add <code>1</code> to <code>sources_checked</code>. The <code>synthesize</code> node waits until both search nodes finish, then sees the combined state. The reducers make this work without either search node needing to know about the other.
+</p>
+
+<div class="callout key" data-anchor="ch02-callout-parallel">
+  <span class="callout-title">Parallelism through structure</span>
+  <p data-anchor="ch02-callout-parallel-p1">When multiple nodes share the same upstream edge, LangGraph runs them concurrently. You don&rsquo;t write threading code or manage async coordination&mdash;the graph structure implies the parallelism, and reducers handle the merging. This is one of LangGraph&rsquo;s most powerful patterns.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-how-state-flows">How State Actually Flows</h2>
+
+<p data-anchor="ch02-how-state-flows-p1">
+Let&rsquo;s trace through a single invocation to make the state lifecycle concrete. When you call <code>app.invoke({"topic": "quantum computing"})</code>, here&rsquo;s what happens internally:
+</p>
+
+<ol data-anchor="ch02-state-flow-steps">
+  <li data-anchor="ch02-state-flow-step1"><strong>Initialization.</strong> LangGraph creates a state object from your input: <code>{"topic": "quantum computing", "findings": [], "answer": "", "sources_checked": 0}</code>. Fields you didn&rsquo;t provide get default values based on their type.</li>
+  <li data-anchor="ch02-state-flow-step2"><strong>START resolves.</strong> The graph looks at edges from <code>START</code>, finds two targets (<code>search_web</code> and <code>search_docs</code>), and schedules both.</li>
+  <li data-anchor="ch02-state-flow-step3"><strong>Parallel execution.</strong> Both search nodes run concurrently. Each receives the same state snapshot. Each returns a partial update.</li>
+  <li data-anchor="ch02-state-flow-step4"><strong>Reducer merge.</strong> LangGraph applies both updates through the channels. <code>findings</code> gets both items concatenated (via <code>operator.add</code>). <code>sources_checked</code> gets <code>0 + 1 + 1 = 2</code> (via the lambda reducer). These merges are deterministic and conflict-free because the reducers define exactly how to combine concurrent writes.</li>
+  <li data-anchor="ch02-state-flow-step5"><strong>Downstream node.</strong> <code>synthesize</code> receives the merged state, reads all findings, produces the answer.</li>
+  <li data-anchor="ch02-state-flow-step6"><strong>END.</strong> Execution reaches <code>END</code>. The final state is returned to the caller.</li>
+</ol>
+
+<p data-anchor="ch02-how-state-flows-p2">
+This lifecycle is the same whether you have three nodes or thirty. State in, partial updates out, reducers merge, next node runs. The pattern scales because each node is self-contained.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-common-mistakes">Common Mistakes (and How to Avoid Them)</h2>
+
+<p data-anchor="ch02-common-mistakes-p1">
+As you start building graphs, you&rsquo;ll likely hit a few of these. Here&rsquo;s what to watch for:
+</p>
+
+<ol data-anchor="ch02-mistakes-list">
+  <li data-anchor="ch02-mistake-1">
+    <strong>Returning full state from a node.</strong> Don&rsquo;t return every field&mdash;return only what changed. Returning unchanged fields triggers unnecessary reducer calls and can cause subtle bugs with accumulating fields. If a node doesn&rsquo;t modify <code>messages</code>, don&rsquo;t include <code>messages</code> in the return dictionary.
+  </li>
+  <li data-anchor="ch02-mistake-2">
+    <strong>Forgetting to wrap list returns for reducer fields.</strong> If <code>findings</code> uses <code>operator.add</code>, returning <code>{"findings": "a single string"}</code> will fail. You need <code>{"findings": ["a single string"]}</code>&mdash;always a list, even for one item.
+  </li>
+  <li data-anchor="ch02-mistake-3">
+    <strong>Missing edges from START.</strong> If no edge connects <code>START</code> to any node, the graph compiles but immediately returns the initial state without executing anything.
+  </li>
+  <li data-anchor="ch02-mistake-4">
+    <strong>Incomplete path maps.</strong> Every return value from a conditional edge&rsquo;s routing function must appear as a key in the path map. Missing keys cause runtime errors.
+  </li>
+  <li data-anchor="ch02-mistake-5">
+    <strong>Infinite loops.</strong> If your conditional edge can loop back to a previous node, make sure there&rsquo;s always a termination condition. Add a counter or a max-retries check.
+  </li>
+</ol>
+
+<div class="callout warn" data-anchor="ch02-callout-infinite-loops">
+  <span class="callout-title">Guardrails for loops</span>
+  <p data-anchor="ch02-callout-infinite-loops-p1">LangGraph provides a <code>recursion_limit</code> parameter on compiled graphs: <code>app.invoke(inputs, {"recursion_limit": 25})</code>. If your graph exceeds this many node executions in a single invocation, it raises a <code>GraphRecursionError</code>. Set this whenever you have conditional edges that loop.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-design-principles">Design Principles Behind These Concepts</h2>
+
+<p data-anchor="ch02-design-principles-p1">
+The choices LangGraph makes are intentional. Understanding the &ldquo;why&rdquo; helps you use the framework with the grain rather than against it.
+</p>
+
+<p data-anchor="ch02-design-principles-p2">
+<strong>Explicit over implicit.</strong> Every connection between nodes is an edge you added. There&rsquo;s no hidden control flow, no event bus, no implicit ordering. You can read a graph definition top to bottom and know exactly what will execute and in what order.
+</p>
+
+<p data-anchor="ch02-design-principles-p3">
+<strong>State over message passing.</strong> Nodes don&rsquo;t send messages to each other. They read from and write to shared state. This eliminates an entire category of bugs around message ordering, missed messages, and coupling between producers and consumers.
+</p>
+
+<p data-anchor="ch02-design-principles-p4">
+<strong>Partial updates over full state returns.</strong> By asking nodes to return only what changed, LangGraph keeps nodes decoupled. A node that computes a summary doesn&rsquo;t need to know about the 15 other fields in the state. If you add a new field to the state later, existing nodes continue to work unchanged.
+</p>
+
+<p data-anchor="ch02-design-principles-p5">
+<strong>Reducers over coordination.</strong> When parallel nodes need to combine their results, reducers handle it declaratively. You say <em>how</em> values combine (append, sum, union) and the framework takes care of <em>when</em>. This is simpler and safer than manual lock management or merge logic scattered across nodes.
+</p>
+
+<!-- ================================================================== -->
+<h2 data-anchor="ch02-summary">What You Now Know</h2>
+
+<p data-anchor="ch02-summary-p1">
+This chapter gave you the vocabulary for everything that follows. You now know that a LangGraph application is a directed graph of <strong>nodes</strong> (plain Python functions) connected by <strong>edges</strong> (fixed or conditional), all operating on shared <strong>state</strong> (a typed dictionary with optional reducers). You know that <code>START</code> and <code>END</code> mark entry and exit, that <code>StateGraph</code> is the builder, and that <code>.compile()</code> turns your blueprint into a runnable machine. You understand that reducers give you precise control over how state fields merge, and that channels are the invisible plumbing underneath.
+</p>
+
+<p data-anchor="ch02-summary-p2">
+These aren&rsquo;t abstract concepts&mdash;they&rsquo;re the tools you&rsquo;ll use in every graph you build. In the next chapter, we&rsquo;ll take them off the workbench and build your first complete graph from scratch, step by step, with real LLM calls and real output.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch02-nav">
+  <a rel="prev" href="01-why-langgraph.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-building-your-first-graph.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>

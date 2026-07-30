@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Appendix: LangChain + LangGraph Together — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch09-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch09-head">
+  <span class="chapter-num">09</span>
+  <span class="chapter-kicker">Best of both worlds</span>
+  <h1 data-anchor="ch09-title">Appendix: LangChain + LangGraph Together</h1>
+</header>
+
+<p class="lede" data-anchor="ch09-lede">
+You&rsquo;ve spent this entire book learning how to think in graphs&mdash;nodes, edges, state, cycles. Along the way, you may have noticed LangChain lurking quietly inside many of our examples: a chat model here, a tool binding there. That wasn&rsquo;t an accident. LangGraph was born from the LangChain ecosystem, and the two frameworks were designed to work together. The question isn&rsquo;t whether to use one or the other. It&rsquo;s where each one belongs in the stack.
+</p>
+
+<p data-anchor="ch09-intro-context">
+Think of it this way. If you&rsquo;re building a workshop, LangChain is the set of precision tools on your bench&mdash;the drill, the saw, the measuring tape. LangGraph is the blueprint that tells you the order of operations, what happens when a measurement is off, and how to loop back and try again. Neither replaces the other. This appendix shows you exactly how they fit together, with real code you can adapt for production.
+</p>
+
+<!-- ===== SECTION: LangChain Loaders with LangGraph Orchestration ===== -->
+
+<h2 data-anchor="ch09-loaders">LangChain Loaders with LangGraph Orchestration</h2>
+
+<p data-anchor="ch09-loaders-intro">
+One of LangChain&rsquo;s greatest strengths is its library of document loaders. There are loaders for PDFs, web pages, databases, CSV files, Notion exports, Google Drive, and dozens more. Each one knows how to fetch raw content from a specific source and normalize it into a <code>Document</code> object with <code>page_content</code> and <code>metadata</code>. That&rsquo;s a genuinely useful abstraction.
+</p>
+
+<p data-anchor="ch09-loaders-pain">
+The pain shows up when you need to orchestrate multiple loaders, handle failures gracefully, or route documents through different processing paths based on their content. A linear chain can&rsquo;t express &ldquo;if the PDF fails to load, try the cached version; if neither works, flag for human review.&rdquo; A graph can.
+</p>
+
+<h3 data-anchor="ch09-loaders-feeding-nodes">Document Loaders Feeding into Graph Nodes</h3>
+
+<p data-anchor="ch09-loaders-feeding-explain">
+The pattern is simple: wrap a LangChain loader inside a LangGraph node function. The node receives state, calls the loader, and writes the results back into state. The graph handles the flow.
+</p>
+
+<p class="code-label" data-anchor="ch09-loaders-code-label">A graph node that loads web pages using LangChain&rsquo;s WebBaseLoader:</p>
+<pre data-anchor="ch09-loaders-code"><span class="kw">from</span> langchain_community.document_loaders <span class="kw">import</span> WebBaseLoader
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph
+<span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">import</span> operator
+
+<span class="kw">class</span> <span class="ty">IngestState</span>(TypedDict):
+    urls: list[<span class="ty">str</span>]
+    documents: Annotated[list, operator.add]
+    errors: Annotated[list[<span class="ty">str</span>], operator.add]
+
+<span class="kw">def</span> <span class="fn">load_web_documents</span>(state: <span class="ty">IngestState</span>) -> dict:
+    <span class="str">"""Load documents from URLs using LangChain's WebBaseLoader."""</span>
+    docs = []
+    errors = []
+    <span class="kw">for</span> url <span class="kw">in</span> state[<span class="str">"urls"</span>]:
+        <span class="kw">try</span>:
+            loader = <span class="fn">WebBaseLoader</span>(url)
+            docs.extend(loader.<span class="fn">load</span>())
+        <span class="kw">except</span> <span class="ty">Exception</span> <span class="kw">as</span> e:
+            errors.<span class="fn">append</span>(<span class="str">f"Failed to load </span>{url}<span class="str">: </span>{e}<span class="str">"</span>)
+    <span class="kw">return</span> {<span class="str">"documents"</span>: docs, <span class="str">"errors"</span>: errors}
+</pre>
+
+<p data-anchor="ch09-loaders-notice">
+Notice what happened. The LangChain loader does the I/O&mdash;it knows how to fetch and parse a web page. The LangGraph node handles the error collection and state management. Each framework does what it&rsquo;s best at.
+</p>
+
+<h3 data-anchor="ch09-text-splitters">Text Splitters for Chunking Within a Pipeline</h3>
+
+<p data-anchor="ch09-text-splitters-intro">
+Raw documents are rarely ready for an LLM. They need to be split into chunks that fit within context windows and that carry enough meaning to be useful in retrieval. LangChain&rsquo;s text splitters handle this with battle-tested logic for overlap, separator detection, and size constraints.
+</p>
+
+<p class="code-label" data-anchor="ch09-splitter-code-label">Adding a chunking node that uses LangChain&rsquo;s RecursiveCharacterTextSplitter:</p>
+<pre data-anchor="ch09-splitter-code"><span class="kw">from</span> langchain_text_splitters <span class="kw">import</span> RecursiveCharacterTextSplitter
+
+<span class="kw">def</span> <span class="fn">chunk_documents</span>(state: <span class="ty">IngestState</span>) -> dict:
+    <span class="str">"""Split documents into retrieval-sized chunks."""</span>
+    splitter = <span class="fn">RecursiveCharacterTextSplitter</span>(
+        chunk_size=<span class="num">1000</span>,
+        chunk_overlap=<span class="num">200</span>,
+        separators=[<span class="str">"\n\n"</span>, <span class="str">"\n"</span>, <span class="str">". "</span>, <span class="str">" "</span>]
+    )
+    chunks = splitter.<span class="fn">split_documents</span>(state[<span class="str">"documents"</span>])
+    <span class="kw">return</span> {<span class="str">"documents"</span>: chunks}
+
+<span class="cm"># Wire it into the graph</span>
+graph = <span class="fn">StateGraph</span>(<span class="ty">IngestState</span>)
+graph.<span class="fn">add_node</span>(<span class="str">"load"</span>, load_web_documents)
+graph.<span class="fn">add_node</span>(<span class="str">"chunk"</span>, chunk_documents)
+graph.<span class="fn">add_edge</span>(<span class="str">"load"</span>, <span class="str">"chunk"</span>)
+graph.<span class="fn">set_entry_point</span>(<span class="str">"load"</span>)
+graph.<span class="fn">set_finish_point</span>(<span class="str">"chunk"</span>)
+
+pipeline = graph.<span class="fn">compile</span>()
+</pre>
+
+<p data-anchor="ch09-splitter-benefit">
+By placing the splitter in its own node, you gain visibility. LangGraph&rsquo;s tracing shows you how many chunks were produced, how long the splitting took, and what the state looked like before and after. If you later want to swap in a different splitting strategy&mdash;say, semantic chunking&mdash;you replace one node without touching the rest of the graph.
+</p>
+
+<!-- ===== SECTION: Vector Stores in LangGraph Workflows ===== -->
+
+<h2 data-anchor="ch09-vector-stores">Vector Stores in LangGraph Workflows</h2>
+
+<p data-anchor="ch09-vector-intro">
+Retrieval-Augmented Generation&mdash;RAG&mdash;is the most common pattern for grounding LLM responses in real data. The basic idea is straightforward: before the model answers a question, you search a vector store for relevant documents and include them in the prompt. But the &ldquo;basic idea&rdquo; gets complicated fast. What if the retrieved documents aren&rsquo;t relevant enough? What if the answer requires multiple rounds of retrieval? What if you need to combine retrieval with tool calls? These are graph problems.
+</p>
+
+<h3 data-anchor="ch09-retrieval-nodes">Retrieval Nodes That Query Vector Stores</h3>
+
+<p data-anchor="ch09-retrieval-explain">
+A LangChain vector store exposes a <code>.as_retriever()</code> method that returns a Runnable&mdash;an object with an <code>.invoke()</code> method that takes a query string and returns documents. This interface maps cleanly onto a LangGraph node.
+</p>
+
+<p class="code-label" data-anchor="ch09-retrieval-code-label">A retrieval node using FAISS:</p>
+<pre data-anchor="ch09-retrieval-code"><span class="kw">from</span> langchain_community.vectorstores <span class="kw">import</span> FAISS
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> OpenAIEmbeddings
+
+<span class="cm"># Build the vector store (typically done once during ingestion)</span>
+embeddings = <span class="fn">OpenAIEmbeddings</span>()
+vectorstore = FAISS.<span class="fn">from_documents</span>(chunks, embeddings)
+retriever = vectorstore.<span class="fn">as_retriever</span>(search_kwargs={<span class="str">"k"</span>: <span class="num">4</span>})
+
+<span class="kw">def</span> <span class="fn">retrieve</span>(state: dict) -> dict:
+    <span class="str">"""Fetch relevant documents from the vector store."""</span>
+    question = state[<span class="str">"question"</span>]
+    docs = retriever.<span class="fn">invoke</span>(question)
+    <span class="kw">return</span> {<span class="str">"context"</span>: docs}
+</pre>
+
+<p data-anchor="ch09-retrieval-insight">
+The retriever is a LangChain component. It knows how to embed a query, search the vector index, and return ranked documents. The graph node is a thin wrapper that pulls the question from state and pushes the results back. Clean separation.
+</p>
+
+<h3 data-anchor="ch09-rag-pattern">RAG as a Graph Pattern</h3>
+
+<p data-anchor="ch09-rag-pattern-intro">
+Here&rsquo;s where LangGraph truly earns its place. A production RAG system isn&rsquo;t a single retrieve-then-generate step. It&rsquo;s a decision graph: retrieve documents, check relevance, maybe reformulate the query and retrieve again, generate an answer, check whether the answer is grounded in the sources, and either return it or loop back. Let&rsquo;s build this.
+</p>
+
+<p class="code-label" data-anchor="ch09-rag-full-label">Complete RAG pipeline as a LangGraph graph using LangChain retrievers:</p>
+<pre data-anchor="ch09-rag-full-code"><span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_community.vectorstores <span class="kw">import</span> FAISS
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> OpenAIEmbeddings
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+<span class="kw">from</span> typing <span class="kw">import</span> TypedDict
+<span class="kw">from</span> langchain_core.documents <span class="kw">import</span> Document
+
+<span class="kw">class</span> <span class="ty">RAGState</span>(TypedDict):
+    question: <span class="ty">str</span>
+    context: list[<span class="ty">Document</span>]
+    answer: <span class="ty">str</span>
+    relevance_ok: <span class="ty">bool</span>
+    retries: <span class="ty">int</span>
+
+<span class="cm"># LangChain components</span>
+embeddings = <span class="fn">OpenAIEmbeddings</span>()
+vectorstore = FAISS.<span class="fn">from_documents</span>(documents, embeddings)
+retriever = vectorstore.<span class="fn">as_retriever</span>(search_kwargs={<span class="str">"k"</span>: <span class="num">4</span>})
+llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>, temperature=<span class="num">0</span>)
+
+<span class="cm"># Node: retrieve documents</span>
+<span class="kw">def</span> <span class="fn">retrieve_docs</span>(state: <span class="ty">RAGState</span>) -> dict:
+    docs = retriever.<span class="fn">invoke</span>(state[<span class="str">"question"</span>])
+    <span class="kw">return</span> {<span class="str">"context"</span>: docs}
+
+<span class="cm"># Node: check if retrieved docs are relevant</span>
+<span class="kw">def</span> <span class="fn">check_relevance</span>(state: <span class="ty">RAGState</span>) -> dict:
+    docs_text = <span class="str">"\n"</span>.<span class="fn">join</span>(d.page_content <span class="kw">for</span> d <span class="kw">in</span> state[<span class="str">"context"</span>])
+    prompt = (
+        <span class="str">f"Question: </span>{state[<span class="str">'question'</span>]}<span class="str">\n\n"</span>
+        <span class="str">f"Documents:\n</span>{docs_text}<span class="str">\n\n"</span>
+        <span class="str">"Are these documents relevant to the question? "</span>
+        <span class="str">"Answer only 'yes' or 'no'."</span>
+    )
+    result = llm.<span class="fn">invoke</span>(prompt)
+    is_relevant = <span class="str">"yes"</span> <span class="kw">in</span> result.content.<span class="fn">lower</span>()
+    <span class="kw">return</span> {<span class="str">"relevance_ok"</span>: is_relevant}
+
+<span class="cm"># Node: generate answer from context</span>
+<span class="kw">def</span> <span class="fn">generate_answer</span>(state: <span class="ty">RAGState</span>) -> dict:
+    docs_text = <span class="str">"\n\n"</span>.<span class="fn">join</span>(d.page_content <span class="kw">for</span> d <span class="kw">in</span> state[<span class="str">"context"</span>])
+    prompt = (
+        <span class="str">"Answer the question based only on the context below.\n\n"</span>
+        <span class="str">f"Context:\n</span>{docs_text}<span class="str">\n\n"</span>
+        <span class="str">f"Question: </span>{state[<span class="str">'question'</span>]}<span class="str">"</span>
+    )
+    result = llm.<span class="fn">invoke</span>(prompt)
+    <span class="kw">return</span> {<span class="str">"answer"</span>: result.content}
+
+<span class="cm"># Node: reformulate question for re-retrieval</span>
+<span class="kw">def</span> <span class="fn">reformulate</span>(state: <span class="ty">RAGState</span>) -> dict:
+    prompt = (
+        <span class="str">f"The original question was: </span>{state[<span class="str">'question'</span>]}<span class="str">\n"</span>
+        <span class="str">"The retrieved documents were not relevant. "</span>
+        <span class="str">"Rephrase the question to improve retrieval."</span>
+    )
+    result = llm.<span class="fn">invoke</span>(prompt)
+    <span class="kw">return</span> {<span class="str">"question"</span>: result.content, <span class="str">"retries"</span>: state[<span class="str">"retries"</span>] + <span class="num">1</span>}
+
+<span class="cm"># Router: check relevance or give up</span>
+<span class="kw">def</span> <span class="fn">route_on_relevance</span>(state: <span class="ty">RAGState</span>) -> <span class="ty">str</span>:
+    <span class="kw">if</span> state[<span class="str">"relevance_ok"</span>]:
+        <span class="kw">return</span> <span class="str">"generate"</span>
+    <span class="kw">if</span> state[<span class="str">"retries"</span>] >= <span class="num">2</span>:
+        <span class="kw">return</span> <span class="str">"generate"</span>  <span class="cm"># give up and answer anyway</span>
+    <span class="kw">return</span> <span class="str">"reformulate"</span>
+
+<span class="cm"># Build the graph</span>
+graph = <span class="fn">StateGraph</span>(<span class="ty">RAGState</span>)
+graph.<span class="fn">add_node</span>(<span class="str">"retrieve"</span>, retrieve_docs)
+graph.<span class="fn">add_node</span>(<span class="str">"check"</span>, check_relevance)
+graph.<span class="fn">add_node</span>(<span class="str">"generate"</span>, generate_answer)
+graph.<span class="fn">add_node</span>(<span class="str">"reformulate"</span>, reformulate)
+
+graph.<span class="fn">set_entry_point</span>(<span class="str">"retrieve"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"retrieve"</span>, <span class="str">"check"</span>)
+graph.<span class="fn">add_conditional_edges</span>(<span class="str">"check"</span>, route_on_relevance, {
+    <span class="str">"generate"</span>: <span class="str">"generate"</span>,
+    <span class="str">"reformulate"</span>: <span class="str">"reformulate"</span>,
+})
+graph.<span class="fn">add_edge</span>(<span class="str">"reformulate"</span>, <span class="str">"retrieve"</span>)  <span class="cm"># cycle back</span>
+graph.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, END)
+
+rag_app = graph.<span class="fn">compile</span>()
+
+<span class="cm"># Run it</span>
+result = rag_app.<span class="fn">invoke</span>({
+    <span class="str">"question"</span>: <span class="str">"How does FAISS handle high-dimensional vectors?"</span>,
+    <span class="str">"context"</span>: [],
+    <span class="str">"answer"</span>: <span class="str">""</span>,
+    <span class="str">"relevance_ok"</span>: <span class="kw">False</span>,
+    <span class="str">"retries"</span>: <span class="num">0</span>,
+})
+<span class="fn">print</span>(result[<span class="str">"answer"</span>])
+</pre>
+
+<p data-anchor="ch09-rag-full-notice">
+Study this graph. It has a cycle&mdash;<code>reformulate</code> loops back to <code>retrieve</code>. It has a conditional exit&mdash;after two failed retrievals, it gives up and generates anyway. It has clear separation of concerns&mdash;each node does one thing. This is the kind of control flow that a simple chain cannot express but that a graph handles naturally.
+</p>
+
+<h3 data-anchor="ch09-retrieval-tools">Combining Retrieval with Tool Calling</h3>
+
+<p data-anchor="ch09-retrieval-tools-intro">
+In more advanced architectures, retrieval is just one of several tools available to an agent. The LLM decides when to search the vector store, when to call an API, and when to answer directly. LangChain&rsquo;s tool-binding interface makes this clean.
+</p>
+
+<p class="code-label" data-anchor="ch09-retrieval-tool-code-label">Making a retriever available as a tool:</p>
+<pre data-anchor="ch09-retrieval-tool-code"><span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+
+@<span class="fn">tool</span>
+<span class="kw">def</span> <span class="fn">search_knowledge_base</span>(query: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Search the internal knowledge base for relevant information."""</span>
+    docs = retriever.<span class="fn">invoke</span>(query)
+    <span class="kw">return</span> <span class="str">"\n\n"</span>.<span class="fn">join</span>(d.page_content <span class="kw">for</span> d <span class="kw">in</span> docs)
+
+<span class="cm"># Now use it in a ReAct agent</span>
+<span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent
+
+agent = <span class="fn">create_react_agent</span>(
+    model=<span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>),
+    tools=[search_knowledge_base],
+)
+</pre>
+
+<p data-anchor="ch09-retrieval-tools-notice">
+The <code>@tool</code> decorator is LangChain. The <code>create_react_agent</code> function is LangGraph. The retriever inside the tool is LangChain. The agent loop that decides when to call the tool is LangGraph. Each layer does its job.
+</p>
+
+<!-- ===== SECTION: LangChain Model Interfaces ===== -->
+
+<h2 data-anchor="ch09-model-interfaces">LangChain Model Interfaces</h2>
+
+<p data-anchor="ch09-model-intro">
+One of LangChain&rsquo;s most practical contributions is its unified interface for LLM providers. Whether you&rsquo;re calling OpenAI, Anthropic, a local Ollama model, or a dozen other providers, the interface is the same: instantiate the model, call <code>.invoke()</code> with messages, get a response. This consistency is especially valuable in LangGraph, where you might want to swap providers without changing your graph logic.
+</p>
+
+<h3 data-anchor="ch09-interchangeable-providers">Interchangeable LLM Providers</h3>
+
+<p data-anchor="ch09-providers-explain">
+Each provider has its own package, but they all conform to the same <code>BaseChatModel</code> interface. This means you can pass any of them into the same graph node.
+</p>
+
+<p class="code-label" data-anchor="ch09-providers-code-label">Using different LLM providers interchangeably in graph nodes:</p>
+<pre data-anchor="ch09-providers-code"><span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+<span class="kw">from</span> langchain_ollama <span class="kw">import</span> ChatOllama
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+<span class="kw">from</span> typing <span class="kw">import</span> TypedDict
+<span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage
+
+<span class="cm"># Three different providers, same interface</span>
+models = {
+    <span class="str">"openai"</span>: <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>, temperature=<span class="num">0</span>),
+    <span class="str">"anthropic"</span>: <span class="fn">ChatAnthropic</span>(model=<span class="str">"claude-sonnet-4-20250514"</span>, temperature=<span class="num">0</span>),
+    <span class="str">"local"</span>: <span class="fn">ChatOllama</span>(model=<span class="str">"llama3"</span>, temperature=<span class="num">0</span>),
+}
+
+<span class="kw">class</span> <span class="ty">MultiModelState</span>(TypedDict):
+    query: <span class="ty">str</span>
+    provider: <span class="ty">str</span>
+    response: <span class="ty">str</span>
+
+<span class="kw">def</span> <span class="fn">call_llm</span>(state: <span class="ty">MultiModelState</span>) -> dict:
+    <span class="str">"""Call whichever LLM provider the state specifies."""</span>
+    model = models[state[<span class="str">"provider"</span>]]
+    messages = [<span class="fn">HumanMessage</span>(content=state[<span class="str">"query"</span>])]
+    result = model.<span class="fn">invoke</span>(messages)
+    <span class="kw">return</span> {<span class="str">"response"</span>: result.content}
+
+<span class="cm"># Build a simple graph</span>
+graph = <span class="fn">StateGraph</span>(<span class="ty">MultiModelState</span>)
+graph.<span class="fn">add_node</span>(<span class="str">"llm"</span>, call_llm)
+graph.<span class="fn">set_entry_point</span>(<span class="str">"llm"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"llm"</span>, END)
+app = graph.<span class="fn">compile</span>()
+
+<span class="cm"># Same graph, different providers</span>
+r1 = app.<span class="fn">invoke</span>({<span class="str">"query"</span>: <span class="str">"Explain RAG briefly."</span>, <span class="str">"provider"</span>: <span class="str">"openai"</span>, <span class="str">"response"</span>: <span class="str">""</span>})
+r2 = app.<span class="fn">invoke</span>({<span class="str">"query"</span>: <span class="str">"Explain RAG briefly."</span>, <span class="str">"provider"</span>: <span class="str">"anthropic"</span>, <span class="str">"response"</span>: <span class="str">""</span>})
+r3 = app.<span class="fn">invoke</span>({<span class="str">"query"</span>: <span class="str">"Explain RAG briefly."</span>, <span class="str">"provider"</span>: <span class="str">"local"</span>, <span class="str">"response"</span>: <span class="str">""</span>})
+</pre>
+
+<p data-anchor="ch09-providers-notice">
+The graph definition doesn&rsquo;t change at all. The <code>call_llm</code> node picks the right model from a dictionary based on state. This is the kind of flexibility that comes from LangChain&rsquo;s consistent interface, deployed within LangGraph&rsquo;s state management.
+</p>
+
+<h3 data-anchor="ch09-bind-tools">Using bind_tools() for Tool Calling</h3>
+
+<p data-anchor="ch09-bind-tools-intro">
+When you call <code>model.bind_tools(tools)</code>, LangChain attaches tool schemas to the model so the LLM knows what tools are available. The model can then return <code>tool_calls</code> in its response, which your graph can route and execute. This is the bridge between LangChain&rsquo;s tool definitions and LangGraph&rsquo;s execution loop.
+</p>
+
+<p class="code-label" data-anchor="ch09-bind-tools-code-label">Binding tools to a model for use in a graph:</p>
+<pre data-anchor="ch09-bind-tools-code"><span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+
+@<span class="fn">tool</span>
+<span class="kw">def</span> <span class="fn">get_weather</span>(city: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Get current weather for a city."""</span>
+    <span class="cm"># In production, call a real weather API</span>
+    <span class="kw">return</span> <span class="str">f"Weather in </span>{city}<span class="str">: 72°F, partly cloudy"</span>
+
+@<span class="fn">tool</span>
+<span class="kw">def</span> <span class="fn">search_docs</span>(query: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Search internal documentation."""</span>
+    <span class="kw">return</span> <span class="str">f"Found 3 results for: </span>{query}<span class="str">"</span>
+
+<span class="cm"># Bind tools to the model</span>
+llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>)
+llm_with_tools = llm.<span class="fn">bind_tools</span>([get_weather, search_docs])
+
+<span class="cm"># Now llm_with_tools can return tool_calls in its responses</span>
+<span class="cm"># LangGraph's ToolNode or create_react_agent handles execution</span>
+</pre>
+
+<p data-anchor="ch09-bind-tools-note">
+The key insight: <code>bind_tools()</code> doesn&rsquo;t execute anything. It just tells the model what tools exist. LangGraph&rsquo;s tool execution node (or the <code>create_react_agent</code> wrapper) handles actually calling the tools and feeding results back. LangChain defines. LangGraph executes.
+</p>
+
+<h3 data-anchor="ch09-structured-output">Structured Output with .with_structured_output()</h3>
+
+<p data-anchor="ch09-structured-intro">
+Sometimes you need the LLM to return data in a specific shape&mdash;not free-form text, but a Python object with typed fields. LangChain&rsquo;s <code>.with_structured_output()</code> method handles the prompt engineering and parsing to make this reliable.
+</p>
+
+<p class="code-label" data-anchor="ch09-structured-code-label">Using structured output in a graph node:</p>
+<pre data-anchor="ch09-structured-code"><span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel, Field
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+
+<span class="kw">class</span> <span class="ty">Classification</span>(BaseModel):
+    <span class="str">"""Classify user intent."""</span>
+    category: <span class="ty">str</span> = <span class="fn">Field</span>(description=<span class="str">"One of: question, complaint, praise, request"</span>)
+    urgency: <span class="ty">int</span> = <span class="fn">Field</span>(description=<span class="str">"1-5, where 5 is most urgent"</span>)
+    summary: <span class="ty">str</span> = <span class="fn">Field</span>(description=<span class="str">"One-sentence summary"</span>)
+
+llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>)
+classifier = llm.<span class="fn">with_structured_output</span>(<span class="ty">Classification</span>)
+
+<span class="kw">def</span> <span class="fn">classify_input</span>(state: dict) -> dict:
+    <span class="str">"""Classify user input into structured categories."""</span>
+    result = classifier.<span class="fn">invoke</span>(state[<span class="str">"user_message"</span>])
+    <span class="kw">return</span> {
+        <span class="str">"category"</span>: result.category,
+        <span class="str">"urgency"</span>: result.urgency,
+        <span class="str">"summary"</span>: result.summary,
+    }
+</pre>
+
+<p data-anchor="ch09-structured-benefit">
+This is powerful in a graph context. The structured output becomes part of the state, and conditional edges can route based on the classification&mdash;urgent complaints go to one path, casual questions go to another. LangChain guarantees the shape of the data. LangGraph uses that shape for routing decisions.
+</p>
+
+<!-- ===== SECTION: When to Combine Both ===== -->
+
+<h2 data-anchor="ch09-when-combine">When to Combine Both in Production</h2>
+
+<p data-anchor="ch09-combine-intro">
+If you&rsquo;ve read this far, the pattern is probably becoming clear. But let&rsquo;s make it explicit, because getting this wrong leads to either over-engineered pipelines or under-powered agents.
+</p>
+
+<h3 data-anchor="ch09-langchain-for-components">LangChain for Components</h3>
+
+<p data-anchor="ch09-components-explain">
+LangChain excels as a component library. It gives you battle-tested implementations of common building blocks: model interfaces, embedding functions, vector store connectors, document loaders, text splitters, output parsers, and tool definitions. These components have been used in thousands of production systems. Their edge cases are well-mapped. Their APIs are stable.
+</p>
+
+<p data-anchor="ch09-components-list">
+Reach for LangChain when you need:
+</p>
+<ul data-anchor="ch09-components-items">
+  <li data-anchor="ch09-comp-models">A chat model with a standard interface (<code>ChatOpenAI</code>, <code>ChatAnthropic</code>, <code>ChatOllama</code>)</li>
+  <li data-anchor="ch09-comp-embeddings">Embedding functions for vector similarity</li>
+  <li data-anchor="ch09-comp-vectorstores">Vector store connectors (FAISS, Chroma, Pinecone, Weaviate)</li>
+  <li data-anchor="ch09-comp-loaders">Document loaders for specific data sources</li>
+  <li data-anchor="ch09-comp-splitters">Text splitters with configurable chunking strategies</li>
+  <li data-anchor="ch09-comp-tools">Tool definitions with the <code>@tool</code> decorator</li>
+  <li data-anchor="ch09-comp-parsers">Output parsers and structured output helpers</li>
+</ul>
+
+<h3 data-anchor="ch09-langgraph-for-orchestration">LangGraph for Orchestration</h3>
+
+<p data-anchor="ch09-orchestration-explain">
+LangGraph excels at flow control. It gives you the ability to define how components interact: what runs first, what runs next, what happens when something fails, and when to loop back. It manages state across steps, supports human-in-the-loop patterns, and provides streaming, persistence, and observability out of the box.
+</p>
+
+<p data-anchor="ch09-orchestration-list">
+Reach for LangGraph when you need:
+</p>
+<ul data-anchor="ch09-orchestration-items">
+  <li data-anchor="ch09-orch-branching">Conditional branching based on LLM output</li>
+  <li data-anchor="ch09-orch-cycles">Cycles and retry loops</li>
+  <li data-anchor="ch09-orch-state">State management across multiple steps</li>
+  <li data-anchor="ch09-orch-human">Human-in-the-loop approval gates</li>
+  <li data-anchor="ch09-orch-parallel">Parallel execution of independent tasks</li>
+  <li data-anchor="ch09-orch-streaming">Streaming intermediate results</li>
+  <li data-anchor="ch09-orch-persistence">Persistence and resumption of long-running workflows</li>
+  <li data-anchor="ch09-orch-observe">Step-level observability and debugging</li>
+</ul>
+
+<h3 data-anchor="ch09-recommended-architecture">The Recommended Architecture</h3>
+
+<p data-anchor="ch09-arch-statement">
+The recommended architecture is simple: <strong>LangGraph at the top, LangChain components inside nodes.</strong> The graph defines the workflow. The nodes contain LangChain components that do the actual work. This gives you the best of both worlds&mdash;reliable components with flexible orchestration.
+</p>
+
+<div class="callout key" data-anchor="ch09-callout-key">
+  <span class="callout-title">Key Insight</span>
+  <p data-anchor="ch09-callout-key-text">LangChain builds the parts. LangGraph wires the machine.</p>
+</div>
+
+<p data-anchor="ch09-arch-analogy">
+This is like how a factory works. The machines on the assembly line (LangChain components) are specialized&mdash;one drills, one welds, one paints. The conveyor system (LangGraph) decides which machine runs next, handles exceptions, and routes products through quality checks. You wouldn&rsquo;t use the conveyor system to drill holes. You wouldn&rsquo;t use the drill to route products.
+</p>
+
+<!-- ===== Responsibility Table ===== -->
+
+<h2 data-anchor="ch09-responsibility-table-heading">LangChain vs. LangGraph Responsibilities</h2>
+
+<p data-anchor="ch09-table-intro">
+When you&rsquo;re deciding where a piece of logic belongs, this table is your guide. The left column is what LangChain handles&mdash;the building blocks. The right column is what LangGraph handles&mdash;the orchestration logic.
+</p>
+
+<figure data-anchor="ch09-table-fig">
+<table data-anchor="ch09-table">
+  <caption data-anchor="ch09-table-caption">LangChain responsibility vs. LangGraph responsibility</caption>
+  <thead data-anchor="ch09-table-head">
+    <tr>
+      <th data-anchor="ch09-th-lc">LangChain Handles</th>
+      <th data-anchor="ch09-th-lg">LangGraph Handles</th>
+    </tr>
+  </thead>
+  <tbody data-anchor="ch09-table-body">
+    <tr data-anchor="ch09-row-models">
+      <td>LLM provider interfaces (ChatOpenAI, ChatAnthropic, etc.)</td>
+      <td>Agent loops and decision cycles</td>
+    </tr>
+    <tr data-anchor="ch09-row-tools">
+      <td>Tool definitions and schemas</td>
+      <td>Tool execution routing and result handling</td>
+    </tr>
+    <tr data-anchor="ch09-row-retrieval">
+      <td>Vector store connections and similarity search</td>
+      <td>Multi-step RAG with relevance checks and retries</td>
+    </tr>
+    <tr data-anchor="ch09-row-loaders">
+      <td>Document loading from specific sources</td>
+      <td>Ingestion pipelines with error handling and branching</td>
+    </tr>
+    <tr data-anchor="ch09-row-splitting">
+      <td>Text splitting and chunking strategies</td>
+      <td>Routing chunks to different processing paths</td>
+    </tr>
+    <tr data-anchor="ch09-row-parsing">
+      <td>Output parsing and structured extraction</td>
+      <td>Conditional edges based on parsed output</td>
+    </tr>
+    <tr data-anchor="ch09-row-prompts">
+      <td>Prompt templates and formatting</td>
+      <td>State management across prompt invocations</td>
+    </tr>
+    <tr data-anchor="ch09-row-embeddings">
+      <td>Embedding computation</td>
+      <td>Parallel embedding of multiple document batches</td>
+    </tr>
+    <tr data-anchor="ch09-row-memory">
+      <td>Message formatting and history windowing</td>
+      <td>Persistent conversation state and checkpointing</td>
+    </tr>
+    <tr data-anchor="ch09-row-callbacks">
+      <td>Individual component callbacks</td>
+      <td>Graph-level streaming and observability</td>
+    </tr>
+  </tbody>
+</table>
+</figure>
+
+<!-- ===== Architecture Diagram ===== -->
+
+<h2 data-anchor="ch09-arch-diagram-heading">Layered Architecture Diagram</h2>
+
+<p data-anchor="ch09-diagram-intro">
+The following diagram shows how the layers fit together. LangGraph sits at the orchestration layer, defining the workflow. LangChain components live inside the nodes, doing the heavy lifting. External services&mdash;LLM APIs, vector databases, data sources&mdash;sit at the bottom.
+</p>
+
+<figure class="diagram-fig" data-anchor="ch09-arch-diagram">
+<svg class="diagram" viewBox="0 0 720 520" aria-label="Layered architecture diagram showing LangGraph orchestration layer above LangChain component layer above external services" xmlns="http://www.w3.org/2000/svg">
+  <title>Layered architecture: LangGraph on top, LangChain inside, external services below</title>
+  <defs>
+    <marker id="ch09-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+    </marker>
+    <marker id="ch09-arrow-soft" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="var(--ink-soft)" stroke-width="1.5"/>
+    </marker>
+  </defs>
+
+  <!-- Application Layer -->
+  <rect x="40" y="20" width="640" height="60" rx="8" class="box-hot" stroke-width="2"/>
+  <text x="360" y="50" class="lbl-hot" text-anchor="middle" font-size="16" font-weight="700">Your Application</text>
+  <text x="360" y="68" class="lbl" text-anchor="middle" font-size="11">API endpoints, UI, CLI</text>
+
+  <!-- Arrow down -->
+  <line x1="360" y1="80" x2="360" y2="105" class="flow-hot" marker-end="url(#ch09-arrow)"/>
+
+  <!-- LangGraph Layer -->
+  <rect x="40" y="110" width="640" height="150" rx="8" class="box-alt" stroke-width="2"/>
+  <text x="360" y="138" class="lbl-hot" text-anchor="middle" font-size="15" font-weight="700">LangGraph &mdash; Orchestration Layer</text>
+  <text x="360" y="155" class="lbl" text-anchor="middle" font-size="11">StateGraph &middot; Nodes &middot; Edges &middot; Cycles &middot; Persistence</text>
+
+  <!-- Nodes inside LangGraph -->
+  <rect x="70" y="170" width="130" height="70" rx="6" class="box"/>
+  <text x="135" y="195" class="lbl" text-anchor="middle" font-size="12" font-weight="600">Retrieve Node</text>
+  <text x="135" y="213" class="lbl" text-anchor="middle" font-size="10">retriever.invoke()</text>
+  <text x="135" y="228" class="lbl" text-anchor="middle" font-size="9" fill="var(--ink-soft)">LangChain inside</text>
+
+  <rect x="225" y="170" width="130" height="70" rx="6" class="box"/>
+  <text x="290" y="195" class="lbl" text-anchor="middle" font-size="12" font-weight="600">LLM Node</text>
+  <text x="290" y="213" class="lbl" text-anchor="middle" font-size="10">model.invoke()</text>
+  <text x="290" y="228" class="lbl" text-anchor="middle" font-size="9" fill="var(--ink-soft)">LangChain inside</text>
+
+  <rect x="380" y="170" width="130" height="70" rx="6" class="box"/>
+  <text x="445" y="195" class="lbl" text-anchor="middle" font-size="12" font-weight="600">Tool Node</text>
+  <text x="445" y="213" class="lbl" text-anchor="middle" font-size="10">tool.invoke()</text>
+  <text x="445" y="228" class="lbl" text-anchor="middle" font-size="9" fill="var(--ink-soft)">LangChain inside</text>
+
+  <rect x="535" y="170" width="130" height="70" rx="6" class="box"/>
+  <text x="600" y="195" class="lbl" text-anchor="middle" font-size="12" font-weight="600">Check Node</text>
+  <text x="600" y="213" class="lbl" text-anchor="middle" font-size="10">classifier.invoke()</text>
+  <text x="600" y="228" class="lbl" text-anchor="middle" font-size="9" fill="var(--ink-soft)">LangChain inside</text>
+
+  <!-- Edges between nodes -->
+  <line x1="200" y1="205" x2="225" y2="205" class="flow" marker-end="url(#ch09-arrow-soft)"/>
+  <line x1="355" y1="205" x2="380" y2="205" class="flow" marker-end="url(#ch09-arrow-soft)"/>
+  <line x1="510" y1="205" x2="535" y2="205" class="flow" marker-end="url(#ch09-arrow-soft)"/>
+
+  <!-- Arrow down to LangChain layer -->
+  <line x1="360" y1="260" x2="360" y2="290" class="flow-hot" marker-end="url(#ch09-arrow)"/>
+
+  <!-- LangChain Layer -->
+  <rect x="40" y="295" width="640" height="80" rx="8" class="box" stroke-width="2"/>
+  <text x="360" y="322" class="lbl-hot" text-anchor="middle" font-size="15" font-weight="700">LangChain &mdash; Component Library</text>
+  <text x="80" y="352" class="lbl" text-anchor="start" font-size="11">ChatOpenAI</text>
+  <text x="190" y="352" class="lbl" text-anchor="start" font-size="11">ChatAnthropic</text>
+  <text x="315" y="352" class="lbl" text-anchor="start" font-size="11">Retrievers</text>
+  <text x="410" y="352" class="lbl" text-anchor="start" font-size="11">Embeddings</text>
+  <text x="510" y="352" class="lbl" text-anchor="start" font-size="11">Loaders</text>
+  <text x="585" y="352" class="lbl" text-anchor="start" font-size="11">Splitters</text>
+
+  <!-- Arrow down to external -->
+  <line x1="360" y1="375" x2="360" y2="405" class="flow" stroke-dasharray="5,4" marker-end="url(#ch09-arrow-soft)"/>
+
+  <!-- External Services -->
+  <rect x="40" y="410" width="640" height="80" rx="8" stroke="var(--rule)" fill="none" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <text x="360" y="437" class="lbl" text-anchor="middle" font-size="14" font-weight="600">External Services</text>
+  <text x="115" y="465" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink-soft)">OpenAI API</text>
+  <text x="245" y="465" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink-soft)">Anthropic API</text>
+  <text x="375" y="465" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink-soft)">FAISS / Pinecone</text>
+  <text x="520" y="465" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink-soft)">Web / PDFs / DBs</text>
+  <text x="640" y="465" class="lbl" text-anchor="middle" font-size="11" fill="var(--ink-soft)">Ollama</text>
+</svg>
+</figure>
+
+<p data-anchor="ch09-diagram-explain">
+Read the diagram from top to bottom. Your application talks to LangGraph. LangGraph orchestrates the flow between nodes. Each node uses LangChain components internally. Those components talk to external services. The boundaries are clean, the responsibilities are clear, and each layer can change independently.
+</p>
+
+<!-- ===== SECTION: What Stays Where ===== -->
+
+<h2 data-anchor="ch09-stays-where">What Stays in LangChain vs. What Moves to LangGraph</h2>
+
+<p data-anchor="ch09-stays-intro">
+If you&rsquo;re already using LangChain and considering a move to LangGraph, the transition doesn&rsquo;t have to be all-or-nothing. Here&rsquo;s a practical guide for what stays and what moves.
+</p>
+
+<h3 data-anchor="ch09-stays-langchain">What Stays in LangChain</h3>
+
+<p data-anchor="ch09-stays-lc-explain">
+Keep using LangChain for individual components that do one thing well:
+</p>
+
+<ul data-anchor="ch09-stays-lc-list">
+  <li data-anchor="ch09-stays-lc-models"><strong>Model instantiation.</strong> <code>ChatOpenAI(model=&quot;gpt-4o&quot;)</code> is concise, well-tested, and handles authentication, retries, and rate limiting. No reason to rewrite it.</li>
+  <li data-anchor="ch09-stays-lc-tools"><strong>Tool definitions.</strong> The <code>@tool</code> decorator with docstring-based schema generation is genuinely useful. Keep it.</li>
+  <li data-anchor="ch09-stays-lc-retrievers"><strong>Retrievers and vector stores.</strong> LangChain&rsquo;s retriever interface abstracts over many different vector store backends. This is a good abstraction.</li>
+  <li data-anchor="ch09-stays-lc-loaders"><strong>Document loaders and splitters.</strong> These are utility components. They load data and chunk it. LangChain&rsquo;s implementations are mature.</li>
+  <li data-anchor="ch09-stays-lc-embeddings"><strong>Embedding models.</strong> Same story&mdash;a clean interface over multiple providers.</li>
+  <li data-anchor="ch09-stays-lc-structured"><strong>Structured output.</strong> <code>.with_structured_output()</code> handles the messiness of coercing LLM output into typed objects.</li>
+</ul>
+
+<h3 data-anchor="ch09-moves-langgraph">What Moves to LangGraph</h3>
+
+<p data-anchor="ch09-moves-lg-explain">
+Move orchestration logic out of LangChain chains and into LangGraph graphs:
+</p>
+
+<ul data-anchor="ch09-moves-lg-list">
+  <li data-anchor="ch09-moves-lg-chains"><strong>Sequential chains.</strong> If you&rsquo;re using <code>SequentialChain</code> or the pipe operator (<code>|</code>) to string together multiple steps, consider whether you need conditional logic, error handling, or cycles. If you do, use a graph.</li>
+  <li data-anchor="ch09-moves-lg-agents"><strong>Agent loops.</strong> LangChain&rsquo;s legacy <code>AgentExecutor</code> is superseded by LangGraph&rsquo;s <code>create_react_agent</code>. The graph-based version gives you more control over the loop, better streaming, and persistence.</li>
+  <li data-anchor="ch09-moves-lg-routing"><strong>Routing logic.</strong> If your chain has <code>RunnableBranch</code> or complex conditional logic, a graph with conditional edges is more readable and debuggable.</li>
+  <li data-anchor="ch09-moves-lg-state"><strong>Multi-step state.</strong> If you&rsquo;re passing state through multiple chain steps using <code>RunnablePassthrough</code> or custom dictionaries, LangGraph&rsquo;s typed state is cleaner.</li>
+  <li data-anchor="ch09-moves-lg-human"><strong>Human-in-the-loop.</strong> LangGraph has built-in <code>interrupt()</code> support. Building this in plain LangChain requires manual checkpointing.</li>
+  <li data-anchor="ch09-moves-lg-error"><strong>Error recovery.</strong> If a step fails and you need to retry with different parameters or fall back to a different strategy, that&rsquo;s a graph pattern.</li>
+</ul>
+
+<div class="callout note" data-anchor="ch09-callout-migration">
+  <span class="callout-title">Migration Note</span>
+  <p data-anchor="ch09-callout-migration-text">You don&rsquo;t need to migrate all at once. Start by wrapping your existing LangChain chains in LangGraph nodes. Each node can contain a full LCEL chain internally. Over time, as you need more control, you can break the chain apart into separate nodes with edges between them. The graph grows organically from your needs, not from a rewrite mandate.</p>
+</div>
+
+<!-- ===== SECTION: create_react_agent Under the Hood ===== -->
+
+<h2 data-anchor="ch09-react-under-hood">create_react_agent: Where Both Meet</h2>
+
+<p data-anchor="ch09-react-intro">
+If you&rsquo;ve used <code>create_react_agent</code> from LangGraph&rsquo;s prebuilt module, you&rsquo;ve already been using both frameworks together without thinking about it. Let&rsquo;s look under the hood.
+</p>
+
+<p class="code-label" data-anchor="ch09-react-code-label">What create_react_agent does internally:</p>
+<pre data-anchor="ch09-react-code"><span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+
+@<span class="fn">tool</span>
+<span class="kw">def</span> <span class="fn">multiply</span>(a: <span class="ty">int</span>, b: <span class="ty">int</span>) -> <span class="ty">int</span>:
+    <span class="str">"""Multiply two numbers."""</span>
+    <span class="kw">return</span> a * b
+
+<span class="cm"># This one line combines both frameworks:</span>
+<span class="cm"># - ChatOpenAI (LangChain) provides the model interface</span>
+<span class="cm"># - @tool (LangChain) defines the tool schema</span>
+<span class="cm"># - create_react_agent (LangGraph) builds the graph:</span>
+<span class="cm">#   - An "agent" node that calls the model</span>
+<span class="cm">#   - A "tools" node that executes tool calls</span>
+<span class="cm">#   - Conditional edges that loop until no more tools are needed</span>
+<span class="cm">#   - State management for messages</span>
+agent = <span class="fn">create_react_agent</span>(
+    model=<span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>),
+    tools=[multiply],
+)
+</pre>
+
+<p data-anchor="ch09-react-explain">
+Under the hood, <code>create_react_agent</code> calls <code>model.bind_tools(tools)</code>&mdash;a LangChain operation&mdash;and builds a <code>StateGraph</code> with two nodes and a conditional edge&mdash;a LangGraph operation. The Runnable interface that LangChain&rsquo;s chat models implement is directly compatible with LangGraph&rsquo;s node functions. There&rsquo;s no adapter layer, no translation step. They were designed to fit together.
+</p>
+
+<!-- ===== SECTION: Production Patterns ===== -->
+
+<h2 data-anchor="ch09-production-patterns">Production Patterns</h2>
+
+<p data-anchor="ch09-production-intro">
+Let&rsquo;s close with some patterns you&rsquo;ll encounter in real systems. These are common architectures that use both frameworks effectively.
+</p>
+
+<h3 data-anchor="ch09-pattern-rag-agent">Pattern 1: RAG Agent with Fallback</h3>
+
+<p data-anchor="ch09-pattern-rag-explain">
+An agent that tries retrieval first, falls back to web search if the knowledge base doesn&rsquo;t have the answer, and uses structured output for quality checks.
+</p>
+
+<p class="code-label" data-anchor="ch09-pattern-rag-code-label">RAG agent with fallback search:</p>
+<pre data-anchor="ch09-pattern-rag-code"><span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+<span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent
+
+@<span class="fn">tool</span>
+<span class="kw">def</span> <span class="fn">search_knowledge_base</span>(query: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Search the internal knowledge base. Use this first."""</span>
+    docs = retriever.<span class="fn">invoke</span>(query)
+    <span class="kw">if not</span> docs:
+        <span class="kw">return</span> <span class="str">"No relevant documents found in knowledge base."</span>
+    <span class="kw">return</span> <span class="str">"\n\n"</span>.<span class="fn">join</span>(d.page_content <span class="kw">for</span> d <span class="kw">in</span> docs)
+
+@<span class="fn">tool</span>
+<span class="kw">def</span> <span class="fn">web_search</span>(query: <span class="ty">str</span>) -> <span class="ty">str</span>:
+    <span class="str">"""Search the web. Use when knowledge base has no answer."""</span>
+    <span class="cm"># In production, call a search API</span>
+    <span class="kw">return</span> <span class="str">f"Web results for: </span>{query}<span class="str">"</span>
+
+agent = <span class="fn">create_react_agent</span>(
+    model=<span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>),
+    tools=[search_knowledge_base, web_search],
+    prompt=<span class="str">"You are a research assistant. Always try the knowledge "</span>
+           <span class="str">"base first. Only use web search if the knowledge base "</span>
+           <span class="str">"does not have relevant information."</span>,
+)
+</pre>
+
+<h3 data-anchor="ch09-pattern-multi-model">Pattern 2: Multi-Model Pipeline</h3>
+
+<p data-anchor="ch09-pattern-multi-explain">
+Different steps in a workflow might benefit from different models. Use a cheap, fast model for classification and a powerful model for generation.
+</p>
+
+<p class="code-label" data-anchor="ch09-pattern-multi-code-label">Using different models for different stages:</p>
+<pre data-anchor="ch09-pattern-multi-code"><span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+<span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel, Field
+
+<span class="cm"># Fast model for triage</span>
+triage_model = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>, temperature=<span class="num">0</span>)
+
+<span class="cm"># Powerful model for generation</span>
+writer_model = <span class="fn">ChatAnthropic</span>(
+    model=<span class="str">"claude-sonnet-4-20250514"</span>, temperature=<span class="num">0.7</span>
+)
+
+<span class="kw">class</span> <span class="ty">Triage</span>(BaseModel):
+    complexity: <span class="ty">str</span> = <span class="fn">Field</span>(description=<span class="str">"simple or complex"</span>)
+
+triage_classifier = triage_model.<span class="fn">with_structured_output</span>(<span class="ty">Triage</span>)
+
+<span class="kw">def</span> <span class="fn">triage_node</span>(state: dict) -> dict:
+    result = triage_classifier.<span class="fn">invoke</span>(state[<span class="str">"question"</span>])
+    <span class="kw">return</span> {<span class="str">"complexity"</span>: result.complexity}
+
+<span class="kw">def</span> <span class="fn">simple_answer</span>(state: dict) -> dict:
+    result = triage_model.<span class="fn">invoke</span>(state[<span class="str">"question"</span>])
+    <span class="kw">return</span> {<span class="str">"answer"</span>: result.content}
+
+<span class="kw">def</span> <span class="fn">complex_answer</span>(state: dict) -> dict:
+    result = writer_model.<span class="fn">invoke</span>(state[<span class="str">"question"</span>])
+    <span class="kw">return</span> {<span class="str">"answer"</span>: result.content}
+
+<span class="kw">def</span> <span class="fn">route_by_complexity</span>(state: dict) -> <span class="ty">str</span>:
+    <span class="kw">return</span> <span class="str">"simple"</span> <span class="kw">if</span> state[<span class="str">"complexity"</span>] == <span class="str">"simple"</span> <span class="kw">else</span> <span class="str">"complex"</span>
+
+graph = <span class="fn">StateGraph</span>(dict)
+graph.<span class="fn">add_node</span>(<span class="str">"triage"</span>, triage_node)
+graph.<span class="fn">add_node</span>(<span class="str">"simple"</span>, simple_answer)
+graph.<span class="fn">add_node</span>(<span class="str">"complex"</span>, complex_answer)
+graph.<span class="fn">set_entry_point</span>(<span class="str">"triage"</span>)
+graph.<span class="fn">add_conditional_edges</span>(<span class="str">"triage"</span>, route_by_complexity, {
+    <span class="str">"simple"</span>: <span class="str">"simple"</span>,
+    <span class="str">"complex"</span>: <span class="str">"complex"</span>,
+})
+graph.<span class="fn">add_edge</span>(<span class="str">"simple"</span>, END)
+graph.<span class="fn">add_edge</span>(<span class="str">"complex"</span>, END)
+
+pipeline = graph.<span class="fn">compile</span>()
+</pre>
+
+<p data-anchor="ch09-pattern-multi-notice">
+This is cost optimization through architecture. Simple questions get a fast, cheap answer. Complex questions get a thorough, expensive one. LangChain provides both model interfaces with the same API. LangGraph routes between them based on the triage result. The graph makes the cost tradeoff visible and configurable.
+</p>
+
+<h3 data-anchor="ch09-pattern-ingest">Pattern 3: Document Ingestion Pipeline</h3>
+
+<p data-anchor="ch09-pattern-ingest-explain">
+A full ingestion pipeline loads documents from multiple sources, chunks them, generates embeddings, and stores them in a vector database. Error handling at each stage is critical in production.
+</p>
+
+<p class="code-label" data-anchor="ch09-pattern-ingest-code-label">Ingestion pipeline with error handling:</p>
+<pre data-anchor="ch09-pattern-ingest-code"><span class="kw">from</span> langchain_community.document_loaders <span class="kw">import</span> WebBaseLoader
+<span class="kw">from</span> langchain_text_splitters <span class="kw">import</span> RecursiveCharacterTextSplitter
+<span class="kw">from</span> langchain_community.vectorstores <span class="kw">import</span> FAISS
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> OpenAIEmbeddings
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, END
+
+<span class="kw">def</span> <span class="fn">load_documents</span>(state: dict) -> dict:
+    loader = <span class="fn">WebBaseLoader</span>(state[<span class="str">"urls"</span>])
+    <span class="kw">try</span>:
+        docs = loader.<span class="fn">load</span>()
+        <span class="kw">return</span> {<span class="str">"documents"</span>: docs, <span class="str">"load_error"</span>: <span class="kw">None</span>}
+    <span class="kw">except</span> <span class="ty">Exception</span> <span class="kw">as</span> e:
+        <span class="kw">return</span> {<span class="str">"documents"</span>: [], <span class="str">"load_error"</span>: <span class="fn">str</span>(e)}
+
+<span class="kw">def</span> <span class="fn">chunk_documents</span>(state: dict) -> dict:
+    splitter = <span class="fn">RecursiveCharacterTextSplitter</span>(
+        chunk_size=<span class="num">1000</span>, chunk_overlap=<span class="num">200</span>
+    )
+    chunks = splitter.<span class="fn">split_documents</span>(state[<span class="str">"documents"</span>])
+    <span class="kw">return</span> {<span class="str">"chunks"</span>: chunks}
+
+<span class="kw">def</span> <span class="fn">embed_and_store</span>(state: dict) -> dict:
+    embeddings = <span class="fn">OpenAIEmbeddings</span>()
+    vectorstore = FAISS.<span class="fn">from_documents</span>(state[<span class="str">"chunks"</span>], embeddings)
+    vectorstore.<span class="fn">save_local</span>(<span class="str">"./faiss_index"</span>)
+    <span class="kw">return</span> {<span class="str">"status"</span>: <span class="str">"stored"</span>, <span class="str">"chunk_count"</span>: <span class="fn">len</span>(state[<span class="str">"chunks"</span>])}
+
+<span class="kw">def</span> <span class="fn">check_load_result</span>(state: dict) -> <span class="ty">str</span>:
+    <span class="kw">return</span> <span class="str">"error"</span> <span class="kw">if</span> state.<span class="fn">get</span>(<span class="str">"load_error"</span>) <span class="kw">else</span> <span class="str">"chunk"</span>
+
+<span class="kw">def</span> <span class="fn">handle_error</span>(state: dict) -> dict:
+    <span class="kw">return</span> {<span class="str">"status"</span>: <span class="str">f"Failed: </span>{state[<span class="str">'load_error'</span>]}<span class="str">"</span>}
+
+graph = <span class="fn">StateGraph</span>(dict)
+graph.<span class="fn">add_node</span>(<span class="str">"load"</span>, load_documents)
+graph.<span class="fn">add_node</span>(<span class="str">"chunk"</span>, chunk_documents)
+graph.<span class="fn">add_node</span>(<span class="str">"store"</span>, embed_and_store)
+graph.<span class="fn">add_node</span>(<span class="str">"error"</span>, handle_error)
+graph.<span class="fn">set_entry_point</span>(<span class="str">"load"</span>)
+graph.<span class="fn">add_conditional_edges</span>(<span class="str">"load"</span>, check_load_result, {
+    <span class="str">"chunk"</span>: <span class="str">"chunk"</span>,
+    <span class="str">"error"</span>: <span class="str">"error"</span>,
+})
+graph.<span class="fn">add_edge</span>(<span class="str">"chunk"</span>, <span class="str">"store"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"store"</span>, END)
+graph.<span class="fn">add_edge</span>(<span class="str">"error"</span>, END)
+
+ingest = graph.<span class="fn">compile</span>()
+</pre>
+
+<p data-anchor="ch09-pattern-ingest-notice">
+Every component inside these nodes&mdash;the loader, the splitter, the embeddings, the vector store&mdash;is LangChain. The error handling, the routing, the step-by-step progression&mdash;that&rsquo;s LangGraph. The separation means you can swap FAISS for Pinecone by changing one node. You can add a metadata enrichment step by adding one node and one edge. The pipeline grows without becoming fragile.
+</p>
+
+<!-- ===== SECTION: Common Pitfalls ===== -->
+
+<h2 data-anchor="ch09-pitfalls">Common Pitfalls</h2>
+
+<p data-anchor="ch09-pitfalls-intro">
+A few mistakes come up often enough to be worth naming:
+</p>
+
+<ol data-anchor="ch09-pitfalls-list">
+  <li data-anchor="ch09-pitfall-over-graph"><strong>Over-graphing.</strong> Not every LLM call needs a graph. If your workflow is truly linear&mdash;load, split, embed, store&mdash;with no branching or error recovery, a simple script or LCEL chain is fine. Add a graph when you need the control flow it provides.</li>
+  <li data-anchor="ch09-pitfall-under-graph"><strong>Under-graphing.</strong> The opposite mistake: building complex logic inside a single node when it should be multiple nodes with edges. If a node has three <code>if</code> statements and two try/except blocks, consider splitting it up. The graph should reflect the actual decision structure.</li>
+  <li data-anchor="ch09-pitfall-version-mismatch"><strong>Version mismatches.</strong> LangChain and LangGraph release independently. Check compatibility. The <code>langchain-core</code> package is the shared foundation&mdash;make sure all your <code>langchain-*</code> packages use the same version of it.</li>
+  <li data-anchor="ch09-pitfall-state-bloat"><strong>State bloat.</strong> Don&rsquo;t store full document objects in state if you only need their text. State is serialized for persistence and checkpointing. Keep it lean.</li>
+  <li data-anchor="ch09-pitfall-mixing-old"><strong>Mixing old and new.</strong> LangChain&rsquo;s legacy <code>AgentExecutor</code> and LangGraph&rsquo;s <code>create_react_agent</code> are not meant to be used together. Pick one. The LangGraph version is the recommended path forward.</li>
+</ol>
+
+<div class="callout warn" data-anchor="ch09-callout-warn">
+  <span class="callout-title">Watch Out</span>
+  <p data-anchor="ch09-callout-warn-text">If you find yourself importing from <code>langchain.agents</code> (the old agent module) and <code>langgraph.prebuilt</code> in the same file, stop and pick one. The old agent framework and the new graph-based framework solve the same problem in different ways. Mixing them creates confusion, not capability.</p>
+</div>
+
+<!-- ===== SECTION: Quick Reference ===== -->
+
+<h2 data-anchor="ch09-quick-reference">Quick Reference: Import Map</h2>
+
+<p data-anchor="ch09-imports-intro">
+Here&rsquo;s a reference for where the key pieces come from, so you never have to guess which package provides what.
+</p>
+
+<figure data-anchor="ch09-import-table-fig">
+<table data-anchor="ch09-import-table">
+  <caption data-anchor="ch09-import-table-caption">Key imports from LangChain and LangGraph</caption>
+  <thead data-anchor="ch09-import-table-head">
+    <tr>
+      <th data-anchor="ch09-import-th-what">What You Need</th>
+      <th data-anchor="ch09-import-th-import">Import From</th>
+      <th data-anchor="ch09-import-th-framework">Framework</th>
+    </tr>
+  </thead>
+  <tbody data-anchor="ch09-import-table-body">
+    <tr data-anchor="ch09-import-openai">
+      <td>ChatOpenAI</td>
+      <td><code>langchain_openai</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-anthropic">
+      <td>ChatAnthropic</td>
+      <td><code>langchain_anthropic</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-ollama">
+      <td>ChatOllama</td>
+      <td><code>langchain_ollama</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-faiss">
+      <td>FAISS vector store</td>
+      <td><code>langchain_community.vectorstores</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-webloader">
+      <td>WebBaseLoader</td>
+      <td><code>langchain_community.document_loaders</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-splitter">
+      <td>RecursiveCharacterTextSplitter</td>
+      <td><code>langchain_text_splitters</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-tool-dec">
+      <td>@tool decorator</td>
+      <td><code>langchain_core.tools</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-embeddings">
+      <td>OpenAIEmbeddings</td>
+      <td><code>langchain_openai</code></td>
+      <td>LangChain</td>
+    </tr>
+    <tr data-anchor="ch09-import-stategraph">
+      <td>StateGraph</td>
+      <td><code>langgraph.graph</code></td>
+      <td>LangGraph</td>
+    </tr>
+    <tr data-anchor="ch09-import-react">
+      <td>create_react_agent</td>
+      <td><code>langgraph.prebuilt</code></td>
+      <td>LangGraph</td>
+    </tr>
+    <tr data-anchor="ch09-import-checkpointer">
+      <td>MemorySaver</td>
+      <td><code>langgraph.checkpoint.memory</code></td>
+      <td>LangGraph</td>
+    </tr>
+    <tr data-anchor="ch09-import-interrupt">
+      <td>interrupt</td>
+      <td><code>langgraph.types</code></td>
+      <td>LangGraph</td>
+    </tr>
+  </tbody>
+</table>
+</figure>
+
+<!-- ===== SECTION: Closing ===== -->
+
+<h2 data-anchor="ch09-closing">Wrapping Up</h2>
+
+<p data-anchor="ch09-closing-summary">
+Throughout this book, we&rsquo;ve built agents from first principles. We started with the core graph abstraction&mdash;nodes, edges, state. We added conditional routing, cycles, tool use, memory, persistence, human-in-the-loop patterns, and streaming. We built a complete Q&amp;A agent as a case study. And now, in this appendix, we&rsquo;ve seen how the LangChain ecosystem provides the components that make LangGraph nodes powerful.
+</p>
+
+<p data-anchor="ch09-closing-principle">
+The principle is worth restating one more time: <strong>LangGraph controls the flow. LangChain provides the parts.</strong> Use LangGraph to define what happens when, in what order, under what conditions. Use LangChain to instantiate models, define tools, connect to vector stores, load documents, and parse outputs. The boundary between them is the node function&rsquo;s signature&mdash;state in, state out.
+</p>
+
+<p data-anchor="ch09-closing-forward">
+This is not the only way to build AI applications. But it is a principled way&mdash;one that separates concerns, makes logic visible, and scales from a single LLM call to a multi-agent system with persistence and human oversight. You now have the tools and the patterns. Go build something that works.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch09-nav">
+  <a rel="prev" href="08-case-study-qa-agent.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>

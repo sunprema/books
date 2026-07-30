@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Production Patterns — LangGraph</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="langgraph">
+
+<header class="topbar" data-anchor="ch07-topbar">
+  <span class="brand">LangGraph</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+<article class="book-leaf">
+
+<header class="chapter-head" data-anchor="ch07-head">
+  <span class="chapter-num">07</span>
+  <span class="chapter-kicker">Ship it, watch it, fix it</span>
+  <h1 data-anchor="ch07-title">Production Patterns</h1>
+</header>
+
+<p class="lede" data-anchor="ch07-lede">
+You have a graph that works on your laptop. It handles branching, loops, human-in-the-loop pauses, and multi-agent coordination. Now a harder question arrives: what happens when a user is staring at a blank screen for twelve seconds while your LLM thinks? What happens when the API returns a 503 at 2 a.m.? What happens when a container restarts mid-run? This chapter is about the gap between &ldquo;it works&rdquo; and &ldquo;it works in production.&rdquo; We will walk through four areas&mdash;streaming, observability, deployment, and error handling&mdash;that turn a prototype into something you can ship with confidence.
+</p>
+
+<!-- ───────────────────── STREAMING ───────────────────── -->
+
+<h2 data-anchor="ch07-streaming">Streaming: Show Progress as It Happens</h2>
+
+<p data-anchor="ch07-streaming-intro">
+The single most impactful change you can make for user experience is to stop waiting until the entire graph finishes before showing output. LangGraph&rsquo;s streaming interface lets you push partial results to your client as soon as each node completes&mdash;or even as individual tokens arrive from an LLM call. The mechanism is straightforward: instead of calling <code>graph.invoke()</code>, you call <code>graph.stream()</code> and iterate over chunks.
+</p>
+
+<h3 data-anchor="ch07-stream-modes">Stream Modes</h3>
+
+<p data-anchor="ch07-stream-modes-intro">
+The <code>stream_mode</code> parameter controls what each chunk contains. LangGraph supports five modes, and choosing the right one depends on what your consumer needs.
+</p>
+
+<table data-anchor="ch07-stream-modes-table">
+  <caption data-anchor="ch07-stream-modes-caption">Streaming modes and their use cases</caption>
+  <thead>
+    <tr>
+      <th data-anchor="ch07-th-mode">Mode</th>
+      <th data-anchor="ch07-th-yields">Each chunk yields</th>
+      <th data-anchor="ch07-th-use">Best for</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr data-anchor="ch07-mode-values">
+      <td><code>&quot;values&quot;</code></td>
+      <td>Full state after each node runs</td>
+      <td>Debugging, UI that re-renders whole state</td>
+    </tr>
+    <tr data-anchor="ch07-mode-updates">
+      <td><code>&quot;updates&quot;</code></td>
+      <td>Only the keys a node changed</td>
+      <td>Efficient frontends, incremental UI updates</td>
+    </tr>
+    <tr data-anchor="ch07-mode-messages">
+      <td><code>&quot;messages&quot;</code></td>
+      <td>LLM message objects as they arrive</td>
+      <td>Chat interfaces showing token-by-token output</td>
+    </tr>
+    <tr data-anchor="ch07-mode-events">
+      <td><code>&quot;events&quot;</code></td>
+      <td>Fine-grained lifecycle events</td>
+      <td>Custom dashboards, logging pipelines</td>
+    </tr>
+    <tr data-anchor="ch07-mode-custom">
+      <td><code>&quot;custom&quot;</code></td>
+      <td>Whatever your node emits explicitly</td>
+      <td>Progress bars, intermediate artifacts</td>
+    </tr>
+  </tbody>
+</table>
+
+<p data-anchor="ch07-stream-mode-note">
+The default mode is <code>&quot;values&quot;</code>. In most production apps, you will want <code>&quot;updates&quot;</code> for efficiency or <code>&quot;messages&quot;</code> for chat-style token streaming. You can also pass a list of modes to receive multiple streams interleaved.
+</p>
+
+<h3 data-anchor="ch07-stream-code">Streaming in Practice</h3>
+
+<p data-anchor="ch07-stream-code-intro">
+Here is a concrete example. We have a simple two-node graph&mdash;one that retrieves documents, one that generates an answer&mdash;and we stream updates to see each node&rsquo;s output the moment it finishes.
+</p>
+
+<p class="code-label" data-anchor="ch07-stream-code-label">Streaming with &ldquo;updates&rdquo; mode</p>
+<pre data-anchor="ch07-stream-code-block"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langchain_openai <span class="kw">import</span> ChatOpenAI
+<span class="kw">from</span> typing <span class="kw">import</span> TypedDict, Annotated
+<span class="kw">import</span> operator
+
+<span class="kw">class</span> <span class="ty">State</span>(TypedDict):
+    question: <span class="ty">str</span>
+    documents: Annotated[<span class="ty">list</span>, operator.add]
+    answer: <span class="ty">str</span>
+
+<span class="kw">def</span> <span class="fn">retrieve</span>(state: <span class="ty">State</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># Simulate retrieval</span>
+    docs = [<span class="str">"Doc A: LangGraph supports streaming."</span>,
+            <span class="str">"Doc B: Use stream_mode for control."</span>]
+    <span class="kw">return</span> {<span class="str">"documents"</span>: docs}
+
+<span class="kw">def</span> <span class="fn">generate</span>(state: <span class="ty">State</span>) -> <span class="ty">dict</span>:
+    llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+    context = <span class="str">"\n"</span>.<span class="fn">join</span>(state[<span class="str">"documents"</span>])
+    prompt = <span class="str">f"Answer based on:\n</span>{context}<span class="str">\n\nQuestion: </span>{state[<span class="str">'question'</span>]}<span class="str">"</span>
+    response = llm.<span class="fn">invoke</span>(prompt)
+    <span class="kw">return</span> {<span class="str">"answer"</span>: response.content}
+
+graph = <span class="fn">StateGraph</span>(<span class="ty">State</span>)
+graph.<span class="fn">add_node</span>(<span class="str">"retrieve"</span>, retrieve)
+graph.<span class="fn">add_node</span>(<span class="str">"generate"</span>, generate)
+graph.<span class="fn">add_edge</span>(START, <span class="str">"retrieve"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"retrieve"</span>, <span class="str">"generate"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, END)
+
+app = graph.<span class="fn">compile</span>()
+
+<span class="cm"># Stream updates as each node completes</span>
+<span class="kw">for</span> chunk <span class="kw">in</span> app.<span class="fn">stream</span>(
+    {<span class="str">"question"</span>: <span class="str">"How does LangGraph handle streaming?"</span>},
+    stream_mode=<span class="str">"updates"</span>
+):
+    <span class="cm"># chunk is a dict: {"node_name": {changed_keys}}</span>
+    <span class="kw">for</span> node_name, updates <span class="kw">in</span> chunk.<span class="fn">items</span>():
+        <span class="fn">print</span>(<span class="str">f"Node '</span>{node_name}<span class="str">' updated: </span>{<span class="fn">list</span>(updates.<span class="fn">keys</span>())}<span class="str">"</span>)</pre>
+
+<p data-anchor="ch07-stream-code-output">
+When you run this, you see <code>Node &rsquo;retrieve&rsquo; updated: [&rsquo;documents&rsquo;]</code> appear immediately after retrieval finishes, without waiting for the generate step. The user knows something is happening.
+</p>
+
+<h3 data-anchor="ch07-token-streaming">Streaming Tokens from LLM Calls</h3>
+
+<p data-anchor="ch07-token-streaming-intro">
+Node-level streaming is good, but for chat applications you want tokens as they emerge from the language model. The <code>&quot;messages&quot;</code> stream mode does exactly this. Each chunk contains an <code>AIMessageChunk</code> with partial content as it arrives from the provider.
+</p>
+
+<p class="code-label" data-anchor="ch07-token-stream-label">Token-level streaming with &ldquo;messages&rdquo; mode</p>
+<pre data-anchor="ch07-token-stream-block"><span class="cm"># Stream individual tokens from LLM calls</span>
+<span class="kw">for</span> chunk <span class="kw">in</span> app.<span class="fn">stream</span>(
+    {<span class="str">"question"</span>: <span class="str">"Explain streaming in LangGraph."</span>},
+    stream_mode=<span class="str">"messages"</span>
+):
+    msg, metadata = chunk
+    <span class="cm"># msg is an AIMessageChunk during generation</span>
+    <span class="kw">if</span> msg.content:
+        <span class="fn">print</span>(msg.content, end=<span class="str">""</span>, flush=<span class="kw">True</span>)</pre>
+
+<p data-anchor="ch07-token-streaming-detail">
+The tuple returned by each chunk includes the message object and metadata telling you which node produced it. This lets you build a typewriter effect in a chat UI while still distinguishing output from different nodes if your graph has multiple LLM calls.
+</p>
+
+<h3 data-anchor="ch07-astream-events">Fine-Grained Events with astream_events</h3>
+
+<p data-anchor="ch07-astream-events-intro">
+For maximum control, the async method <code>astream_events</code> emits structured events for every significant moment in the graph&rsquo;s lifecycle: node starts, node ends, LLM token emissions, tool calls, retries, and more. Each event carries a name, a run ID, and data that you can filter, route, or log however you need.
+</p>
+
+<p class="code-label" data-anchor="ch07-astream-events-label">Using astream_events for detailed tracing</p>
+<pre data-anchor="ch07-astream-events-block"><span class="kw">async for</span> event <span class="kw">in</span> app.<span class="fn">astream_events</span>(
+    {<span class="str">"question"</span>: <span class="str">"What is LangGraph?"</span>},
+    version=<span class="str">"v2"</span>
+):
+    kind = event[<span class="str">"event"</span>]
+    <span class="kw">if</span> kind == <span class="str">"on_chat_model_stream"</span>:
+        token = event[<span class="str">"data"</span>][<span class="str">"chunk"</span>].content
+        <span class="kw">if</span> token:
+            <span class="fn">print</span>(token, end=<span class="str">""</span>, flush=<span class="kw">True</span>)
+    <span class="kw">elif</span> kind == <span class="str">"on_chain_start"</span>:
+        <span class="fn">print</span>(<span class="str">f"\n--- Node started: </span>{event[<span class="str">'name'</span>]}<span class="str"> ---"</span>)</pre>
+
+<p data-anchor="ch07-astream-events-note">
+The <code>version=&quot;v2&quot;</code> parameter selects the current event schema. Use <code>astream_events</code> when you need to build custom monitoring dashboards, pipe events to external systems, or implement sophisticated progress indicators that go beyond what the simpler stream modes offer.
+</p>
+
+<!-- ───── Streaming Pipeline Diagram ───── -->
+
+<figure class="diagram-fig" data-anchor="ch07-streaming-diagram">
+<svg class="diagram" viewBox="0 0 780 260" aria-label="Streaming pipeline: user request flows through graph nodes, with chunks emitted at each step to the client" role="img">
+  <title>Streaming pipeline architecture</title>
+  <defs>
+    <marker id="ch07-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--ink)" />
+    </marker>
+    <marker id="ch07-arrow-hot" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)" />
+    </marker>
+  </defs>
+
+  <!-- Client -->
+  <rect class="box" x="10" y="100" width="110" height="50" rx="6" />
+  <text class="lbl" x="65" y="130" text-anchor="middle">Client</text>
+
+  <!-- graph.stream() -->
+  <rect class="box-hot" x="170" y="100" width="130" height="50" rx="6" />
+  <text class="lbl-hot" x="235" y="130" text-anchor="middle">graph.stream()</text>
+
+  <!-- Node A -->
+  <rect class="box" x="350" y="40" width="120" height="50" rx="6" />
+  <text class="lbl" x="410" y="70" text-anchor="middle">Node A</text>
+
+  <!-- Node B -->
+  <rect class="box" x="350" y="160" width="120" height="50" rx="6" />
+  <text class="lbl" x="410" y="190" text-anchor="middle">Node B</text>
+
+  <!-- Chunk stream -->
+  <rect class="box-alt" x="540" y="40" width="110" height="50" rx="6" />
+  <text class="lbl" x="595" y="70" text-anchor="middle">Chunk 1</text>
+
+  <rect class="box-alt" x="540" y="160" width="110" height="50" rx="6" />
+  <text class="lbl" x="595" y="190" text-anchor="middle">Chunk 2</text>
+
+  <!-- Yield back -->
+  <rect class="box-hot" x="690" y="100" width="80" height="50" rx="6" />
+  <text class="lbl-hot" x="730" y="130" text-anchor="middle">yield</text>
+
+  <!-- Arrows -->
+  <line class="flow" x1="120" y1="125" x2="168" y2="125" marker-end="url(#ch07-arrow)" />
+  <line class="flow" x1="300" y1="115" x2="348" y2="72" marker-end="url(#ch07-arrow)" />
+  <line class="flow" x1="300" y1="135" x2="348" y2="178" marker-end="url(#ch07-arrow)" />
+  <line class="flow" x1="470" y1="65" x2="538" y2="65" marker-end="url(#ch07-arrow)" />
+  <line class="flow" x1="470" y1="185" x2="538" y2="185" marker-end="url(#ch07-arrow)" />
+  <line class="flow-hot" x1="650" y1="65" x2="690" y2="115" marker-end="url(#ch07-arrow-hot)" />
+  <line class="flow-hot" x1="650" y1="185" x2="690" y2="140" marker-end="url(#ch07-arrow-hot)" />
+
+  <!-- Label -->
+  <text class="lbl" x="390" y="22" text-anchor="middle" font-size="11" fill="var(--ink-soft)">Each node emits a chunk as soon as it finishes</text>
+  <text class="lbl" x="390" y="245" text-anchor="middle" font-size="11" fill="var(--ink-soft)">Chunks are yielded to the client iterator in order</text>
+</svg>
+</figure>
+
+<h3 data-anchor="ch07-custom-streaming">Custom Stream Emissions</h3>
+
+<p data-anchor="ch07-custom-streaming-intro">
+Sometimes you want to emit something that is neither state nor LLM tokens&mdash;a progress percentage, an intermediate image URL, or a status message. Inside any node function, you can use the <code>writer</code> callback from the <code>RunnableConfig</code> to push custom data to clients streaming with <code>stream_mode=&quot;custom&quot;</code>.
+</p>
+
+<p class="code-label" data-anchor="ch07-custom-stream-label">Emitting custom stream data from a node</p>
+<pre data-anchor="ch07-custom-stream-block"><span class="kw">from</span> langgraph.config <span class="kw">import</span> get_stream_writer
+
+<span class="kw">def</span> <span class="fn">process_documents</span>(state: <span class="ty">State</span>) -> <span class="ty">dict</span>:
+    writer = <span class="fn">get_stream_writer</span>()
+    docs = state[<span class="str">"documents"</span>]
+    <span class="kw">for</span> i, doc <span class="kw">in</span> <span class="fn">enumerate</span>(docs):
+        <span class="cm"># ... process document ...</span>
+        writer({<span class="str">"progress"</span>: (i + <span class="num">1</span>) / <span class="fn">len</span>(docs), <span class="str">"current_doc"</span>: doc.id})
+    <span class="kw">return</span> {<span class="str">"processed"</span>: <span class="kw">True</span>}</pre>
+
+<p data-anchor="ch07-custom-streaming-detail">
+On the client side, chunks from <code>stream_mode=&quot;custom&quot;</code> will contain exactly the dictionaries you passed to the writer. This is how you build rich progress indicators without polluting your graph state.
+</p>
+
+<!-- ───────────────────── OBSERVABILITY ───────────────────── -->
+
+<h2 data-anchor="ch07-observability">Observability with LangSmith</h2>
+
+<p data-anchor="ch07-observability-intro">
+Streaming tells your users what&rsquo;s happening. Observability tells <em>you</em> what&rsquo;s happening. When a graph produces an unexpected answer, you need to trace the execution path: which nodes ran, what state they saw, what the LLM received and returned, and where things diverged from your expectations. LangSmith provides this tracing layer.
+</p>
+
+<h3 data-anchor="ch07-langsmith-setup">Setting Up LangSmith Integration</h3>
+
+<p data-anchor="ch07-langsmith-setup-detail">
+Integration requires setting environment variables before your graph runs. LangSmith is opt-in&mdash;your code does not change, and you do not import anything new.
+</p>
+
+<p class="code-label" data-anchor="ch07-langsmith-env-label">Environment variables for LangSmith tracing</p>
+<pre data-anchor="ch07-langsmith-env-block"><span class="cm"># Enable tracing</span>
+<span class="kw">export</span> LANGSMITH_TRACING=<span class="str">"true"</span>
+<span class="kw">export</span> LANGSMITH_API_KEY=<span class="str">"lsv2_pt_..."</span>
+<span class="kw">export</span> LANGSMITH_PROJECT=<span class="str">"my-production-graph"</span></pre>
+
+<p data-anchor="ch07-langsmith-auto">
+Once these are set, every <code>graph.invoke()</code> or <code>graph.stream()</code> call is automatically traced. Each trace appears in the LangSmith dashboard as a hierarchical tree of runs&mdash;the graph execution at the top, each node as a child, and each LLM call or tool invocation nested under its node.
+</p>
+
+<h3 data-anchor="ch07-tracing-execution">Tracing Execution Through the Graph</h3>
+
+<p data-anchor="ch07-tracing-detail">
+A LangSmith trace for a LangGraph execution shows you several things that are difficult to reconstruct from logs alone:
+</p>
+
+<ul data-anchor="ch07-tracing-list">
+  <li data-anchor="ch07-tracing-list-order"><strong>Execution order</strong>&mdash;which nodes ran and in what sequence, including parallel branches</li>
+  <li data-anchor="ch07-tracing-list-state"><strong>State snapshots</strong>&mdash;the full state before and after each node, so you can see exactly how data transformed</li>
+  <li data-anchor="ch07-tracing-list-llm"><strong>LLM inputs and outputs</strong>&mdash;the exact prompts sent to the model and the responses returned</li>
+  <li data-anchor="ch07-tracing-list-latency"><strong>Latency breakdown</strong>&mdash;how long each node took, making bottlenecks visible</li>
+  <li data-anchor="ch07-tracing-list-tokens"><strong>Token counts and costs</strong>&mdash;per-call and aggregate token usage across the entire graph run</li>
+  <li data-anchor="ch07-tracing-list-errors"><strong>Error details</strong>&mdash;full stack traces when nodes fail, with the state that caused the failure</li>
+</ul>
+
+<h3 data-anchor="ch07-debugging-runs">Debugging Failed Runs</h3>
+
+<p data-anchor="ch07-debugging-detail">
+When a production run fails, LangSmith lets you filter by error status, locate the failing node, inspect the state it received, and see the full exception. Because LangGraph checkpoints state at each step, you can even reproduce the failure by replaying from the checkpoint just before the error&mdash;no need to reconstruct the user&rsquo;s entire input sequence.
+</p>
+
+<p data-anchor="ch07-debugging-tags">
+You can also add custom metadata to make traces easier to find. Pass a <code>config</code> dictionary with tags or metadata to any invocation.
+</p>
+
+<p class="code-label" data-anchor="ch07-metadata-label">Adding metadata to a traced run</p>
+<pre data-anchor="ch07-metadata-block">result = app.<span class="fn">invoke</span>(
+    {<span class="str">"question"</span>: <span class="str">"What is streaming?"</span>},
+    config={
+        <span class="str">"tags"</span>: [<span class="str">"production"</span>, <span class="str">"v2.1"</span>],
+        <span class="str">"metadata"</span>: {
+            <span class="str">"user_id"</span>: <span class="str">"usr_abc123"</span>,
+            <span class="str">"session_id"</span>: <span class="str">"sess_xyz789"</span>
+        }
+    }
+)</pre>
+
+<p data-anchor="ch07-debugging-search">
+Now in LangSmith you can search for all runs tagged <code>&quot;production&quot;</code>, filter by user ID, or find every run in a particular session. This is essential for customer support scenarios where you need to understand what the system did for a specific user.
+</p>
+
+<div class="callout note" data-anchor="ch07-callout-langsmith">
+  <span class="callout-title" data-anchor="ch07-callout-langsmith-title">Tracing overhead</span>
+  <p data-anchor="ch07-callout-langsmith-body">
+    LangSmith tracing adds minimal latency because traces are sent asynchronously in a background thread. The overhead is typically under 1 millisecond per traced call. In high-throughput scenarios, you can reduce volume by sampling: set <code>LANGSMITH_TRACING_SAMPLE_RATE</code> to a value between 0 and 1 to trace only a fraction of runs.
+  </p>
+</div>
+
+<!-- ───────────────────── DEPLOYMENT ───────────────────── -->
+
+<h2 data-anchor="ch07-deployment">Deployment Considerations</h2>
+
+<p data-anchor="ch07-deployment-intro">
+A graph running in a Jupyter notebook or a CLI script is not the same as a graph running behind an API that serves thousands of concurrent requests. Deployment adds requirements around packaging, serving, scaling, and lifecycle management. LangGraph provides several paths depending on your constraints.
+</p>
+
+<h3 data-anchor="ch07-langgraph-platform">LangGraph Platform</h3>
+
+<p data-anchor="ch07-platform-intro">
+LangGraph Platform is the managed infrastructure layer purpose-built for deploying LangGraph applications. It provides a standardized API server that wraps your graph in REST endpoints, handles persistence with built-in checkpointing, manages background runs, and supports streaming out of the box. The platform comes in two flavors: a fully managed cloud offering and a self-hosted option where you run the same infrastructure on your own machines.
+</p>
+
+<h3 data-anchor="ch07-langgraph-json">The langgraph.json Configuration File</h3>
+
+<p data-anchor="ch07-langgraph-json-intro">
+At the heart of any LangGraph deployment is a <code>langgraph.json</code> file that declares your graphs, dependencies, and environment configuration.
+</p>
+
+<p class="code-label" data-anchor="ch07-langgraph-json-label">A langgraph.json configuration file</p>
+<pre data-anchor="ch07-langgraph-json-block">{
+    <span class="str">"dependencies"</span>: [<span class="str">"."</span>],
+    <span class="str">"graphs"</span>: {
+        <span class="str">"qa_agent"</span>: <span class="str">"./src/agent.py:graph"</span>
+    },
+    <span class="str">"env"</span>: <span class="str">".env"</span>,
+    <span class="str">"python_version"</span>: <span class="str">"3.11"</span>
+}</pre>
+
+<p data-anchor="ch07-langgraph-json-detail">
+The <code>&quot;graphs&quot;</code> field maps a name to a Python module path and variable. LangGraph Platform uses this to locate your compiled graph object. The <code>&quot;dependencies&quot;</code> field points to directories or requirements files. The <code>&quot;env&quot;</code> field tells the platform where to find your environment variables.
+</p>
+
+<h3 data-anchor="ch07-local-dev">Local Development with LangGraph CLI</h3>
+
+<p data-anchor="ch07-local-dev-intro">
+Before deploying to the cloud, you can run the same platform API server locally using the LangGraph CLI.
+</p>
+
+<p class="code-label" data-anchor="ch07-langgraph-cli-label">Starting a local development server</p>
+<pre data-anchor="ch07-langgraph-cli-block"><span class="cm"># Install the CLI</span>
+pip install langgraph-cli
+
+<span class="cm"># Start the local dev server</span>
+langgraph dev</pre>
+
+<p data-anchor="ch07-local-dev-detail">
+This spins up a local API server (by default on port 8123) that mirrors the production LangGraph Platform API. You get the same REST endpoints, the same streaming behavior, and the same checkpointing&mdash;all running on your machine. It hot-reloads when you change your graph code, making the development loop fast.
+</p>
+
+<h3 data-anchor="ch07-rest-api">REST API Endpoints</h3>
+
+<p data-anchor="ch07-rest-api-intro">
+Whether running locally or in the cloud, LangGraph Platform exposes a consistent set of REST endpoints for interacting with your deployed graph. The most important ones are:
+</p>
+
+<ul data-anchor="ch07-rest-endpoints-list">
+  <li data-anchor="ch07-endpoint-runs"><code>POST /threads/{thread_id}/runs</code>&mdash;start a new graph run</li>
+  <li data-anchor="ch07-endpoint-stream"><code>POST /threads/{thread_id}/runs/stream</code>&mdash;start a run and stream results via server-sent events</li>
+  <li data-anchor="ch07-endpoint-state"><code>GET /threads/{thread_id}/state</code>&mdash;retrieve the current state of a thread</li>
+  <li data-anchor="ch07-endpoint-history"><code>GET /threads/{thread_id}/history</code>&mdash;fetch the state history for checkpointing and replay</li>
+  <li data-anchor="ch07-endpoint-create-thread"><code>POST /threads</code>&mdash;create a new thread (conversation)</li>
+</ul>
+
+<p data-anchor="ch07-rest-api-detail">
+The thread-based API is a natural fit for conversational applications. Each thread maintains its own checkpoint history, so separate conversations are isolated. You can also use the Python or JavaScript SDK to interact with these endpoints without constructing HTTP requests manually.
+</p>
+
+<p class="code-label" data-anchor="ch07-sdk-label">Using the LangGraph SDK to interact with a deployed graph</p>
+<pre data-anchor="ch07-sdk-block"><span class="kw">from</span> langgraph_sdk <span class="kw">import</span> get_client
+
+client = <span class="fn">get_client</span>(url=<span class="str">"http://localhost:8123"</span>)
+
+<span class="cm"># Create a thread</span>
+thread = <span class="kw">await</span> client.threads.<span class="fn">create</span>()
+
+<span class="cm"># Stream a run</span>
+<span class="kw">async for</span> chunk <span class="kw">in</span> client.runs.<span class="fn">stream</span>(
+    thread[<span class="str">"thread_id"</span>],
+    <span class="str">"qa_agent"</span>,  <span class="cm"># graph name from langgraph.json</span>
+    input={<span class="str">"question"</span>: <span class="str">"What is LangGraph?"</span>},
+    stream_mode=<span class="str">"updates"</span>
+):
+    <span class="fn">print</span>(chunk)</pre>
+
+<h3 data-anchor="ch07-deployment-options">Comparing Deployment Options</h3>
+
+<p data-anchor="ch07-deployment-options-intro">
+Your choice depends on your operational maturity, compliance requirements, and budget. Here is how the options compare:
+</p>
+
+<table data-anchor="ch07-deployment-table">
+  <caption data-anchor="ch07-deployment-caption">LangGraph deployment options comparison</caption>
+  <thead>
+    <tr>
+      <th data-anchor="ch07-deploy-th-option">Option</th>
+      <th data-anchor="ch07-deploy-th-hosting">Hosting</th>
+      <th data-anchor="ch07-deploy-th-effort">Operational effort</th>
+      <th data-anchor="ch07-deploy-th-scaling">Scaling</th>
+      <th data-anchor="ch07-deploy-th-best">Best for</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr data-anchor="ch07-deploy-cloud">
+      <td>LangGraph Cloud</td>
+      <td>Fully managed by LangChain</td>
+      <td>Minimal&mdash;deploy via GitHub</td>
+      <td>Automatic</td>
+      <td>Teams wanting fast iteration, no infra management</td>
+    </tr>
+    <tr data-anchor="ch07-deploy-self-hosted">
+      <td>Self-Hosted Platform</td>
+      <td>Your infrastructure (K8s, Docker)</td>
+      <td>Moderate&mdash;you manage containers</td>
+      <td>You configure</td>
+      <td>Compliance-sensitive orgs, data residency requirements</td>
+    </tr>
+    <tr data-anchor="ch07-deploy-byos">
+      <td>Bring Your Own Server</td>
+      <td>Any Python hosting (EC2, Cloud Run, etc.)</td>
+      <td>Higher&mdash;you handle everything</td>
+      <td>You manage</td>
+      <td>Existing infra, maximum control, simple graphs</td>
+    </tr>
+    <tr data-anchor="ch07-deploy-local">
+      <td>Local Dev Server</td>
+      <td>Your laptop via <code>langgraph dev</code></td>
+      <td>None</td>
+      <td>N/A</td>
+      <td>Development, testing, prototyping</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout note" data-anchor="ch07-callout-deploy">
+  <span class="callout-title" data-anchor="ch07-callout-deploy-title">Cloud vs. self-hosted</span>
+  <p data-anchor="ch07-callout-deploy-body">
+    LangGraph Cloud and the self-hosted platform run the same API server and support the same features&mdash;streaming, checkpointing, cron jobs, background runs, and double-texting handling. The difference is purely operational: who manages the infrastructure. If you start with Cloud, migrating to self-hosted later is straightforward because the API surface is identical.
+  </p>
+</div>
+
+<!-- ───────────────────── ERROR HANDLING ───────────────────── -->
+
+<h2 data-anchor="ch07-error-handling">Error Handling and Durable Execution</h2>
+
+<p data-anchor="ch07-error-handling-intro">
+LLM applications fail in ways that traditional software does not. API rate limits, transient network errors, model timeouts, and content filter rejections are all routine in production. LangGraph provides structured mechanisms for handling these failures without littering your node functions with try/except blocks.
+</p>
+
+<h3 data-anchor="ch07-retry-policy">RetryPolicy for Transient Failures</h3>
+
+<p data-anchor="ch07-retry-intro">
+The most common production failure is a transient API error&mdash;a 429 rate limit, a 503 service unavailable, or a network timeout. These resolve on their own if you wait and try again. LangGraph&rsquo;s <code>RetryPolicy</code> automates this pattern with configurable backoff.
+</p>
+
+<p class="code-label" data-anchor="ch07-retry-label">Configuring RetryPolicy on a node</p>
+<pre data-anchor="ch07-retry-block"><span class="kw">from</span> langgraph.pregel <span class="kw">import</span> RetryPolicy
+
+<span class="cm"># Define a retry policy with exponential backoff</span>
+retry = <span class="fn">RetryPolicy</span>(
+    max_attempts=<span class="num">3</span>,            <span class="cm"># Try up to 3 times total</span>
+    initial_interval=<span class="num">1.0</span>,      <span class="cm"># Wait 1 second before first retry</span>
+    backoff_factor=<span class="num">2.0</span>,        <span class="cm"># Double the wait each time: 1s, 2s</span>
+    max_interval=<span class="num">10.0</span>,         <span class="cm"># Never wait more than 10 seconds</span>
+    retry_on=<span class="kw">lambda</span> exc: <span class="fn">isinstance</span>(exc, (<span class="ty">TimeoutError</span>, <span class="ty">ConnectionError</span>))
+)
+
+graph = <span class="fn">StateGraph</span>(<span class="ty">State</span>)
+graph.<span class="fn">add_node</span>(
+    <span class="str">"call_llm"</span>,
+    call_llm_function,
+    retry=retry  <span class="cm"># Attach the retry policy to this node</span>
+)
+graph.<span class="fn">add_node</span>(
+    <span class="str">"search_web"</span>,
+    search_function,
+    retry=<span class="fn">RetryPolicy</span>(max_attempts=<span class="num">5</span>)  <span class="cm"># More retries for flaky APIs</span>
+)</pre>
+
+<p data-anchor="ch07-retry-detail">
+Notice the <code>retry_on</code> parameter. By default, <code>RetryPolicy</code> retries on any exception. In practice, you want to be more selective: retry on network errors and rate limits, but not on <code>ValueError</code> from your own code (that indicates a bug, not a transient failure). The <code>retry_on</code> callable receives the exception and returns <code>True</code> if a retry should be attempted.
+</p>
+
+<p data-anchor="ch07-retry-behavior">
+When a retry is triggered, LangGraph does not re-execute the entire graph&mdash;it only retries the specific node that failed. The rest of the graph&rsquo;s state remains intact thanks to checkpointing. If all retry attempts are exhausted, the exception propagates to the caller.
+</p>
+
+<h3 data-anchor="ch07-error-handlers">Error Handlers on Nodes</h3>
+
+<p data-anchor="ch07-error-handlers-intro">
+Sometimes retrying is not the right response. If an LLM call fails because the input is too long, retrying will fail every time. Instead, you want to catch the error and take an alternative path&mdash;maybe truncate the input, use a smaller model, or return a fallback response. LangGraph lets you attach error handlers at the node level.
+</p>
+
+<p class="code-label" data-anchor="ch07-error-handler-label">Error handler that provides a fallback response</p>
+<pre data-anchor="ch07-error-handler-block"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="kw">def</span> <span class="fn">generate_answer</span>(state: <span class="ty">State</span>) -> <span class="ty">dict</span>:
+    <span class="cm"># This might fail: context too long, model overloaded, etc.</span>
+    llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o"</span>)
+    response = llm.<span class="fn">invoke</span>(state[<span class="str">"prompt"</span>])
+    <span class="kw">return</span> {<span class="str">"answer"</span>: response.content}
+
+<span class="kw">def</span> <span class="fn">handle_generation_error</span>(state: <span class="ty">State</span>, error: <span class="ty">Exception</span>, config) -> <span class="ty">dict</span>:
+    <span class="cm"># Fallback: use a shorter prompt with a cheaper model</span>
+    <span class="fn">print</span>(<span class="str">f"Primary generation failed: </span>{error}<span class="str">"</span>)
+    llm = <span class="fn">ChatOpenAI</span>(model=<span class="str">"gpt-4o-mini"</span>)
+    short_prompt = state[<span class="str">"prompt"</span>][:<span class="num">2000</span>]  <span class="cm"># Truncate aggressively</span>
+    response = llm.<span class="fn">invoke</span>(short_prompt)
+    <span class="kw">return</span> {
+        <span class="str">"answer"</span>: response.content,
+        <span class="str">"used_fallback"</span>: <span class="kw">True</span>
+    }
+
+graph = <span class="fn">StateGraph</span>(<span class="ty">State</span>)
+graph.<span class="fn">add_node</span>(
+    <span class="str">"generate"</span>,
+    generate_answer,
+    error_handler=handle_generation_error
+)
+graph.<span class="fn">add_edge</span>(START, <span class="str">"generate"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, END)
+app = graph.<span class="fn">compile</span>()</pre>
+
+<p data-anchor="ch07-error-handler-detail">
+The error handler receives the same state the original node received, plus the exception that was raised and the config. It returns a state update just like a normal node function. From the graph&rsquo;s perspective, the node succeeded&mdash;the handler&rsquo;s return value replaces the failed node&rsquo;s output. This lets the rest of the graph continue executing normally.
+</p>
+
+<p data-anchor="ch07-error-handler-vs-retry">
+Error handlers and retry policies work together. If a node has both, retries are attempted first. Only after all retry attempts are exhausted does the error handler fire. This gives you a layered strategy: retry transient failures, then fall back gracefully for persistent ones.
+</p>
+
+<h3 data-anchor="ch07-timeout-policies">Timeout Policies</h3>
+
+<p data-anchor="ch07-timeout-intro">
+LLM calls can hang indefinitely if the provider has issues. A timeout prevents a single slow node from blocking your entire graph. You can set timeouts at the node level.
+</p>
+
+<p class="code-label" data-anchor="ch07-timeout-label">Setting a timeout on a node</p>
+<pre data-anchor="ch07-timeout-block">graph.<span class="fn">add_node</span>(
+    <span class="str">"slow_analysis"</span>,
+    analyze_documents,
+    retry=<span class="fn">RetryPolicy</span>(max_attempts=<span class="num">2</span>),
+    <span class="cm"># If the node doesn't complete within 30 seconds, it raises a TimeoutError</span>
+    metadata={<span class="str">"timeout"</span>: <span class="num">30</span>}
+)</pre>
+
+<p data-anchor="ch07-timeout-detail">
+When a timeout fires, the node raises a <code>TimeoutError</code>. If the node has a retry policy that covers <code>TimeoutError</code>, it will retry. If it has an error handler, the handler will fire after retries are exhausted. This creates a robust execution chain: try the node, time out if it hangs, retry a few times, fall back if it still fails.
+</p>
+
+<h3 data-anchor="ch07-durable-execution">Durable Execution</h3>
+
+<p data-anchor="ch07-durable-intro">
+Here is a scenario that keeps production engineers up at night: a multi-step agent is ten minutes into a complex task. It has called six tools, accumulated context, and is about to deliver the final answer. Then the container restarts. Without durable execution, the entire run is lost. The user has to start over.
+</p>
+
+<p data-anchor="ch07-durable-mechanism">
+LangGraph solves this through its checkpointing system, which you met in the chapter on persistence. In a production deployment, checkpointing is not just about human-in-the-loop workflows&mdash;it is the foundation of <strong>durable execution</strong>. After each node completes, the graph&rsquo;s full state is persisted to a checkpoint store (Postgres in production, SQLite for local development). If the process dies, the graph can resume from the last checkpoint rather than restarting from scratch.
+</p>
+
+<div class="callout key" data-anchor="ch07-callout-durable">
+  <span class="callout-title" data-anchor="ch07-callout-durable-title">Durable execution guarantees</span>
+  <p data-anchor="ch07-callout-durable-body">
+    Durable execution means your graph survives process restarts. LangGraph achieves this by checkpointing state after each node execution. When the graph resumes, it replays from the last successful checkpoint&mdash;nodes that already completed are skipped, and execution picks up exactly where it left off. This is critical for long-running agents that might take minutes or hours to complete. It also means that deploying new code does not kill in-flight runs: they continue from their last checkpoint on the new version of the container.
+  </p>
+</div>
+
+<p data-anchor="ch07-durable-setup">
+Durable execution requires no special configuration beyond having a persistent checkpointer. On LangGraph Platform, this is set up automatically with a PostgreSQL-backed store. For self-hosted deployments, you configure the checkpointer in your graph compilation.
+</p>
+
+<p class="code-label" data-anchor="ch07-durable-label">Compiling a graph with a persistent checkpointer</p>
+<pre data-anchor="ch07-durable-block"><span class="kw">from</span> langgraph.checkpoint.postgres <span class="kw">import</span> PostgresSaver
+
+<span class="cm"># Connect to your Postgres database</span>
+checkpointer = <span class="fn">PostgresSaver</span>.from_conn_string(
+    <span class="str">"postgresql://user:pass@localhost:5432/langgraph"</span>
+)
+
+<span class="cm"># Compile with the persistent checkpointer</span>
+app = graph.<span class="fn">compile</span>(checkpointer=checkpointer)
+
+<span class="cm"># Now every run is durable:</span>
+<span class="cm"># - State is saved after each node</span>
+<span class="cm"># - Runs survive process restarts</span>
+<span class="cm"># - You can resume from any checkpoint</span>
+config = {<span class="str">"configurable"</span>: {<span class="str">"thread_id"</span>: <span class="str">"user-123-session-1"</span>}}
+result = app.<span class="fn">invoke</span>(input_data, config=config)</pre>
+
+<p data-anchor="ch07-durable-resume">
+If the process crashes mid-run, you resume by invoking the same thread ID with <code>None</code> as input. The graph reads the last checkpoint, determines which node was executing, and resumes from there.
+</p>
+
+<p class="code-label" data-anchor="ch07-resume-label">Resuming a graph after a process restart</p>
+<pre data-anchor="ch07-resume-block"><span class="cm"># After process restart, resume with the same thread_id</span>
+config = {<span class="str">"configurable"</span>: {<span class="str">"thread_id"</span>: <span class="str">"user-123-session-1"</span>}}
+
+<span class="cm"># Pass None to resume from the last checkpoint</span>
+result = app.<span class="fn">invoke</span>(<span class="kw">None</span>, config=config)</pre>
+
+<h3 data-anchor="ch07-combining-patterns">Putting It All Together</h3>
+
+<p data-anchor="ch07-combining-intro">
+In a production graph, you combine all of these patterns. Each node gets a retry policy tuned to its specific failure modes, error handlers provide fallback behavior, timeouts prevent hangs, and the whole system is durably checkpointed so nothing is lost to infrastructure failures.
+</p>
+
+<p class="code-label" data-anchor="ch07-production-label">A production-ready graph with full error handling</p>
+<pre data-anchor="ch07-production-block"><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.pregel <span class="kw">import</span> RetryPolicy
+<span class="kw">from</span> langgraph.checkpoint.postgres <span class="kw">import</span> PostgresSaver
+
+<span class="cm"># Different retry policies for different failure profiles</span>
+llm_retry = <span class="fn">RetryPolicy</span>(
+    max_attempts=<span class="num">3</span>,
+    initial_interval=<span class="num">1.0</span>,
+    backoff_factor=<span class="num">2.0</span>,
+    max_interval=<span class="num">10.0</span>
+)
+
+api_retry = <span class="fn">RetryPolicy</span>(
+    max_attempts=<span class="num">5</span>,
+    initial_interval=<span class="num">0.5</span>,
+    backoff_factor=<span class="num">1.5</span>,
+    max_interval=<span class="num">30.0</span>
+)
+
+graph = <span class="fn">StateGraph</span>(<span class="ty">State</span>)
+
+graph.<span class="fn">add_node</span>(<span class="str">"retrieve"</span>, retrieve_docs, retry=api_retry)
+graph.<span class="fn">add_node</span>(
+    <span class="str">"generate"</span>,
+    generate_answer,
+    retry=llm_retry,
+    error_handler=fallback_generate
+)
+graph.<span class="fn">add_node</span>(<span class="str">"validate"</span>, validate_output)
+
+graph.<span class="fn">add_edge</span>(START, <span class="str">"retrieve"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"retrieve"</span>, <span class="str">"generate"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"generate"</span>, <span class="str">"validate"</span>)
+graph.<span class="fn">add_edge</span>(<span class="str">"validate"</span>, END)
+
+<span class="cm"># Durable checkpointing</span>
+checkpointer = <span class="fn">PostgresSaver</span>.from_conn_string(DB_URL)
+app = graph.<span class="fn">compile</span>(checkpointer=checkpointer)</pre>
+
+<!-- ───────────────────── BRINGING IT TOGETHER ───────────────────── -->
+
+<h2 data-anchor="ch07-production-checklist">A Production Readiness Checklist</h2>
+
+<p data-anchor="ch07-checklist-intro">
+Before you ship, walk through this list. Each item maps back to a pattern we covered in this chapter:
+</p>
+
+<ol data-anchor="ch07-checklist-list">
+  <li data-anchor="ch07-check-streaming"><strong>Streaming enabled</strong>&mdash;your API or UI uses <code>stream()</code> rather than <code>invoke()</code> for any user-facing interaction, so users see progress immediately</li>
+  <li data-anchor="ch07-check-tracing"><strong>Tracing configured</strong>&mdash;LangSmith environment variables are set, and you have tagged your runs with version and user metadata for searchability</li>
+  <li data-anchor="ch07-check-retry"><strong>Retry policies on external calls</strong>&mdash;every node that calls an LLM or external API has a <code>RetryPolicy</code> with appropriate backoff and exception filtering</li>
+  <li data-anchor="ch07-check-fallback"><strong>Error handlers for critical nodes</strong>&mdash;nodes where failure would break the user experience have fallback logic via error handlers</li>
+  <li data-anchor="ch07-check-timeout"><strong>Timeouts on slow nodes</strong>&mdash;nodes that call external services have timeouts to prevent indefinite hangs</li>
+  <li data-anchor="ch07-check-checkpoint"><strong>Persistent checkpointing</strong>&mdash;a PostgreSQL or equivalent checkpointer is configured so runs survive process restarts</li>
+  <li data-anchor="ch07-check-config"><strong>langgraph.json defined</strong>&mdash;your deployment configuration file exists and correctly references your graph</li>
+  <li data-anchor="ch07-check-testing"><strong>Local dev server tested</strong>&mdash;you have run <code>langgraph dev</code> and verified the REST API behaves as expected before deploying</li>
+</ol>
+
+<div class="callout warn" data-anchor="ch07-callout-idempotency">
+  <span class="callout-title" data-anchor="ch07-callout-idempotency-title">Side effects and retries</span>
+  <p data-anchor="ch07-callout-idempotency-body">
+    When you add retry policies, make sure your node functions are safe to call multiple times. If a node sends an email, charges a credit card, or writes to a database, a retry could duplicate that side effect. Either make these operations idempotent (using idempotency keys) or move side-effect-producing logic after the retry boundary. This is not a LangGraph-specific concern&mdash;it is the oldest lesson in distributed systems&mdash;but it catches people off guard when they first add retries to an LLM pipeline.
+  </p>
+</div>
+
+<!-- ───────────────────── CLOSING ───────────────────── -->
+
+<h2 data-anchor="ch07-summary">What You Have Learned</h2>
+
+<p data-anchor="ch07-summary-text">
+Production is not a single feature&mdash;it is a layer of patterns applied consistently. Streaming transforms user experience by showing work in progress rather than hiding behind a spinner. Observability with LangSmith gives you the ability to trace, debug, and understand what your graph does in the real world. Deployment options range from fully managed cloud to self-hosted infrastructure, all sharing the same API surface. And error handling&mdash;retry policies, error handlers, timeouts, and durable execution&mdash;ensures your graph keeps running even when the external services it depends on do not.
+</p>
+
+<p data-anchor="ch07-transition">
+With your graph production-ready, we can turn to a complete worked example. In the next chapter, we will build a full question-answering agent from scratch, applying every pattern from this book&mdash;state design, tool integration, human-in-the-loop, and the production patterns you just learned&mdash;to create something you could actually deploy.
+</p>
+
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav" data-anchor="ch07-nav">
+  <a rel="prev" href="06-multi-agent-systems.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-case-study-qa-agent.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+
+<!-- shelf-chip:begin (generated by build-library) -->
+<div class="bb-shelf-bar">
+<a class="bb-chip bb-shelf-chip" href="../../../index.html" title="Back to the Library (Esc)" aria-label="Back to the Library">&#8962; Library</a>
+<button type="button" class="bb-chip bb-share-chip" title="Share this book" aria-label="Share this book" hidden>&#8599; Share</button>
+</div>
+<style>
+.bb-shelf-bar{position:fixed;left:14px;bottom:12px;z-index:2147483000;display:flex;gap:8px}
+.bb-chip{
+  font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:#fff;background:rgba(20,18,15,.58);border:1px solid rgba(255,255,255,.28);
+  padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer;opacity:.35;
+  transition:opacity .2s ease;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.bb-chip:hover,.bb-chip:focus-visible,.bb-share-chip.is-copied{opacity:1}
+@media print{.bb-shelf-bar{display:none}}
+</style>
+<script>
+(function(){
+  var bar=document.querySelector('.bb-shelf-bar');if(!bar)return;
+  var lib=bar.querySelector('.bb-shelf-chip');
+  var share=bar.querySelector('.bb-share-chip');
+  if(location.protocol==='file:'){bar.style.display='none';return}
+  if(lib){
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Escape'||window.__bookbankNav||document.fullscreenElement)return;
+      location.href=lib.getAttribute('href');
+    });
+  }
+  if(share){
+    var canShare=typeof navigator.share==='function';
+    var canCopy=!!(navigator.clipboard&&navigator.clipboard.writeText);
+    if(!canShare&&!canCopy){share.remove();return}
+    share.hidden=false;
+    if(!canShare){share.title='Copy link to this book';share.setAttribute('aria-label','Copy link to this book');}
+    var idle=share.innerHTML;
+    share.addEventListener('click',function(){
+      var url=location.href;
+      var title=(document.title||'A BookBank book').replace(/\s+/g,' ').trim();
+      if(canShare){
+        navigator.share({title:title,text:title,url:url}).catch(function(){});
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function(){
+        share.classList.add('is-copied');
+        share.innerHTML='&#10003; Link copied';
+        setTimeout(function(){share.classList.remove('is-copied');share.innerHTML=idle;},1600);
+      }).catch(function(){});
+    });
+  }
+})();
+</script>
+<!-- shelf-chip:end -->
+
+</body>
+</html>
