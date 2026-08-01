@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reduce Allocations &middot; Performance Hints</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="performance-hints">
+
+<header class="book-bar">
+  <span class="bar-title">Performance Hints</span>
+  <span class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch8-kicker">Chapter Eight</p>
+    <h1 class="chapter-title" data-anchor="ch8-title">Reduce Allocations</h1>
+
+    <p class="lede" data-anchor="ch8-lede">
+      Allocation is the cost that hides best. It never has its own peak in a profile
+      because it is charged to a thousand different callers — which makes it the single
+      most likely explanation for the flat profile in Chapter Three.
+    </p>
+
+    <h2 data-anchor="ch8-h-three">One allocation, three bills</h2>
+
+    <p data-anchor="ch8-three-1">
+      When people say "allocation is slow" they usually mean the first of these. There
+      are three:
+    </p>
+
+    <ol data-anchor="ch8-three-list">
+      <li>
+        <strong>Time inside the allocator.</strong> Finding a free block, updating
+        bookkeeping, possibly taking a lock. The obvious one.
+      </li>
+      <li>
+        <strong>Initialization and destruction.</strong> The object gets constructed and
+        later destroyed, and for anything non-trivial that can dwarf the allocator time.
+      </li>
+      <li>
+        <strong>A bigger cache footprint.</strong> Each allocation typically lands on a
+        <em>new cache line</em>. Allocate a thousand small objects and you have scattered
+        your working set across a thousand lines that used to be somebody else's.
+      </li>
+    </ol>
+
+    <div class="callout key" data-anchor="ch8-callout-third">
+      <span class="callout-label">The one people forget</span>
+      <p>
+        The third bill is often the largest, and it is the one a microbenchmark of
+        <code>malloc</code> will never show you. It is not paid at the allocation site.
+        It is paid later, by whatever code has to walk that scattered data.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch8-h-unnecessary">Allocations you didn't need at all</h2>
+
+    <p data-anchor="ch8-unnec-1">
+      Start with the ones that produce nothing. A function returns a fresh empty object
+      each time it is asked for an empty object. Every caller gets its own identical
+      nothing.
+    </p>
+
+    <pre data-anchor="ch8-code-empty"><code><span class="kw">static</span> <span class="kw">const</span> <span class="ty">std</span>::<span class="ty">shared_ptr</span>&lt;<span class="ty">DeviceInfo</span>&gt;&amp; <span class="fn">empty_device_info</span>() {
+  <span class="kw">static</span> <span class="ty">std</span>::<span class="ty">shared_ptr</span>&lt;<span class="ty">DeviceInfo</span>&gt;* result =
+      <span class="kw">new</span> <span class="ty">std</span>::<span class="ty">shared_ptr</span>&lt;<span class="ty">DeviceInfo</span>&gt;(<span class="kw">new</span> <span class="ty">DeviceInfo</span>);
+  <span class="kw">return</span> *result;
+}</code></pre>
+
+    <p data-anchor="ch8-unnec-2">
+      One shared empty instance, handed out forever. In the document's benchmark this
+      change increased throughput by <strong>21%</strong> — from removing an allocation
+      whose result nobody was going to modify.
+    </p>
+
+    <p data-anchor="ch8-unnec-3">
+      The same shape recurs: use a <strong>statically-allocated zero vector</strong>
+      instead of allocating a vector and filling it with zeroes. Check whether the static
+      data suffices before you reach for the heap. It's a two-line guard, and in the
+      common case the heap never gets touched.
+    </p>
+
+    <h2 data-anchor="ch8-h-reserve">Size it once, not N times</h2>
+
+    <p data-anchor="ch8-res-1">
+      A vector grown by repeated <code>push_back</code> reallocates as it goes,
+      <em>copying everything it already holds</em> each time. If you know the final size —
+      and you usually do — say so.
+    </p>
+
+    <div class="callout warn" data-anchor="ch8-callout-quadratic">
+      <span class="callout-label">Read this one carefully</span>
+      <p>
+        Do <strong>not</strong> use <code>resize</code> or <code>reserve</code> to grow
+        one element at a time. Calling <code>reserve(n+1)</code> inside the loop can make
+        every step reallocate and copy — the exact quadratic behaviour you were trying to
+        avoid, now with the word "optimization" in the commit message. Reserve
+        <em>once</em>, outside the loop, with the total.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch8-h-copy">Don't copy what you can move, point at, or index</h2>
+
+    <p data-anchor="ch8-copy-1">
+      Prefer moves to copies. Store pointers or indices rather than copies of objects
+      (Chapter Six's indices, arriving from the other direction). And look hard at
+      pipelines that pass large buffers through several layers — each layer is a chance
+      for a copy nobody intended.
+    </p>
+
+    <p data-anchor="ch8-copy-2">
+      The document's example: a benchmark sending roughly 400&nbsp;KB tensors over gRPC
+      got about a <strong>10&ndash;15% speedup</strong> from eliminating one extra copy.
+      One. On data that was going to cross a network anyway.
+    </p>
+
+    <h2 data-anchor="ch8-h-reuse">Reuse the temporary</h2>
+
+    <p data-anchor="ch8-reuse-1">
+      A container declared inside a loop is allocated and freed on every iteration. Hoist
+      it out, clear it between iterations, and you allocate once for the whole loop —
+      and after the first few iterations its capacity has settled at the size the loop
+      actually needs, so even the clearing costs nothing.
+    </p>
+
+    <pre data-anchor="ch8-code-hoist"><code><span class="cm">// Allocates (and frees) once per iteration.</span>
+<span class="kw">for</span> (<span class="kw">const</span> <span class="kw">auto</span>&amp; row : rows) {
+  <span class="ty">Record</span> record;
+  <span class="fn">Fill</span>(&amp;record, row);
+  <span class="fn">Emit</span>(record);
+}
+
+<span class="cm">// Allocates once, reused. Same output, same readability.</span>
+<span class="ty">Record</span> record;
+<span class="kw">for</span> (<span class="kw">const</span> <span class="kw">auto</span>&amp; row : rows) {
+  record.<span class="fn">Clear</span>();
+  <span class="fn">Fill</span>(&amp;record, row);
+  <span class="fn">Emit</span>(record);
+}</code></pre>
+
+    <figure class="diagram-fig" data-anchor="ch8-fig-reuse">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="ch8-fig-t">
+        <title id="ch8-fig-t">Timeline comparison: allocating inside a loop gives one allocate-free pair per
+        iteration, while hoisting the buffer gives a single allocation reused across all iterations.</title>
+
+        <text class="big" x="14" y="20">Inside the loop</text>
+        <line class="stroke-soft" x1="14" y1="52" x2="546" y2="52"/>
+        <g>
+          <rect class="fill-red" x="30"  y="42" width="9" height="20"/>
+          <rect class="fill-red" x="98"  y="42" width="9" height="20"/>
+          <rect class="fill-red" x="166" y="42" width="9" height="20"/>
+          <rect class="fill-red" x="234" y="42" width="9" height="20"/>
+          <rect class="fill-red" x="302" y="42" width="9" height="20"/>
+          <rect class="fill-red" x="370" y="42" width="9" height="20"/>
+          <rect class="fill-red" x="438" y="42" width="9" height="20"/>
+          <rect class="fill-red" x="506" y="42" width="9" height="20"/>
+        </g>
+        <text class="red" x="14" y="80">one alloc + free per iteration</text>
+
+        <text class="big" x="14" y="108">Hoisted, cleared</text>
+        <line class="stroke-soft" x1="14" y1="126" x2="546" y2="126"/>
+        <rect class="fill-red" x="30" y="116" width="9" height="20"/>
+        <g>
+          <circle class="fill-soft" cx="102" cy="126" r="4"/>
+          <circle class="fill-soft" cx="170" cy="126" r="4"/>
+          <circle class="fill-soft" cx="238" cy="126" r="4"/>
+          <circle class="fill-soft" cx="306" cy="126" r="4"/>
+          <circle class="fill-soft" cx="374" cy="126" r="4"/>
+          <circle class="fill-soft" cx="442" cy="126" r="4"/>
+          <circle class="fill-soft" cx="510" cy="126" r="4"/>
+        </g>
+        <text class="dim" x="60" y="146">one alloc, then Clear() &mdash; capacity already right</text>
+      </svg>
+      <figcaption>
+        The loop body is unchanged. Only the lifetime of the buffer moved.
+      </figcaption>
+    </figure>
+
+    <p data-anchor="ch8-reuse-2">
+      The same idea crosses an API boundary as a <strong>scratch parameter</strong>: a
+      function that serializes into a caller-supplied string, rather than returning a
+      fresh one, lets the caller reuse one buffer across thousands of calls. It looks
+      slightly less elegant in the signature and it removes thousands of allocations,
+      which is a trade the hot path is happy to make. (Note the connection to Chapter
+      Four: once again, the win is available only because the interface exposes it.)
+    </p>
+
+    <h2 data-anchor="ch8-h-finding">Finding them</h2>
+
+    <p data-anchor="ch8-find-1">
+      Since allocation cost doesn't concentrate into a peak, don't hunt it with a CPU
+      profile. Use an <strong>allocation profile</strong>: it counts allocations by call
+      site, which turns a diffuse cost into a ranked list. This is why "reduce allocation
+      counts via allocation profiling" appeared in Chapter Three's list of moves for a
+      flat profile — it is the instrument that makes the invisible cost visible.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-cheaper-containers.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-avoid-unnecessary-work.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

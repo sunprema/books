@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Better Memory Representation &middot; Performance Hints</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="performance-hints">
+
+<header class="book-bar">
+  <span class="bar-title">Performance Hints</span>
+  <span class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch6-kicker">Chapter Six</p>
+    <h1 class="chapter-title" data-anchor="ch6-title">Better Memory Representation</h1>
+
+    <p class="lede" data-anchor="ch6-lede">
+      Look back at the table in Chapter Two: main memory is a hundred times an L1 hit. On
+      a modern machine most programs are not computing — they are waiting for bytes to
+      arrive. Which means that how your data <em>sits</em> is often more important than
+      what you do to it.
+    </p>
+
+    <h2 data-anchor="ch6-h-compact">Smaller is faster, for a physical reason</h2>
+
+    <p data-anchor="ch6-compact-1">
+      The document's phrasing is precise, so here it is: use compact representations for
+      data that is accessed often or that makes up a large portion of the application's
+      memory, because a compact representation <em>touches fewer cache lines and uses less
+      memory-bus bandwidth</em>.
+    </p>
+
+    <p data-anchor="ch6-compact-2">
+      That's the whole mechanism, and it's worth sitting with because it explains
+      everything else in this chapter. Memory does not arrive a byte at a time. It
+      arrives in cache lines. If the four bytes you need live in a struct of 64 bytes,
+      you paid for 64 bytes. Halve the struct and you fit twice as many per line — the
+      same loop now does half as many trips to memory, having changed no logic at all.
+    </p>
+
+    <div class="callout warn" data-anchor="ch6-callout-contention">
+      <span class="callout-label">The counter-indication</span>
+      <p>
+        Packing has a failure mode: <strong>cache-line contention</strong>. Squeeze fields
+        that different threads <em>write</em> onto one line and those cores now fight over
+        it, invalidating each other's copies. You made the struct smaller and the program
+        slower. Compaction is for data that is read together, not for data that is
+        written apart.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch6-h-padding">Field order, and the holes you didn't know about</h2>
+
+    <p data-anchor="ch6-padding-1">
+      Here's a thing that surprises people the first time. The compiler aligns fields, so
+      declaration order changes <code>sizeof</code>. Not the semantics — just the size,
+      silently, for free, in either direction.
+    </p>
+
+    <pre data-anchor="ch6-code-padding"><code><span class="cm">// Alternating sizes: the compiler inserts padding to keep alignment.</span>
+<span class="kw">struct</span> <span class="ty">Entry</span> {
+  <span class="ty">uint8_t</span>  kind;      <span class="cm">// 1 byte, then 7 bytes of padding</span>
+  <span class="ty">uint64_t</span> offset;    <span class="cm">// 8</span>
+  <span class="ty">uint8_t</span>  flags;     <span class="cm">// 1 byte, then 7 more bytes of padding</span>
+  <span class="ty">uint64_t</span> length;    <span class="cm">// 8</span>
+};                     <span class="cm">// 32 bytes, 14 of them nothing at all</span>
+
+<span class="cm">// Same fields, grouped by alignment.</span>
+<span class="kw">struct</span> <span class="ty">Entry</span> {
+  <span class="ty">uint64_t</span> offset;    <span class="cm">// 8</span>
+  <span class="ty">uint64_t</span> length;    <span class="cm">// 8</span>
+  <span class="ty">uint8_t</span>  kind;      <span class="cm">// 1</span>
+  <span class="ty">uint8_t</span>  flags;     <span class="cm">// 1, then 6 bytes of tail padding</span>
+};                     <span class="cm">// 24 bytes</span></code></pre>
+
+    <p data-anchor="ch6-padding-2">
+      A quarter of the memory gone, and the diff is a reordering. If you have a hundred
+      million of these, that is 800&nbsp;MB you were storing for the sake of alignment
+      rules.
+    </p>
+
+    <p data-anchor="ch6-padding-3">
+      Two smaller moves in the same family. Use a smaller numeric type when the values
+      fit — <code>uint8_t</code> instead of <code>int</code> for something that never
+      exceeds 200. And give enums an explicit underlying type, because otherwise they
+      are int-width:
+    </p>
+
+    <pre data-anchor="ch6-code-enum"><code><span class="kw">enum class</span> <span class="ty">OpType</span> { kAdd, kMul, kLoad, kStore };            <span class="cm">// 4 bytes</span>
+<span class="kw">enum class</span> <span class="ty">OpType</span> : <span class="ty">uint8_t</span> { kAdd, kMul, kLoad, kStore }; <span class="cm">// 1 byte</span></code></pre>
+
+    <h2 data-anchor="ch6-h-hotcold">Hot next to hot, cold somewhere else</h2>
+
+    <p data-anchor="ch6-hotcold-1">
+      Size is only half of it. <em>Neighbourhood</em> is the other half, and there are
+      three separate rules hiding in it.
+    </p>
+
+    <ol data-anchor="ch6-hotcold-list">
+      <li>
+        <strong>Put frequently-accessed fields together.</strong> If the common operation
+        touches four fields, having them adjacent means one cache line served the whole
+        operation instead of four.
+      </li>
+      <li>
+        <strong>Separate hot read-only fields from hot mutable ones.</strong> This is the
+        subtle one. A field that is written constantly, sharing a line with fields that
+        are only read, drags those read-only fields out of every other core's cache on
+        every write. Split them and the read-only line stays valid everywhere.
+      </li>
+      <li>
+        <strong>Move cold data out of the way</strong> — to the end of the struct, behind
+        an indirection, or into a separate parallel array. A debug string that is used
+        once a week should not be occupying the cache line your inner loop needs.
+      </li>
+    </ol>
+
+    <figure class="diagram-fig" data-anchor="ch6-fig-lines">
+      <svg class="diagram" viewBox="0 0 560 178" role="img" aria-labelledby="ch6-fig-t">
+        <title id="ch6-fig-t">Before and after: hot fields scattered among cold ones require four cache lines
+        per operation; grouping the hot fields together requires one.</title>
+
+        <text class="big" x="14" y="20">Scattered: 4 lines fetched</text>
+        <g>
+          <rect class="stroke-soft fill-none" x="14" y="30" width="120" height="20"/>
+          <rect class="fill-red" x="16" y="32" width="16" height="16"/>
+          <rect class="fill-soft" x="34" y="32" width="98" height="16"/>
+          <rect class="stroke-soft fill-none" x="14" y="54" width="120" height="20"/>
+          <rect class="fill-red" x="16" y="56" width="16" height="16"/>
+          <rect class="fill-soft" x="34" y="56" width="98" height="16"/>
+          <rect class="stroke-soft fill-none" x="14" y="78" width="120" height="20"/>
+          <rect class="fill-red" x="16" y="80" width="16" height="16"/>
+          <rect class="fill-soft" x="34" y="80" width="98" height="16"/>
+          <rect class="stroke-soft fill-none" x="14" y="102" width="120" height="20"/>
+          <rect class="fill-red" x="16" y="104" width="16" height="16"/>
+          <rect class="fill-soft" x="34" y="104" width="98" height="16"/>
+        </g>
+        <text class="dim" x="146" y="44">hot field</text>
+        <text class="dim" x="146" y="68">hot field</text>
+        <text class="dim" x="146" y="92">hot field</text>
+        <text class="dim" x="146" y="116">hot field</text>
+        <text class="red" x="14" y="140">4 &times; ~50 ns</text>
+
+        <text class="big" x="306" y="20">Grouped: 1 line fetched</text>
+        <rect class="stroke-red fill-none" x="306" y="30" width="120" height="20"/>
+        <rect class="fill-red" x="308" y="32" width="64" height="16"/>
+        <rect class="fill-soft" x="374" y="32" width="50" height="16"/>
+        <rect class="stroke-soft fill-none" x="306" y="54" width="120" height="20"/>
+        <rect class="fill-soft" x="308" y="56" width="116" height="16"/>
+        <rect class="stroke-soft fill-none" x="306" y="78" width="120" height="20"/>
+        <rect class="fill-soft" x="308" y="80" width="116" height="16"/>
+        <rect class="stroke-soft fill-none" x="306" y="102" width="120" height="20"/>
+        <rect class="fill-soft" x="308" y="104" width="116" height="16"/>
+        <text class="dim" x="438" y="44">all four hot fields</text>
+        <text class="dim" x="438" y="92">cold data</text>
+        <text class="red" x="306" y="140">1 &times; ~50 ns</text>
+
+        <text class="dim" x="14" y="166">Same struct, same fields, same total bytes &mdash; only the order changed.</text>
+      </svg>
+      <figcaption>
+        The operation didn't get smarter. It stopped waiting three extra times.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ch6-h-indices">Indices instead of pointers</h2>
+
+    <p data-anchor="ch6-idx-1">
+      On a 64-bit machine, a pointer costs 64 bits. A pointer-rich structure — a graph, a
+      tree, a linked anything — can spend most of its memory on addresses rather than on
+      data. The alternative is to keep the elements in an array and refer to them by
+      index.
+    </p>
+
+    <p data-anchor="ch6-idx-2">
+      You get two wins at once, and the second is the bigger one:
+    </p>
+
+    <ul data-anchor="ch6-idx-list">
+      <li>
+        <strong>The reference shrinks.</strong> If you'll never have more than four
+        billion elements, a <code>uint32_t</code> index halves it. If you'll never have
+        more than 65,536, a <code>uint16_t</code> quarters it.
+      </li>
+      <li>
+        <strong>The elements become contiguous.</strong> This is the real prize. Nodes
+        reached by pointer are scattered wherever the allocator put them, so traversal is
+        a sequence of unpredictable jumps — a cache miss each. Nodes in an array sit next
+        to each other, so the hardware prefetcher can see you coming and the data is
+        already there.
+      </li>
+    </ul>
+
+    <div class="callout key" data-anchor="ch6-callout-summary">
+      <span class="callout-label">The through-line</span>
+      <p>
+        Compact it, order it so the hot fields share a line, move the cold parts away, and
+        use indices so the elements are contiguous. Four different techniques, one
+        underlying goal: <strong>touch fewer cache lines</strong>. Every memory hint in
+        this book is a restatement of that sentence.
+      </p>
+    </div>
+
+    <p data-anchor="ch6-outro">
+      One more note before the next chapter. Bit- and byte-level encodings can shrink
+      things dramatically, and the document endorses them — with two conditions. Keep them
+      behind a well-tested encapsulation boundary, so the cleverness is in one file rather
+      than smeared across the codebase, and validate the win with benchmarks rather than
+      with reasoning. A hand-packed representation that saves memory and costs more
+      decode time than it saves is entirely possible, and you will not know which you
+      built until you measure.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-algorithmic-improvements.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-cheaper-containers.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
