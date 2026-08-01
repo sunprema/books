@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Shape of an Interface &middot; Performance Hints</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="performance-hints">
+
+<header class="book-bar">
+  <span class="bar-title">Performance Hints</span>
+  <span class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch4-kicker">Chapter Four</p>
+    <h1 class="chapter-title" data-anchor="ch4-title">The Shape of an Interface</h1>
+
+    <p class="lede" data-anchor="ch4-lede">
+      An interface is a promise about what is possible. Get the shape wrong and you have
+      promised your callers a slow program — and worse, you have made it impossible for
+      them to fix, because the waste is on your side of the line.
+    </p>
+
+    <h2 data-anchor="ch4-h-bulk">Bulk APIs: cross the boundary once</h2>
+
+    <p data-anchor="ch4-bulk-1">
+      Start with the simplest observation. Every call across an API boundary costs
+      something — a call, maybe a lock, maybe a check, maybe a cache miss on the
+      callee's state. If a caller needs a thousand things, a singular interface makes
+      them pay that fixed cost a thousand times.
+    </p>
+
+    <p data-anchor="ch4-bulk-2">
+      Look at what happens to the lock in a bulk delete:
+    </p>
+
+    <pre data-anchor="ch4-code-bulk"><code><span class="kw">template</span> &lt;<span class="kw">typename</span> <span class="ty">T</span>&gt;
+<span class="ty">absl</span>::<span class="ty">Status</span> <span class="ty">ObjectStore</span>&lt;<span class="ty">T</span>&gt;::<span class="fn">DeleteRefs</span>(<span class="ty">absl</span>::<span class="ty">Span</span>&lt;<span class="kw">const</span> <span class="ty">Ref</span>&gt; refs) {
+  <span class="ty">util</span>::<span class="ty">Status</span> result;
+  <span class="ty">absl</span>::<span class="ty">MutexLock</span> l(&amp;mu_);          <span class="cm">// once, for the whole batch</span>
+  <span class="kw">for</span> (<span class="kw">auto</span> ref : refs) {
+    result.<span class="fn">Update</span>(<span class="fn">DeleteRefLocked</span>(ref));
+  }
+  <span class="kw">return</span> result;
+}</code></pre>
+
+    <p data-anchor="ch4-bulk-3">
+      One mutex acquisition instead of N. At 15&nbsp;ns per uncontended lock/unlock — and
+      far worse under contention — a batch of a thousand just gave back fifteen
+      microseconds and, more importantly, stopped a thousand threads from queueing at the
+      same door.
+    </p>
+
+    <p data-anchor="ch4-bulk-4">
+      But the amortized lock is the small win. The <strong>real</strong> win is that a
+      bulk interface tells you something a singular one cannot: what the caller wants in
+      total. That unlocks algorithmic improvements the one-at-a-time version has no way
+      to reach. A <code>LookupMany</code> can sort the keys, or probe them in an order
+      that plays well with the cache, or notice that they share a prefix. It can even
+      simplify its own return type — if clients only need to know whether <em>all</em>
+      the keys were found, the bulk call returns one boolean where the singular one
+      returned a thousand results nobody examined individually.
+    </p>
+
+    <div class="callout key" data-anchor="ch4-callout-bulk">
+      <span class="callout-label">The general principle</span>
+      <p>
+        A singular API forces the callee to be ignorant. It can never do better than
+        handling one request at a time, because one request at a time is all it is ever
+        told about.
+      </p>
+    </div>
+
+    <p data-anchor="ch4-bulk-5">
+      And if converting the callers is too big a job? The document's pragmatic answer:
+      use the bulk operation <em>internally</em> and cache the results to serve the
+      singular calls that follow. The caller keeps its loop; you stop paying for it.
+    </p>
+
+    <h2 data-anchor="ch4-h-views">View types: stop copying at the door</h2>
+
+    <p data-anchor="ch4-views-1">
+      The second move is almost free and pays constantly. Prefer <strong>view
+      types</strong> for function arguments: <code>std::string_view</code>,
+      <code>absl::Span&lt;T&gt;</code>, <code>absl::FunctionRef&lt;R(Args...)&gt;</code>.
+    </p>
+
+    <p data-anchor="ch4-views-2">
+      Two things happen at once. The copy disappears — you take a pointer and a length
+      instead of duplicating the bytes. And the caller is freed: a function taking
+      <code>Span&lt;const int&gt;</code> accepts a vector, an array, an inlined vector, a
+      slice of any of them. A function taking <code>const std::vector&lt;int&gt;&amp;</code>
+      quietly demands that everyone build a vector first, and some of them will, at cost,
+      just to call you.
+    </p>
+
+    <figure class="diagram-fig" data-anchor="ch4-fig-view">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="ch4-fig-t">
+        <title id="ch4-fig-t">Taking a concrete container forces the caller to materialize a copy;
+        taking a view type points at the caller's existing bytes.</title>
+
+        <text class="big" x="14" y="20">const std::vector&lt;T&gt;&amp;</text>
+        <rect class="stroke-soft fill-soft" x="14" y="30" width="86" height="34" rx="3"/>
+        <text class="dim" x="24" y="50">caller data</text>
+        <path class="stroke-red" d="M104 47 L146 47"/>
+        <path class="fill-red" d="M146 43 l8 4 -8 4 z"/>
+        <rect class="stroke-red fill-none" x="158" y="30" width="86" height="34" rx="3"/>
+        <text class="red" x="168" y="50">a copy</text>
+        <text class="dim" x="14" y="80">bytes duplicated to satisfy the signature</text>
+
+        <text class="big" x="306" y="20">absl::Span&lt;const T&gt;</text>
+        <rect class="stroke-soft fill-soft" x="306" y="30" width="86" height="34" rx="3"/>
+        <text class="dim" x="316" y="50">caller data</text>
+        <path class="stroke dash" d="M450 47 L400 47"/>
+        <path class="fill-ink" d="M400 43 l-8 4 8 4 z"/>
+        <rect class="stroke-soft fill-none" x="450" y="30" width="96" height="34" rx="3"/>
+        <text class="dim" x="460" y="50">ptr + length</text>
+        <text class="dim" x="306" y="80">nothing moves; any container works</text>
+
+        <line class="stroke-soft" x1="14" y1="102" x2="546" y2="102"/>
+        <text class="dim" x="14" y="122">The copy on the left is invisible in the callee's profile &mdash;</text>
+        <text class="dim" x="14" y="138">it is charged to whoever was forced to make it.</text>
+      </svg>
+      <figcaption>
+        A signature is a bill you send to your callers. View types send a smaller one.
+      </figcaption>
+    </figure>
+
+    <h2 data-anchor="ch4-h-precomputed">Let the caller pass what it already has</h2>
+
+    <p data-anchor="ch4-pre-1">
+      Sometimes the callee recomputes something the caller was already holding. The clock
+      is the classic case: a stats-recording function reads the wall clock, and it is
+      being called from a loop that already knows the time.
+    </p>
+
+    <pre data-anchor="ch4-code-precomputed"><code><span class="kw">static</span> <span class="kw">void</span> <span class="fn">RecordRPC</span>(<span class="kw">const</span> <span class="ty">Name</span> &amp;name, <span class="kw">const</span> <span class="ty">RPC_Stats_Measurement</span>&amp; m,
+                      <span class="ty">WallTime</span> now);   <span class="cm">// caller passes the reading it has</span></code></pre>
+
+    <p data-anchor="ch4-pre-2">
+      One parameter, and a clock read per call disappears. The pattern generalizes to
+      anything the caller plausibly has in hand: a hash it already computed, a length it
+      already knows, a lookup it already did. The signature is the place where you find
+      out.
+    </p>
+
+    <h2 data-anchor="ch4-h-thread">Thread-compatible, not thread-safe</h2>
+
+    <p data-anchor="ch4-thread-1">
+      The last one is the most counter-intuitive, because it sounds like an argument
+      against safety. It isn't.
+    </p>
+
+    <p data-anchor="ch4-thread-2">
+      Most types should be <strong>thread-compatible</strong> — safe to use from multiple
+      threads provided the caller synchronizes externally — rather than
+      <strong>thread-safe</strong>, which means the type locks internally on every
+      operation. The reason is simple arithmetic: if the type locks internally, then
+      <em>every</em> caller pays for synchronization, including the overwhelming majority
+      that use it from one thread, or that already hold a lock covering the whole
+      operation.
+    </p>
+
+    <pre data-anchor="ch4-code-thread"><code><span class="cm">// Callers were already externally synchronized, so the lock was pure tax.</span>
+<span class="ty">TransferPhase</span> <span class="ty">HitlessTransferPhase</span>::<span class="fn">get</span>() <span class="kw">const</span> { <span class="kw">return</span> phase_; }</code></pre>
+
+    <p data-anchor="ch4-thread-3">
+      There is a genuine flip side, and the document states it: when synchronization is
+      needed almost every time anyway, <em>move it inside the type</em>. Then the type
+      owns the locking and can optimize it — a finer-grained scheme, a lock-free fast
+      path, a sharded mutex — without a single caller changing. The question isn't
+      "safe or fast". It's "who is in a position to know what synchronization is
+      actually needed here", and you should put the lock where that knowledge lives.
+    </p>
+
+    <div class="callout warn" data-anchor="ch4-callout-frozen">
+      <span class="callout-label">Why this chapter comes first</span>
+      <p>
+        Every other chapter in this book describes a change you can make later, behind
+        your interface, without telling anyone. This one describes changes that become
+        migrations the moment your interface has users. Get the shape right while it is
+        still cheap.
+      </p>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-measurement.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-algorithmic-improvements.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

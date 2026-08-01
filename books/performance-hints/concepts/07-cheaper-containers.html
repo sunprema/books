@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheaper Containers &middot; Performance Hints</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="performance-hints">
+
+<header class="book-bar">
+  <span class="bar-title">Performance Hints</span>
+  <span class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <p class="kicker" data-anchor="ch7-kicker">Chapter Seven</p>
+    <h1 class="chapter-title" data-anchor="ch7-title">Cheaper Containers</h1>
+
+    <p class="lede" data-anchor="ch7-lede">
+      The previous chapter was about the shape of one object. This one is about the shape
+      of a collection of them — which is where the same cache-line argument stops being a
+      micro-optimization and starts being worth tens of percent.
+    </p>
+
+    <h2 data-anchor="ch7-h-batched">Batched storage: stop allocating per element</h2>
+
+    <p data-anchor="ch7-batched-1">
+      A node-based container — <code>std::map</code>, <code>std::unordered_map</code>,
+      <code>std::list</code> — allocates a separate object for every element. Two costs
+      follow from that, and they compound:
+    </p>
+
+    <ul data-anchor="ch7-batched-list">
+      <li><strong>Allocator overhead per element</strong>, paid on every insert and every erase.</li>
+      <li>
+        <strong>Terrible cache behaviour</strong>, because the elements end up wherever
+        the allocator had room. Iterating a node-based map is a tour of your heap: each
+        step is a jump the prefetcher cannot anticipate, which is a main-memory reference
+        that Chapter Two priced at 50&nbsp;ns.
+      </li>
+    </ul>
+
+    <p data-anchor="ch7-batched-2">
+      The flat alternatives — <code>std::vector</code>,
+      <code>absl::flat_hash_map</code>, <code>absl::flat_hash_set</code> — store many
+      elements contiguously. One allocation covers many elements, and iteration walks
+      straight down memory in exactly the pattern the hardware is built to accelerate.
+    </p>
+
+    <p data-anchor="ch7-batched-3">
+      Where a fully flat structure isn't viable, chunking gets you most of the way:
+      partition elements into fixed-size chunks. You keep the asymptotic behaviour that
+      made you want the structure, and you cut the cache footprint because each chunk is
+      contiguous.
+    </p>
+
+    <h2 data-anchor="ch7-h-inlined">Inlined storage: the allocation that never happens</h2>
+
+    <p data-anchor="ch7-inlined-1">
+      Now consider the very common case where a container holds three elements. A
+      <code>std::vector</code> still heap-allocates for those three. An
+      <code>InlinedVector</code> embeds space for a small number of elements directly
+      inside the object, so a small collection costs zero allocations.
+    </p>
+
+    <p data-anchor="ch7-inlined-2">
+      This pays best in exactly two situations, and it's worth knowing which you're in:
+      when instances are frequently constructed as stack variables (the allocation and
+      free were the entire cost of a short-lived object), and when very many instances
+      exist at once (you removed one allocation each, a million times).
+    </p>
+
+    <div class="callout warn" data-anchor="ch7-callout-inlined">
+      <span class="callout-label">The counter-indication</span>
+      <p>
+        Large <code>sizeof(T)</code> ruins it. Inline capacity for 4 elements of a
+        200-byte type makes every instance 800 bytes, whether it holds anything or not —
+        including the ones you store a million of, and including the ones that are empty.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch7-h-nested">Flatten unnecessarily nested maps</h2>
+
+    <p data-anchor="ch7-nested-1">
+      A map of maps looks natural in the domain and is often wasteful in the machine.
+      Every lookup is two lookups: hash or compare the outer key, land on an inner
+      container (probably a cache miss), then hash or compare again. And every inner
+      container carries its own bookkeeping.
+    </p>
+
+    <pre data-anchor="ch7-code-nested"><code><span class="cm">// Two levels: two lookups, and one inner map's overhead per outer key.</span>
+<span class="ty">absl</span>::<span class="ty">btree_map</span>&lt;<span class="ty">std</span>::<span class="ty">string</span>, <span class="ty">absl</span>::<span class="ty">btree_map</span>&lt;<span class="ty">std</span>::<span class="ty">string</span>, <span class="ty">OpDef</span>&gt;&gt; ops;
+
+<span class="cm">// One level, compound key: one lookup, views instead of strings,</span>
+<span class="cm">// and a pointer instead of a stored OpDef.</span>
+<span class="ty">absl</span>::<span class="ty">btree_map</span>&lt;<span class="ty">std</span>::<span class="ty">pair</span>&lt;<span class="ty">absl</span>::<span class="ty">string_view</span>, <span class="ty">absl</span>::<span class="ty">string_view</span>&gt;,
+                <span class="kw">const</span> <span class="ty">OpDef</span>*&gt; ops;</code></pre>
+
+    <p data-anchor="ch7-nested-2">
+      Look at how much that one line changed. The double lookup collapsed to one. The
+      owned strings became views. The stored value became a pointer. Three separate wins
+      from asking "does this actually need to be two structures?"
+    </p>
+
+    <div class="callout warn" data-anchor="ch7-callout-nested">
+      <span class="callout-label">The counter-indication</span>
+      <p>
+        If the first key is large, the nested form may win: nesting stores that key
+        <em>once</em> for all its children, while flattening repeats it in every compound
+        key. Measure with your real key sizes and your real fan-out.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch7-h-arenas">Arenas</h2>
+
+    <p data-anchor="ch7-arena-1">
+      An arena allocates a big block up front and hands out pieces of it, then frees the
+      whole block at once. Three things get cheaper: allocation becomes a pointer bump;
+      independently-allocated items land in <em>fewer cache lines</em> because they are
+      adjacent; and destruction of the individual objects goes away entirely — you drop
+      the block.
+    </p>
+
+    <p data-anchor="ch7-arena-2">
+      Arenas suit complex data structures with many sub-objects — a parsed message, an
+      expression tree, a request's whole working set. Give the arena a sensible initial
+      size, or you will spend the win on growing it.
+    </p>
+
+    <div class="callout warn" data-anchor="ch7-callout-arena">
+      <span class="callout-label">The counter-indication</span>
+      <p>
+        Do not put many short-lived objects into a long-lived arena. Nothing is reclaimed
+        until the arena dies, so a request-scoped allocation in a process-scoped arena is
+        a leak wearing a very respectable hat.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch7-h-arrays">When the map was an array all along</h2>
+
+    <p data-anchor="ch7-arrays-1">
+      Here is my favourite hint in the whole document, because the fix is so much simpler
+      than the thing it replaces. If a map's keys are small integers or enum values — or
+      if the map only ever holds a handful of entries — a plain array or vector usually
+      beats it outright.
+    </p>
+
+    <pre data-anchor="ch7-code-array"><code><span class="cm">// Keys are RTP payload types: 0..127. This was never really a map.</span>
+<span class="cm">// const gtl::flat_map&lt;int, int&gt; payload_type_to_clock_frequency_;</span>
+<span class="ty">int</span> payload_type_to_clock_frequency_[<span class="num">128</span>];</code></pre>
+
+    <p data-anchor="ch7-arrays-2">
+      Count what vanished: the hash computation, the probe sequence, the load-factor
+      bookkeeping, the node allocations, the pointer chase. What replaced all of it is a
+      single indexed load — and 128 ints is 512 bytes, which is a rounding error. For
+      genuinely tiny maps the same logic applies with linear search: scanning six
+      contiguous entries beats hashing one, because the six live in a single cache line
+      and the hash does not.
+    </p>
+
+    <h2 data-anchor="ch7-h-bits">Bit vectors instead of sets</h2>
+
+    <p data-anchor="ch7-bits-1">
+      Same idea, applied to sets. If your set's domain is small integers, a bit vector
+      represents membership in one bit per possible element. Two hundred and fifty-six
+      possible members fit in 32 bytes — half a cache line for the entire set.
+    </p>
+
+    <p data-anchor="ch7-bits-2">
+      And the set operations become single instructions on machine words: union is
+      <strong>OR</strong>, intersection is <strong>AND</strong>. Where a hash set would
+      iterate one side and probe the other, the bit vector does 64 elements per
+      instruction.
+    </p>
+
+    <div class="callout key" data-anchor="ch7-callout-bits">
+      <span class="callout-label">Measured</span>
+      <p>
+        Replacing <code>dense_hash_set&lt;ZoneId&gt;</code> with
+        <code>util::bitmap::InlinedBitVector&lt;256&gt;</code> gave
+        <strong>26&ndash;31% improvements</strong> across benchmarks. Not the inner loop —
+        the benchmarks. That is what changing a representation can be worth.
+      </p>
+    </div>
+
+    <p data-anchor="ch7-bits-3">
+      The document takes the trick a step further with bit <em>matrices</em>: tracking
+      reachability between operands as a matrix of bits rather than as
+      <code>std::unordered_map&lt;const HloInstruction*, std::unordered_set&lt;const
+      HloInstruction*&gt;&gt;</code>. Read that type out loud and you can hear the cache
+      misses. The bit matrix answers the same question with an indexed bit test.
+    </p>
+
+    <p data-anchor="ch7-outro">
+      Notice that every hint in this chapter is the same question asked about a different
+      container: <em>does the structure I reached for by habit match what this data
+      actually is?</em> Small dense integer keys are an array. Small-domain membership is
+      a bit vector. Two keys are one compound key. A few elements are a flat scan. The
+      general-purpose container is the right default precisely because it makes no
+      assumptions — which means that when you <em>do</em> know something, you are paying
+      for ignorance you no longer have.
+    </p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-memory-layout.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-reduce-allocations.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
