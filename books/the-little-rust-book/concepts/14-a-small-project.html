@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Small Project — The Little Rust Book</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="the-little-rust-book">
+
+<div class="leaf-rule"></div>
+<div class="book-topbar">
+  <span>The Little Rust Book</span>
+  <span class="tb-links">
+    <a href="../index.html" rel="home">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open" data-anchor="ch13-open">
+      <span class="chapter-num">13</span>
+      <p class="kicker">Chapter thirteen</p>
+      <h1>A Small Project</h1>
+    </div>
+
+    <p class="lede" data-anchor="ch13-lede">
+      Let's build one thing end to end: <code>logstat</code>, a command-line
+      tool that reads a log file and reports how many lines hit each status
+      code. Small enough to hold in your head, big enough to use structs,
+      enums, traits, iterators, errors, modules and tests — which is to say,
+      the whole book.
+    </p>
+
+    <h2 data-anchor="ch13-h-structure">Project structure</h2>
+
+    <pre data-anchor="ch13-code-layout"><code>logstat/
+  Cargo.toml
+  src/
+    main.rs        <span class="cm"># argument handling and printing. Thin.</span>
+    lib.rs         <span class="cm"># the public API: run(), Report</span>
+    parse.rs       <span class="cm"># one line -> one Entry</span>
+    error.rs       <span class="cm"># LogError</span>
+  tests/
+    end_to_end.rs  <span class="cm"># uses only the public API</span></code></pre>
+
+    <p data-anchor="ch13-p1">
+      The split is the point. Logic in the library, process concerns in the
+      binary. It costs one extra file and it is what makes the thing testable —
+      an integration test can call <code>logstat::run</code> without spawning a
+      process or capturing stdout.
+    </p>
+
+    <h2 data-anchor="ch13-h-types">Core types</h2>
+
+    <pre data-anchor="ch13-code-types"><code><span class="cm">// src/lib.rs</span>
+<span class="kw">pub</span> <span class="kw">mod</span> error;
+<span class="kw">mod</span> parse;
+
+<span class="kw">pub</span> <span class="kw">use</span> error::<span class="ty">LogError</span>;
+
+<span class="kw">use</span> std::collections::<span class="ty">BTreeMap</span>;
+
+<span class="at">#[derive(Debug, Clone, Copy, PartialEq, Eq)]</span>
+<span class="kw">pub</span> <span class="kw">enum</span> <span class="ty">Class</span> { <span class="en">Ok</span>, <span class="en">Redirect</span>, <span class="en">ClientError</span>, <span class="en">ServerError</span> }
+
+<span class="kw">impl</span> <span class="ty">Class</span> {
+    <span class="kw">fn</span> <span class="fn">of</span>(status: <span class="ty">u16</span>) -&gt; <span class="ty">Option</span>&lt;<span class="ty">Self</span>&gt; {
+        <span class="kw">match</span> status {
+            <span class="num">200</span>..=<span class="num">299</span> =&gt; <span class="en">Some</span>(<span class="ty">Class</span>::<span class="en">Ok</span>),
+            <span class="num">300</span>..=<span class="num">399</span> =&gt; <span class="en">Some</span>(<span class="ty">Class</span>::<span class="en">Redirect</span>),
+            <span class="num">400</span>..=<span class="num">499</span> =&gt; <span class="en">Some</span>(<span class="ty">Class</span>::<span class="en">ClientError</span>),
+            <span class="num">500</span>..=<span class="num">599</span> =&gt; <span class="en">Some</span>(<span class="ty">Class</span>::<span class="en">ServerError</span>),
+            _ =&gt; <span class="en">None</span>,
+        }
+    }
+}
+
+<span class="at">#[derive(Debug, Default)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">Report</span> {
+    <span class="kw">pub</span> counts: <span class="ty">BTreeMap</span>&lt;<span class="ty">u16</span>, <span class="ty">usize</span>&gt;,
+    <span class="kw">pub</span> skipped: <span class="ty">usize</span>,
+}</code></pre>
+
+    <p data-anchor="ch13-p2">
+      <code>Class::of</code> returns <code>Option</code> rather than a
+      <code>Class::Unknown</code> variant — an unrecognised status isn't a
+      class, it's the absence of one, and the type should say so.
+      <code>BTreeMap</code> rather than <code>HashMap</code> because the report
+      should come out in a stable order.
+    </p>
+
+    <h2 data-anchor="ch13-h-errors">The error type</h2>
+
+    <pre data-anchor="ch13-code-error"><code><span class="cm">// src/error.rs</span>
+<span class="kw">use</span> std::fmt;
+
+<span class="at">#[derive(Debug)]</span>
+<span class="kw">pub</span> <span class="kw">enum</span> <span class="ty">LogError</span> {
+    <span class="en">Io</span> { path: <span class="ty">String</span>, source: std::io::<span class="ty">Error</span> },
+    <span class="en">Empty</span>(<span class="ty">String</span>),
+}
+
+<span class="kw">impl</span> fmt::<span class="ty">Display</span> <span class="kw">for</span> <span class="ty">LogError</span> {
+    <span class="kw">fn</span> <span class="fn">fmt</span>(&amp;<span class="kw">self</span>, f: &amp;<span class="kw">mut</span> fmt::<span class="ty">Formatter</span>&lt;<span class="lif">'_</span>&gt;) -&gt; fmt::<span class="ty">Result</span> {
+        <span class="kw">match</span> <span class="kw">self</span> {
+            <span class="ty">LogError</span>::<span class="en">Io</span> { path, source } =&gt; <span class="mac">write!</span>(f, <span class="str">"{path}: {source}"</span>),
+            <span class="ty">LogError</span>::<span class="en">Empty</span>(path) =&gt; <span class="mac">write!</span>(f, <span class="str">"{path}: no parsable lines"</span>),
+        }
+    }
+}
+
+<span class="kw">impl</span> std::error::<span class="ty">Error</span> <span class="kw">for</span> <span class="ty">LogError</span> {
+    <span class="kw">fn</span> <span class="fn">source</span>(&amp;<span class="kw">self</span>) -&gt; <span class="ty">Option</span>&lt;&amp;(<span class="kw">dyn</span> std::error::<span class="ty">Error</span> + <span class="lif">'static</span>)&gt; {
+        <span class="kw">match</span> <span class="kw">self</span> {
+            <span class="ty">LogError</span>::<span class="en">Io</span> { source, .. } =&gt; <span class="en">Some</span>(source),
+            <span class="ty">LogError</span>::<span class="en">Empty</span>(_) =&gt; <span class="en">None</span>,
+        }
+    }
+}</code></pre>
+
+    <p data-anchor="ch13-p3">
+      Note the <code>path</code> field. A bare <code>io::Error</code> says
+      "No such file or directory" and leaves the user guessing which file. An
+      error type is a place to keep context, and adding it is usually the
+      difference between a usable CLI and an annoying one.
+    </p>
+
+    <h2 data-anchor="ch13-h-parse">Parsing and IO</h2>
+
+    <pre data-anchor="ch13-code-run"><code><span class="cm">// src/parse.rs</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">status_of</span>(line: &amp;<span class="ty">str</span>) -&gt; <span class="ty">Option</span>&lt;<span class="ty">u16</span>&gt; {
+    <span class="cm">// …a common-log-format line: the status is the 9th field</span>
+    line.<span class="fn">split_whitespace</span>().<span class="fn">nth</span>(<span class="num">8</span>)?.<span class="fn">parse</span>().<span class="fn">ok</span>()
+}
+
+<span class="cm">// src/lib.rs</span>
+<span class="kw">use</span> std::fs::<span class="ty">File</span>;
+<span class="kw">use</span> std::io::{<span class="ty">BufRead</span>, <span class="ty">BufReader</span>};
+
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">run</span>(path: &amp;<span class="ty">str</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Report</span>, <span class="ty">LogError</span>&gt; {
+    <span class="kw">let</span> file = <span class="ty">File</span>::<span class="fn">open</span>(path)
+        .<span class="fn">map_err</span>(|source| <span class="ty">LogError</span>::<span class="en">Io</span> { path: path.<span class="fn">into</span>(), source })?;
+
+    <span class="kw">let</span> <span class="kw">mut</span> report = <span class="ty">Report</span>::<span class="fn">default</span>();
+
+    <span class="kw">for</span> line <span class="kw">in</span> <span class="ty">BufReader</span>::<span class="fn">new</span>(file).<span class="fn">lines</span>() {
+        <span class="kw">let</span> line = line
+            .<span class="fn">map_err</span>(|source| <span class="ty">LogError</span>::<span class="en">Io</span> { path: path.<span class="fn">into</span>(), source })?;
+        <span class="kw">match</span> parse::<span class="fn">status_of</span>(&amp;line).<span class="fn">filter</span>(|s| <span class="ty">Class</span>::<span class="fn">of</span>(*s).<span class="fn">is_some</span>()) {
+            <span class="en">Some</span>(s) =&gt; *report.counts.<span class="fn">entry</span>(s).<span class="fn">or_insert</span>(<span class="num">0</span>) += <span class="num">1</span>,
+            <span class="en">None</span> =&gt; report.skipped += <span class="num">1</span>,
+        }
+    }
+
+    <span class="kw">if</span> report.counts.<span class="fn">is_empty</span>() {
+        <span class="kw">return</span> <span class="en">Err</span>(<span class="ty">LogError</span>::<span class="en">Empty</span>(path.<span class="fn">into</span>()));
+    }
+    <span class="en">Ok</span>(report)
+}</code></pre>
+
+    <p data-anchor="ch13-p4">
+      <code>BufReader::new(file).lines()</code> streams: memory stays flat
+      whether the log is a kilobyte or forty gigabytes. Compare
+      <code>fs::read_to_string</code>, which is perfect for a config file and
+      catastrophic here. Each <code>line</code> is itself a
+      <code>Result</code>, because a read can fail halfway through.
+    </p>
+
+    <h2 data-anchor="ch13-h-main">The binary</h2>
+
+    <pre data-anchor="ch13-code-main"><code><span class="cm">// src/main.rs</span>
+<span class="kw">use</span> std::process::<span class="ty">ExitCode</span>;
+
+<span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">ExitCode</span> {
+    <span class="kw">let</span> <span class="en">Some</span>(path) = std::env::<span class="fn">args</span>().<span class="fn">nth</span>(<span class="num">1</span>) <span class="kw">else</span> {
+        <span class="mac">eprintln!</span>(<span class="str">"usage: logstat &lt;file&gt;"</span>);
+        <span class="kw">return</span> <span class="ty">ExitCode</span>::<span class="fn">from</span>(<span class="num">2</span>);
+    };
+
+    <span class="kw">match</span> logstat::<span class="fn">run</span>(&amp;path) {
+        <span class="en">Ok</span>(report) =&gt; {
+            <span class="kw">for</span> (status, n) <span class="kw">in</span> &amp;report.counts {
+                <span class="mac">println!</span>(<span class="str">"{status:&gt;5}  {n}"</span>);
+            }
+            <span class="mac">eprintln!</span>(<span class="str">"({} lines skipped)"</span>, report.skipped);
+            <span class="ty">ExitCode</span>::<span class="ty">SUCCESS</span>
+        }
+        <span class="en">Err</span>(e) =&gt; {
+            <span class="mac">eprintln!</span>(<span class="str">"logstat: {e}"</span>);
+            <span class="ty">ExitCode</span>::<span class="ty">FAILURE</span>
+        }
+    }
+}</code></pre>
+
+    <p data-anchor="ch13-p5">
+      Results to stdout, diagnostics to stderr, non-zero exit on failure —
+      that's what makes a tool composable in a pipeline. <code>main</code> can
+      also return <code>Result&lt;(), E&gt;</code> directly, which is shorter
+      but prints the <code>Debug</code> form and always exits 1;
+      <code>ExitCode</code> is what you want once the exit status matters.
+    </p>
+
+    <h2 data-anchor="ch13-h-tests">Tests</h2>
+
+    <pre data-anchor="ch13-code-tests"><code><span class="cm">// tests/end_to_end.rs — sees only the public API</span>
+<span class="kw">use</span> std::io::<span class="ty">Write</span>;
+
+<span class="at">#[test]</span>
+<span class="kw">fn</span> <span class="fn">counts_by_status</span>() {
+    <span class="kw">let</span> <span class="kw">mut</span> f = tempfile::<span class="ty">NamedTempFile</span>::<span class="fn">new</span>().<span class="fn">unwrap</span>();
+    <span class="mac">writeln!</span>(f, <span class="str">r#"h - - [d] "GET / HTTP/1.1" 200 12"#</span>).<span class="fn">unwrap</span>();
+    <span class="mac">writeln!</span>(f, <span class="str">r#"h - - [d] "GET /x HTTP/1.1" 404 0"#</span>).<span class="fn">unwrap</span>();
+
+    <span class="kw">let</span> r = logstat::<span class="fn">run</span>(f.<span class="fn">path</span>().<span class="fn">to_str</span>().<span class="fn">unwrap</span>()).<span class="fn">unwrap</span>();
+    <span class="mac">assert_eq!</span>(r.counts[&amp;<span class="num">200</span>], <span class="num">1</span>);
+    <span class="mac">assert_eq!</span>(r.counts[&amp;<span class="num">404</span>], <span class="num">1</span>);
+}
+
+<span class="at">#[test]</span>
+<span class="kw">fn</span> <span class="fn">missing_file_is_an_error</span>() {
+    <span class="mac">assert!</span>(logstat::<span class="fn">run</span>(<span class="str">"/nope"</span>).<span class="fn">is_err</span>());
+}</code></pre>
+
+    <p data-anchor="ch13-p6">
+      Add <code>tempfile = "3"</code> under <code>[dev-dependencies]</code> and
+      it never ships in the binary. Notice the second test: the error path
+      deserves a test as much as the happy one, and in Rust it is one line
+      because errors are ordinary values.
+    </p>
+
+    <h2 data-anchor="ch13-h-ship">Shipping</h2>
+
+    <pre data-anchor="ch13-code-ship"><code>cargo build --release        <span class="cm"># target/release/logstat</span>
+cargo install --path .       <span class="cm"># into ~/.cargo/bin</span>
+cargo publish                <span class="cm"># crates.io — needs description + license in Cargo.toml</span></code></pre>
+
+    <div class="callout key" data-anchor="ch13-callout-continue">
+      <p class="callout-t">Before you continue</p>
+      <p>
+        Build it, or build your own version of it — a file organiser, a todo
+        manager, whatever you'd actually use. The requirements are the same:
+        library plus thin binary, one real error type with context, streaming
+        IO, an integration test for the happy path and one for a failure. Then
+        run <code>cargo clippy</code> and fix what it finds.
+      </p>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="13-idiomatic-rust.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="15-conclusion.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concurrency and Async — The Little Rust Book</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="the-little-rust-book">
+
+<div class="leaf-rule"></div>
+<div class="book-topbar">
+  <span>The Little Rust Book</span>
+  <span class="tb-links">
+    <a href="../index.html" rel="home">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </span>
+</div>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open" data-anchor="ch11-open">
+      <span class="chapter-num">11</span>
+      <p class="kicker">Chapter eleven</p>
+      <h1>Concurrency and Async</h1>
+    </div>
+
+    <p class="lede" data-anchor="ch11-lede">
+      This is where the last seven chapters get paid back. Rust's concurrency
+      story is not a new set of rules — it is the ownership rules, applied
+      across threads, which turns the entire category of data races into
+      compile errors.
+    </p>
+
+    <h2 data-anchor="ch11-h-threads">Threads</h2>
+
+    <pre data-anchor="ch11-code-thread"><code><span class="kw">use</span> std::thread;
+
+<span class="kw">let</span> handle = thread::<span class="fn">spawn</span>(|| {
+    <span class="fn">expensive_work</span>()
+});
+
+<span class="fn">do_something_else</span>();
+
+<span class="kw">let</span> result = handle.<span class="fn">join</span>().<span class="fn">unwrap</span>();   <span class="cm">// waits; Err if it panicked</span></code></pre>
+
+    <p data-anchor="ch11-p1">
+      <code>spawn</code> takes a closure and returns a
+      <code>JoinHandle&lt;T&gt;</code>. <code>join()</code> blocks until the
+      thread finishes and gives you its return value, wrapped in a
+      <code>Result</code> because the thread might have panicked. These are
+      real OS threads, one to one.
+    </p>
+
+    <p data-anchor="ch11-p2">
+      A spawned thread may outlive the scope that created it, so its closure
+      almost always needs <code>move</code> — the compiler will insist, and its
+      suggestion is right.
+    </p>
+
+    <h2 data-anchor="ch11-h-sendsync">Send and Sync do the work</h2>
+
+    <div class="callout key" data-anchor="ch11-callout-sendsync">
+      <p class="callout-t">Two marker traits, no methods</p>
+      <p>
+        <strong><code>Send</code></strong> — this type can be
+        <em>moved</em> to another thread.<br>
+        <strong><code>Sync</code></strong> — <code>&amp;T</code> can be
+        <em>shared</em> with another thread.
+      </p>
+    </div>
+
+    <p data-anchor="ch11-p3">
+      Almost everything is both, automatically, because the compiler derives
+      them structurally. The interesting cases are the exceptions:
+      <code>Rc</code> is neither (its counter isn't atomic), and
+      <code>RefCell</code> is <code>Send</code> but not <code>Sync</code> (its
+      borrow flag isn't either). So the moment you try to share an
+      <code>Rc</code> across a <code>thread::spawn</code>, the program stops
+      compiling — and the reason it stops is a data race you would otherwise
+      have shipped.
+    </p>
+
+    <div class="pullquote" data-anchor="ch11-pull">
+      "Fearless concurrency" is marketing for something specific: you cannot
+      compile a data race. Deadlocks are still yours to earn.
+    </div>
+
+    <h2 data-anchor="ch11-h-channels">Channels: don't share, send</h2>
+
+    <pre data-anchor="ch11-code-channel"><code><span class="kw">use</span> std::sync::mpsc;
+<span class="kw">use</span> std::thread;
+
+<span class="kw">let</span> (tx, rx) = mpsc::<span class="fn">channel</span>();
+
+<span class="kw">for</span> id <span class="kw">in</span> <span class="num">0</span>..<span class="num">4</span> {
+    <span class="kw">let</span> tx = tx.<span class="fn">clone</span>();          <span class="cm">// multi-producer</span>
+    thread::<span class="fn">spawn</span>(<span class="kw">move</span> || {
+        tx.<span class="fn">send</span>(<span class="mac">format!</span>(<span class="str">"worker {id} done"</span>)).<span class="fn">unwrap</span>();
+    });
+}
+<span class="fn">drop</span>(tx);                        <span class="cm">// drop the original, or rx never ends</span>
+
+<span class="kw">for</span> msg <span class="kw">in</span> rx {                   <span class="cm">// single-consumer; ends when all senders are gone</span>
+    <span class="mac">println!</span>(<span class="str">"{msg}"</span>);
+}</code></pre>
+
+    <p data-anchor="ch11-p4">
+      <code>mpsc</code> is multi-producer, single-consumer. The receiver is an
+      iterator that finishes when every sender has been dropped — which is why
+      the <code>drop(tx)</code> line is not optional. Forgetting it is the
+      classic first channel bug: the loop simply never returns.
+    </p>
+
+    <p data-anchor="ch11-p5">
+      Sending a value <em>moves</em> it, so ownership crosses the thread
+      boundary and no sharing is involved at all. Where you can express a
+      problem this way, do.
+    </p>
+
+    <h2 data-anchor="ch11-h-mutex">Shared state: Arc + Mutex</h2>
+
+    <pre data-anchor="ch11-code-mutex"><code><span class="kw">use</span> std::sync::{<span class="ty">Arc</span>, <span class="ty">Mutex</span>};
+<span class="kw">use</span> std::thread;
+
+<span class="kw">let</span> counter = <span class="ty">Arc</span>::<span class="fn">new</span>(<span class="ty">Mutex</span>::<span class="fn">new</span>(<span class="num">0</span>));
+<span class="kw">let</span> <span class="kw">mut</span> handles = <span class="mac">vec!</span>[];
+
+<span class="kw">for</span> _ <span class="kw">in</span> <span class="num">0</span>..<span class="num">8</span> {
+    <span class="kw">let</span> counter = <span class="ty">Arc</span>::<span class="fn">clone</span>(&amp;counter);
+    handles.<span class="fn">push</span>(thread::<span class="fn">spawn</span>(<span class="kw">move</span> || {
+        <span class="kw">let</span> <span class="kw">mut</span> n = counter.<span class="fn">lock</span>().<span class="fn">unwrap</span>();
+        *n += <span class="num">1</span>;
+    }));   <span class="cm">// guard drops here — the lock releases</span>
+}
+
+<span class="kw">for</span> h <span class="kw">in</span> handles { h.<span class="fn">join</span>().<span class="fn">unwrap</span>(); }
+<span class="mac">println!</span>(<span class="str">"{}"</span>, *counter.<span class="fn">lock</span>().<span class="fn">unwrap</span>());   <span class="cm">// 8</span></code></pre>
+
+    <p data-anchor="ch11-p6">
+      <code>Arc</code> gives many owners; <code>Mutex</code> gives one writer
+      at a time. <code>lock()</code> returns a guard, and the guard's
+      <code>Drop</code> releases the lock — so there is no unlock to forget,
+      and no path out of the block that skips it. The <code>Result</code> from
+      <code>lock()</code> reports a <em>poisoned</em> mutex: another thread
+      panicked while holding it, and the data may be inconsistent.
+    </p>
+
+    <div class="callout warn" data-anchor="ch11-callout-lockscope">
+      <p class="callout-t">Keep the guard's scope small</p>
+      <p>
+        A <code>MutexGuard</code> lives until the end of its statement or
+        block. Holding one across a long call — and especially across an
+        <code>.await</code> — is how you turn a lock into a bottleneck or a
+        deadlock. Take what you need, drop the guard, then do the slow thing.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch11-h-async">Async, in one page</h2>
+
+    <p data-anchor="ch11-p7">
+      Threads are the right tool when the work is CPU-bound or the count is
+      small. When you have ten thousand connections mostly waiting on a socket,
+      ten thousand OS threads is the wrong shape. That is what async is for.
+    </p>
+
+    <pre data-anchor="ch11-code-async"><code><span class="kw">async</span> <span class="kw">fn</span> <span class="fn">fetch</span>(url: &amp;<span class="ty">str</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">String</span>, reqwest::<span class="ty">Error</span>&gt; {
+    <span class="kw">let</span> body = reqwest::<span class="fn">get</span>(url).<span class="kw">await</span>?.<span class="fn">text</span>().<span class="kw">await</span>?;
+    <span class="en">Ok</span>(body)
+}
+
+<span class="at">#[tokio::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">Box</span>&lt;<span class="kw">dyn</span> std::error::<span class="ty">Error</span>&gt;&gt; {
+    <span class="kw">let</span> (a, b) = tokio::<span class="mac">join!</span>(
+        <span class="fn">fetch</span>(<span class="str">"https://example.com"</span>),
+        <span class="fn">fetch</span>(<span class="str">"https://example.org"</span>),
+    );
+    <span class="mac">println!</span>(<span class="str">"{} / {}"</span>, a?.<span class="fn">len</span>(), b?.<span class="fn">len</span>());
+    <span class="en">Ok</span>(())
+}</code></pre>
+
+    <div class="callout" data-anchor="ch11-callout-runtime">
+      <p class="callout-t">Rust ships the syntax, not the runtime</p>
+      <p>
+        An <code>async fn</code> returns a <code>Future</code>, and a
+        <code>Future</code> does <strong>nothing</strong> until something polls
+        it. The standard library defines <code>Future</code> and the language
+        provides <code>async</code>/<code>.await</code> — the scheduler, the
+        timers and the IO come from a crate. In practice that crate is
+        <strong>Tokio</strong>: add
+        <code>tokio = { version = "1", features = ["full"] }</code> and put
+        <code>#[tokio::main]</code> on an async <code>main</code>.
+      </p>
+    </div>
+
+    <table data-anchor="ch11-table-choose">
+      <caption>Threads or async</caption>
+      <thead><tr><th>Signal</th><th>Reach for</th></tr></thead>
+      <tbody>
+        <tr><td>CPU-bound work, parallel speedup</td><td>threads (or <code>rayon</code>)</td></tr>
+        <tr><td>A handful of long-lived workers</td><td>threads</td></tr>
+        <tr><td>Thousands of sockets, mostly idle</td><td>async</td></tr>
+        <tr><td>You're writing a network service</td><td>async</td></tr>
+        <tr><td>You're unsure</td><td>threads — simpler, and easy to change</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch11-p8">
+      Async in Rust is genuinely more advanced than the rest of the language —
+      pinning, cancellation, "function colouring", runtime-specific traits.
+      This chapter is deliberately the first mile only. Write the threaded
+      version first; move to async when the shape of the problem asks for it.
+    </p>
+
+    <div class="callout key" data-anchor="ch11-callout-continue">
+      <p class="callout-t">Before you continue</p>
+      <p>
+        Write a tiny program that spawns four threads, each sending a result
+        over an <code>mpsc</code> channel, and prints them as they arrive.
+        Remember the <code>drop(tx)</code>. Then, for contrast, try sharing an
+        <code>Rc</code> into one of those threads and read the error the
+        compiler gives you — that error is the whole chapter in one message.
+      </p>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="11-smart-pointers-and-patterns.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="13-idiomatic-rust.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
