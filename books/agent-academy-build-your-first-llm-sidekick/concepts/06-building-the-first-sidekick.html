@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building the First Sidekick — Agent Academy</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="agent-academy-build-your-first-llm-sidekick">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="topbar">
+      <p class="book-title">Agent Academy</p>
+      <nav>
+        <a href="../index.html">Contents</a>
+        <a href="../cheatsheet.html">Cheatsheet</a>
+      </nav>
+    </header>
+
+    <div class="chapter-open">
+      <span class="chapter-num" aria-hidden="true">06</span>
+      <p class="chapter-kicker">The Real Fight · Assembly</p>
+      <h1 data-anchor="ch6-title">Building the First Sidekick</h1>
+    </div>
+
+    <p data-anchor="ch6-p1">No new techniques in this chapter. That is the point. Everything Kohai needs,
+      you already learned — this is the training montage where the separate drills become one motion.</p>
+
+    <h2 data-anchor="ch6-h-choose">Choosing the model</h2>
+
+    <p data-anchor="ch6-p2">Pick before you build, because it changes the economics of every later
+      decision. Here are the three you will actually choose between:</p>
+
+    <table data-anchor="ch6-table-models">
+      <thead>
+        <tr><th>Model</th><th>ID</th><th>Context</th><th>Max output</th><th>$ / MTok in · out</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Claude Opus 5</td><td><code>claude-opus-5</code></td><td>1M</td><td>128k</td><td>5 · 25</td></tr>
+        <tr><td>Claude Sonnet 5</td><td><code>claude-sonnet-5</code></td><td>1M</td><td>128k</td><td>3 · 15</td></tr>
+        <tr><td>Claude Haiku 4.5</td><td><code>claude-haiku-4-5</code></td><td>200k</td><td>64k</td><td>1 · 5</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch6-p3">We use <code>claude-opus-5</code> for Kohai. Release notes need judgment about
+      what a reader cares about, which is precisely where the capable model earns its price. Note also that
+      on Opus 5 and Sonnet 5 the <code>effort</code> parameter <span class="key">defaults to high</span> on
+      the Claude API — you have to set it explicitly to use a different level, so if you want a cheaper,
+      quicker run you must ask for one.</p>
+
+    <div class="aside" data-anchor="ch6-aside-freshness">
+      <span class="sfx">These numbers expire</span>
+      <p>Prices, IDs, context windows and cutoffs move. The figures above were current when this book was
+        written, and Sonnet 5 additionally carried introductory pricing of $2/$10 per MTok through
+        31&nbsp;August&nbsp;2026. Do not hardcode any of it in a system you will still be running next
+        year — chapter&nbsp;8 shows how to ask the API instead.</p>
+    </div>
+
+    <h2 data-anchor="ch6-h-tools">Step one: the tools, for real</h2>
+
+    <p data-anchor="ch6-p4">Chapter 3 gave you the schemas. Here are the implementations. Note the
+      argument-list form of <code>subprocess.run</code> — no shell, so a ref name cannot become a
+      command — and the <code>cwd</code> pin, so the agent cannot wander into another repository.</p>
+
+    <pre data-anchor="ch6-code-impl"><code><span class="kw">import</span> subprocess
+
+REPO = <span class="str">"/path/to/your/repo"</span>
+
+<span class="kw">def</span> <span class="fn">git</span>(*args) -&gt; <span class="ty">str</span>:
+    result = subprocess.<span class="fn">run</span>(
+        [<span class="str">"git"</span>, *args],
+        cwd=REPO, capture_output=<span class="kw">True</span>, text=<span class="kw">True</span>, timeout=<span class="num">20</span>,
+    )
+    <span class="kw">if</span> result.returncode != <span class="num">0</span>:
+        <span class="kw">raise</span> <span class="ty">ToolError</span>(result.stderr.<span class="fn">strip</span>() <span class="kw">or</span> <span class="str">"git failed"</span>)
+    <span class="kw">return</span> result.stdout
+
+<span class="kw">def</span> <span class="fn">list_commits</span>(since: <span class="ty">str</span>, until: <span class="ty">str</span> = <span class="str">"HEAD"</span>) -&gt; <span class="ty">str</span>:
+    <span class="kw">return</span> <span class="fn">git</span>(<span class="str">"log"</span>, <span class="str">"--no-merges"</span>, <span class="str">"--pretty=%h%x09%an%x09%ad%x09%s"</span>,
+               <span class="str">"--date=short"</span>, <span class="str">f"{since}..{until}"</span>)
+
+<span class="kw">def</span> <span class="fn">show_commit</span>(sha: <span class="ty">str</span>) -&gt; <span class="ty">str</span>:
+    <span class="kw">return</span> <span class="fn">git</span>(<span class="str">"show"</span>, <span class="str">"--stat"</span>, <span class="str">"--pretty=%B"</span>, sha)
+
+HANDLERS = {<span class="str">"list_commits"</span>: list_commits, <span class="str">"show_commit"</span>: show_commit}</code></pre>
+
+    <h2 data-anchor="ch6-h-dispatch">Step two: the dispatcher that cannot crash the run</h2>
+
+    <p data-anchor="ch6-p5">Chapter 3's lesson, made concrete. Every failure becomes a tool result the
+      model can read, and the message says both what went wrong and what would have worked:</p>
+
+    <pre data-anchor="ch6-code-dispatch"><code><span class="kw">class</span> <span class="ty">ToolError</span>(<span class="ty">Exception</span>): ...
+
+<span class="kw">def</span> <span class="fn">run_tool</span>(name: <span class="ty">str</span>, args: <span class="ty">dict</span>) -&gt; <span class="ty">tuple</span>[<span class="ty">str</span>, <span class="ty">bool</span>]:
+    <span class="str">"""Returns (content, is_error). Never raises."""</span>
+    handler = HANDLERS.<span class="fn">get</span>(name)
+    <span class="kw">if</span> handler <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> <span class="str">f"Error: no tool named {name!r}. Available: {sorted(HANDLERS)}"</span>, <span class="kw">True</span>
+    <span class="kw">try</span>:
+        <span class="kw">return</span> <span class="fn">handler</span>(**args), <span class="kw">False</span>
+    <span class="kw">except</span> <span class="ty">ToolError</span> <span class="kw">as</span> e:
+        tags = <span class="fn">git</span>(<span class="str">"tag"</span>, <span class="str">"--sort=-creatordate"</span>).<span class="fn">split</span>()[:<span class="num">5</span>]
+        <span class="kw">return</span> <span class="str">f"Error: {e} Recent tags: {tags}"</span>, <span class="kw">True</span>
+    <span class="kw">except</span> <span class="ty">TypeError</span> <span class="kw">as</span> e:
+        <span class="kw">return</span> <span class="str">f"Error: bad arguments for {name}: {e}"</span>, <span class="kw">True</span></code></pre>
+
+    <h2 data-anchor="ch6-h-loop">Step three: the loop</h2>
+
+    <p data-anchor="ch6-p6">Unchanged from chapter 2, plus an iteration bound. Never ship an unbounded
+      <code>while</code> around a paid API call:</p>
+
+    <pre data-anchor="ch6-code-run"><code><span class="kw">import</span> anthropic
+
+client = anthropic.<span class="ty">Anthropic</span>()   <span class="cm"># credentials come from the environment</span>
+
+SYSTEM = <span class="str">"""You draft release notes for a software project.
+Use the tools to read the actual commit history — never guess a commit.
+Group changes by what a reader cares about (features, fixes, breaking
+changes) and drop pure chores unless they change behaviour.
+Cite the short hash for every entry."""</span>
+
+<span class="kw">def</span> <span class="fn">draft_release_notes</span>(since: <span class="ty">str</span>, max_iterations: <span class="ty">int</span> = <span class="num">12</span>) -&gt; <span class="ty">str</span>:
+    messages = [{<span class="str">"role"</span>: <span class="str">"user"</span>,
+                 <span class="str">"content"</span>: <span class="str">f"Draft the release notes for everything since {since}."</span>}]
+
+    <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(max_iterations):
+        response = client.messages.<span class="fn">create</span>(
+            model=<span class="str">"claude-opus-5"</span>,
+            max_tokens=<span class="num">16000</span>,
+            system=SYSTEM,
+            tools=KOHAI_TOOLS,
+            messages=messages,
+        )
+
+        <span class="kw">if</span> response.stop_reason != <span class="str">"tool_use"</span>:
+            <span class="kw">return</span> <span class="fn">finish</span>(response)
+
+        messages.<span class="fn">append</span>({<span class="str">"role"</span>: <span class="str">"assistant"</span>, <span class="str">"content"</span>: response.content})
+
+        results = []
+        <span class="kw">for</span> block <span class="kw">in</span> response.content:
+            <span class="kw">if</span> block.type != <span class="str">"tool_use"</span>:
+                <span class="kw">continue</span>
+            content, is_error = <span class="fn">run_tool</span>(block.name, block.input)
+            results.<span class="fn">append</span>({
+                <span class="str">"type"</span>: <span class="str">"tool_result"</span>,
+                <span class="str">"tool_use_id"</span>: block.id,
+                <span class="str">"content"</span>: content,
+                <span class="str">"is_error"</span>: is_error,
+            })
+
+        <span class="cm"># All results from one turn go back in ONE user message.</span>
+        messages.<span class="fn">append</span>({<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: results})
+
+    <span class="kw">raise</span> <span class="ty">RuntimeError</span>(<span class="str">"iteration limit reached without a final answer"</span>)</code></pre>
+
+    <p data-anchor="ch6-p7">And a <code>finish</code> that does not pretend every non-<code>tool_use</code>
+      ending is a success — chapter 8 expands this, but even the first version should not lie to you:</p>
+
+    <pre data-anchor="ch6-code-finish"><code><span class="kw">def</span> <span class="fn">finish</span>(response) -&gt; <span class="ty">str</span>:
+    <span class="kw">if</span> response.stop_reason == <span class="str">"max_tokens"</span>:
+        <span class="kw">raise</span> <span class="ty">RuntimeError</span>(<span class="str">"truncated: raise max_tokens or narrow the range"</span>)
+    <span class="kw">if</span> response.stop_reason == <span class="str">"refusal"</span>:
+        <span class="kw">raise</span> <span class="ty">RuntimeError</span>(<span class="str">"the model declined this request"</span>)
+    <span class="kw">return</span> <span class="str">""</span>.<span class="fn">join</span>(b.text <span class="kw">for</span> b <span class="kw">in</span> response.content <span class="kw">if</span> b.type == <span class="str">"text"</span>)</code></pre>
+
+    <h2 data-anchor="ch6-h-trace">What the fight actually looks like</h2>
+
+    <figure class="diagram-fig" data-anchor="ch6-fig-trace">
+      <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="ch6-fig-trace-t">
+        <title id="ch6-fig-trace-t">A four-turn trace: list commits, an error and retry, a detail lookup,
+          then the final draft.</title>
+
+        <line class="stroke-soft" x1="86" y1="14" x2="86" y2="192"/>
+        <text x="10" y="26">turn 1</text>
+        <text x="10" y="66">turn 2</text>
+        <text x="10" y="106">turn 3</text>
+        <text x="10" y="146">turn 4</text>
+
+        <rect class="stroke fill-bg" x="96" y="14" width="200" height="26"/>
+        <text class="mono" x="106" y="31">list_commits(since="v2.3.0")</text>
+        <rect class="stroke-red fill-bg" x="304" y="14" width="242" height="26"/>
+        <text class="mono red" x="314" y="31">is_error: unknown ref. tags: v2.2.1…</text>
+
+        <rect class="stroke fill-bg" x="96" y="54" width="200" height="26"/>
+        <text class="mono" x="106" y="71">list_commits(since="v2.2.1")</text>
+        <rect class="stroke fill-soft" x="304" y="54" width="242" height="26"/>
+        <text class="mono" x="314" y="71">41 commits</text>
+
+        <rect class="stroke fill-bg" x="96" y="94" width="200" height="26"/>
+        <text class="mono" x="106" y="111">show_commit("a1c9f02")</text>
+        <rect class="stroke fill-soft" x="304" y="94" width="242" height="26"/>
+        <text class="mono" x="314" y="111">full message + changed files</text>
+
+        <rect class="stroke-thick fill-ink" x="96" y="134" width="450" height="26"/>
+        <text class="big on-ink" x="106" y="151">stop_reason: end_turn — the draft</text>
+
+        <text class="dim" x="96" y="182">the retry in turn 2 cost one round trip and saved the run</text>
+      </svg>
+      <figcaption>A real trace. The failure in turn 1 is not a bug — it is the recovery path from
+        chapter 3 working exactly as designed.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch6-h-runner">The shortcut you have now earned</h2>
+
+    <p data-anchor="ch6-p8">Having written the loop by hand, you are allowed to stop writing it. The SDKs
+      provide a <span class="key">Tool Runner</span> that executes your tools and sends the results back
+      automatically, so the round trip does not have to be written by hand:</p>
+
+    <pre data-anchor="ch6-code-runner"><code>runner = client.beta.messages.<span class="fn">tool_runner</span>(
+    model=<span class="str">"claude-opus-5"</span>,
+    max_tokens=<span class="num">16000</span>,
+    tools=[list_commits_tool, show_commit_tool],
+    messages=messages,
+)
+final_message = runner.<span class="fn">until_done</span>()</code></pre>
+
+    <p data-anchor="ch6-p9">Use it. But you will debug it far better for having built the manual version
+      first, because when a run goes strange you will know exactly which of the five steps is misbehaving
+      rather than staring at a helper you never opened.</p>
+
+    <h2 data-anchor="ch6-h-adding">Adding memory to a working agent</h2>
+
+    <p data-anchor="ch6-p10">Kohai works. Now make it remember. This is a three-line change plus a
+      handler:</p>
+
+    <pre data-anchor="ch6-code-mem"><code>KOHAI_TOOLS = [
+    list_commits_tool,
+    show_commit_tool,
+    {<span class="str">"type"</span>: <span class="str">"memory_20250818"</span>, <span class="str">"name"</span>: <span class="str">"memory"</span>},   <span class="cm"># new</span>
+]
+HANDLERS[<span class="str">"memory"</span>] = memory_handler   <span class="cm"># six commands, safe_path on every one</span></code></pre>
+
+    <p data-anchor="ch6-p11">On the next run, Kohai views <code>/memories</code> before doing anything else
+      — the protocol instruction the API adds for you — finds the note it wrote about your
+      <code>chore(deps):</code> convention, and skips those commits without being told again. That is the
+      whole memory arc, cashed in.</p>
+
+    <h2 data-anchor="ch6-h-levelup">What you can do now that you couldn't before</h2>
+
+    <p data-anchor="ch6-p12">You have built an agent. Not read about one — built one, with real tools over
+      real data, a dispatcher that recovers instead of crashing, an iteration bound, honest handling of
+      the ways a turn can end, and memory that survives the process.</p>
+
+    <p data-anchor="ch6-p13">And here is the honest power-level check: what you have is a
+      <span class="key">good single agent</span>. It is not yet reliable enough to run unattended, and it
+      is one agent. The next two chapters address exactly those two gaps — in that order, because
+      reliability is the harder one and most people skip it to build the fun one.</p>
+
+    <div class="panel sources" data-anchor="ch6-sources">
+      <h4>Sources</h4>
+      <ul>
+        <li>Models overview — platform.claude.com/docs/en/about-claude/models/overview</li>
+        <li>Tool use with Claude, overview — platform.claude.com/docs/en/agents-and-tools/tool-use/overview</li>
+        <li>Memory tool — platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool</li>
+      </ul>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="05-the-guardrail-trial.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="07-the-multi-agent-tournament.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

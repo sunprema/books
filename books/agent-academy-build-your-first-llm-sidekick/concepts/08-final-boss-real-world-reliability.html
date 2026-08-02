@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Final Boss: Real-World Reliability — Agent Academy</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="agent-academy-build-your-first-llm-sidekick">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="topbar">
+      <p class="book-title">Agent Academy</p>
+      <nav>
+        <a href="../index.html">Contents</a>
+        <a href="../cheatsheet.html">Cheatsheet</a>
+      </nav>
+    </header>
+
+    <div class="chapter-open">
+      <span class="chapter-num" aria-hidden="true">08</span>
+      <p class="chapter-kicker">Final Battle · Monday Morning</p>
+      <h1 data-anchor="ch8-title">Final Boss: Real-World Reliability</h1>
+    </div>
+
+    <p data-anchor="ch8-p1">The final boss is not a harder version of anything you have fought. It is
+      Monday. Your agent has been running unattended over the weekend, the person who wrote it is on
+      holiday, and something is quietly wrong in a way nobody will notice until Thursday.</p>
+
+    <p data-anchor="ch8-p2">Everything in this chapter exists to make that Thursday impossible.</p>
+
+    <h2 data-anchor="ch8-h-stop">Technique one: exhaust the stop reasons</h2>
+
+    <p data-anchor="ch8-p3">Chapter 2 told you the loop exits on <code>"end_turn"</code>,
+      <code>"max_tokens"</code>, <code>"stop_sequence"</code> or <code>"refusal"</code>, and chapter 3
+      added <code>"pause_turn"</code>. Here is the reveal I promised: those five are not variations of
+      "done." They are five different outcomes and exactly one of them is success.</p>
+
+    <table data-anchor="ch8-table-stop">
+      <thead><tr><th><code>stop_reason</code></th><th>Means</th><th>Correct response</th></tr></thead>
+      <tbody>
+        <tr><td><code>tool_use</code></td><td>It wants a tool run</td><td>Execute, return results, continue</td></tr>
+        <tr><td><code>end_turn</code></td><td>Finished naturally</td><td>Take the answer</td></tr>
+        <tr><td><code>pause_turn</code></td><td>The server-side loop hit its iteration cap</td><td>Re-send the conversation including the paused response</td></tr>
+        <tr><td><code>max_tokens</code></td><td>Output ran out of room — the answer is <em>truncated</em></td><td>Raise <code>max_tokens</code> or narrow the task. Never ship it</td></tr>
+        <tr><td><code>stop_sequence</code></td><td>Hit a sequence you configured</td><td>Handle per your own design</td></tr>
+        <tr><td><code>refusal</code></td><td>The model declined</td><td>Surface it; do not blindly re-send</td></tr>
+      </tbody>
+    </table>
+
+    <div class="panel tone" data-anchor="ch8-panel-pause">
+      <p style="margin:0"><span class="key">A paused turn is not a failure.</span> It means the work is not
+        finished. Re-send the conversation, including the paused response, to let the model continue where
+        it left off.</p>
+    </div>
+
+    <p data-anchor="ch8-p4">Treating <code>pause_turn</code> as an error is the classic way to throw away a
+      research turn that was halfway through its own loop. Treating <code>max_tokens</code> as success is
+      how a truncated draft gets published. Here is the exhaustive version:</p>
+
+    <pre data-anchor="ch8-code-stops"><code><span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(MAX_ITERATIONS):
+    response = client.messages.<span class="fn">create</span>(...)
+
+    <span class="kw">if</span> response.stop_reason == <span class="str">"tool_use"</span>:
+        <span class="cm"># ... execute, append results ...</span>
+        <span class="kw">continue</span>
+
+    <span class="kw">if</span> response.stop_reason == <span class="str">"pause_turn"</span>:
+        <span class="cm"># Not an error: the server-side loop hit its cap. Re-send.</span>
+        messages.<span class="fn">append</span>({<span class="str">"role"</span>: <span class="str">"assistant"</span>, <span class="str">"content"</span>: response.content})
+        <span class="kw">continue</span>
+
+    <span class="kw">if</span> response.stop_reason == <span class="str">"max_tokens"</span>:
+        <span class="kw">raise</span> <span class="ty">Truncated</span>(response)
+
+    <span class="kw">if</span> response.stop_reason == <span class="str">"refusal"</span>:
+        <span class="kw">return</span> <span class="fn">handle_refusal</span>(response)
+
+    <span class="kw">return</span> response          <span class="cm"># end_turn: the only success</span>
+
+<span class="kw">raise</span> <span class="ty">IterationLimit</span>()   <span class="cm"># the loop must be bounded</span></code></pre>
+
+    <p data-anchor="ch8-p5">Note the <code>for</code> rather than a <code>while</code>. An unbounded loop
+      around a paid API call is a bill with no upper limit, and it only takes one tool that keeps
+      returning something the model wants to investigate.</p>
+
+    <h2 data-anchor="ch8-h-hallucination">Technique two: verify what can be verified</h2>
+
+    <p data-anchor="ch8-p6">"Hallucination" is a big scary word for something usually quite tractable. In
+      an agent, most invented facts are invented in a place where a cheap check would have caught them —
+      because the whole reason you built an agent was that the ground truth was reachable.</p>
+
+    <p data-anchor="ch8-p7">Kohai cites commit hashes. A hash either appears in <code>git log</code> or it
+      does not. That is not a judgment call, it is a set membership test, and it costs microseconds:</p>
+
+    <pre data-anchor="ch8-code-verify"><code><span class="kw">import</span> re
+
+<span class="kw">def</span> <span class="fn">verify_hashes</span>(draft: <span class="ty">str</span>, since: <span class="ty">str</span>) -&gt; <span class="ty">list</span>[<span class="ty">str</span>]:
+    real = {line.<span class="fn">split</span>(<span class="str">"\t"</span>)[<span class="num">0</span>] <span class="kw">for</span> line <span class="kw">in</span> <span class="fn">list_commits</span>(since).<span class="fn">splitlines</span>() <span class="kw">if</span> line}
+    cited = <span class="fn">set</span>(re.<span class="fn">findall</span>(<span class="str">r"\b[0-9a-f]{7,40}\b"</span>, draft))
+    <span class="kw">return</span> <span class="fn">sorted</span>(cited - real)   <span class="cm"># empty list = nothing invented</span>
+
+<span class="kw">if</span> bad := <span class="fn">verify_hashes</span>(draft, <span class="str">"v2.2.1"</span>):
+    <span class="kw">raise</span> <span class="ty">Unverified</span>(<span class="str">f"draft cites commits that do not exist: {bad}"</span>)</code></pre>
+
+    <p data-anchor="ch8-p8">Ten lines, and they turn "the agent sometimes makes things up" into a hard
+      failure you find immediately rather than a soft one you find in a customer's inbox. Ask of every
+      agent output: <span class="key">what claim here is mechanically checkable?</span> Check that, and
+      stop worrying about the rest until you have.</p>
+
+    <div class="aside" data-anchor="ch8-aside-regex">
+      <span class="sfx">Yes, that's a regex</span>
+      <p>Chapter 1 told you that parsing model output with a regex means the structure belonged in a
+        schema. This one is different, and the difference is worth naming: that regex extracted a
+        <em>decision the pipeline would act on</em>. This one audits a <em>claim in prose meant for
+        humans</em>. The first is control flow and belongs in a tool call. The second is verification of
+        the deliverable itself, and there is nothing else it could be.</p>
+    </div>
+
+    <h2 data-anchor="ch8-h-retry">Technique three: retry the transient, escalate the rest</h2>
+
+    <p data-anchor="ch8-p9">Errors sort into three bins and each gets a different response.</p>
+
+    <table data-anchor="ch8-table-errors">
+      <thead><tr><th>Kind</th><th>Example</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Model-recoverable</strong></td><td>Bad ref, missing file, malformed argument</td>
+            <td>Return as a tool result with <code>is_error</code> true — the model retries itself</td></tr>
+        <tr><td><strong>Transient</strong></td><td>Rate limit, 5xx, connection reset</td>
+            <td>Retry with backoff, outside the agent loop</td></tr>
+        <tr><td><strong>Terminal</strong></td><td>Bad credentials, missing permission, iteration limit</td>
+            <td>Stop and escalate to a human</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch8-p10">The first row is the one people miss, and it is the one that makes agents feel
+      robust. Errors returned as tool results with <code>is_error</code> true are what
+      <span class="key">let the model adapt rather than fail blindly</span>. The other two rows are
+      ordinary distributed-systems hygiene; the SDKs already retry rate limits and server errors for you,
+      so do not build a second retry layer on top without checking.</p>
+
+    <h2 data-anchor="ch8-h-observability">Technique four: log the trace, not the answer</h2>
+
+    <p data-anchor="ch8-p11">When a run goes wrong you will not ask "what did it say." You will ask "what
+      did it <em>do</em>, and why did it think that was reasonable." So log the trace: for every turn, the
+      stop reason, every tool name and its arguments, every result including errors, and the token usage.</p>
+
+    <p data-anchor="ch8-p12">Cost is observable per request — the response reports input and output token
+      counts in its <code>usage</code> metrics. And remember tool use adds tokens on top of a normal
+      request from three places: the <code>tools</code> parameter itself, the <code>tool_use</code> and
+      <code>tool_result</code> blocks, and an automatically included tool-use system prompt. Server tools
+      can add usage-based charges beyond tokens as well — web search, for instance, charges per search
+      performed. An agent that is 30% more expensive this week is telling you something about its
+      behaviour, and you will only hear it if you were writing the numbers down.</p>
+
+    <pre data-anchor="ch8-code-log"><code>log.<span class="fn">info</span>(
+    <span class="str">"agent.turn"</span>,
+    extra={
+        <span class="str">"run_id"</span>: run_id,
+        <span class="str">"turn"</span>: turn,
+        <span class="str">"stop_reason"</span>: response.stop_reason,
+        <span class="str">"tools"</span>: [b.name <span class="kw">for</span> b <span class="kw">in</span> response.content <span class="kw">if</span> b.type == <span class="str">"tool_use"</span>],
+        <span class="str">"in_tokens"</span>: response.usage.input_tokens,
+        <span class="str">"out_tokens"</span>: response.usage.output_tokens,
+    },
+)</code></pre>
+
+    <h2 data-anchor="ch8-h-limits">Technique five: ask, don't hardcode</h2>
+
+    <p data-anchor="ch8-p13">Every model constant in chapter 6 will eventually be wrong. Model capabilities
+      and token limits can be queried programmatically through the Models API, whose response includes
+      <code>max_input_tokens</code>, <code>max_tokens</code>, and a <code>capabilities</code> object for
+      every available model. A harness that checks limits at runtime does not silently break the week a
+      constant changes.</p>
+
+    <p data-anchor="ch8-p14">The same caution applies to what the model can know unaided.
+      <span class="key">Reliable knowledge cutoffs are published per model</span> — May 2026 for Claude
+      Opus 5, January 2026 for Claude Sonnet 5 — and that bounds what an agent can answer without a
+      retrieval tool. When your agent confidently discusses a library version released after its cutoff,
+      that is not a mystery. That is a missing tool.</p>
+
+    <h2 data-anchor="ch8-h-eval">Technique six: an eval set beats an opinion</h2>
+
+    <p data-anchor="ch8-p15">"It seems better" is not a measurement, and you will change your prompt many
+      times. Build a small fixed set of cases — for Kohai, ten tag ranges from real history with a
+      human-approved answer for each — and run it before every prompt change. Twenty cases is enough to
+      catch a regression. Zero cases means every change is a coin flip you cannot see the result of.</p>
+
+    <p data-anchor="ch8-p16">Score what you can score automatically: hash validity, whether known-important
+      commits appear, whether chores were excluded. Save the human judgment for the cases the automatic
+      scores pass and you still dislike.</p>
+
+    <h2 data-anchor="ch8-h-done">Technique seven: the discipline of "done"</h2>
+
+    <p data-anchor="ch8-p17">One rule from the multisession pattern deserves its own section, because it is
+      the difference between a progress log you can trust and one that lies: mark a feature complete
+      <span class="key">only after end-to-end verification confirms it works</span>, not when the code is
+      written.</p>
+
+    <p data-anchor="ch8-p18">Apply it to the agent and to yourself. An agent that records "release notes
+      drafted" before the hashes were verified will resume tomorrow from a state that never existed. A
+      developer who ships an agent because the happy path ran once is making the same mistake with a
+      longer feedback loop.</p>
+
+    <h2 data-anchor="ch8-h-checklist">The deployment checklist</h2>
+
+    <div class="panel" data-anchor="ch8-panel-checklist">
+      <ul style="margin-bottom:0">
+        <li>Every <code>stop_reason</code> has an explicit branch — including <code>pause_turn</code>.</li>
+        <li>The loop is bounded by iteration count.</li>
+        <li>Tool failures return as <code>is_error</code> results, not exceptions.</li>
+        <li>Every irreversible tool is gated or absent.</li>
+        <li>Every path and identifier is validated against an allowlist, resolved first.</li>
+        <li>Mechanically checkable claims in the output are checked.</li>
+        <li>Every turn is logged: stop reason, tools, arguments, results, tokens.</li>
+        <li>An eval set exists and runs before prompt changes.</li>
+        <li>Model IDs and limits come from configuration or the API, not from a literal in the loop.</li>
+        <li>A human can see what the agent did without reading the code.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="ch8-h-graduation">Graduation</h2>
+
+    <p data-anchor="ch8-p19">Look back at where this started: a chatbot inventing commits, because it had
+      no way to look. You now know why that happened, and you have built the thing that fixes it — a loop,
+      a menu of tools, memory that survives the process, a boundary in code, and a checklist that catches
+      the ways it can quietly go wrong.</p>
+
+    <p data-anchor="ch8-p20">Here is your honest final power-level check, because I promised those.
+      Everything in this book is the <span class="key">basic form</span>. Real systems add evaluation
+      harnesses, tracing infrastructure, cost controls, permission models, and a great deal of
+      unglamorous operational work. But the mechanism does not get more exotic than what you have. Bigger
+      agents are the same loop with better instrumentation and harder-won judgment about what to put on
+      the menu.</p>
+
+    <p data-anchor="ch8-p21">You have the anatomy. Go build something that actually needs it — and give
+      your sidekick a better name than Kohai.</p>
+
+    <div class="panel sources" data-anchor="ch8-sources">
+      <h4>Sources</h4>
+      <ul>
+        <li>How tool use works — platform.claude.com/docs/en/agents-and-tools/tool-use/how-tool-use-works</li>
+        <li>Tool use with Claude, overview — platform.claude.com/docs/en/agents-and-tools/tool-use/overview</li>
+        <li>Memory tool — platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool</li>
+        <li>Models overview — platform.claude.com/docs/en/about-claude/models/overview</li>
+      </ul>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-the-multi-agent-tournament.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="../cheatsheet.html">Cheatsheet ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
