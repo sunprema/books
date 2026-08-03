@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>09 &middot; Uploads, Forms, and Browser Integration &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch09-head">
+      <span class="chapter-num">09</span>
+      <span class="chapter-kicker">Where the server meets the browser directly</span>
+      <h1>Uploads, Forms, and Browser Integration</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch09-lede">
+      Most of what we've built so far treats the browser as a rendering
+      target for server-computed HTML. File uploads break that model on
+      purpose: the file's bytes never touch the server as a normal
+      <code>handle_event/3</code> payload, because a multi-megabyte upload
+      doesn't belong crammed into a websocket text frame the way a click
+      payload does. LiveView solves this with a dedicated channel for binary
+      data, wired through the same declarative style as everything else.
+    </p>
+
+    <h2 data-anchor="ch09-h-allow-upload">allow_upload/3 &mdash; declaring the contract up front</h2>
+
+    <pre><code><span class="kw">def</span> <span class="fn">mount</span>(_params, _session, socket) <span class="kw">do</span>
+  {:ok,
+   socket
+   |&gt; assign(:uploaded_files, [])
+   |&gt; allow_upload(:avatar, accept: ~w(.jpg .jpeg .png), max_entries: 1, max_file_size: 5_000_000)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch09-p1">
+      <code>allow_upload/3</code> registers an upload configuration &mdash;
+      accepted extensions, how many files, a size ceiling &mdash; under a
+      name (<code>:avatar</code>) that the template and later callbacks refer
+      back to. That configuration populates <code>@uploads.avatar</code>,
+      which a <code>&lt;.live_file_input&gt;</code> component renders as a
+      file picker wired up with the right <code>accept</code> and
+      <code>multiple</code> attributes automatically:
+    </p>
+
+    <pre><code>&lt;.form for={@form} phx-change=<span class="str">"validate"</span> phx-submit=<span class="str">"save"</span>&gt;
+  &lt;.live_file_input upload={@uploads.avatar} /&gt;
+  &lt;button type=<span class="str">"submit"</span>&gt;Upload&lt;/button&gt;
+&lt;/.form&gt;</code></pre>
+
+    <p data-anchor="ch09-p2">
+      Both <code>phx-change</code> and <code>phx-submit</code> matter here,
+      and for different reasons than an ordinary form. <code>phx-change</code>
+      fires as the visitor selects a file &mdash; before any bytes are
+      uploaded &mdash; triggering an automatic <code>"validate"</code> event
+      that lets <code>@uploads.avatar.entries</code> report client-side
+      validation errors (wrong extension, too large) immediately, with
+      progress and error state managed for you. <code>phx-submit</code> is
+      what actually starts the upload and, once every entry finishes, calls
+      your <code>"save"</code> handler.
+    </p>
+
+    <h2 data-anchor="ch09-h-consume">consume_uploaded_entries/3 &mdash; the one moment files exist</h2>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_event</span>(<span class="str">"save"</span>, _params, socket) <span class="kw">do</span>
+  paths =
+    consume_uploaded_entries(socket, :avatar, <span class="kw">fn</span> %{path: path}, _entry -&gt;
+      dest = Path.join(<span class="str">"priv/static/uploads"</span>, Path.basename(path))
+      File.cp!(path, dest)
+      {:ok, <span class="str">"/uploads/"</span> &lt;&gt; Path.basename(dest)}
+    <span class="kw">end</span>)
+
+  {:noreply, update(socket, :uploaded_files, &amp;(&amp;1 ++ paths))}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch09-p3">
+      <code>consume_uploaded_entries/3</code> is deliberately the
+      <em>only</em> place the uploaded file's temporary path is available
+      &mdash; it hands your function a temp path per entry, and once the
+      function returns, LiveView cleans that temp file up. This forces
+      "do something durable with the file" (copy it to permanent storage,
+      hand it to an upload service) to happen in one clear place, rather than
+      leaving temp files hanging around for a later callback to maybe get to.
+    </p>
+
+    <div class="callout warn" data-anchor="ch09-warn1">
+      <span class="callout-title">Trap, and Chapter&nbsp;10's rule showing up again</span>
+      <p>
+        Client-reported file metadata &mdash; the declared content type, the
+        declared size before the bytes arrive &mdash; is exactly as
+        untrustworthy as any other client input. LiveView enforces
+        <code>max_file_size</code> as chunks actually arrive over the wire,
+        not by trusting whatever the browser claims up front, which is why
+        the check can't be bypassed by a doctored request. Whatever you do
+        with the consumed file afterward &mdash; especially if you inspect
+        its declared content type to decide how to handle it &mdash;
+        deserves the same "never trust it, verify server-side" treatment.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch09-h-hooks">Client hooks: when the browser needs to do something LiveView can't express</h2>
+
+    <p data-anchor="ch09-p4">
+      Uploads are a natural moment to reach for a <span class="term">JS
+      client hook</span> &mdash; Chapter&nbsp;5 mentioned
+      <code>push_event/3</code> as the escape hatch for server-to-client
+      instructions with no markup diff; hooks are the receiving end of that
+      escape hatch, plus a way to go the other direction. A hook attaches to
+      an element via <code>phx-hook</code> (which requires that element carry
+      a unique DOM id) and implements a small set of lifecycle callbacks:
+    </p>
+
+    <pre><code><span class="cm">// assets/js/hooks.js</span>
+<span class="kw">const</span> Hooks = {};
+
+Hooks.DropZone = {
+  <span class="fn">mounted</span>() {
+    <span class="kw">this</span>.el.addEventListener(<span class="str">"drop"</span>, (e) =&gt; {
+      e.preventDefault();
+      <span class="kw">this</span>.pushEvent(<span class="str">"file_dropped"</span>, { count: e.dataTransfer.files.length });
+    });
+  },
+  <span class="fn">destroyed</span>() { <span class="cm">/* clean up anything mounted() started */</span> }
+};
+
+<span class="kw">export default</span> Hooks;</code></pre>
+
+    <table data-anchor="ch09-tbl-lifecycle">
+      <caption>Client hook lifecycle callbacks</caption>
+      <thead><tr><th>Callback</th><th>Fires when</th></tr></thead>
+      <tbody>
+        <tr><td><code>mounted</code></td><td>The element joins the DOM and its LiveView has finished mounting</td></tr>
+        <tr><td><code>beforeUpdate</code></td><td>Just before the server patches this element &mdash; must stay synchronous</td></tr>
+        <tr><td><code>updated</code></td><td>Just after the server patches this element</td></tr>
+        <tr><td><code>destroyed</code></td><td>The element is removed &mdash; by a parent patch, or the LiveView unmounting</td></tr>
+        <tr><td><code>disconnected</code></td><td>The parent LiveView's socket disconnects</td></tr>
+        <tr><td><code>reconnected</code></td><td>The parent LiveView's socket reconnects (Chapter&nbsp;1's recovery path)</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch09-p5">
+      Inside those callbacks, <code>this.pushEvent(event, payload, callback)</code>
+      sends a message to the LiveView &mdash; landing in
+      <code>handle_event/3</code> exactly like a <code>phx-click</code> would
+      &mdash; and <code>this.handleEvent(event, callback)</code> is the
+      receiving end of a server-side <code>push_event/3</code>. Together they
+      form a full round trip: server pushes an instruction the DOM alone
+      can't express (play this sound, focus this element, initialize a
+      third-party JS widget), and the hook can push back whatever that
+      interaction produces.
+    </p>
+
+    <div class="callout key" data-anchor="ch09-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        Reach for a hook only when something needs a real browser API a
+        <code>phx-*</code> binding doesn't cover &mdash; drag-and-drop,
+        clipboard access, a charting library, focus management. If a
+        <code>phx-click</code> or <code>phx-change</code> binding already
+        expresses what you need, a hook is solving a problem you don't have.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch09-h-takeaway">What we actually gained</h2>
+
+    <ul data-anchor="ch09-takeaway-list">
+      <li><code>allow_upload/3</code> declares the contract; <code>phx-change</code>
+        validates as files are picked; <code>phx-submit</code> uploads and
+        triggers your save handler.</li>
+      <li><code>consume_uploaded_entries/3</code> is the one place a
+        temp file path is available &mdash; move it to durable storage there,
+        or lose it.</li>
+      <li>Client-declared file metadata is untrusted input, same as any
+        form field; LiveView enforces size limits from the actual bytes
+        received, not the client's claims.</li>
+      <li>JS hooks bridge server state and browser-only APIs through
+        <code>pushEvent</code>/<code>handleEvent</code>, reached for only
+        when a <code>phx-*</code> binding genuinely can't express the need.</li>
+      <li>Chapter&nbsp;10 closes the loop on every "untrusted input" aside
+        threaded through this book, and adds the piece none of the earlier
+        chapters covered: what a dropped connection means for the
+        authorization checks Chapter&nbsp;1 promised would re-run.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch09-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://github.com/phoenixframework/phoenix_live_view/blob/main/guides/server/uploads.md">File Uploads &mdash; Phoenix LiveView guide</a></li>
+        <li><a href="https://github.com/phoenixframework/phoenix_live_view/blob/main/guides/client/js-interop.md">JavaScript Interoperability &mdash; Phoenix LiveView guide</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-pubsub-and-streams.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-security-and-reconnection.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

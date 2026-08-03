@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>04 &middot; The Static/Dynamic Split and the Diff Engine &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch04-head">
+      <span class="chapter-num">04</span>
+      <span class="chapter-kicker">Why LiveView feels reactive without a client framework</span>
+      <h1>The Static/Dynamic Split and the Diff Engine</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch04-lede">
+      Here's the trick question: LiveView re-renders the whole template on
+      every assign change &mdash; so why doesn't a chat app with a thousand
+      messages on screen re-send a thousand messages' worth of HTML every time
+      someone hits "send"? The answer is a compile-time transformation that
+      happens to every HEEx template, and once we've seen it, "diffing" stops
+      being magic and starts being a straightforward data structure.
+    </p>
+
+    <h2 data-anchor="ch04-h-split">What the compiler actually does</h2>
+
+    <p data-anchor="ch04-p1">
+      Take a template with one interpolation:
+    </p>
+
+    <pre><code>&lt;h1&gt;{expand_title(@title)}&lt;/h1&gt;</code></pre>
+
+    <p data-anchor="ch04-p2">
+      The HEEx compiler doesn't treat that as one string to regenerate on
+      every render. It splits it into two separate parts at compile time: the
+      <span class="term">static</span> part &mdash;
+      <code>&lt;h1&gt;</code> and <code>&lt;/h1&gt;</code>, markup that can
+      never change no matter what <code>@title</code> is &mdash; and the
+      <span class="term">dynamic</span> part &mdash; the result of calling
+      <code>expand_title(@title)</code>, the only piece that could possibly
+      differ between renders.
+    </p>
+
+    <p data-anchor="ch04-p3">
+      On the very first render, both parts go to the client, because the
+      client has nothing to compare against yet. On every render after that,
+      LiveView checks whether <code>@title</code> changed. If it didn't,
+      <em>the dynamic part isn't even recomputed</em> &mdash; not just
+      "not sent," but never evaluated at all, because
+      <code>render/1</code> was never asked to run that branch of the
+      template. If it did change, only the new dynamic value goes over the
+      wire; the static markup, already sitting in the browser's DOM from the
+      first render, is never resent.
+    </p>
+
+    <div class="callout key" data-anchor="ch04-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        A LiveView diff is not "compute the new HTML, compute the old HTML,
+        find the difference." It's "know in advance which parts of the
+        template are static, and only ever compute or send the dynamic parts
+        that changed." The diffing happens before render, not after.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch04-h-nested-fields">Field-level tracking</h2>
+
+    <p data-anchor="ch04-p4">
+      This granularity goes deeper than "which template expression changed."
+      LiveView tracks changes down to individual fields of a struct or map
+      that's being read through <code>@</code>. If <code>@user.name</code>
+      changes but <code>@user.id</code> doesn't, a template section that only
+      reads <code>@user.id</code> is untouched &mdash; even though
+      <code>@user</code> itself, as a whole value, is technically a new term.
+      That's the payoff of reassigning through <code>assign/3</code> that
+      Chapter&nbsp;3 flagged: the tracker needs the full old and new values to
+      compute this field-level diff, and it only sees them when the
+      reassignment goes through the sanctioned path.
+    </p>
+
+    <h2 data-anchor="ch04-h-defeat">What silently defeats change tracking</h2>
+
+    <p data-anchor="ch04-p5">
+      Because the optimization depends on the compiler being able to isolate
+      a dynamic expression at compile time, anything that hides the real
+      dependency from that expression breaks it. Three patterns do this
+      routinely, and all three are things a Rails or Django habit will reach
+      for without thinking twice:
+    </p>
+
+    <p data-anchor="ch04-p6">
+      <span class="term">1. Doing real work inside the template.</span>
+    </p>
+
+    <pre><code><span class="cm">## defeats tracking &mdash; runs on every render, changed or not</span>
+&lt;p&gt;Users online: {Accounts.count_online_users()}&lt;/p&gt;</code></pre>
+
+    <p data-anchor="ch04-p7">
+      The compiler sees a function call with no assign dependency it can
+      track, so it has no signal telling it "this hasn't changed, skip it."
+      It re-evaluates <code>count_online_users/0</code> &mdash; a database
+      query &mdash; on <em>every single render</em>, whether or not the
+      online count actually moved. The fix is to compute it in a callback and
+      assign the result, so change tracking has an assign to key off:
+    </p>
+
+    <pre><code><span class="cm">## in handle_info, on a timer or a presence_diff message</span>
+assign(socket, :online_count, Accounts.count_online_users())</code></pre>
+
+    <p data-anchor="ch04-p8">
+      <span class="term">2. Local variables computed in the template.</span>
+    </p>
+
+    <pre><code><span class="cm">## defeats tracking &mdash; `total` isn't a tracked assign</span>
+&lt;% total = @subtotal + @tax %&gt;
+&lt;p&gt;Total: {total}&lt;/p&gt;</code></pre>
+
+    <p data-anchor="ch04-p9">
+      A <code>&lt;% &hellip; %&gt;</code> local binding looks harmless, but it
+      obscures which assigns the value actually depends on. Move the
+      computation into a plain function and call it with the assigns it
+      needs &mdash; <code>{total(@subtotal, @tax)}</code> &mdash; and the
+      compiler can once again see through to <code>@subtotal</code> and
+      <code>@tax</code> directly.
+    </p>
+
+    <p data-anchor="ch04-p10">
+      <span class="term">3. Generic map-mutation functions.</span> Building
+      an updated map with <code>Map.put(socket.assigns, :count, n)</code>
+      instead of <code>assign(socket, :count, n)</code> updates the value,
+      but skips the bookkeeping <code>assign/3</code> does to mark
+      <code>:count</code> as changed. The template will eventually show the
+      right value on some future render that touches it for other reasons,
+      but the specific optimization &mdash; "only send what changed, right
+      when it changed" &mdash; is gone for that assignment.
+    </p>
+
+    <figure class="diagram" data-anchor="ch04-fig-diff">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="ch04-fig-diff-title">
+        <title id="ch04-fig-diff-title">A template compiles to static and dynamic parts; only a changed dynamic part is recomputed and sent on a later render</title>
+
+        <text x="16" y="20" class="big">Render 1 &mdash; everything goes</text>
+        <rect x="16" y="30" width="110" height="34" class="stroke fill-soft"/>
+        <text x="24" y="51" class="mono">&lt;h1&gt;</text>
+        <rect x="140" y="30" width="130" height="34" class="stroke-red"/>
+        <text x="150" y="51" class="mono red">"Ownership"</text>
+        <rect x="284" y="30" width="120" height="34" class="stroke fill-soft"/>
+        <text x="292" y="51" class="mono">&lt;/h1&gt;</text>
+        <text x="420" y="51" class="lbl">static</text>
+        <text x="150" y="24" class="lbl red">dynamic</text>
+
+        <path d="M16 90 L544 90" class="stroke-soft dash"/>
+
+        <text x="16" y="112" class="big">Render 2 &mdash; @title changed</text>
+        <rect x="16" y="122" width="110" height="34" class="fill-none stroke-soft"/>
+        <text x="24" y="143" class="dim mono">not resent</text>
+        <rect x="140" y="122" width="130" height="34" class="stroke-red fill-red"/>
+        <text x="150" y="143" class="mono on-ink">"Borrowing"</text>
+        <rect x="284" y="122" width="120" height="34" class="fill-none stroke-soft"/>
+        <text x="292" y="143" class="dim mono">not resent</text>
+
+        <text x="150" y="170" class="lbl red">only this crosses the wire</text>
+      </svg>
+      <figcaption>The static markup ships once. Every later render sends only the dynamic parts whose assign dependency actually changed.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch04-h-verify">Seeing it for real</h2>
+
+    <div class="callout spec" data-anchor="ch04-spec1">
+      <span class="callout-title">In practice</span>
+      <p>
+        Open your browser's network tab, filter to WS (websocket), and click
+        something that changes one small piece of a busy page. A well-tracked
+        template sends a frame with just that one changed value &mdash; a few
+        dozen bytes. A frame that's suspiciously large for a small visible
+        change is a sign some part of the template just lost its tracking,
+        and is worth reaching for
+        <a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html"><code>Phoenix.LiveView.Utils</code></a>-adjacent
+        debug helpers or simply re-reading the template for one of the three
+        patterns above.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch04-h-takeaway">What we actually gained</h2>
+
+    <ul data-anchor="ch04-takeaway-list">
+      <li>HEEx compiles templates into static and dynamic parts at compile
+        time &mdash; the diff strategy exists before a single render runs.</li>
+      <li>An unchanged assign means the dynamic expression that reads it is
+        skipped entirely, not just "not sent" &mdash; it's not even
+        recomputed.</li>
+      <li>Change tracking sees through <code>@user.name</code> to the field
+        level, but only for values reassigned through <code>assign/3</code>.</li>
+      <li>Function calls in the template, local <code>&lt;% %&gt;</code>
+        bindings, and generic map mutation all defeat it &mdash; compute in a
+        callback, assign the result, read the assign in the template.</li>
+      <li>Chapter&nbsp;5 is where those assigns start changing in response to
+        something other than a page load: client events and server
+        messages.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch04-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://github.com/phoenixframework/phoenix_live_view/blob/main/guides/server/assigns-eex.md">Assigns and HEEx templates &mdash; Phoenix LiveView guide</a></li>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-assigns-and-state.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-events-and-messages.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>10 &middot; Security, Authorization, and Reconnection &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch10-head">
+      <span class="chapter-num">10</span>
+      <span class="chapter-kicker">The rule that was underneath every chapter so far</span>
+      <h1>Security, Authorization, and Reconnection</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch10-lede">
+      Look back over this book and a pattern repeats: Chapter&nbsp;2's path
+      params, Chapter&nbsp;5's event payloads, Chapter&nbsp;9's upload
+      metadata &mdash; every one of them got a callout warning that the value
+      in question came from the client and couldn't be trusted at face
+      value. That wasn't nine separate warnings. It's one rule, stated once
+      properly here: <strong>anything that crosses from the browser to the
+      server is untrusted, full stop</strong>, and LiveView's persistent
+      connection changes exactly nothing about that.
+    </p>
+
+    <h2 data-anchor="ch10-h-two-checkpoints">Two authentication checkpoints for one connection</h2>
+
+    <p data-anchor="ch10-p1">
+      Recall Chapter&nbsp;1's two-render lifecycle: a LiveView starts as a
+      plain HTTP request, then upgrades to a websocket. Both of those legs
+      need session validation, and they need it <em>independently</em>
+      &mdash; the plug pipeline validates the session for the disconnected
+      HTTP render, and <code>mount/3</code> validates it again for the
+      connected websocket render. Skipping the second because "the plug
+      pipeline already checked" misses that the websocket handshake is a
+      genuinely separate connection, subject to its own hijacking and replay
+      concerns; LiveView doesn't inherit trust from the HTTP leg
+      automatically.
+    </p>
+
+    <p data-anchor="ch10-p2">
+      In practice this means authentication (who is this?) happens the same
+      way it would for a regular controller &mdash; session tokens, checked
+      by plugs shared with the rest of the app &mdash; while
+      <strong>authorization</strong> (is this specific user allowed to do
+      this specific thing?) shows up at three separate points inside the
+      LiveView itself, and needs checking at all three:
+    </p>
+
+    <table data-anchor="ch10-tbl-checkpoints">
+      <caption>Where authorization belongs, and what each checkpoint answers</caption>
+      <thead><tr><th>Checkpoint</th><th>Question it answers</th></tr></thead>
+      <tbody>
+        <tr><td><code>mount/3</code></td><td>Is this user allowed to open this page at all?</td></tr>
+        <tr><td><code>handle_params/3</code></td><td>Is this user allowed to navigate to <em>this specific</em> URL/params &mdash; e.g., someone else's record id?</td></tr>
+        <tr><td><code>handle_event/3</code></td><td>Is this user allowed to perform <em>this specific action</em> &mdash; e.g., delete <em>this</em> post?</td></tr>
+      </tbody>
+    </table>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_event</span>(<span class="str">"delete_post"</span>, %{<span class="str">"id"</span> =&gt; id}, socket) <span class="kw">do</span>
+  post = Blog.get_post!(id)
+
+  <span class="kw">if</span> Blog.can_delete?(socket.assigns.current_user, post) <span class="kw">do</span>
+    Blog.delete_post!(post)
+    {:noreply, put_flash(socket, :info, <span class="str">"Post deleted"</span>)}
+  <span class="kw">else</span>
+    {:noreply, put_flash(socket, :error, <span class="str">"Not allowed"</span>)}
+  <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch10-p3">
+      Notice that the check passes <code>socket.assigns.current_user</code>
+      &mdash; something the server put there itself, back in
+      <code>mount/3</code>, from a validated session &mdash; never anything
+      read out of the event payload. The <code>id</code> came from the
+      client and is only trustworthy as "a string the client sent"; the
+      <em>user</em> making the request is only trustworthy because it was
+      resolved server-side and never re-derived from anything the client
+      claims about itself.
+    </p>
+
+    <div class="callout key" data-anchor="ch10-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        A disabled button, a hidden menu item, a client-side route guard
+        &mdash; none of these are authorization. They're UI polish that a
+        legitimate user experiences as guidance and an attacker simply
+        ignores, by hand-crafting a <code>handle_event</code> payload the
+        real UI would never send. The only checks that count are the ones
+        running in your Elixir code, against server-held data.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch10-h-liveid">Disconnecting a live session on logout</h2>
+
+    <p data-anchor="ch10-p4">
+      A LiveView's persistent connection creates a wrinkle a stateless
+      controller never had to think about: a visitor can log out in one
+      browser tab while an already-connected LiveView process, in another
+      tab, keeps right on running with the old session's assigns still
+      resident in memory &mdash; nothing about closing an HTTP session
+      automatically tears down a live process that was already spawned from
+      it. Phoenix's answer is <code>live_socket_id</code>: a per-session
+      identifier your logout flow can broadcast a disconnect against,
+      forcing every LiveView tied to that session to drop and reconnect
+      &mdash; which, per Chapter&nbsp;1, means running <code>mount/3</code>'s
+      authorization checks again from a clean slate.
+    </p>
+
+    <pre><code><span class="cm">## on login, tag the session so it can be targeted later</span>
+conn
+|&gt; put_session(:live_socket_id, <span class="str">"users_socket:#{user.id}"</span>)
+
+<span class="cm">## on logout, force every LiveView tied to that id to disconnect</span>
+MyAppWeb.Endpoint.broadcast(<span class="str">"users_socket:#{user.id}"</span>, <span class="str">"disconnect"</span>, %{})</code></pre>
+
+    <p data-anchor="ch10-p5">
+      Without this, "log out" only ever meant "the next plain HTTP request
+      will be treated as logged out" &mdash; an already-open LiveView tab
+      would keep displaying (and acting on) data as the old user until the
+      visitor manually reloaded it.
+    </p>
+
+    <h2 data-anchor="ch10-h-recap-reconnect">Reconnection, revisited</h2>
+
+    <p data-anchor="ch10-p6">
+      This closes a loop Chapter&nbsp;1 opened but didn't fully justify.
+      Every reconnect &mdash; whether from a network blip, a crash, or the
+      forced disconnect above &mdash; re-runs <code>mount/3</code> and
+      <code>handle_params/3</code> from scratch, against a fresh session
+      lookup. There is no code path where a LiveView process keeps running
+      indefinitely on a permission decision made once, minutes or hours
+      earlier, and never revisited. As long as your authorization checks
+      read live data &mdash; the current user record, its current role
+      &mdash; rather than a value captured once at mount and trusted forever
+      after, every reconnect is a fresh chance for those checks to catch a
+      permission that has since changed.
+    </p>
+
+    <div class="callout spec" data-anchor="ch10-spec1">
+      <span class="callout-title">In practice</span>
+      <p>
+        Test this directly: open a page that depends on a role, then revoke
+        that role from another session while the tab stays open. Nothing
+        changes immediately &mdash; the process is still running with
+        whatever it assigned at mount. Force a reconnect (toggle the network
+        tab's offline switch off and on, or kill and restart the app in
+        dev) and watch <code>mount/3</code>'s authorization check catch it.
+        That gap between "permission revoked" and "next reconnect" is the
+        honest security boundary a long-lived connection buys you &mdash;
+        know its size for your application, and use
+        <code>live_socket_id</code> broadcasts for the cases where it needs
+        to be zero.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch10-h-takeaway">What we actually gained &mdash; and what this book was really about</h2>
+
+    <ul data-anchor="ch10-takeaway-list">
+      <li>Authentication and authorization are separate concerns: sessions
+        are validated on both the HTTP and websocket legs; authorization is
+        checked independently at <code>mount/3</code>,
+        <code>handle_params/3</code>, and every <code>handle_event/3</code>.</li>
+      <li>Nothing from the client &mdash; params, event payloads, upload
+        metadata &mdash; is trustworthy until server code says so, no matter
+        how the UI constrained what a well-behaved client would send.</li>
+      <li><code>live_socket_id</code> broadcasts close the gap between
+        "session ended" and "the already-open tab notices."</li>
+      <li>Every reconnect is a full re-mount, which means it's also a full
+        re-check of whatever <code>mount/3</code> validates &mdash; as long
+        as those checks read current, not cached, permission data.</li>
+    </ul>
+
+    <p data-anchor="ch10-p7">
+      Ten chapters ago we asked whether a LiveView page was a controller or
+      a websocket. The answer we've built since is more precise than
+      "both": a LiveView is a supervised BEAM process that happens to speak
+      HTML on one connection and receive typed messages on another &mdash;
+      one process, one mailbox, one set of assigns, reacting the same way
+      whether the message came from a click, a broadcast, an async task, or
+      a fresh reconnect. Once that model is load-bearing in your head, the
+      rest of the API &mdash; every function this book named &mdash; reads
+      less like a framework's magic and more like the obvious tool for the
+      job it names.
+    </p>
+
+    <div class="sources" data-anchor="ch10-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://github.com/phoenixframework/phoenix_live_view/blob/main/guides/server/security-model.md">Security considerations of the LiveView model &mdash; Phoenix LiveView guide</a></li>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-uploads-forms-and-hooks.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

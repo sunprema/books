@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>08 &middot; PubSub, Streams, and Cross-Process Updates &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch08-head">
+      <span class="chapter-num">08</span>
+      <span class="chapter-kicker">One process's news is another's handle_info</span>
+      <h1>PubSub, Streams, and Cross-Process Updates</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch08-lede">
+      Chapter&nbsp;1 leaned hard on isolation: one LiveView process per
+      connected browser tab, crash-isolated from every other. Taken alone,
+      that sounds like it should make a live-updating dashboard impossible
+      &mdash; if every visitor's process is sealed off from every other,
+      how does one person's action show up on another person's screen? The
+      answer is a broadcast mechanism that doesn't break the isolation, it
+      just gives every interested process the same message at the same time.
+    </p>
+
+    <h2 data-anchor="ch08-h-pubsub">Phoenix.PubSub: a topic, a broadcast, a mailbox</h2>
+
+    <p data-anchor="ch08-p1">
+      <code>Phoenix.PubSub</code> is a topic-based publish/subscribe system
+      built into every Phoenix app. A process subscribes to a topic string;
+      any process (LiveView or otherwise) that broadcasts to that topic gets
+      the message delivered to every subscriber's mailbox &mdash; which, for
+      a LiveView, means it shows up in <code>handle_info/2</code>, exactly as
+      Chapter&nbsp;5 described.
+    </p>
+
+    <pre><code><span class="cm">## subscribe once connected (Chapter 1's connected?/1 guard matters here too)</span>
+<span class="kw">def</span> <span class="fn">mount</span>(_params, _session, socket) <span class="kw">do</span>
+  <span class="kw">if</span> connected?(socket), <span class="kw">do:</span> Phoenix.PubSub.subscribe(MyApp.PubSub, <span class="str">"orders:new"</span>)
+  {:ok, assign(socket, :orders, Orders.recent())}
+<span class="kw">end</span>
+
+<span class="cm">## broadcast from anywhere &mdash; a context function, a background job, another LiveView</span>
+<span class="kw">def</span> <span class="fn">create_order</span>(attrs) <span class="kw">do</span>
+  {:ok, order} = Orders.insert(attrs)
+  Phoenix.PubSub.broadcast(MyApp.PubSub, <span class="str">"orders:new"</span>, {:order_created, order})
+  {:ok, order}
+<span class="kw">end</span>
+
+<span class="cm">## every subscribed LiveView receives this</span>
+<span class="kw">def</span> <span class="fn">handle_info</span>({:order_created, order}, socket) <span class="kw">do</span>
+  {:noreply, stream_insert(socket, :orders, order, at: 0)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch08-p2">
+      Notice what didn't happen: the code that creates an order has no idea
+      how many LiveViews are watching, or whether any are. It broadcasts once
+      to a topic; PubSub fans that single message out to every current
+      subscriber's mailbox. Add a hundred more people watching the same
+      dashboard, and the broadcasting code doesn't change at all &mdash; only
+      the number of processes receiving the fan-out grows.
+    </p>
+
+    <figure class="diagram" data-anchor="ch08-fig-fanout">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="ch08-fig-fanout-title">
+        <title id="ch08-fig-fanout-title">One broadcast to a topic is delivered as handle_info to every LiveView process subscribed to that topic</title>
+        <rect x="16" y="70" width="140" height="42" class="stroke-red fill-red"/>
+        <text x="30" y="88" class="big on-ink">Orders context</text>
+        <text x="30" y="102" class="mono on-ink dim">PubSub.broadcast</text>
+
+        <rect x="230" y="16" width="130" height="40" class="stroke fill-soft"/>
+        <text x="242" y="32" class="big">LiveView A</text>
+        <text x="242" y="46" class="dim">handle_info/2</text>
+
+        <rect x="230" y="74" width="130" height="40" class="stroke fill-soft"/>
+        <text x="242" y="90" class="big">LiveView B</text>
+        <text x="242" y="104" class="dim">handle_info/2</text>
+
+        <rect x="230" y="132" width="130" height="40" class="stroke fill-soft"/>
+        <text x="242" y="148" class="big">LiveView C</text>
+        <text x="242" y="162" class="dim">handle_info/2</text>
+
+        <path d="M156 88 L230 36" class="stroke-red"/>
+        <path d="M222 38 L230 36 L226 44" class="stroke-red"/>
+        <path d="M156 91 L230 94" class="stroke-red"/>
+        <path d="M222 90 L230 94 L222 98" class="stroke-red"/>
+        <path d="M156 100 L230 152" class="stroke-red"/>
+        <path d="M222 148 L230 152 L224 158" class="stroke-red"/>
+
+        <text x="400" y="90" class="lbl">independent processes,</text>
+        <text x="400" y="102" class="lbl">one message each</text>
+      </svg>
+      <figcaption>Broadcasting doesn't reach into any process's memory &mdash; it delivers the same message to each subscriber's mailbox, and each LiveView decides for itself what to do with it.</figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch08-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        PubSub doesn't compromise per-process isolation &mdash; it's built on
+        top of it. Every subscriber gets its own copy of the message and
+        reacts on its own terms, in its own process, at its own pace. A slow
+        or crashed subscriber never blocks the broadcaster or any other
+        subscriber.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch08-h-streams">Streams: collections the server doesn't hold</h2>
+
+    <p data-anchor="ch08-p3">
+      That last example used <code>stream_insert/4</code> rather than
+      <code>assign/3</code>, and this is where Chapter&nbsp;3's "temporary
+      assigns aren't always enough" gets resolved. A live order dashboard
+      that stays open for hours can receive thousands of
+      <code>:order_created</code> broadcasts. Even with temporary assigns
+      resetting after each render, every one of those broadcasts still goes
+      through a full assign-and-diff cycle keyed to a growing (or, if you
+      cap it, awkwardly truncated) list.
+    </p>
+
+    <p data-anchor="ch08-p4">
+      <code>stream(socket, :orders, initial_orders)</code> takes a different
+      approach entirely: the server tells the client to render an initial
+      set of items, each with a stable DOM id, and <em>never holds the full
+      collection in <code>socket.assigns</code> again</em>. From then on,
+      <code>stream_insert/4</code>, <code>stream_delete/3</code>, and
+      <code>stream_delete_by_dom_id/3</code> send small, targeted
+      instructions &mdash; "insert this one item at this position," "remove
+      the item with this id" &mdash; and the browser's DOM becomes the
+      authoritative record of what's currently shown. The server's job
+      shrinks to "tell the client what changed," never "remember the whole
+      list so I can re-render it."
+    </p>
+
+    <pre><code>&lt;ul id=<span class="str">"orders"</span> phx-update=<span class="str">"stream"</span>&gt;
+  &lt;li :for={{dom_id, order} &lt;- @streams.orders} id={dom_id}&gt;
+    {order.customer_name} &mdash; {order.total}
+  &lt;/li&gt;
+&lt;/ul&gt;</code></pre>
+
+    <p data-anchor="ch08-p5">
+      That <code>phx-update="stream"</code> attribute is what tells the
+      client-side runtime to manage this container's children by DOM id
+      rather than by re-rendering the whole list on every patch &mdash; the
+      client-side half of the same "the collection lives in the DOM, not the
+      process" contract.
+    </p>
+
+    <table data-anchor="ch08-tbl-recap">
+      <caption>Revisiting Chapter 3's state table with streams filled in</caption>
+      <thead>
+        <tr><th>Strategy</th><th>Server keeps</th><th>Best for</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Plain <code>assign/3</code></td><td>The full value, always</td><td>Small, bounded state</td></tr>
+        <tr><td>Temporary assigns</td><td>Only the latest delta</td><td>Unbounded but low-volume append-only lists</td></tr>
+        <tr><td><span class="term">Streams</span></td><td>Nothing &mdash; the DOM owns it by id</td><td>Large or high-volume, frequently mutated collections</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn" data-anchor="ch08-warn1">
+      <span class="callout-title">Trap</span>
+      <p>
+        Because a stream isn't held server-side, you can't read
+        <code>socket.assigns.streams.orders</code> back out as a list to,
+        say, count how many orders are showing or search through them in a
+        later callback &mdash; that data simply isn't there anymore after the
+        initial render. If a LiveView needs to both stream a collection for
+        display <em>and</em> reason about its contents elsewhere, keep a
+        separate, smaller assign for whatever summary you actually need
+        (a count, a total) rather than trying to derive it from the stream.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch08-h-takeaway">What we actually gained</h2>
+
+    <ul data-anchor="ch08-takeaway-list">
+      <li>PubSub fans one broadcast out to every subscribed process's own
+        mailbox, arriving as an ordinary <code>handle_info/2</code> &mdash;
+        it doesn't reach into any process's state directly.</li>
+      <li>Subscriber isolation from Chapter&nbsp;1 holds: a slow or crashed
+        subscriber never blocks the broadcast or any other subscriber.</li>
+      <li>Streams move a collection's authoritative copy out of
+        <code>socket.assigns</code> and into the client DOM, keyed by
+        stable id &mdash; the right tool once temporary assigns' per-render
+        reset isn't enough on its own.</li>
+      <li>Chapter&nbsp;9 turns to input flowing the other way &mdash; forms
+        and file uploads &mdash; and the client-side JS hooks that bridge
+        server state to browser-only APIs.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch08-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation (stream/4, stream_insert/4, stream_delete/3)</a></li>
+        <li><a href="https://phoenix.hexdocs.pm/live_view.html">LiveView &mdash; Phoenix guide</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-hooks-and-extension.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-uploads-forms-and-hooks.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>
