@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The 9P Protocol — Plan 9</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="plan-9">
+
+<header class="book-bar">
+  <span class="bar-title">Plan 9</span>
+  <nav class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open">
+      <p class="chapter-num">03</p>
+      <p class="chapter-kicker">Part 2 &middot; Mechanism</p>
+      <h1 class="chapter-title">The 9P Protocol</h1>
+      <p class="chapter-dek">The wire format underneath <code>bind</code> and <code>mount</code>: fids, qids, thirteen kinds of request answered one way each, tags that let a connection carry more than one conversation at once, and what actually changed when the protocol became 9P2000.</p>
+    </div>
+
+    <p class="lede" data-anchor="p9p-lede">Chapter two ended on a promise: <code>mount</code> is a front door, and something is being spoken on the other side of it. That something is 9P &mdash; the one protocol chapter one told you reaches every resource in the system, local or remote, and the thing the mount device in your kernel is translating your ordinary <code>open</code>/<code>read</code>/<code>write</code> calls into. It is not a large protocol. Thirteen request types, a handful of framing rules, two kinds of identifier. Learn those and you can read any 9P conversation on the wire, which is the point of this chapter &mdash; the next one, on file servers, is entirely about programs that answer these messages, and it will assume you can already read them.</p>
+
+    <h2 data-anchor="p9p-h-shape">The shape of a message</h2>
+    <p data-anchor="p9p-p1">Every 9P message, request or reply, has the same three-field head:</p>
+    <pre><code>size[4]  type[1]  tag[2]  ...type-specific fields...</code></pre>
+    <p data-anchor="p9p-p2"><code>size</code> is the length of the <em>entire</em> message, including these four bytes &mdash; it's the only thing that tells a reader where this message ends and the next one begins. That matters more than it looks: 9P has no delimiter, no framing byte, nothing but this count. It follows that 9P needs a transport that preserves message boundaries and delivers bytes reliably and in order, and has no mechanism of its own to recover if that transport drops or reorders anything. A pipe already has these properties; raw TCP doesn't delimit messages and UDP doesn't guarantee order, which is exactly why Plan&nbsp;9 originally paired 9P with a purpose-built transport, IL, instead of just using TCP.</p>
+    <p data-anchor="p9p-p3"><code>type</code> is one byte naming the message &mdash; <code>Tversion</code>, <code>Rattach</code>, and so on, from a fixed enumeration. Multi-byte integers in the fields that follow are little-endian; variable-length data, including every text string, is a two-byte count <code>n</code> followed by <code>n</code> bytes of UTF-8 with <em>no</em> trailing NUL &mdash; and the NUL character itself is illegal anywhere in a 9P string, which is what keeps file names, user names, and error text unambiguous without needing a terminator convention at all.</p>
+
+    <h2 data-anchor="p9p-h-ids">Two identifiers, two different jobs</h2>
+    <p data-anchor="p9p-p4">9P conversations run on two kinds of identifier that are easy to blur together the first time you meet them, because both show up in nearly every message. They answer different questions.</p>
+    <p data-anchor="p9p-p5">A <strong>fid</strong> is a 32-bit number the <em>client</em> picks, naming "the file I currently mean" for the rest of a conversation &mdash; not restricted to files open for I/O; a directory mid-walk or a file being <code>stat</code>'d is a fid too. Think of it as a handle the client hands the server on every subsequent message about that file. Because the client chooses it, and because a connection's fid space is shared by everyone using that connection, whatever multiplexes several clients onto one connection (the mount device, or a program like <code>exportfs</code> two chapters from now) has to make sure no two callers ever pick the same one.</p>
+    <p data-anchor="p9p-p6">A <strong>qid</strong> is the opposite direction: the <em>server's</em> own unforgeable identity for a file, thirteen bytes the server hands back whenever a fid comes to point at something &mdash; on <code>auth</code>, <code>attach</code>, <code>walk</code>, <code>open</code>, and <code>create</code> replies. It packs a one-byte type (a directory, an append-only file, and so on &mdash; the high bits of the file's mode, echoed), a four-byte version that a server typically bumps on every modification, and an eight-byte path unique across the whole served hierarchy. Two files on one server are the same file if and only if their qids match; a client can hold several different fids that all happen to resolve to one qid, and that's fine &mdash; qid identity, not fid identity, is what "the same file" means in 9P.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 175" role="img" aria-labelledby="p9p-d1t">
+        <title id="p9p-d1t">A fid is client-chosen and conversation-scoped; a qid is server-assigned and identifies the file itself</title>
+        <text x="16" y="20" class="dim">client picks &mdash;</text>
+        <rect x="16" y="30" width="150" height="34" class="stroke fill-soft"/>
+        <text x="24" y="52" class="big mono">fid 7</text>
+        <text x="180" y="52" class="dim">"my handle for whatever I last walked/opened"</text>
+
+        <path d="M16 90 L544 90" class="stroke-soft dash"/>
+
+        <text x="16" y="112" class="red">server returns &mdash;</text>
+        <rect x="16" y="122" width="150" height="34" class="stroke-red"/>
+        <text x="24" y="144" class="big red mono">qid</text>
+        <text x="180" y="138" class="dim">type[1] + vers[4] + path[8]</text>
+        <text x="180" y="156" class="dim">"the file itself, unforgeably" &mdash; same qid = same file</text>
+      </svg>
+      <figcaption><b>Different questions.</b> A fid says which handle a client is using in this conversation; a qid says which actual file is on the other end of it &mdash; two fids can share one qid.</figcaption>
+    </figure>
+
+    <h2 data-anchor="p9p-h-tags">Tags, and why 9P isn't lockstep</h2>
+    <p data-anchor="p9p-p7">The two-byte <code>tag</code> is chosen by the client and echoed back unchanged in the reply. Its purpose is concurrency: a client may have several T-messages outstanding on one connection at once, as long as no two of them share a tag, and a server is explicitly allowed to delay a reply and answer a <em>later</em> request first. That's not an edge case &mdash; it's necessary. A read on a file the kernel synthesizes from keyboard input might have nothing to return yet; a 9P server that could only ever answer requests in the order it received them would have to stall every other client behind that one pending read. Tags are what let it not do that.</p>
+    <p data-anchor="p9p-p8">There's exactly one reserved tag, <code>NOTAG</code> &mdash; <code>(ushort)~0</code>, all bits set &mdash; used only for the very first <code>Tversion</code> on a brand-new connection, before ordinary tag-matching rules are even in effect yet.</p>
+
+    <div class="callout warning" data-anchor="p9p-callout-tags">
+      <span class="callout-label">Don't assume in-order replies</span>
+      It's tempting to treat 9P like a simple call-and-response RPC and assume replies come back in the order requests went out. They don't have to. Code &mdash; or a mental model &mdash; that assumes strict FIFO ordering will misbehave against a perfectly compliant server the first time it delays one request behind another.
+    </div>
+
+    <h2 data-anchor="p9p-h-messages">Thirteen requests, one shape each</h2>
+    <p data-anchor="p9p-p9">Every <code>T</code>-message gets an <code>R</code>-message back whose type is exactly one greater, or the universal <code>Rerror</code> carrying a text <code>ename</code> instead &mdash; there's no per-message error type, and no <code>Terror</code> at all. (One message, <code>Tflush</code>, can never draw an <code>Rerror</code>; more on that below.) Walking through the set in the order a connection actually uses them:</p>
+
+    <h3 data-anchor="p9p-h3-version">version and auth &mdash; opening the connection</h3>
+    <p data-anchor="p9p-p10"><code>Tversion</code>/<code>Rversion</code> must be the first exchange on any connection, tagged <code>NOTAG</code>, and the client sends no other request until the reply arrives. The client proposes <code>msize</code>, the largest complete message (this four-byte size field included) it will ever send or accept; the server replies with its own <code>msize</code> &mdash; which must be no larger than the client's &mdash; and either the client's version string, an earlier one it prefers instead, or the literal string <code>"unknown"</code> if it recognizes none of them. A successful exchange resets the whole connection: outstanding I/O aborts, every fid is automatically clunked. Everything between one <code>Tversion</code> and the next is called a <em>session</em>.</p>
+    <p data-anchor="p9p-p11">Authentication, if the server wants any, rides on top of the ordinary message set rather than being some separate channel. <code>Tauth</code> hands the server a fresh <code>afid</code> plus the <code>uname</code>/<code>aname</code> a following attach will use; a server that doesn't require authentication just answers <code>Rerror</code>, and the client sets <code>afid</code> to <code>NOFID</code> in the attach that follows. A server that does require it replies with an <code>aqid</code> of type <code>QTAUTH</code>, which the client then reads and writes with ordinary <code>Tread</code>/<code>Twrite</code> to run whatever authentication protocol the two sides agree on &mdash; 9P itself doesn't define that protocol, which is deliberate; chapter&nbsp;8 is where factotum fills in what usually goes there.</p>
+
+    <h3 data-anchor="p9p-h3-attach">attach &mdash; the fid that means "the whole tree"</h3>
+    <p data-anchor="p9p-p12"><code>Tattach</code> is what turns a bare, version-negotiated connection into an actual client of the server: it binds a client-chosen <code>fid</code> to the root of the exported hierarchy, names the user (<code>uname</code>) and, for a server exporting more than one tree, which one (<code>aname</code>). It is an error if <code>fid</code> is already in use. Every other fid a client ever has on this connection is reached by walking, sooner or later, from this one.</p>
+    <pre><code><span class="dim">size</span>[4] <span class="fn">Tattach</span> <span class="dim">tag</span>[2] <span class="dim">fid</span>[4] <span class="dim">afid</span>[4] <span class="dim">uname</span>[s] <span class="dim">aname</span>[s]
+<span class="dim">size</span>[4] <span class="fn">Rattach</span> <span class="dim">tag</span>[2] <span class="dim">qid</span>[13]</code></pre>
+
+    <h3 data-anchor="p9p-h3-walk">walk &mdash; descending, one message at a time (or several elements at once)</h3>
+    <p data-anchor="p9p-p13"><code>Twalk</code> takes an existing <code>fid</code> and a proposed <code>newfid</code>, plus a list of path elements, and descends the hierarchy element by element &mdash; up to sixteen elements per message (<code>MAXWELEM</code>). That's a cap on one message, not on how deep a path can be; a deeper path just costs more than one <code>Twalk</code>. <code>Rwalk</code> returns one qid per successfully walked element, so a partial failure is visible directly in the count returned (fewer qids than elements requested) without disturbing the original <code>fid</code> or committing <code>newfid</code> &mdash; only a fully successful walk makes <code>newfid</code> live. Walking zero elements duplicates <code>fid</code> onto <code>newfid</code>, which is how a client clones a fid before doing something destructive to the copy. <code>".."</code> is a legal element meaning parent directory (the root's parent is itself); <code>"."</code> never appears on the wire at all &mdash; it's resolved locally, before a message is even built.</p>
+    <pre><code><span class="dim">size</span>[4] <span class="fn">Twalk</span>  <span class="dim">tag</span>[2] <span class="dim">fid</span>[4] <span class="dim">newfid</span>[4] <span class="dim">nwname</span>[2] nwname&times;(<span class="dim">wname</span>[s])
+<span class="dim">size</span>[4] <span class="fn">Rwalk</span>  <span class="dim">tag</span>[2] <span class="dim">nwqid</span>[2]  nwqid&times;(<span class="dim">qid</span>[13])</code></pre>
+
+    <h3 data-anchor="p9p-h3-open">open and create &mdash; readying a fid for I/O</h3>
+    <p data-anchor="p9p-p14"><code>Topen</code> and <code>Tcreate</code> both leave a fid ready for <code>read</code>/<code>write</code> and both return a qid plus an <code>iounit</code> &mdash; if nonzero, the largest transfer guaranteed not to be split across multiple 9P messages. <code>open</code>'s one-byte <code>mode</code> packs an access type (<code>OREAD</code>=0, <code>OWRITE</code>=1, <code>ORDWR</code>=2, <code>OEXEC</code>=3) with two independent bits: <code>OTRUNC</code> to truncate on open, <code>ORCLOSE</code> to remove the file the moment this fid is later clunked. <code>create</code> takes a name and requested permission bits &mdash; setting <code>DMDIR</code>, the top bit, asks for a directory instead of a plain file &mdash; and the server masks those bits down against the containing directory's own permissions before opening the new file according to <code>mode</code>; asking for world-readable inside a directory that isn't doesn't make the new file world-readable.</p>
+
+    <h3 data-anchor="p9p-h3-read">read and write &mdash; explicit offsets, no server-side cursor</h3>
+    <p data-anchor="p9p-p15"><code>Tread</code>/<code>Twrite</code> move <code>count</code> bytes at an explicit <code>offset</code> on an already-opened fid. That's a deliberate design choice, not an incidental one: 9P is offset-addressed on every call, closer to <code>pread</code>/<code>pwrite</code> than to a stream where the server remembers where you left off. (A Plan&nbsp;9 <code>seek</code>(2) moves the <em>client's</em> notion of offset and generates no message at all.) Reading a directory instead returns a whole number of stat-shaped entries &mdash; the same structure a plain <code>Tstat</code> returns for one file &mdash; and a client must resume a directory read exactly where the previous read's byte count left off; seeking to any other directory offset is illegal.</p>
+
+    <h3 data-anchor="p9p-h3-clunk">clunk and remove &mdash; letting go of a fid</h3>
+    <p data-anchor="p9p-p16"><code>Tclunk</code> tells the server a fid is no longer needed. On its own it never touches the file &mdash; it just retires the handle &mdash; unless that fid was opened with <code>ORCLOSE</code>, in which case clunking also deletes it. Either way the fid number becomes reusable immediately, and it's invalid to the client from that point even if <code>Rclunk</code> itself somehow comes back as an error. <code>Tremove</code> is exactly a clunk with a delete side effect bolted on: the server always clunks <code>fid</code>, whether or not the removal succeeds, and the request fails outright if the client lacks write permission in the parent directory.</p>
+
+    <h3 data-anchor="p9p-h3-stat">stat and wstat &mdash; one structure for reading and writing attributes</h3>
+    <p data-anchor="p9p-p17"><code>Tstat</code>/<code>Rstat</code> and <code>Twstat</code>/<code>Rwstat</code> move one machine-independent directory-entry structure &mdash; qid, mode, access and modify times, length, and the textual name/owner/group/last-modifier &mdash; the exact structure a directory read hands back one of per entry. A <code>wstat</code> is all-or-nothing: every requested change lands, or none does. A field can be left explicitly untouched &mdash; an empty string for a text field, the field's maximum integer value for a numeric one &mdash; and permission is scoped per field: renaming needs write permission in the parent, changing length needs it on the file itself, and mode/mtime/group changes are restricted to the owner or the relevant group leader. Nothing in <code>wstat</code> can change who owns a file.</p>
+
+    <h3 data-anchor="p9p-h3-flush">flush and error &mdash; canceling, and the one universal failure</h3>
+    <p data-anchor="p9p-p18"><code>Tflush</code> asks the server to abandon a still-pending request named by <code>oldtag</code>. The server must answer immediately with <code>Rflush</code> &mdash; never <code>Rerror</code> &mdash; and either abort the pending transaction or let it finish before flushing it. The client must wait for that <code>Rflush</code> before reusing <code>oldtag</code>, and, because the original request may already have changed server state by the time it's flushed &mdash; a <code>Tcreate</code> that already made a file, a <code>Twalk</code> that already allocated a fid &mdash; if the real reply arrives before the <code>Rflush</code> does, the client must honor it as having happened, not treat the flush as having erased it.</p>
+    <p data-anchor="p9p-p19"><code>Rerror</code> is the one reply any T-message except <code>Tflush</code> can draw instead of its expected answer &mdash; there's no <code>Terror</code>, and no per-message error variant. It carries the matching <code>tag</code> and a plain-text <code>ename</code> describing the failure, which a client may truncate if it's unreasonably long, since the string is advisory, not protocol state.</p>
+
+    <div class="callout key-idea" data-anchor="p9p-callout-13">
+      <span class="callout-label">The whole set, at a glance</span>
+      <code>version</code> and <code>auth</code> open the connection; <code>attach</code> claims a root; <code>walk</code> navigates; <code>open</code>/<code>create</code> ready a fid for I/O; <code>read</code>/<code>write</code> move bytes at an offset; <code>clunk</code>/<code>remove</code> let go of a fid; <code>stat</code>/<code>wstat</code> inspect or change attributes; <code>flush</code> cancels; <code>error</code> reports failure. Thirteen requests, thirteen jobs, no overlap.
+    </div>
+
+    <h2 data-anchor="p9p-h-2000">9P2000 versus the earlier protocol</h2>
+    <p data-anchor="p9p-p20">The message set above is 9P2000's &mdash; the version string that's been the default since 2000, and the one every later description of Plan&nbsp;9 (including this book) assumes. It isn't the protocol's first shape. An earlier revision kept two jobs separate that 9P2000 folds together. A <code>session</code> message used to do connection-opening authentication on its own, before anything else was possible on the connection; 9P2000 splits that into <code>Tversion</code> for negotiation and an optional, separate <code>Tauth</code> for authentication, so a connection that needs no authentication doesn't carry the machinery for it. And a <code>clone</code> message used to exist purely to copy a fid before walking into a directory with it &mdash; so the directory's own fid would survive the walk intact; 9P2000 absorbs that into <code>Twalk</code> itself, both by letting a zero-element walk act as a clone and by letting one <code>Twalk</code> carry several path elements in a single message. A clone followed by several single-step walks, in the older protocol, is one <code>Twalk</code> message in 9P2000.</p>
+    <p data-anchor="p9p-p21">The practical upshot: fewer message round trips for the same navigation, and a cleaner separation between "can we talk at all" (<code>version</code>) and "who are you" (<code>auth</code>), which is exactly the separation chapter&nbsp;8 needs when it explains why authentication in Plan&nbsp;9 is optional per server rather than baked into connecting at all.</p>
+
+    <h2 data-anchor="p9p-h-dialects">Two dialects, two different problems</h2>
+    <p data-anchor="p9p-p22">Version negotiation isn't just for picking "9P2000" versus something older &mdash; the same <code>Tversion</code> string can name a dialect that adds to 9P2000 rather than replacing it, and a server that doesn't recognize the extended string can legitimately answer with plain <code>"9P2000"</code> instead. Two such dialects matter in practice, and they solve genuinely different problems, not the same problem at two version numbers.</p>
+    <p data-anchor="p9p-p23"><strong>9P2000.u</strong> bolts Unix concepts onto the existing messages as extra fields. Base 9P names users and groups only as text; <code>.u</code> adds a numeric <code>n_uname</code> alongside the text uname on <code>attach</code>/<code>auth</code>, so a Unix-flavored server can work with numeric uid/gid directly. It adds a numeric errno hint onto <code>Rerror</code> next to the existing text <code>ename</code>, so a client that can't match the string against a table still has a numeric fallback. And it adds an <code>extension</code> string to the <code>stat</code>/<code>wstat</code> structure, letting device-special files, symbolic links, and hard links &mdash; concepts base 9P2000 has no notion of &mdash; be represented inside the existing <code>stat</code> message instead of inventing new ones.</p>
+    <p data-anchor="p9p-p24"><strong>9P2000.L</strong> takes the opposite approach, and it exists for a different consumer: Linux's own v9fs client (and things built on it, like QEMU's virtio-9p transport), which needs to answer to the Linux VFS layer, not extend Plan&nbsp;9's file model. Rather than adding a few fields to the messages above, <code>.L</code> keeps a subset of 9P2000's core and lays a parallel set of Linux-shaped messages alongside it: <code>Tlopen</code>/<code>Tlcreate</code> (open and create using Linux's <code>O_*</code> flags instead of the mode byte), <code>Tsymlink</code>, <code>Tmknod</code>, <code>Tlink</code>, <code>Trename</code>/<code>Trenameat</code>, <code>Treadlink</code>, <code>Tgetattr</code>/<code>Tsetattr</code> in place of <code>stat</code>/<code>wstat</code>, <code>Txattrwalk</code>/<code>Txattrcreate</code>, <code>Treaddir</code>, <code>Tfsync</code>, and <code>Tlock</code>/<code>Tgetlock</code> for POSIX advisory locking. Errors on <code>.L</code> travel through <code>Rlerror</code>, which carries only a numeric Linux errno &mdash; no text string at all, the opposite tradeoff from <code>.u</code>'s string-plus-hint.</p>
+
+    <table data-anchor="p9p-table-dialects">
+      <thead>
+        <tr><th>Dialect</th><th>Approach</th><th>Adds</th><th>Errors</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>9P2000</td><td>base protocol</td><td>&mdash;</td><td>text <code>ename</code> only</td></tr>
+        <tr><td>9P2000.u</td><td>extend existing messages</td><td>numeric uid, symlink/device/hardlink via <code>stat</code> extension</td><td>text + numeric hint</td></tr>
+        <tr><td>9P2000.L</td><td>parallel Linux-VFS message set</td><td><code>Tlopen</code>, <code>Tgetattr</code>, <code>Tsymlink</code>, <code>Tlock</code>, &hellip;</td><td>numeric <code>Rlerror</code> only</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warning" data-anchor="p9p-callout-dialects">
+      <span class="callout-label">.u and .L aren't the same idea twice</span>
+      It's easy to assume <code>.L</code> is just <code>.u</code>, later and more complete. They're not in a superset relationship: <code>.u</code> solves "represent Unix-only file kinds inside 9P2000's own message shapes," <code>.L</code> solves "answer to the Linux VFS directly," with a mostly disjoint set of new messages and a different error-reporting convention. A server speaking one doesn't thereby speak the other, and a client has to negotiate the specific string it wants.
+    </div>
+
+    <hr>
+
+    <h2 data-anchor="p9p-h-close">So what did we actually gain?</h2>
+    <p data-anchor="p9p-p25">Thirteen request types, a three-field message head, two identifiers that never get confused for each other once you know which direction each one points, and a tag scheme that turns "one connection" into "as many concurrent conversations as you have tags for." That's the entire protocol chapter one promised you was universal &mdash; the same thirteen messages serve a local kernel device and a file server three networks away, because nothing about them assumes locality. And it's the same thirteen messages <code>bind</code> and <code>mount</code> were quietly wrapping the whole time: <code>mount</code>'s <code>fd</code> becomes a <code>Tversion</code>/<code>Tattach</code> pair before you ever see a prompt again, and every subsequent path lookup through that mount point is a <code>Twalk</code> you never typed. The next chapter opens the other end of the wire: what it actually takes to write something that answers these thirteen messages well &mdash; kernel devices, the <code>lib9p</code> serving loop, and what makes a good file-server interface in the first place.</p>
+
+    <p class="cm" data-anchor="p9p-sources" style="margin-top:2rem;">Sources: <code>intro</code>(5) &middot; <code>version</code>(5) &middot; <code>attach</code>(5) &middot; <code>walk</code>(5) &middot; <code>open</code>(5) &middot; <code>read</code>(5) &middot; <code>clunk</code>(5) &middot; <code>remove</code>(5) &middot; <code>stat</code>(5) &middot; <code>flush</code>(5) &middot; <code>error</code>(5) &middot; <em>Plan 9 from Bell Labs</em> (Pike, Presotto, Thompson, Trickey, Winterbottom) &middot; the 9P2000.u Unix extension spec &middot; the Linux v9fs (9P2000.L) documentation.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="02-namespaces.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="04-file-servers.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
