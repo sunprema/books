@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>06 &middot; Async Work: Tasks, Results, and Failure &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch06-head">
+      <span class="chapter-num">06</span>
+      <span class="chapter-kicker">Keeping the process responsive</span>
+      <h1>Async Work: Tasks, Results, and Failure</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch06-lede">
+      A LiveView process handles one message at a time &mdash; that's just
+      what a <code>GenServer</code>-shaped mailbox means. So what happens if
+      <code>handle_event/3</code> needs to call a slow external API? If it
+      does that inline, the process can't respond to <em>anything else</em>
+      &mdash; not a click, not a PubSub message &mdash; until that call
+      returns. LiveView's async primitives exist to get real work off the
+      main process without giving up the safety of "one process holds the
+      state."
+    </p>
+
+    <h2 data-anchor="ch06-h-problem">The problem with a naive Task.async</h2>
+
+    <p data-anchor="ch06-p1">
+      You could, of course, just spawn a raw <code>Task</code> and send
+      yourself a message when it's done &mdash; and in fact that's close to
+      what LiveView does under the hood. But hand-rolling it means
+      hand-rolling the failure cases too: what happens if the task crashes?
+      If the LiveView navigates away before the task finishes? If two clicks
+      fire the same fetch before the first one lands? <code>start_async/3</code>
+      and <code>assign_async/3</code> exist because those questions have the
+      same right answer often enough to bake it in once.
+    </p>
+
+    <h2 data-anchor="ch06-h-assignasync">assign_async/3 &mdash; the common case</h2>
+
+    <p data-anchor="ch06-p2">
+      For the shape "run this function, and I want the result in an assign
+      when it's done, with loading/error states handled for me,"
+      <code>assign_async/3</code> is the direct tool:
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">mount</span>(%{<span class="str">"id"</span> =&gt; id}, _session, socket) <span class="kw">do</span>
+  {:ok,
+   assign_async(socket, :report, <span class="kw">fn</span> -&gt;
+     {:ok, %{report: Reports.generate_slowly(id)}}
+   <span class="kw">end</span>)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch06-p3">
+      The function runs in a <em>linked</em> task, only once the socket is
+      connected &mdash; recall Chapter&nbsp;1's disconnected/connected split;
+      an async fetch during the disconnected render would just be wasted
+      work for a process about to die. <code>socket.assigns.report</code>
+      becomes a <code>Phoenix.LiveView.AsyncResult</code> struct that starts
+      in a loading state and updates itself once the task resolves:
+    </p>
+
+    <pre><code>&lt;.async_result :let={report} assign={@report}&gt;
+  &lt;:loading&gt;Generating your report&hellip;&lt;/:loading&gt;
+  &lt;:failed :let={_reason}&gt;Something went wrong. Try again.&lt;/:failed&gt;
+  {report.title}
+&lt;/.async_result&gt;</code></pre>
+
+    <p data-anchor="ch06-p4">
+      The function you hand to <code>assign_async/3</code> must return
+      <code>{:ok, assigns_map}</code> or <code>{:error, reason}</code> &mdash;
+      that's the whole contract, and the loading/success/failure branches in
+      the template above map onto it directly, with no manual state
+      juggling in your callbacks at all.
+    </p>
+
+    <h2 data-anchor="ch06-h-startasync">start_async/3 and handle_async/3 &mdash; when you want more control</h2>
+
+    <p data-anchor="ch06-p5">
+      Sometimes the result doesn't map cleanly onto "assign one thing when
+      it's ready" &mdash; maybe it should trigger a flash message, or update
+      two unrelated assigns, or kick off a second async task. That's what
+      <code>start_async/3</code> plus a <code>handle_async/3</code> callback
+      buys: the same crash-safe, connected-only, linked-task machinery, but
+      you write the completion logic yourself instead of it being implied by
+      the assign shape.
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_event</span>(<span class="str">"generate"</span>, _params, socket) <span class="kw">do</span>
+  {:noreply, start_async(socket, :report_gen, <span class="kw">fn</span> -&gt; Reports.generate_slowly(socket.assigns.id) <span class="kw">end</span>)}
+<span class="kw">end</span>
+
+<span class="kw">def</span> <span class="fn">handle_async</span>(:report_gen, {:ok, report}, socket) <span class="kw">do</span>
+  {:noreply, socket |&gt; assign(:report, report) |&gt; put_flash(:info, <span class="str">"Report ready"</span>)}
+<span class="kw">end</span>
+
+<span class="kw">def</span> <span class="fn">handle_async</span>(:report_gen, {:exit, reason}, socket) <span class="kw">do</span>
+  {:noreply, put_flash(socket, :error, <span class="str">"Generation failed: #{inspect(reason)}"</span>)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch06-p6">
+      Notice the two <code>handle_async/3</code> clauses: the task either
+      finished with <code>{:ok, result}</code>, or it exited &mdash; crashed,
+      timed out, whatever &mdash; and arrives as <code>{:exit, reason}</code>.
+      Handling both explicitly is the whole point of reaching for this over a
+      bare <code>Task</code>: there is no code path where a failed task
+      silently vanishes and leaves the UI stuck on "loading" forever.
+    </p>
+
+    <div class="callout key" data-anchor="ch06-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        <code>assign_async/3</code> is <code>start_async/3</code> +
+        <code>handle_async/3</code> with the completion logic pre-written for
+        the single-assign case. Reach for the lower-level pair only when a
+        result needs to do more than fill in one assign.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch06-h-pitfalls">The pitfall: copying the whole socket into a task</h2>
+
+    <p data-anchor="ch06-p7">
+      Both functions run their closure in a separate process, which means
+      whatever the closure captures gets copied across process boundaries
+      &mdash; and it is easy to accidentally capture <code>socket</code>
+      itself instead of just the field the task needs:
+    </p>
+
+    <pre><code><span class="cm">## copies the ENTIRE socket &mdash; every assign, every internal field &mdash;
+## into the task's process just to read one field out of it</span>
+start_async(socket, :fetch, <span class="kw">fn</span> -&gt; Api.fetch(socket.assigns.user_id) <span class="kw">end</span>)
+
+<span class="cm">## copies exactly what's needed</span>
+user_id = socket.assigns.user_id
+start_async(socket, :fetch, <span class="kw">fn</span> -&gt; Api.fetch(user_id) <span class="kw">end</span>)</code></pre>
+
+    <p data-anchor="ch06-p8">
+      For a socket with a handful of small assigns this is a rounding
+      error. For one holding a large dataset, a big embedded struct, or
+      anything with a nested LiveComponent tree, the copy is real work and
+      real memory &mdash; bind the specific values you need to local variables
+      before the closure, the same discipline as passing arguments to any
+      other spawned process.
+    </p>
+
+    <h2 data-anchor="ch06-h-cancel">Cancellation and process linking</h2>
+
+    <p data-anchor="ch06-p9">
+      Because the async task is <em>linked</em> to the LiveView process, the
+      relationship holds in both directions: if the LiveView process dies
+      (a crash, or simply navigating away), the linked task is torn down
+      with it &mdash; no orphaned work still running against a page nobody's
+      looking at. Going the other way, <code>cancel_async/3</code> lets a
+      handler explicitly kill an in-flight task &mdash; the natural response
+      to, say, a user typing a new search query before the previous search's
+      results have come back.
+    </p>
+
+    <h2 data-anchor="ch06-h-takeaway">What we actually gained</h2>
+
+    <ul data-anchor="ch06-takeaway-list">
+      <li>Async primitives keep the LiveView process free to answer other
+        messages while real work happens on a linked task elsewhere.</li>
+      <li><code>assign_async/3</code> for the common "fill one assign, get
+        loading/failed states for free" case;
+        <code>start_async/3</code> + <code>handle_async/3</code> when
+        completion needs to do more.</li>
+      <li>Both handle task failure as a first-class outcome &mdash; there's
+        no silent "stuck loading forever" path.</li>
+      <li>Capture only what a task's closure needs, not the whole socket,
+        to avoid copying more than necessary across the process boundary.</li>
+      <li>Chapter&nbsp;7 turns to a different extension point &mdash; hooks
+        and <code>on_mount</code> &mdash; for behavior that needs to run
+        across many LiveViews, not just inside one.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch06-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation (assign_async/3, start_async/3, handle_async/3, cancel_async/3)</a></li>
+        <li><a href="https://phoenixframework-phoenix_live_view.mintlify.app/server/async-operations">Async Operations &mdash; Phoenix LiveView guide</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-events-and-messages.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-hooks-and-extension.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

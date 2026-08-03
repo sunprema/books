@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>02 &middot; Router, Mount, and the Initial Render &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch02-head">
+      <span class="chapter-num">02</span>
+      <span class="chapter-kicker">The backbone trio</span>
+      <h1>Router, Mount, and the Initial Render</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch02-lede">
+      Every LiveView page, no matter how simple or elaborate, is assembled by
+      exactly three callbacks running in a fixed order: <code>mount/3</code>,
+      then <code>handle_params/3</code>, then <code>render/1</code>. Get
+      comfortable with what each one is <em>for</em> &mdash; not just what it
+      does &mdash; and a surprising amount of "why doesn't my LiveView update"
+      confusion evaporates on its own.
+    </p>
+
+    <h2 data-anchor="ch02-h-router">Wiring it up in the router</h2>
+
+    <p data-anchor="ch02-p1">
+      A LiveView enters the picture through the router, with <code>live/3</code>
+      standing in for <code>get/3</code>:
+    </p>
+
+    <p class="code-label">lib/my_app_web/router.ex</p>
+    <pre><code><span class="kw">scope</span> <span class="str">"/"</span>, MyAppWeb <span class="kw">do</span>
+  pipe_through :browser
+
+  live <span class="str">"/dashboard"</span>, DashboardLive, :index
+  live <span class="str">"/posts/:id/edit"</span>, PostLive, :edit
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch02-p2">
+      That <code>:index</code> / <code>:edit</code> atom is the <strong>live
+      action</strong>. It's how one LiveView module serves several related
+      routes &mdash; a list view and an edit view for the same resource,
+      say &mdash; without duplicating <code>mount/3</code>. The live action
+      shows up as <code>socket.assigns.live_action</code>, and
+      <code>handle_params/3</code> is exactly where you branch on it.
+    </p>
+
+    <p data-anchor="ch02-p3">
+      Routes that should share one persistent connection &mdash; so
+      navigating between them feels instant instead of re-running the whole
+      HTTP+websocket handshake &mdash; are grouped under
+      <code>live_session</code>. We'll lean on this again in Chapter&nbsp;5,
+      when <code>push_navigate/2</code> needs somewhere to navigate
+      <em>to</em> without tearing the socket down.
+    </p>
+
+    <h2 data-anchor="ch02-h-mount">mount/3 &mdash; wiring up assigns, nothing else</h2>
+
+    <p data-anchor="ch02-p4">
+      <code>mount(params, session, socket)</code> is called once per render
+      pass (recall Chapter&nbsp;1: that's twice on a fresh load, once on every
+      reconnect). Its job is narrow on purpose: put the socket into a valid
+      initial state by assigning whatever the page needs, and return
+      <code>{:ok, socket}</code> or <code>{:ok, socket, opts}</code>.
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">mount</span>(%{<span class="str">"id"</span> =&gt; post_id}, _session, socket) <span class="kw">do</span>
+  post = Blog.get_post!(post_id)
+
+  {:ok,
+   socket
+   |&gt; assign(:post, post)
+   |&gt; assign(:page_title, post.title)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch02-p5">
+      <code>params</code> here are the <em>path</em> params &mdash;
+      <code>%{"id" =&gt; "42"}</code> for <code>/posts/42/edit</code>.
+      <code>session</code> is the plug session, the same one a controller
+      would see, which is how a LiveView learns who's logged in. Both are
+      untrusted client-adjacent data in the sense Chapter&nbsp;10 covers in
+      depth &mdash; a path param is a string an attacker can set to anything
+      the route pattern allows.
+    </p>
+
+    <p data-anchor="ch02-p6">
+      The options tuple is worth knowing even though most mounts don't need
+      it. <code>{:ok, socket, temporary_assigns: [comments: []]}</code> tells
+      LiveView to reset <code>:comments</code> to <code>[]</code> after every
+      render instead of keeping the last-rendered value resident in the
+      process &mdash; Chapter&nbsp;3 explains exactly why that matters for
+      memory. <code>{:ok, socket, layout: {MyAppWeb.Layouts, :minimal}}</code>
+      overrides the root layout for just this LiveView.
+    </p>
+
+    <div class="callout warn" data-anchor="ch02-warn1">
+      <span class="callout-title">Trap</span>
+      <p>
+        Don't reach for URL query params inside <code>mount/3</code>. They
+        aren't passed to it &mdash; only path params and the session are.
+        Query params, and every later change to the URL from
+        <code>push_patch/2</code>, arrive through <code>handle_params/3</code>
+        instead. A common bug is expecting <code>?tab=settings</code> to show
+        up in <code>mount/3</code>'s first argument; it never will.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch02-h-handleparams">handle_params/3 &mdash; the URL is the source of truth</h2>
+
+    <p data-anchor="ch02-p7">
+      <code>handle_params(params, uri, socket)</code> runs immediately after
+      <code>mount/3</code> on every render pass, and then again on its own
+      every time the URL changes via <code>push_patch/2</code> or a
+      <code>&lt;.link patch={&hellip;}&gt;</code> the visitor clicks.
+      This is the callback that reads query params, and it's where a
+      guided-mode-style page decides which tab, filter, or step to show based
+      on the URL rather than on hidden internal state.
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_params</span>(params, _uri, socket) <span class="kw">do</span>
+  tab = Map.get(params, <span class="str">"tab"</span>, <span class="str">"overview"</span>)
+  {:noreply, assign(socket, :active_tab, tab)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch02-p8">
+      The reason this split exists &mdash; rather than folding params
+      handling into <code>mount/3</code> &mdash; is that <code>mount/3</code>
+      only runs when the process is born, but a URL can change many times
+      over that process's life as the visitor clicks around inside your app.
+      Treating the URL as the single source of truth for "what should this
+      page currently show" is also what makes the browser's back button work
+      correctly for free: navigating back changes the URL, which re-invokes
+      <code>handle_params/3</code>, which re-derives the right assigns.
+    </p>
+
+    <h2 data-anchor="ch02-h-render">render/1 &mdash; a pure function of assigns</h2>
+
+    <p data-anchor="ch02-p9">
+      <code>render(assigns)</code> is called after <em>every</em> assign
+      change, and its contract is the simplest of the three: given the
+      current assigns, return a <code>Phoenix.LiveView.Rendered</code>
+      struct &mdash; almost always by writing a
+      <code>~H&#8203;"""&hellip;"""</code> HEEx template, either inline or
+      loaded automatically from a colocated <code>.html.heex</code> file.
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">render</span>(assigns) <span class="kw">do</span>
+  ~H<span class="str">"""
+  &lt;h1&gt;{@post.title}&lt;/h1&gt;
+  &lt;p&gt;{@post.body}&lt;/p&gt;
+  """</span>
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch02-p10">
+      Treat <code>render/1</code> as a <strong>pure function</strong>: same
+      assigns in, same markup out, no side effects, no database calls. The
+      moment a call like <code>Repo.all(Comment)</code> shows up inside a
+      template, LiveView's change tracking &mdash; the whole reason renders
+      are cheap &mdash; stops working for that section, because it can no
+      longer tell whether the section's output actually changed without
+      running the query every time. Chapter&nbsp;4 shows exactly why.
+    </p>
+
+    <figure class="diagram" data-anchor="ch02-fig-flow">
+      <svg class="diagram" viewBox="0 0 560 140" role="img" aria-labelledby="ch02-fig-flow-title">
+        <title id="ch02-fig-flow-title">Router dispatches to mount, then handle_params, then render, in that fixed order</title>
+        <rect x="16" y="40" width="130" height="40" class="stroke fill-soft"/>
+        <text x="26" y="56" class="big">Router</text>
+        <text x="26" y="70" class="dim">live "/posts/:id"</text>
+
+        <rect x="212" y="40" width="130" height="40" class="stroke fill-soft"/>
+        <text x="222" y="56" class="big">mount/3</text>
+        <text x="222" y="70" class="dim">params, session</text>
+
+        <rect x="408" y="40" width="136" height="40" class="stroke fill-soft"/>
+        <text x="418" y="56" class="big">handle_params/3</text>
+        <text x="418" y="70" class="dim">uri, query params</text>
+
+        <path d="M146 60 L212 60" class="stroke"/>
+        <path d="M204 56 L212 60 L204 64" class="stroke"/>
+        <path d="M342 60 L408 60" class="stroke"/>
+        <path d="M400 56 L408 60 L400 64" class="stroke"/>
+
+        <path d="M476 80 L476 108 L136 108 L136 90" class="stroke-red"/>
+        <path d="M132 98 L136 90 L140 98" class="stroke-red"/>
+        <rect x="60" y="90" width="150" height="36" class="stroke-red"/>
+        <text x="70" y="106" class="big red">render/1</text>
+        <text x="70" y="120" class="dim red">pure function of assigns</text>
+
+        <text x="220" y="130" class="lbl">re-runs on every push_patch</text>
+      </svg>
+      <figcaption>mount/3 runs once per process birth; handle_params/3 and render/1 both re-run every time the URL or assigns change.</figcaption>
+    </figure>
+
+    <div class="callout key" data-anchor="ch02-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        Divide responsibility by <em>when</em> it needs to run:
+        <code>mount/3</code> for once-per-connection setup,
+        <code>handle_params/3</code> for anything driven by the URL,
+        <code>render/1</code> for turning the current assigns into markup and
+        nothing more.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch02-h-takeaway">What we actually gained</h2>
+
+    <p data-anchor="ch02-p11">
+      Splitting "set up state," "react to the URL," and "draw the page" into
+      three callbacks with three distinct contracts means each one stays
+      small enough to reason about on its own. A bug where the wrong tab
+      shows up after a back-button press is a <code>handle_params/3</code>
+      bug; a bug where a brand-new visitor sees stale data is a
+      <code>mount/3</code> bug; a bug where the markup itself is wrong for
+      the assigns it was given is a <code>render/1</code> bug. That's a much
+      smaller search space than "somewhere in this 200-line module."
+    </p>
+
+    <ul data-anchor="ch02-takeaway-list">
+      <li><span class="term">mount/3</span> assigns the initial state; runs
+        once per process birth (and once, disconnected, before that).</li>
+      <li><span class="term">handle_params/3</span> is the URL's handler; it
+        owns query params and re-runs on every in-session navigation.</li>
+      <li><span class="term">render/1</span> stays pure &mdash; assigns in,
+        HEEx out, no queries, no side effects.</li>
+      <li>Chapter&nbsp;3 picks up right where <code>assign/3</code> left off:
+        what actually lives in <code>socket.assigns</code>, and how LiveView
+        decides what to re-render when one value changes.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch02-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation (mount/3, handle_params/3, render/1)</a></li>
+        <li><a href="https://phoenix.hexdocs.pm/live_view.html">LiveView &mdash; Phoenix guide</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-the-lifecycle.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-assigns-and-state.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

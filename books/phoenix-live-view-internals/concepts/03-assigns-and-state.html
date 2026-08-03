@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>03 &middot; Socket Assigns and State Transitions &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch03-head">
+      <span class="chapter-num">03</span>
+      <span class="chapter-kicker">The one piece of mutable state you're allowed</span>
+      <h1>Socket Assigns and State Transitions</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch03-lede">
+      Everything a LiveView knows about the current page lives in one place:
+      <code>socket.assigns</code>, an ordinary Elixir map living in the
+      process's heap. There's no client-side state store, no separate cache
+      layer &mdash; assigns <em>are</em> the state, and the moment they change,
+      LiveView goes and figures out what the browser needs to know about it.
+      Let's build up exactly how that works, because "assigns change &rarr;
+      page updates" is doing more work than it looks like.
+    </p>
+
+    <h2 data-anchor="ch03-h-assign">assign/3 and the render loop it drives</h2>
+
+    <p data-anchor="ch03-p1">
+      <code>assign(socket, :count, 5)</code> (or the pipeable
+      <code>assign(socket, count: 5)</code> for several keys at once) does two
+      things: it puts <code>:count</code> into
+      <code>socket.assigns</code>, and it marks that key as
+      <strong>changed</strong> for this render cycle. After every callback
+      that returns an updated socket &mdash; <code>handle_event/3</code>,
+      <code>handle_info/2</code>, whatever &mdash; LiveView calls
+      <code>render/1</code> again, but the changed-keys tracking is what lets
+      it skip re-computing anything that only depended on assigns that
+      <em>didn't</em> change. We'll follow that tracking all the way to the
+      wire in Chapter&nbsp;4; for now, the mental model to hold is simpler:
+      <strong>assigning is the only way anything on the page updates.</strong>
+      There's no two-way data binding, no client store to mutate directly
+      &mdash; every visible change traces back to some callback calling
+      <code>assign/3</code>.
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_event</span>(<span class="str">"increment"</span>, _params, socket) <span class="kw">do</span>
+  {:noreply, update(socket, :count, &amp;(&amp;1 + 1))}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch03-p2">
+      <code>update/3</code> is just <code>assign/3</code> with the new value
+      derived from the old one &mdash; convenient for counters, toggles, and
+      anything that's naturally "the next state given the current state."
+    </p>
+
+    <h2 data-anchor="ch03-h-nested">Reassigning, not mutating, nested data</h2>
+
+    <p data-anchor="ch03-p3">
+      Because assigns are an ordinary immutable map, "updating" a field
+      inside a nested struct means building a new struct and reassigning it
+      whole, exactly like anywhere else in Elixir:
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_event</span>(<span class="str">"toggle_published"</span>, _params, socket) <span class="kw">do</span>
+  post = %{socket.assigns.post | published: !socket.assigns.post.published}
+  {:noreply, assign(socket, :post, post)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch03-p4">
+      This matters for change tracking, which we're building toward in
+      Chapter&nbsp;4: LiveView can track changes at the level of individual
+      struct/map <em>fields</em> (so a template that only reads
+      <code>@post.title</code> won't re-render when
+      <code>@post.published</code> flips), but only when you reassign through
+      <code>assign/3</code>. Reach for <code>Map.put/3</code> or
+      <code>Kernel.put_in/3</code> on the assigns map directly, bypassing
+      <code>assign/3</code>, and that tracking has nothing to hook into.
+    </p>
+
+    <h2 data-anchor="ch03-h-temporary">Temporary assigns: state that resets itself</h2>
+
+    <p data-anchor="ch03-p5">
+      Every assign, by default, stays resident in the process for as long as
+      the process lives &mdash; which is exactly what you want for
+      <code>@current_user</code>, but a genuine liability for something like a
+      chat log that only ever grows. A LiveView that assigns the full message
+      history on every new message keeps that entire history alive in memory
+      for the lifetime of the connection, even though the client only ever
+      needed to see the diff.
+    </p>
+
+    <p data-anchor="ch03-p6">
+      <span class="term">Temporary assigns</span> solve this by telling
+      LiveView "reset this key back to a default value immediately after each
+      render" &mdash; declared once, in <code>mount/3</code>'s options:
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">mount</span>(_params, _session, socket) <span class="kw">do</span>
+  {:ok, assign(socket, :messages, []), temporary_assigns: [messages: []]}
+<span class="kw">end</span>
+
+<span class="kw">def</span> <span class="fn">handle_info</span>({:new_message, msg}, socket) <span class="kw">do</span>
+  {:noreply, assign(socket, :messages, [msg])}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch03-p7">
+      Read that <code>handle_info/2</code> carefully: it assigns
+      <code>[msg]</code>, a list of <em>one</em> message, not the whole
+      history appended. The template renders that one new message, LiveView
+      diffs it against the last render and patches the client-side DOM (which
+      still has every earlier message sitting in it from previous patches),
+      and then &mdash; because <code>:messages</code> is temporary &mdash;
+      LiveView resets <code>socket.assigns.messages</code> back to
+      <code>[]</code> before the next render. The server never holds the full
+      log at once; the browser's DOM does.
+    </p>
+
+    <div class="callout key" data-anchor="ch03-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        Temporary assigns don't change what gets sent to the browser on any
+        <em>given</em> render &mdash; they change what the <em>process</em>
+        keeps holding afterward. Use them for anything append-only and
+        unbounded: chat messages, activity feeds, log tails.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch03-h-streams-preview">When even that isn't enough: a preview of streams</h2>
+
+    <p data-anchor="ch03-p8">
+      Temporary assigns solve unbounded <em>growth</em>, but they still
+      round-trip every appended item through the full assign-and-diff
+      machinery, and they don't help when you need to reorder, delete, or
+      bulk-reset a large collection efficiently. That's what
+      <code>stream/4</code> is for &mdash; a purpose-built mechanism for large
+      collections that we'll cover properly in Chapter&nbsp;8, once
+      PubSub gives us a reason to be pushing collection updates from other
+      processes in the first place.
+    </p>
+
+    <h2 data-anchor="ch03-h-table">Choosing a state strategy</h2>
+
+    <table data-anchor="ch03-tbl-compare">
+      <caption>Three ways to hold changing state in a LiveView</caption>
+      <thead>
+        <tr><th>Strategy</th><th>Server keeps</th><th>Best for</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Plain <code>assign/3</code></td>
+          <td>The full current value, always</td>
+          <td>Small, bounded state &mdash; a form, a selected tab, a counter</td>
+        </tr>
+        <tr>
+          <td>Temporary assigns</td>
+          <td>Only the latest delta, reset after render</td>
+          <td>Append-only, unbounded lists &mdash; chat, activity feeds</td>
+        </tr>
+        <tr>
+          <td>Streams (Ch.&nbsp;8)</td>
+          <td>Nothing &mdash; the client owns the collection by DOM id</td>
+          <td>Large or frequently reordered/mutated collections</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="ch03-h-takeaway">What we actually gained</h2>
+
+    <ul data-anchor="ch03-takeaway-list">
+      <li>Assigns are the <em>only</em> mutable state a LiveView has, and
+        <code>assign/3</code> is the only sanctioned way to change them.</li>
+      <li>Reassign nested data as new values, not in-place mutations &mdash;
+        both idiomatic Elixir and required for change tracking to see the
+        field that actually changed.</li>
+      <li>Temporary assigns trade "the process remembers everything" for
+        "the process remembers only the latest render," which is exactly
+        the trade unbounded, append-only state wants.</li>
+      <li>Chapter&nbsp;4 follows one <code>assign/3</code> call all the way
+        to the bytes sent over the websocket, and explains precisely why
+        some code defeats that optimization.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch03-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation (assign/3, temporary_assigns)</a></li>
+        <li><a href="https://phoenix.hexdocs.pm/live_view.html">LiveView &mdash; Phoenix guide</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-router-mount-and-render.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-diffing-the-dom.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

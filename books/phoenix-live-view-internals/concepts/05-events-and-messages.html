@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>05 &middot; Client Events, Server Messages, and Navigation &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch05-head">
+      <span class="chapter-num">05</span>
+      <span class="chapter-kicker">Three ways in, three ways out</span>
+      <h1>Client Events, Server Messages, and Navigation</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch05-lede">
+      A LiveView process, like any BEAM process, spends most of its life
+      waiting for a message and reacting to it. What makes it feel alive is
+      that those messages come from two very different directions &mdash; a
+      click in the browser, or a broadcast from some other part of your
+      system &mdash; and LiveView gives each direction its own callback so
+      the two never get confused with each other.
+    </p>
+
+    <h2 data-anchor="ch05-h-events">handle_event/3 &mdash; the client asking for something</h2>
+
+    <p data-anchor="ch05-p1">
+      Bindings like <code>phx-click</code>, <code>phx-submit</code>, and
+      <code>phx-change</code> turn a DOM interaction into a message sent over
+      the websocket, which arrives as a call to
+      <code>handle_event(event_name, payload, socket)</code>:
+    </p>
+
+    <pre><code>&lt;button phx-click=<span class="str">"increment"</span> phx-value-amount=<span class="str">"5"</span>&gt;+5&lt;/button&gt;</code></pre>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_event</span>(<span class="str">"increment"</span>, %{<span class="str">"amount"</span> =&gt; amount}, socket) <span class="kw">do</span>
+  {:noreply, update(socket, :count, &amp;(&amp;1 + String.to_integer(amount)))}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch05-p2">
+      That <code>payload</code> map &mdash; here, <code>%{"amount" =&gt;
+      "5"}</code> &mdash; is built entirely on the client from
+      <code>phx-value-*</code> attributes and form input values. Chapter&nbsp;10
+      spells out the consequence directly: nothing stops a browser's dev tools
+      from sending <code>handle_event("increment", %{"amount" =&gt;
+      "999999999"}, socket)</code> instead of clicking the button at all. The
+      payload is exactly as trustworthy as any other client-submitted form
+      field, no more.
+    </p>
+
+    <h2 data-anchor="ch05-h-info">handle_info/2 &mdash; a message from somewhere else in the BEAM</h2>
+
+    <p data-anchor="ch05-p3">
+      <code>handle_info(message, socket)</code> is the ordinary
+      <code>GenServer</code> callback for "a message landed in my mailbox
+      that didn't come through <code>handle_call</code> or
+      <code>handle_cast</code>." For a LiveView, the most common source is a
+      PubSub broadcast the process subscribed to back in
+      <code>mount/3</code> &mdash; Chapter&nbsp;8 builds a whole feature
+      around exactly this pattern &mdash; but it's just as much at home
+      receiving a message from <code>Process.send_after/3</code> for a
+      recurring tick, or from a linked <code>Task</code> completing (though
+      for that specific case, prefer the purpose-built
+      <code>start_async/3</code> from Chapter&nbsp;6, which handles crashes
+      more gracefully than a hand-rolled task and a raw
+      <code>handle_info/2</code>).
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">handle_info</span>({:metric_updated, value}, socket) <span class="kw">do</span>
+  {:noreply, assign(socket, :current_value, value)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch05-p4">
+      <code>handle_cast/2</code> exists too, for the rarer case of another
+      process calling <code>GenServer.cast/2</code> directly against the
+      LiveView's pid &mdash; useful if some other part of your supervision
+      tree already holds that pid and wants to push to it without going
+      through PubSub at all.
+    </p>
+
+    <div class="callout key" data-anchor="ch05-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        <code>handle_event/3</code> answers "what did the person looking at
+        this page just do." <code>handle_info/2</code> answers "what
+        happened somewhere else in the system that this page cares about."
+        Keeping that distinction sharp is what makes a LiveView's message
+        handlers readable at a glance months later.
+      </p>
+    </div>
+
+    <figure class="diagram" data-anchor="ch05-fig-seq">
+      <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="ch05-fig-seq-title">
+        <title id="ch05-fig-seq-title">A click sends handle_event; a PubSub broadcast from another process arrives as handle_info; both end in an assign and a diffed patch</title>
+        <text x="30" y="20" class="big">Browser</text>
+        <text x="270" y="20" class="big">LiveView process</text>
+        <text x="480" y="20" class="big">Other process</text>
+        <path d="M60 30 L60 180" class="stroke-soft dash"/>
+        <path d="M300 30 L300 180" class="stroke-soft dash"/>
+        <path d="M510 30 L510 180" class="stroke-soft dash"/>
+
+        <path d="M60 55 L300 55" class="stroke"/>
+        <path d="M292 51 L300 55 L292 59" class="stroke"/>
+        <text x="80" y="48" class="lbl">phx-click</text>
+        <text x="130" y="70" class="dim">handle_event/3</text>
+
+        <path d="M510 100 L300 100" class="stroke-red"/>
+        <path d="M308 96 L300 100 L308 104" class="stroke-red"/>
+        <text x="330" y="93" class="lbl red">PubSub.broadcast</text>
+        <text x="150" y="115" class="dim">handle_info/2</text>
+
+        <path d="M300 140 L300 155" class="stroke"/>
+        <text x="150" y="150" class="dim">assign/3 &rarr; diff (Ch. 4)</text>
+
+        <path d="M300 165 L60 165" class="stroke"/>
+        <path d="M68 161 L60 165 L68 169" class="stroke"/>
+        <text x="120" y="180" class="lbl">patched DOM</text>
+      </svg>
+      <figcaption>Two different origins, one shared destination: whatever handler runs, the only way forward is through an assign.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch05-h-navigation">Three ways to move, three different guarantees</h2>
+
+    <p data-anchor="ch05-p5">
+      LiveView has three distinct navigation functions, and reaching for the
+      wrong one is a common source of "why did my socket reconnect when I
+      didn't expect it to."
+    </p>
+
+    <table data-anchor="ch05-tbl-nav">
+      <caption>Navigation functions and what they actually do</caption>
+      <thead>
+        <tr><th>Function</th><th>Process</th><th>Re-runs</th><th>Use for</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>push_patch(socket, to:)</code></td>
+          <td>Same process, same mount</td>
+          <td><code>handle_params/3</code> only</td>
+          <td>Changing the URL within one LiveView &mdash; a tab, a filter, a page number</td>
+        </tr>
+        <tr>
+          <td><code>push_navigate(socket, to:)</code></td>
+          <td>New process, same <code>live_session</code></td>
+          <td><code>mount/3</code> and <code>handle_params/3</code></td>
+          <td>Moving to a different LiveView without a full page reload</td>
+        </tr>
+        <tr>
+          <td><code>redirect(socket, to:)</code></td>
+          <td>Full page reload</td>
+          <td>Everything, from an HTTP request</td>
+          <td>Crossing a <code>live_session</code> boundary, or after a plain (non-live) action</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch05-p6">
+      <code>push_patch/2</code> is the cheapest of the three by a wide margin
+      &mdash; it never leaves the current process, so nothing in
+      <code>socket.assigns</code> is lost, and the only work is a fresh
+      <code>handle_params/3</code> call plus a render. That makes it the
+      right choice for anything that's really "the same page, different
+      view of it": paginating a table, switching tabs, expanding a filter.
+      <code>push_navigate/2</code> spawns a genuinely new process, which is
+      why it re-runs <code>mount/3</code> &mdash; it's a fresh start, just
+      one that skips the websocket teardown/rebuild that a full
+      <code>redirect/2</code> would cost.
+    </p>
+
+    <h2 data-anchor="ch05-h-pushevent">push_event/3 &mdash; talking to client-side JavaScript</h2>
+
+    <p data-anchor="ch05-p7">
+      Everything so far has been server state driving server-rendered
+      markup. <code>push_event(socket, event, payload)</code> is the escape
+      hatch for when the server needs to trigger client-only behavior that
+      has no markup representation &mdash; playing a sound, focusing an
+      element, kicking off a CSS animation the diff wouldn't otherwise
+      produce. It dispatches a <code>"phx:" &lt;&gt; event</code> browser
+      event that a JS hook's <code>handleEvent</code> callback picks up
+      &mdash; Chapter&nbsp;9 covers hooks properly when uploads give us a
+      concrete reason to write one.
+    </p>
+
+    <h2 data-anchor="ch05-h-takeaway">What we actually gained</h2>
+
+    <ul data-anchor="ch05-takeaway-list">
+      <li><code>handle_event/3</code> handles what the client did;
+        <code>handle_info/2</code> handles what some other process reported
+        &mdash; kept apart, a handler's origin is obvious from its name.</li>
+      <li>Event payloads are exactly as trustworthy as any other client
+        input &mdash; validate them the same way you'd validate a form.</li>
+      <li>Reach for the cheapest navigation function that does the job:
+        <code>push_patch</code> for same-view URL changes,
+        <code>push_navigate</code> for a new LiveView without a full reload,
+        <code>redirect</code> only when you must leave the socket behind.</li>
+      <li>Chapter&nbsp;6 covers what happens when a handler needs to do real
+        work &mdash; a slow API call, a report to generate &mdash; without
+        blocking the process from answering anything else in the meantime.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch05-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation (handle_event/3, handle_info/2, push_patch/2, push_navigate/2, push_event/3)</a></li>
+        <li><a href="https://phoenix.hexdocs.pm/live_view.html">LiveView &mdash; Phoenix guide</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-diffing-the-dom.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-async-work.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

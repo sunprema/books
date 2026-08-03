@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>07 &middot; Hooks, on_mount, and Extension Points &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch07-head">
+      <span class="chapter-num">07</span>
+      <span class="chapter-kicker">Cross-cutting behavior, without copy-paste</span>
+      <h1>Hooks, on_mount, and Extension Points</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch07-lede">
+      Every LiveView we've written so far has kept its callbacks to itself.
+      But real applications have a handful of things that dozens of
+      LiveViews all need &mdash; "check the user is logged in," "log every
+      event for telemetry," "close a menu when the URL changes." Copy-pasting
+      that logic into every <code>mount/3</code> is exactly the kind of
+      repetition Elixir gives us tools to avoid, and LiveView's answer is a
+      pair of server-side hook mechanisms, distinct from the client-side JS
+      hooks Chapter&nbsp;9 covers.
+    </p>
+
+    <h2 data-anchor="ch07-h-onmount">on_mount/1 &mdash; running before mount, everywhere</h2>
+
+    <p data-anchor="ch07-p1">
+      <code>on_mount/1</code> lets a module inject logic that runs
+      <em>before</em> a LiveView's own <code>mount/3</code>, wired up either
+      per-LiveView or, more usefully, once for an entire
+      <code>live_session</code> in the router:
+    </p>
+
+    <p class="code-label">lib/my_app_web/live/auth_hooks.ex</p>
+    <pre><code><span class="kw">defmodule</span> MyAppWeb.AuthHooks <span class="kw">do</span>
+  <span class="kw">import</span> Phoenix.LiveView
+
+  <span class="kw">def</span> <span class="fn">on_mount</span>(:require_authenticated, _params, session, socket) <span class="kw">do</span>
+    <span class="kw">case</span> Accounts.get_user_by_session(session) <span class="kw">do</span>
+      <span class="kw">nil</span> -&gt; {:halt, redirect(socket, to: <span class="str">"/login"</span>)}
+      user -&gt; {:cont, assign(socket, :current_user, user)}
+    <span class="kw">end</span>
+  <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+    <pre><code><span class="cm"># router.ex</span>
+live_session :authenticated, on_mount: [{MyAppWeb.AuthHooks, :require_authenticated}] <span class="kw">do</span>
+  live <span class="str">"/dashboard"</span>, DashboardLive
+  live <span class="str">"/settings"</span>, SettingsLive
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch07-p2">
+      The return contract &mdash; <code>{:cont, socket}</code> to keep going,
+      <code>{:halt, socket}</code> to stop &mdash; is the same shape every
+      hook mechanism in this chapter uses, and it's worth internalizing once:
+      <span class="term">cont</span> means "this LiveView's own
+      <code>mount/3</code> should still run," <span class="term">halt</span>
+      means "don't even bother, I've already redirected/rejected."
+      Authentication is the canonical use, but the same mechanism is just as
+      at home assigning a shared value every LiveView in a session wants
+      &mdash; feature flags, the current locale, an analytics session id.
+    </p>
+
+    <h2 data-anchor="ch07-h-attachhook">attach_hook/4 &mdash; intercepting a LiveView's own callbacks</h2>
+
+    <p data-anchor="ch07-p3">
+      Where <code>on_mount/1</code> only runs once, at the very start,
+      <code>attach_hook/4</code> can intercept
+      <em>every</em> subsequent call to <code>handle_params/3</code>,
+      <code>handle_event/3</code>, <code>handle_info/2</code>,
+      <code>handle_async/3</code>, or the render-adjacent
+      <code>after_render</code> stage &mdash; called inside
+      <code>mount/3</code> (or later), and typically for something narrower
+      and more local than a whole authentication scheme:
+    </p>
+
+    <pre><code><span class="kw">def</span> <span class="fn">mount</span>(_params, _session, socket) <span class="kw">do</span>
+  {:ok,
+   attach_hook(socket, :close_menu_on_nav, :handle_params, <span class="kw">fn</span> _params, _uri, socket -&gt;
+     {:cont, assign(socket, :menu_open?, false)}
+   <span class="kw">end</span>)}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch07-p4">
+      That hook fires on every <code>handle_params/3</code> call for this one
+      LiveView &mdash; closing a nav menu on every URL change &mdash; without
+      the LiveView's own <code>handle_params/3</code> clause needing to know
+      the menu exists at all. A hook attached to <code>:handle_event</code>
+      can also <code>{:halt, reply, socket}</code>, short-circuiting before
+      the LiveView's own <code>handle_event/3</code> clauses ever see the
+      event &mdash; the shape a request-logging or rate-limiting hook would
+      use.
+    </p>
+
+    <div class="callout key" data-anchor="ch07-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        <code>on_mount/1</code> is for "run this once, before everything
+        else, for every LiveView that opts in" &mdash; wired in the router.
+        <code>attach_hook/4</code> is for "intercept this <em>specific</em>
+        callback, on this specific LiveView, every time it fires" &mdash;
+        wired inside the LiveView itself.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch07-h-livecomponent">Hooks versus LiveComponents</h2>
+
+    <p data-anchor="ch07-p5">
+      It's tempting to reach for a <code>Phoenix.LiveComponent</code> any
+      time markup gets reused, but a LiveComponent is solving a different
+      problem than a hook is. A LiveComponent bundles <strong>state and
+      event handling</strong> into a reusable, stateful unit &mdash; its own
+      <code>mount/1</code>, <code>update/2</code>, <code>render/1</code>, and
+      <code>handle_event/3</code> &mdash; but it does <em>not</em> get its own
+      process. It runs inside the parent LiveView's process, sharing memory
+      with it; only the assigns are scoped separately.
+    </p>
+
+    <table data-anchor="ch07-tbl-compare">
+      <caption>Four ways to reuse behavior, and what each one actually gives you</caption>
+      <thead>
+        <tr><th>Mechanism</th><th>Has state?</th><th>Own process?</th><th>Reach for it when&hellip;</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Function component</td>
+          <td>No</td>
+          <td>No</td>
+          <td>Reusing markup with no event handling of its own &mdash; the default choice</td>
+        </tr>
+        <tr>
+          <td>LiveComponent</td>
+          <td>Yes</td>
+          <td>No (parent's process)</td>
+          <td>The reused piece needs its own <code>handle_event/3</code> and internal state</td>
+        </tr>
+        <tr>
+          <td><code>attach_hook/4</code></td>
+          <td>Reads/writes host socket</td>
+          <td>No</td>
+          <td>Intercepting one callback on one LiveView, without owning any markup</td>
+        </tr>
+        <tr>
+          <td><code>on_mount/1</code></td>
+          <td>Reads/writes host socket</td>
+          <td>No</td>
+          <td>The same setup logic needs to run for every LiveView in a session</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="ch07-p6">
+      The official guidance is blunt about the first row: prefer a function
+      component whenever it's enough, precisely because it's the simplest
+      abstraction with the smallest surface area. Reach for a LiveComponent
+      specifically when a piece of UI needs to encapsulate both its own
+      event handling <em>and</em> its own state &mdash; a self-contained
+      autocomplete widget with its own open/closed state and its own
+      keystroke handling is a good fit; a card that just displays a passed-in
+      struct is not, and should stay a function component.
+    </p>
+
+    <div class="callout warn" data-anchor="ch07-warn1">
+      <span class="callout-title">Trap</span>
+      <p>
+        Because a LiveComponent shares its parent's process, a bug inside
+        one doesn't get the fault isolation Chapter&nbsp;1 described for a
+        LiveView itself &mdash; an unhandled crash in a LiveComponent takes
+        down the whole parent LiveView's process, menu bar and all. That's
+        one more reason to reach for the plainest mechanism that solves the
+        problem: less code running inside the one process means less that
+        can bring the whole page down with it.
+      </p>
+    </div>
+
+    <h2 data-anchor="ch07-h-takeaway">What we actually gained</h2>
+
+    <ul data-anchor="ch07-takeaway-list">
+      <li><code>on_mount/1</code> centralizes once-per-connection setup
+        &mdash; authentication first among equals &mdash; across every
+        LiveView that opts in via <code>live_session</code>.</li>
+      <li><code>attach_hook/4</code> intercepts a specific callback on a
+        specific LiveView, useful for behavior that's local rather than
+        application-wide.</li>
+      <li>Both share the same <code>{:cont, socket}</code> /
+        <code>{:halt, socket}</code> contract &mdash; learn it once.</li>
+      <li>A LiveComponent is for state <em>and</em> event handling that
+        deserves its own encapsulated unit; it still runs inside the parent's
+        process, so it doesn't buy the fault isolation a separate LiveView
+        would.</li>
+      <li>Chapter&nbsp;8 turns from single-process concerns to
+        multi-process ones: how LiveViews talk to <em>each other</em>, and
+        to the rest of your application, via PubSub and streams.</li>
+    </ul>
+
+    <div class="sources" data-anchor="ch07-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation (on_mount/1, attach_hook/4)</a></li>
+        <li><a href="https://github.com/phoenixframework/phoenix_live_view/blob/main/lib/phoenix_live_component.ex">Phoenix.LiveComponent &mdash; module documentation</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-async-work.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-pubsub-and-streams.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>

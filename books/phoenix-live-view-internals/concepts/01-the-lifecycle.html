@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>01 &middot; The Lifecycle: From HTTP to Living Process &mdash; Phoenix LiveView: Internals</title>
+<link rel="stylesheet" href="../assets/book.css" />
+</head>
+<body data-book="phoenix-live-view-internals">
+
+<header class="topbar">
+  <span class="brand">Phoenix LiveView: Internals</span>
+  <span class="spacer"></span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-head" data-anchor="ch01-head">
+      <span class="chapter-num">01</span>
+      <span class="chapter-kicker">Where a LiveView actually lives</span>
+      <h1>The Lifecycle: From HTTP to Living Process</h1>
+    </header>
+
+    <p class="lede" data-anchor="ch01-lede">
+      Let's start with a question that trips up almost everyone new to LiveView:
+      when you visit a LiveView page, is your browser talking to a controller,
+      or to a websocket? The honest answer is <em>both, in sequence</em> &mdash;
+      and the gap between those two answers is where most of LiveView's
+      internals live. We're going to build the mental model one request at a
+      time, the same way we'd trace a request through any system we didn't
+      write: by watching what actually happens.
+    </p>
+
+    <h2 data-anchor="ch01-h-two-renders">Two renders, one module</h2>
+
+    <p data-anchor="ch01-p1">
+      A LiveView module gets rendered <strong>twice</strong> for a single page
+      visit, by two completely different transport mechanisms, and it doesn't
+      know the difference unless it asks.
+    </p>
+
+    <p data-anchor="ch01-p2">
+      The first render happens the moment the browser makes its initial GET
+      request. Phoenix's router dispatches it like any other HTTP request,
+      through the ordinary plug pipeline &mdash; session, CSRF token,
+      authentication plugs, all of it. At the end of that pipeline sits your
+      LiveView, and Phoenix calls <code>mount/3</code>, then
+      <code>handle_params/3</code>, then <code>render/1</code>, and ships the
+      resulting HTML back as a perfectly normal HTTP response. At this point
+      there is no persistent process, no websocket, nothing stateful at all.
+      It's a request that started and finished, the same as any Phoenix
+      controller action.
+    </p>
+
+    <p data-anchor="ch01-p3">
+      The second render happens moments later, once the page's JavaScript
+      (<code>LiveSocket</code>) opens a websocket connection back to the
+      server. <em>Now</em> Phoenix spawns a dedicated process for this specific
+      browser tab, and that process runs <code>mount/3</code> and
+      <code>handle_params/3</code> <strong>again</strong> &mdash; this time with
+      a socket that is connected. It renders once more, diffs that render
+      against what the disconnected render already put on the page, and sends
+      only the differences down the wire. From this point on, the process
+      stays alive for as long as the tab stays open, holding your application
+      state in memory between one user interaction and the next.
+    </p>
+
+    <div class="callout key" data-anchor="ch01-key1">
+      <span class="callout-title">Key idea</span>
+      <p>
+        <code>mount/3</code> runs twice on a fresh page load: once disconnected
+        (HTTP, no process), once connected (websocket, a live process). Both
+        runs execute the <em>same code</em>. <code>Phoenix.LiveView.connected?/1</code>
+        is how a mount tells them apart &mdash; true only on the second pass.
+      </p>
+    </div>
+
+    <p data-anchor="ch01-p4">
+      That distinction matters in practice more than it sounds like it should.
+      Imagine subscribing to a PubSub topic in <code>mount/3</code> so the
+      LiveView gets live updates. Do that unconditionally, and the
+      <em>disconnected</em> render subscribes too &mdash; a process that is
+      about to die anyway, having never been meant to receive messages at all.
+      The idiom is to gate anything with a side effect behind
+      <code>connected?/1</code>:
+    </p>
+
+    <p class="code-label">lib/my_app_web/live/dashboard_live.ex</p>
+    <pre><code><span class="kw">def</span> <span class="fn">mount</span>(_params, _session, socket) <span class="kw">do</span>
+  <span class="kw">if</span> connected?(socket) <span class="kw">do</span>
+    Phoenix.PubSub.subscribe(MyApp.PubSub, <span class="str">"dashboard:updates"</span>)
+  <span class="kw">end</span>
+
+  {:ok, assign(socket, :count, MyApp.Metrics.current_count())}
+<span class="kw">end</span></code></pre>
+
+    <p data-anchor="ch01-p5">
+      Notice that the <em>data fetch</em> &mdash; <code>current_count/0</code>
+      &mdash; runs on both passes. That's deliberate: the disconnected render
+      is what search engines and slow connections actually see, so it should
+      show real content, not a blank shell waiting for JavaScript. Only
+      subscriptions, timers, and anything else that would leak or duplicate
+      belong behind the guard.
+    </p>
+
+    <h2 data-anchor="ch01-h-process">A LiveView is a process, not a template</h2>
+
+    <p data-anchor="ch01-p6">
+      Here's the reframe that makes the rest of this book click: stop thinking
+      of a LiveView as a template that happens to update itself, and start
+      thinking of it as <strong>a BEAM process</strong> that happens to render
+      HTML. Once the websocket connects, your LiveView module is running
+      inside a process that behaves like a <code>GenServer</code> &mdash; it
+      has its own mailbox, its own isolated heap, and its own supervised
+      lifecycle, riding on top of a Phoenix Channel for the actual
+      wire-transport.
+    </p>
+
+    <p data-anchor="ch01-p7">
+      This is not an implementation detail you can safely ignore. It's the
+      reason LiveView gets fault isolation for free: if one visitor's LiveView
+      process crashes &mdash; a bad pattern match, an unhandled exit from a
+      linked task &mdash; it takes down <em>exactly one browser tab's worth of
+      state</em>. Every other connected user's process keeps running,
+      untouched, because the BEAM's whole design point is that a crashing
+      process cannot corrupt another process's memory. Compare that to a
+      thread-per-request model backed by shared application state, where the
+      blast radius of "something went wrong" is much harder to draw a boundary
+      around.
+    </p>
+
+    <figure class="diagram" data-anchor="ch01-fig-timeline">
+      <svg class="diagram" viewBox="0 0 560 210" role="img" aria-labelledby="ch01-fig-timeline-title">
+        <title id="ch01-fig-timeline-title">A browser's GET request is served statelessly by the plug pipeline; the websocket upgrade then spawns a dedicated LiveView process that outlives the request</title>
+
+        <rect x="16" y="30" width="150" height="40" class="stroke fill-soft"/>
+        <text x="26" y="46" class="big">Browser</text>
+        <text x="26" y="60" class="dim">GET /dashboard</text>
+
+        <rect x="220" y="30" width="150" height="40" class="stroke fill-soft"/>
+        <text x="230" y="46" class="big">Plug pipeline</text>
+        <text x="230" y="60" class="dim">session, csrf, auth</text>
+
+        <rect x="424" y="30" width="120" height="40" class="stroke fill-soft"/>
+        <text x="434" y="46" class="big">mount/3</text>
+        <text x="434" y="60" class="dim">disconnected</text>
+
+        <path d="M166 50 L220 50" class="stroke"/>
+        <path d="M212 46 L220 50 L212 54" class="stroke"/>
+        <path d="M370 50 L424 50" class="stroke"/>
+        <path d="M416 46 L424 50 L416 54" class="stroke"/>
+
+        <text x="16" y="100" class="dim">HTML response &mdash; no process yet</text>
+        <path d="M16 108 L544 108" class="stroke-soft dash"/>
+
+        <text x="16" y="140" class="red">websocket upgrade</text>
+        <rect x="180" y="150" width="180" height="42" class="stroke-red"/>
+        <text x="190" y="168" class="big red">LiveView process</text>
+        <text x="190" y="184" class="dim">mount/3 again, connected</text>
+
+        <path d="M16 148 L180 171" class="stroke-red"/>
+        <path d="M170 165 L180 171 L172 179" class="stroke-red"/>
+
+        <text x="380" y="170" class="lbl">GenServer-like</text>
+        <text x="380" y="184" class="lbl">own mailbox, own heap</text>
+      </svg>
+      <figcaption>The disconnected render and the connected process run the same module, but only one of them lives past the response.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch01-h-reconnect">Crashes and dropped connections</h2>
+
+    <p data-anchor="ch01-p8">
+      Because the connected LiveView is just a process, "the connection
+      dropped" and "the process crashed" resolve to the same recovery path:
+      the client-side <code>LiveSocket</code> notices the channel is gone,
+      shows a (configurable) disconnected indicator, and attempts to
+      reconnect. When it succeeds, the browser doesn't resume the old process
+      &mdash; that process, and whatever was in its memory, is gone for good.
+      Instead the whole handshake happens again from the top:
+      <code>mount/3</code>, then <code>handle_params/3</code>, exactly as if
+      the visitor had loaded the page for the first time.
+    </p>
+
+    <div class="callout spec" data-anchor="ch01-spec1">
+      <span class="callout-title">In practice</span>
+      <p>
+        This is why LiveView state should be treated as a cache of a
+        durable source of truth, not the source of truth itself. If a
+        counter only lives in <code>socket.assigns</code> and the process
+        restarts, the counter resets. Fine for UI state like "which tab is
+        open"; not fine for anything a user would be upset to lose &mdash;
+        that belongs in the database, and <code>mount/3</code> should reload
+        it, not reinvent it.
+      </p>
+    </div>
+
+    <p data-anchor="ch01-p9">
+      That reconnection path is also a quiet security feature, which
+      Chapter&nbsp;10 leans on directly: because every reconnect re-runs
+      <code>mount/3</code>'s authorization checks from scratch, there is no
+      window where a process keeps running with permissions the current
+      session no longer has, as long as those checks read live data (the
+      current user, their current role) instead of a value captured once and
+      never revisited.
+    </p>
+
+    <h2 data-anchor="ch01-h-takeaway">What we actually gained</h2>
+
+    <p data-anchor="ch01-p10">
+      So what did splitting the lifecycle into "stateless render, then live
+      process" actually buy us? Three things worth naming explicitly, because
+      the rest of this book assumes them:
+    </p>
+
+    <ul data-anchor="ch01-takeaway-list">
+      <li><span class="term">A working page with no JavaScript.</span> The
+        disconnected render is real HTML, so the first paint is fast and
+        crawlable, and a visitor on a flaky connection still sees content.</li>
+      <li><span class="term">Per-visitor fault isolation.</span> Each connected
+        tab is its own supervised process; one crash affects one visitor.</li>
+      <li><span class="term">A recovery model that's also a security model.</span>
+        A dropped connection doesn't leave a zombie process behind &mdash; it
+        forces a full re-mount, re-running whatever authorization logic
+        <code>mount/3</code> contains.</li>
+    </ul>
+
+    <p data-anchor="ch01-p11">
+      Chapter&nbsp;2 zooms into that first pass in detail &mdash; what the
+      router actually wires up, and the precise contract of
+      <code>mount/3</code>, <code>handle_params/3</code>, and
+      <code>render/1</code> as a trio.
+    </p>
+
+    <div class="sources" data-anchor="ch01-sources">
+      <h2>Sources</h2>
+      <ol>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html">Phoenix.LiveView &mdash; module documentation</a></li>
+        <li><a href="https://hexdocs.pm/phoenix_live_view/welcome.html">Phoenix LiveView &mdash; Welcome guide</a></li>
+        <li><a href="https://fly.io/phoenix-files/a-liveview-is-a-process/">A LiveView is a Process &mdash; The Phoenix Files</a></li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="02-router-mount-and-render.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script>
+document.addEventListener('click', function(e){
+  var b = e.target.closest && e.target.closest('.img-copy');
+  if(!b) return;
+  var p = b.closest('.img-slot').querySelector('.img-prompt');
+  if(p && navigator.clipboard) navigator.clipboard.writeText(p.textContent.trim());
+});
+</script>
+</body>
+</html>
