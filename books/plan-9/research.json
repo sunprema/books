@@ -607,7 +607,83 @@
       ],
       "furtherReading": ["src-9p-lib3", "src-9p-file3", "src-intro3-devices", "src-srv3", "src-srv4", "src-exportfs4", "src-consolefs4"]
     },
-    "mount-bind-union": {},
+    "mount-bind-union": {
+      "researched": "2026-08-03",
+      "claims": [
+        {
+          "text": "bind and mount both modify the file name space of the current process and other processes in its name-space group. For both calls, old names an existing file or directory already in the current name space; it is evaluated as in intro(2), except the final path element is not translated (so old itself, not what it currently points to, is the thing being changed).",
+          "sources": ["src-bind2-man"]
+        },
+        {
+          "text": "Both bind and mount take a flag governing how the newly-visible thing joins whatever is already at old. MREPL (the default, value 0) replaces old outright; if the result is a directory (for mount this is true by definition, since a mount target must be a directory) old becomes a union directory of exactly one component, the new one. MBEFORE requires both old and the new thing to be directories and splices the new directory onto the front of the union at old, so it is searched first. MAFTER is identical but splices onto the end. MCREATE can be OR'd onto any of MREPL/MBEFORE/MAFTER to mark that specific component as eligible to receive a newly created file. MCACHE, valid only for mount, turns on local client-side caching for files reached through that mount; by default file contents are always fetched fresh from the server, and with MCACHE on, currency of a cached file is re-verified at each open, not on every read.",
+          "sources": ["src-bind2-man"]
+        },
+        {
+          "text": "At the command line, bind(1) and mount(1) expose the same flags as options: no option is MREPL, -b is MBEFORE, -a is MAFTER, -c is MCREATE (usable with either -b or -a, or alone), and -C (mount only) is MCACHE. mount also takes -k keypattern to constrain which factotum(4) key is used and -n to skip authentication entirely; -q makes either command exit silently on failure. The namespace(6) description-file operations mount and bind accept the identical option letters, interpreted exactly as in bind(1).",
+          "sources": ["src-bind-man", "src-namespace6-man"]
+        },
+        {
+          "text": "A union directory is what results when bind or mount stacks multiple directories at one point in the name space; Plan 9 documentation describes it as behaving like the concatenation of its constituent directories. A file-name lookup in a union directory searches each component in the union's order and takes the first match; reading a union directory (e.g. via ls) likewise concatenates the directory listing of each component in that same order.",
+          "sources": ["src-9p-io-9"]
+        },
+        {
+          "text": "The canonical union directory is /bin itself: it is built as a union of /$cputype/bin (the compiled binaries for the local architecture) and /rc/bin (architecture-independent shell scripts), plus optionally more directories a user adds. Because the search order is structural — part of the name space, not a per-shell variable — this construction makes the shell's $PATH variable unnecessary; Plan 9's rc has no such variable at all.",
+          "sources": ["src-9p-io-9", "src-9p-io-names"]
+        },
+        {
+          "text": "Which union component receives a newly-created file is governed separately from lookup order. By default, a directory added to a union does not accept new files at all, though create() on a name that already exists in that directory still succeeds normally regardless of the flag. The MCREATE flag, set when a directory is bound or mounted into the union, marks that component as create-eligible. When create() makes a genuinely new name inside a union directory, the components are tried in union order and the file is created in the first one that has create permission; if that particular create fails (e.g. no write permission), the whole create() fails — it does not fall through to try the next create-eligible component.",
+          "sources": ["src-9p-io-9", "src-bind2-man"]
+        },
+        {
+          "text": "This creation rule is deliberately designed to support one common pattern: a user unions a private, writable directory into an otherwise public, read-only union (for example, ahead of /bin with -b -c) so that new files they create land in their own directory while the public components stay untouched.",
+          "sources": ["src-9p-io-9"]
+        },
+        {
+          "text": "Internally, the kernel represents the whole name space as a mount table: a list of (from, to) channel pairs. Whenever a walk successfully advances a channel to a new name, the mount table is checked for a from entry matching that name; if one exists, the to channel is cloned and substituted for the channel the walk was using. A union directory is implemented by making that to channel the head of a linked list of channels, one per union component. If a walk fails to find the requested name in the first channel of the list, it follows the list, clones the next channel, and retries the walk there — which is the mechanical, per-name-lookup version of the 'search each component in order, first match wins' rule.",
+          "sources": ["src-9p-io-9"]
+        },
+        {
+          "text": "unmount(char *name, char *old) reverses a bind or mount. If name is the null string/zero, everything currently bound or mounted at old is removed — the whole union at that point, however many components it has. If name is non-zero, it is evaluated exactly as bind's name argument is, and only the binding that would attach that specific result to old is undone, leaving any other components of a union at old untouched.",
+          "sources": ["src-bind2-man", "src-bind-man"]
+        },
+        {
+          "text": "mount(2) documents a specific ordering constraint as a BUGS-section note: mount does not return until it has successfully attached to the file server, so the process performing the mount cannot simultaneously be the process serving the connection — posting the pipe end for serving and mounting the other end must happen from separate processes (or the server side must already be running before the mount call).",
+          "sources": ["src-bind2-man"]
+        },
+        {
+          "text": "The namespace(6) description-file format and the ns(1) command (already introduced as the mechanism that boots a process's first name space and inspects a running one) are the same vocabulary this chapter's flags feed into: every mount/bind line in a namespace(6) file, and every line ns(1) prints back from /proc/pid/ns, is exactly one of these bind(2)/mount(2) calls with one of these four flags, spelled out as its bind(1)/mount(1) option letters.",
+          "sources": ["src-namespace6-man", "src-ns1-man"]
+        }
+      ],
+      "snippets": [
+        {
+          "lang": "c",
+          "code": "int bind(char *name, char *old, int flag);\nint mount(int fd, int afd, char *old, int flag, char *aname);\nint unmount(char *name, char *old);\n\n/* flag is one of: */\n#define MREPL    0x0000   /* replace old outright (default) */\n#define MBEFORE  0x0001   /* splice new dir to the FRONT of the union at old */\n#define MAFTER   0x0002   /* splice new dir to the BACK of the union at old */\n/* OR in: */\n#define MCREATE  0x0004   /* this component accepts newly-created files */\n#define MCACHE   0x0010   /* mount only: cache file contents locally */",
+          "note": "flag constants and signatures per bind(2)/mount(2); MREPL/MBEFORE/MAFTER are mutually exclusive positions, MCREATE and MCACHE are independent bits OR'd onto any of them",
+          "sources": ["src-bind2-man"]
+        },
+        {
+          "lang": "sh",
+          "code": "# /bin as a union: architecture binaries, then rc scripts, then a private directory\nbind -a /386/bin  /bin      # -a = MAFTER: append at the end of the union\nbind -a /rc/bin   /bin      # -a = MAFTER: append after that\nbind -b -c $home/bin /bin   # -b -c = MBEFORE|MCREATE: search ME first, and\n                             #   anything I create lands here, not in /bin's\n                             #   public components",
+          "note": "option letters and semantics per bind(1); /$cputype/bin + /rc/bin union per the overview paper's description of /bin",
+          "sources": ["src-bind-man", "src-9p-io-9"]
+        },
+        {
+          "lang": "sh",
+          "code": "# undo one specific binding vs. undo everything at a point\nunmount /n/dump/1992/0716/mips/lib/libc.a /mips/lib/libc.a   # undo just this bind\nunmount /mips/lib/libc.a                                      # undo EVERYTHING bound/mounted there",
+          "note": "two-argument vs. one-argument unmount per bind(1)/bind(2)",
+          "sources": ["src-bind-man", "src-bind2-man"]
+        }
+      ],
+      "pitfalls": [
+        "MCREATE marks a component eligible to receive new files; it does not make that component the exclusive target. Creation of a genuinely new name still walks the union in search order (as fixed by MBEFORE/MAFTER placement) and uses the first component with create permission — order and MCREATE interact, neither alone determines where a file lands.",
+        "MCREATE only affects create() of a name that does not yet exist anywhere in the union. create() on a name that already exists in some (non-create-eligible) component succeeds normally through ordinary open-for-write semantics — a union with no MCREATE component at all is not read-only for files that are already there, only for genuinely new names.",
+        "unmount with a single argument removes every component bound or mounted at that point, not just the most recently added one — the natural-looking 'undo my last bind' call is actually the two-argument form naming exactly what to remove.",
+        "MBEFORE/MAFTER require both old and the incoming name to already be directories; you cannot union two plain files, and mount's target must always be a directory since the served tree's root is grafted there.",
+        "A union directory's concatenation is positional shadowing, not merging: if the same file name exists in two components, only the first (search-order) match is reachable by that name — the second component's file of the same name is simply never seen through that name, it does not overlay or combine with it."
+      ],
+      "furtherReading": ["src-bind2-man", "src-bind-man", "src-9p-io-9", "src-namespace6-man"]
+    },
     "process-namespaces": {},
     "plumbing": {},
     "security-model": {}
