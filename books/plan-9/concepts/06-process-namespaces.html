@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Process Namespaces — Plan 9</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="plan-9">
+
+<header class="book-bar">
+  <span class="bar-title">Plan 9</span>
+  <nav class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open">
+      <p class="chapter-num">06</p>
+      <p class="chapter-kicker">Part 2 &middot; Mechanism</p>
+      <h1 class="chapter-title">Process Namespaces</h1>
+      <p class="chapter-dek">Chapter&nbsp;2 introduced two of <code>rfork</code>'s bits &mdash; <code>RFNAMEG</code> and <code>RFCNAMEG</code> &mdash; just enough to explain how a name space is inherited, and set the rest of the flag vector aside. This is the rest: <code>RFFDG</code>, <code>RFENVG</code>, <code>RFMEM</code>, and <code>RFPROC</code>'s own quiet rule about when <code>rfork</code> forks at all &mdash; plus the process interface built out of the same file model, <code>/proc</code>, and why <code>/dev/cons</code> is not one file but as many as there are windows.</p>
+    </div>
+
+    <p class="lede" data-anchor="pn-lede">A process is not one indivisible thing on Plan&nbsp;9 &mdash; it is a bundle of resources, and <code>rfork</code> lets you say, per resource, whether the child shares the parent's copy, gets its own, or starts clean. Name space was resource one. This chapter works through the rest of the bundle using the exact same three-way choice, then turns to how a running process is itself represented: as files, under <code>/proc</code>, reachable through the very name space this book has been building since chapter&nbsp;1.</p>
+
+    <h2 data-anchor="pn-h-rfork">One call, and whether it forks at all</h2>
+    <p data-anchor="pn-p1"><code>rfork</code> takes one <code>int</code>, a bit vector, and nothing about that vector is namespace-specific &mdash; it just happens that two of its bits are the ones chapter&nbsp;2 needed. The full shape:</p>
+    <pre><code><span class="ty">int</span> <span class="fn">rfork</span>(<span class="ty">int</span> flags);
+
+<span class="mac">RFPROC</span>    <span class="cm">// create a new (child) process; otherwise the CALLER's</span>
+          <span class="cm">//   own resources are modified in place &mdash; no fork happens</span>
+<span class="mac">RFNAMEG</span>   <span class="cm">// (ch. 2) child gets an independent COPY of the name space</span>
+<span class="mac">RFCNAMEG</span>  <span class="cm">// (ch. 2) child starts with an EMPTY name space</span>
+<span class="mac">RFFDG</span>     <span class="cm">// child gets an independent COPY of the descriptor table</span>
+<span class="mac">RFCFDG</span>    <span class="cm">// child starts with an EMPTY descriptor table</span>
+<span class="mac">RFENVG</span>    <span class="cm">// child gets an independent COPY of /env</span>
+<span class="mac">RFCENVG</span>   <span class="cm">// child starts with an EMPTY /env</span>
+<span class="mac">RFMEM</span>     <span class="cm">// child SHARES data+bss with the parent (stack is always</span>
+          <span class="cm">//   copy-on-write regardless); valid only with RFPROC</span></code></pre>
+    <p data-anchor="pn-p2">Start with <code>RFPROC</code>, because it changes what every other bit means. If it's set, <code>rfork</code> creates a child: the parent's call returns the child's pid, the child's returns <code>0</code>, exactly like <code>fork</code>. If <code>RFPROC</code> is <em>not</em> set, no process is created at all &mdash; the other bits instead modify the resources of the process making the call, in place. That makes <code>rfork(RFNAMEG)</code>, with nothing else, a complete and legal statement on its own: "detach my name space from whoever I was sharing it with," no forking involved. Chapter&nbsp;2's examples all paired <code>RFNAMEG</code>/<code>RFCNAMEG</code> with <code>RFPROC</code> because they were about what a <em>new</em> process inherits; a running process rewriting its own resource sharing, mid-execution, is the other half of the same mechanism.</p>
+
+    <div class="callout key-idea" data-anchor="pn-callout-design">
+      <span class="callout-label">Why one call instead of a thread API and a process API</span>
+      Plan&nbsp;9 deliberately has a single class of process, not processes plus a separate lightweight-thread type. <code>rfork</code>'s bit vector gives fine, independent control over which resources are shared, copied, or started clean, so the same primitive covers everything from a plain <code>fork()</code> to something close to a thread that shares memory but keeps its own name space. Outside the library's own <code>fork()</code>, it's hard to find two <code>rfork</code> call sites in real programs that pass the same bits &mdash; the point of the design is exactly that variety.
+    </div>
+
+    <h2 data-anchor="pn-h-pattern">Shared, copied, or clean &mdash; the same choice, three times</h2>
+    <p data-anchor="pn-p3">Name space, environment, and file descriptors all follow the identical three-way shape: a plain <code>fork()</code> shares the resource outright, one flag splits it into an independent copy, and (for two of the three) a second flag splits it into something empty instead of a copy.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 210" role="img" aria-labelledby="pn-d1t">
+        <title id="pn-d1t">Name space, environment, and descriptor table each default to shared, then split into an independent copy or an empty one on the matching flag</title>
+
+        <text x="16" y="20" class="dim">name space</text>
+        <rect x="120" y="6" width="120" height="30" class="stroke-soft fill-soft"/>
+        <text x="130" y="26" class="on-ink dim mono" style="fill:var(--ink)">shared (default)</text>
+        <path d="M240 21 L288 21" class="stroke-soft dash"/>
+        <rect x="288" y="6" width="130" height="30" class="stroke fill-red"/>
+        <text x="298" y="26" class="on-ink mono">RFNAMEG: copy</text>
+        <path d="M418 21 L458 21" class="stroke-soft dash"/>
+        <rect x="458" y="6" width="86" height="30" class="stroke-soft fill-soft"/>
+        <text x="466" y="26" class="dim mono" style="font-size:9.5px">RFCNAMEG: clean</text>
+
+        <text x="16" y="90" class="dim">environment</text>
+        <rect x="120" y="76" width="120" height="30" class="stroke-soft fill-soft"/>
+        <text x="130" y="96" class="dim mono" style="fill:var(--ink)">shared (default)</text>
+        <path d="M240 91 L288 91" class="stroke-soft dash"/>
+        <rect x="288" y="76" width="130" height="30" class="stroke fill-red"/>
+        <text x="298" y="96" class="on-ink mono">RFENVG: copy</text>
+        <path d="M418 91 L458 91" class="stroke-soft dash"/>
+        <rect x="458" y="76" width="86" height="30" class="stroke-soft fill-soft"/>
+        <text x="466" y="96" class="dim mono" style="font-size:9.5px">RFCENVG: empty</text>
+
+        <text x="16" y="160" class="dim">descriptors</text>
+        <rect x="120" y="146" width="120" height="30" class="stroke-soft fill-soft"/>
+        <text x="130" y="166" class="dim mono" style="fill:var(--ink)">shared (default)</text>
+        <path d="M240 161 L288 161" class="stroke-soft dash"/>
+        <rect x="288" y="146" width="130" height="30" class="stroke fill-red"/>
+        <text x="298" y="166" class="on-ink mono">RFFDG: copy</text>
+        <path d="M418 161 L458 161" class="stroke-soft dash"/>
+        <rect x="458" y="146" width="86" height="30" class="stroke-soft fill-soft"/>
+        <text x="466" y="166" class="dim mono" style="font-size:9.5px">RFCFDG: empty</text>
+
+        <text x="16" y="200" class="red">Three resources, one shape &mdash; not three unrelated flag pairs to memorize separately.</text>
+      </svg>
+      <figcaption><b>The same choice, made three times.</b> "Empty" means genuinely nothing for environment and descriptors; an <code>RFCNAMEG</code> name space is clean but inert until something is mounted onto it &mdash; there's no root to walk until then.</figcaption>
+    </figure>
+
+    <p data-anchor="pn-p4">Environment variables are, unsurprisingly by now, their own file device: <code>#e</code>, conventionally bound to <code>/env</code>, one file per variable holding its value as plain text. Under a plain <code>fork()</code>, parent and child keep seeing exactly the same <code>/env</code> files &mdash; write a new value through either process and the other sees it, same as an unflagged name space. <code>RFENVG</code> splits that into two independent sets that started identical; <code>RFCENVG</code> splits into an empty set. There's no new idea here, only the same one applied to a different device.</p>
+
+    <h2 data-anchor="pn-h-fdg">File descriptors: the table splits, the files don't</h2>
+    <p data-anchor="pn-p5"><code>RFFDG</code> is easy to misread as "the child gets its own files." It doesn't &mdash; it gets its own <em>table</em>. After an <code>RFFDG</code> fork, descriptor <code>3</code> in the child still refers to the exact same open channel descriptor <code>3</code> referred to in the parent; what becomes independent is only the mapping from small integers to those channels, from that point forward. Open a new file in the child afterward and the parent's descriptor <code>3</code> is unaffected, because the tables no longer track each other &mdash; but the channel they both already had open at fork time is still one shared thing underneath, exactly as far as it was shared before.</p>
+    <p data-anchor="pn-p6">Without <code>RFFDG</code>, there's only one table, referenced by both processes, and the difference is sharper than it sounds: close a descriptor in either process and it's closed for both, because there's nothing per-process to distinguish &mdash; "the parent's fd 3" and "the child's fd 3" are the same table slot. That table, shared or independently copied, stays open only until it's explicitly closed or every process still sharing it has exited.</p>
+
+    <h2 data-anchor="pn-h-mem">Memory: <code>RFMEM</code>, and why it needs <code>RFPROC</code></h2>
+    <p data-anchor="pn-p7"><code>RFMEM</code> is the odd one out in the list &mdash; it has no plain-copy default to contrast with, because without it the child simply gets its own copy of data and bss the way a conventional <code>fork</code> would. Set it, and the child instead <em>shares</em> those segments outright with the parent: writes either process makes are visible to the other, live. The stack is never part of that deal; it is always forked copy-on-write regardless of <code>RFMEM</code>, because two processes cannot sensibly share one call stack. And <code>RFMEM</code> only makes sense paired with <code>RFPROC</code> &mdash; sharing memory "with yourself" in place is not a meaningful operation, so the flag describes a property of a newly created process, not an edit to the caller.</p>
+
+    <div class="callout note" data-anchor="pn-callout-rfmem">
+      <span class="callout-label">This is Plan 9's answer to "give me a thread"</span>
+      <code>rfork(RFPROC|RFMEM|RFFDG)</code> &mdash; new process, shared memory, shared-then-independent descriptors &mdash; is about as close as the raw system call gets to spawning a thread: two schedulable processes with one address space between them. Nothing here is a distinct threading API; it's the same eight bits, chosen differently.
+    </div>
+
+    <h2 data-anchor="pn-h-proc">The process, filed under <code>/proc</code></h2>
+    <p data-anchor="pn-p8">Once a process exists, Plan&nbsp;9 represents it the same way it represents everything else worth naming: as files. The process device, conventionally bound as <code>#p&nbsp;/proc</code>, serves a two-level tree &mdash; a flat top level of numbered directories, one per live local process named by its pid, plus a single extra file, <code>/proc/trace</code>, for cross-process trace events. Each per-pid directory exposes roughly a dozen files; the ones worth knowing by name:</p>
+    <table data-anchor="pn-table-proc" style="table-layout:fixed">
+      <colgroup><col style="width:14%"><col style="width:86%"></colgroup>
+      <thead><tr><th>File</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><code>mem</code></td><td>the process's virtual memory, read/write by address &mdash; writes only while <code>Stopped</code></td></tr>
+        <tr><td><code>text</code></td><td>a pseudonym for the executable it runs, for recovering its symbol table</td></tr>
+        <tr><td><code>fd</code></td><td>current directory, then one line per open descriptor: mode, type, qid, offset, name at open</td></tr>
+        <tr><td><code>ns</code></td><td>its file name space, reconstructed as <code>namespace</code>(6) text (see below)</td></tr>
+        <tr><td><code>status</code></td><td>name, owner, state, CPU time, memory, and scheduling priority, fixed-format</td></tr>
+        <tr><td><code>ctl</code></td><td>write-only control messages &mdash; <code>stop</code>, <code>kill</code>, and friends (see below)</td></tr>
+        <tr><td><code>note</code> / <code>notepg</code></td><td>write-only, post a note to this process, or to its whole note group</td></tr>
+        <tr><td><code>wait</code></td><td>blocks and yields records for the process's exited children</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="pn-p9">The crude version of <code>ps</code> chapter&nbsp;2 already showed &mdash; <code>cat /proc/*/status</code> &mdash; is doing exactly what the real <code>ps</code> does, just without the reformatting. That's the whole point of representing a process as files: a debugger opens <code>text</code> and <code>mem</code> directly instead of calling a dedicated debug syscall, and because <code>/proc</code> is reached the same way any other directory is, <code>import helix /proc</code> followed by an ordinary <code>ps</code> or <code>db</code> shows or debugs <code>helix</code>'s processes from your own machine, no remote-debugging protocol required.</p>
+
+    <h2 data-anchor="pn-h-ns">The <code>ns</code> file: a name space, read back as text</h2>
+    <p data-anchor="pn-p10"><code>/proc/pid/ns</code> is the file that closes the loop this book has been building since chapter&nbsp;2: a read-only textual reconstruction of that process's name space, written in the exact <code>namespace</code>(6) grammar that <code>newns</code>/<code>addns</code> consume to build one in the first place, with a final <code>cd</code> line giving the process's current directory. In principle, feeding one process's <code>ns</code> output back through <code>newns</code> rebuilds the same name space elsewhere &mdash; the closest thing Plan&nbsp;9 has to a name-space inspector.</p>
+    <pre><code><span class="fn">cat</span>  /proc/17/status                  <span class="cm"># name, state, cpu time, priority...</span>
+<span class="fn">cat</span>  /proc/17/ns                      <span class="cm"># its namespace, as namespace(6) text</span>
+<span class="fn">echo</span> stop      &gt;/proc/17/ctl       <span class="cm"># suspend it &mdash; no ptrace() anywhere</span>
+<span class="fn">echo</span> hi        &gt;/proc/17/note      <span class="cm"># post a note to just this process</span>
+<span class="fn">echo</span> hi        &gt;/proc/17/notepg    <span class="cm"># post the same note to its whole note group</span></code></pre>
+
+    <div class="callout warning" data-anchor="pn-callout-ns-stale">
+      <span class="callout-label"><code>ns</code> is a snapshot of names, not a live re-lookup</span>
+      Its contents are based on what things were called <em>when each piece of the name space was assembled</em>, not looked up fresh at read time. If a file that got bound in has since been renamed or moved, <code>ns</code> still prints the old name &mdash; the script it hands you can be stale, not a guaranteed-accurate replay.
+    </div>
+
+    <h2 data-anchor="pn-h-ctl">Control and notes, as writes instead of syscalls</h2>
+    <p data-anchor="pn-p11">The <code>ctl</code> file replaces an entire family of process-control syscalls with one write-only file taking short text commands:</p>
+    <table data-anchor="pn-table-ctl" style="table-layout:fixed">
+      <colgroup><col style="width:20%"><col style="width:80%"></colgroup>
+      <thead><tr><th>Message</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>stop</code></td><td>suspend the process into the <code>Stopped</code> state</td></tr>
+        <tr><td><code>start</code></td><td>resume a <code>Stopped</code> process</td></tr>
+        <tr><td><code>kill</code></td><td>kill the process at its next kernel entry</td></tr>
+        <tr><td><code>close&nbsp;n</code></td><td>close file descriptor <code>n</code> in the process</td></tr>
+        <tr><td><code>closefiles</code></td><td>close every open descriptor in the process</td></tr>
+        <tr><td><code>private</code></td><td>make its user memory unreadable by anyone else (inherited on fork, cleared on exec)</td></tr>
+        <tr><td><code>pri&nbsp;n</code></td><td>set its base scheduling priority to <code>n</code></td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="pn-p12"><code>note</code> and <code>notepg</code> are the two write targets for Plan&nbsp;9's signal analog. A string written to <code>note</code> is posted to that one process only; the identical string written to <code>notepg</code> is delivered to every process in the target's <em>note group</em> &mdash; the set of processes that, per <code>RFNOTEG</code> in <code>rfork</code>, share one &mdash; except that a process writing to its own <code>notepg</code> does not receive the note back itself. <code>noteid</code>, alongside them, is a readable and writable integer naming which note group a process currently belongs to.</p>
+
+    <div class="callout key-idea" data-anchor="pn-callout-restraint">
+      <span class="callout-label"><code>/proc</code> is a view, deliberately not a way to create one</span>
+      Plan&nbsp;9's designers were explicit that <code>/proc</code> stops short of one tempting extension: something like <code>cp /bin/date /proc/clone/mem</code> to spawn a process by writing to a file. They rejected it &mdash; answering that write would require the server behind <code>/proc</code>'s 9P requests to construct a new process's open files, name space, and memory image, actions that don't fall naturally out of ordinary read/write/create semantics. Process creation stays on the conventional <code>rfork</code>/<code>exec</code> path; <code>/proc</code> only represents and controls processes that already exist.
+    </div>
+
+    <h2 data-anchor="pn-h-cons">Per-process devices: why <code>/dev/cons</code> isn't one file</h2>
+    <p data-anchor="pn-p13">Nothing about the kernel special-cases <code>/dev/cons</code> to be "the console for whichever process opens it" &mdash; and that's exactly what makes it worth a closer look, because from a shell it certainly behaves that way. The resolution is the window system, <code>8&frac12;</code>, which is itself just a user-level file server for files including <code>/dev/cons</code> and <code>/dev/bitblt</code>. Each window mounts its own private connection to <code>8&frac12;</code> into its own name space, so there isn't one <code>/dev/cons</code> on a running Plan&nbsp;9 desktop &mdash; there are as many as there are windows, each served independently, each answering only to the process that lives in that window. A process's standard input, output, and error are simply connected to whatever <code>/dev/cons</code> its own name space happens to resolve that name to.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="pn-d2t">
+        <title id="pn-d2t">The window system serves a distinct /dev/cons into each window's own name space</title>
+        <text x="16" y="18" class="dim">8&#189; (the window system) &mdash; one server, three clients</text>
+
+        <rect x="16" y="34" width="150" height="80" class="stroke-soft fill-soft"/>
+        <text x="26" y="55" class="big dim mono">window A</text>
+        <text x="26" y="74" class="dim mono">its own</text>
+        <text x="26" y="90" class="dim mono">/dev/cons</text>
+
+        <rect x="205" y="34" width="150" height="80" class="stroke fill-red"/>
+        <text x="215" y="55" class="big on-ink mono">window B</text>
+        <text x="215" y="74" class="on-ink mono">its own</text>
+        <text x="215" y="90" class="on-ink mono">/dev/cons</text>
+
+        <rect x="394" y="34" width="150" height="80" class="stroke-soft fill-soft"/>
+        <text x="404" y="55" class="big dim mono">window C</text>
+        <text x="404" y="74" class="dim mono">its own</text>
+        <text x="404" y="90" class="dim mono">/dev/cons</text>
+
+        <text x="16" y="138" class="red">Same name, three different files &mdash; because three different name spaces resolve it.</text>
+      </svg>
+      <figcaption><b>The name is shared; the file isn't.</b> Each window's <code>/dev/cons</code> is a distinct connection to <code>8&frac12;</code>, mounted only into that window's process's name space &mdash; not a kernel object with per-caller special behavior.</figcaption>
+    </figure>
+
+    <p data-anchor="pn-p14">Compare that to UNIX's <code>/dev/tty</code>, which needs dedicated kernel code that overloads the file, on open, with whichever terminal happens to be attached to the calling process &mdash; a special case written once, in the kernel, for exactly this problem. On Plan&nbsp;9 the same effect &mdash; "this conventional name means something different depending on who's asking" &mdash; is just what a per-process name space already does for every name, with no special-casing anywhere. The window system needing recursion to run inside its own window, or a client application running transparently on a machine with no graphics hardware at all, both fall out of the same fact: <code>/dev/cons</code> is a mount, like any other.</p>
+
+    <hr>
+
+    <h2 data-anchor="pn-h-close">What inheritance still can't do</h2>
+    <p data-anchor="pn-p15">One honest limitation belongs here rather than being glossed over: Plan&nbsp;9 has no operation to export a running name space as data and hand it to an unrelated process &mdash; the only way a name space travels intact is direct <code>fork</code>/<code>rfork</code> inheritance. <code>cpu</code>, which recreates a terminal's environment on a remote CPU server, cannot literally clone the terminal's current name space; it can only re-interpret the user's login profile and substitute a few conventional pieces, such as the binary directory for the server's own architecture. Any local, ad hoc rebinding done before running <code>cpu</code> simply isn't there on the other end. Everything else in this chapter &mdash; the shared/copy/clean triples, <code>/proc</code>, per-window devices &mdash; composes cleanly; this is the one seam the designers left, in print, as future work.</p>
+    <p data-anchor="pn-p16">That closes out how a process and its view of the world relate. The next chapter turns to a specific, deliberately ordinary use of everything so far &mdash; an inter-application message bus, built, of course, as a file server: the plumber.</p>
+
+    <p class="cm" data-anchor="pn-sources" style="margin-top:2rem;">Sources: <code>fork, rfork</code>(2) &middot; <code>proc</code>(3) &middot; <code>env</code>(3) &middot; <code>cons</code>(3) &middot; <em>Plan 9 from Bell Labs</em> and <em>The Use of Name Spaces in Plan 9</em> (Pike, Presotto, Thompson, Trickey, Winterbottom).</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="05-mount-bind-union.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="07-plumbing.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
