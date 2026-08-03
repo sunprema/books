@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mount, Bind, and Union Directories — Plan 9</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="plan-9">
+
+<header class="book-bar">
+  <span class="bar-title">Plan 9</span>
+  <nav class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open">
+      <p class="chapter-num">05</p>
+      <p class="chapter-kicker">Part 2 &middot; Mechanism</p>
+      <h1 class="chapter-title">Mount, Bind, and Union Directories</h1>
+      <p class="chapter-dek">Chapter&nbsp;2 introduced <code>bind</code> and <code>mount</code> and set their flag argument aside for later. This is later: <code>MREPL</code>/<code>MBEFORE</code>/<code>MAFTER</code>/<code>MCREATE</code> in full, how a union directory resolves a lookup, a read, and &mdash; the question chapter&nbsp;4 deliberately deferred &mdash; a <code>create</code>, plus <code>unmount</code> and a look at the kernel structure that makes all of it work.</p>
+    </div>
+
+    <p class="lede" data-anchor="mbu-lede">Two chapters back, you saw the shape of <code>bind</code> and <code>mount</code> and were told to file away that their flag argument exists. Here's the filing cabinet. Nothing new gets bolted on: the same two system calls, the same one flag, examined at the resolution this book has been building toward since chapter&nbsp;1 &mdash; because it turns out that resolution is most of what makes a Plan&nbsp;9 name space actually useful day to day, rather than just cleanly designed.</p>
+
+    <h2 data-anchor="mbu-h-flags">The four flags, precisely</h2>
+    <p data-anchor="mbu-p1">Every <code>bind</code> and <code>mount</code> call ends in a <code>flag</code> argument, and that argument is built from exactly five bits, three of which are mutually exclusive positions and two of which are independent modifiers you OR on top:</p>
+    <pre><code><span class="ty">int</span> <span class="fn">bind</span>(<span class="ty">char</span> *name, <span class="ty">char</span> *old, <span class="ty">int</span> flag);
+<span class="ty">int</span> <span class="fn">mount</span>(<span class="ty">int</span> fd, <span class="ty">int</span> afd, <span class="ty">char</span> *old, <span class="ty">int</span> flag, <span class="ty">char</span> *aname);
+
+<span class="cm">/* flag is one of: */</span>
+<span class="mac">MREPL</span>     <span class="cm">// replace old outright (the default, value 0)</span>
+<span class="mac">MBEFORE</span>   <span class="cm">// splice the new directory onto the FRONT of the union at old</span>
+<span class="mac">MAFTER</span>    <span class="cm">// splice the new directory onto the BACK of the union at old</span>
+<span class="cm">/* OR in: */</span>
+<span class="mac">MCREATE</span>   <span class="cm">// mark this component eligible to receive a newly created file</span>
+<span class="mac">MCACHE</span>    <span class="cm">// mount only: cache this mount's file contents locally</span></code></pre>
+    <p data-anchor="mbu-p2"><code>MREPL</code> is the plain case: <code>old</code> is simply replaced by whatever <code>name</code> names, or by the tree <code>mount</code> just attached. If the result is a directory &mdash; which for <code>mount</code> is guaranteed, since a mount target must already be a directory &mdash; <code>old</code> becomes a union directory with exactly one member. <code>MBEFORE</code> and <code>MAFTER</code> are where "union" stops being a one-member degenerate case: both require <code>old</code> and the incoming directory to already be directories, and both <em>add</em> to whatever union is already sitting at <code>old</code> rather than replacing it &mdash; <code>MBEFORE</code> at the front, searched first; <code>MAFTER</code> at the back, searched last. <code>MCREATE</code> is orthogonal to all three positions: it says nothing about search order, only that this particular component is allowed to receive a file that doesn't exist yet anywhere in the union. <code>MCACHE</code>, valid on <code>mount</code> only, turns on local caching of that mount's file contents; without it, every read goes back to the server, and even with it on, the cache's currency is re-checked at each <code>open</code>, not on every read.</p>
+
+    <table data-anchor="mbu-table-flags" style="table-layout:fixed">
+      <colgroup>
+        <col style="width:18%">
+        <col style="width:24%">
+        <col style="width:58%">
+      </colgroup>
+      <thead>
+        <tr><th>Flag</th><th><code>bind</code>/<code>mount</code> option</th><th>Effect on the union at <code>old</code></th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>MREPL</code></td><td>(none)</td><td>replaces <code>old</code>; becomes a one-member union if a directory</td></tr>
+        <tr><td><code>MBEFORE</code></td><td><code>-b</code></td><td>added to the <strong>front</strong> &mdash; searched first</td></tr>
+        <tr><td><code>MAFTER</code></td><td><code>-a</code></td><td>added to the <strong>back</strong> &mdash; searched last</td></tr>
+        <tr><td><code>MCREATE</code></td><td><code>-c</code></td><td>orthogonal: marks this member create-eligible</td></tr>
+        <tr><td><code>MCACHE</code></td><td><code>-C</code> (mount only)</td><td>orthogonal: enables client-side content caching</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="mbu-p3">The command-line tools use exactly this vocabulary, one option letter per bit: <code>bind -b new old</code> is an <code>MBEFORE</code> bind, <code>bind -a -c new old</code> is <code>MAFTER|MCREATE</code>, and so on. <code>mount</code> takes the same letters plus two more of its own &mdash; <code>-k</code> <var>keypattern</var> to constrain which <code>factotum</code>(4) key an authenticated mount may use, and <code>-n</code> to skip authentication entirely. A <code>namespace</code>(6) description file, the boot-time script chapter&nbsp;2 walked through, uses these identical letters on its own <code>bind</code> and <code>mount</code> lines &mdash; there is no second vocabulary to learn for scripting a name space versus building one interactively.</p>
+
+    <h2 data-anchor="mbu-h-union">What a union directory actually does</h2>
+    <p data-anchor="mbu-p4">Stack more than one directory at a single point with <code>MBEFORE</code>/<code>MAFTER</code> and <code>old</code> becomes a <strong>union directory</strong>: Plan&nbsp;9's own description of it is that it behaves like the <em>concatenation</em> of its members, in the order they were added. That single word does the work for both operations you'll actually perform on it. A <strong>lookup</strong> &mdash; opening or stat&rsquo;ing a name inside the union &mdash; walks the members in order and returns the first one that has that name; the rest are never even consulted. A <strong>directory read</strong> &mdash; listing the union itself, the way <code>ls</code> does &mdash; concatenates each member's listing in that same order, so a name present in two members shows up twice in a plain listing even though only the first copy is ever reachable by opening it.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="mbu-d1t">
+        <title id="mbu-d1t">A lookup for readme in a three-member union searches each member in order and stops at the first match</title>
+        <text x="16" y="20" class="dim">open("readme") &mdash; union at /doc, three members</text>
+
+        <rect x="16" y="34" width="150" height="48" class="stroke fill-red"/>
+        <text x="26" y="55" class="big on-ink mono">$home/doc</text>
+        <text x="26" y="72" class="on-ink dim">has readme &mdash; match</text>
+
+        <rect x="205" y="34" width="150" height="48" class="stroke-soft fill-soft"/>
+        <text x="215" y="55" class="big dim mono">/sys/doc</text>
+        <text x="215" y="72" class="dim">never consulted</text>
+
+        <rect x="394" y="34" width="150" height="48" class="stroke-soft fill-soft"/>
+        <text x="404" y="55" class="big dim mono">/lib/doc</text>
+        <text x="404" y="72" class="dim">never consulted</text>
+
+        <path d="M166 58 L205 58" class="stroke-soft dash"/>
+        <path d="M355 58 L394 58" class="stroke-soft dash"/>
+
+        <text x="16" y="118" class="red">Search order, first match &mdash; not a merge of contents.</text>
+      </svg>
+      <figcaption><b>Concatenation, resolved lazily.</b> Union order comes entirely from how the members were bound (<code>MBEFORE</code> puts one first); a lookup stops at the first hit and a same-named file further back is simply unreachable through that name.</figcaption>
+    </figure>
+
+    <h2 data-anchor="mbu-h-bin">The canonical union: <code>/bin</code></h2>
+    <p data-anchor="mbu-p5">The single most-exercised union directory on any running Plan&nbsp;9 system is <code>/bin</code> itself. It's built from <code>/$cputype/bin</code> &mdash; the compiled binaries for whatever architecture this machine actually is &mdash; unioned with <code>/rc/bin</code>, the architecture-independent shell scripts, and typically a user's own private directory besides. Because that search order is a structural property of the name space rather than a value some shell has to remember, it retires the usual solution to "where do my commands live": Plan&nbsp;9's shell, <code>rc</code>, has no <code>$PATH</code> variable at all. There's nothing for it to consult; the union already <em>is</em> the search path, and it composes with the rest of the file model instead of standing outside it.</p>
+    <pre><code><span class="cm"># architecture binaries, then rc scripts, then a private, writable directory</span>
+<span class="kw">bind</span> -a /386/bin  /bin      <span class="cm"># -a = MAFTER: append at the end of the union</span>
+<span class="kw">bind</span> -a /rc/bin   /bin      <span class="cm"># -a = MAFTER: append after that</span>
+<span class="kw">bind</span> -b -c $home/bin /bin   <span class="cm"># -b -c = MBEFORE|MCREATE: search ME first, and</span>
+                             <span class="cm">#   anything I *create* lands here &mdash; not in</span>
+                             <span class="cm">#   /bin's public, read-only members</span></code></pre>
+    <p data-anchor="mbu-p6">That last line is worth sitting with, because it's the pattern behind nearly every private-directory-in-a-public-union you'll see on a real system: <code>-b</code> puts your directory first in <em>search</em> order, so your own <code>date</code> shadows the system one if you happen to have written one; <code>-c</code> separately marks it as where <em>new</em> files should go. Neither flag implies the other &mdash; you could search your directory first without it accepting creates, or accept creates into a directory buried at the back of the union. The next section is about exactly that second question.</p>
+
+    <h2 data-anchor="mbu-h-create">Who gets a newly created file</h2>
+    <p data-anchor="mbu-p7">Chapter&nbsp;4 closed by deferring this exact question: when a union has several members, which one receives a file that <code>create</code> makes with a genuinely new name? The rule Plan&nbsp;9's designers settled on after several attempts is narrow and specific. By default, a member of a union accepts <em>no</em> new files &mdash; though <code>create</code> on a name that already exists in that member still succeeds normally, MCREATE governs only names that don't exist anywhere in the union yet. Binding or mounting a member with <code>MCREATE</code> set marks it, specifically, as eligible. When a <code>create</code> for a new name lands in the union, the members are tried in the union's search order, and the file is made in the <em>first</em> one that has create permission; if that particular <code>create</code> fails &mdash; no write permission, say &mdash; the whole call fails outright. It does not fall through and try the next eligible member.</p>
+    <p data-anchor="mbu-p8">That's a deliberately narrow rule, and it earns its keep on exactly the pattern from the <code>/bin</code> example above: put a private, writable directory anywhere in an otherwise public, read-only union, mark only it <code>MCREATE</code>, and every new file you create is guaranteed to land there &mdash; never accidentally written into a shared system directory you happen to have permission to search but not to add to.</p>
+
+    <div class="callout warning" data-anchor="mbu-callout-mcreate">
+      <span class="callout-label">MCREATE is not "this is the writable one"</span>
+      A union with zero <code>MCREATE</code> members isn't read-only for files that already exist there &mdash; ordinary <code>open</code> for write and <code>create</code>-on-an-existing-name still work through normal permission checks on whichever member the lookup finds first. <code>MCREATE</code> only decides where a <em>brand-new</em> name is allowed to be born.
+    </div>
+
+    <h2 data-anchor="mbu-h-mnttable">Under the hood: the mount table and channel lists</h2>
+    <p data-anchor="mbu-p9">The kernel's own representation of "search each member in order" is worth seeing, because it's smaller than it sounds. Every open file the kernel is tracking is a structure called a <em>channel</em>, and the whole name space is stored as a <strong>mount table</strong>: a list of <code>(from, to)</code> channel pairs. Whenever a walk successfully advances a channel to some name, the mount table is checked for a <code>from</code> entry matching that name; if there's a hit, the <code>to</code> channel is cloned and substituted for the one the walk was using &mdash; that substitution <em>is</em> a bind or a mount, mechanically. A union directory is nothing more exotic than what happens when that <code>to</code> entry is a <strong>linked list</strong> of channels instead of a single one, one link per union member in bind order. A walk that fails to find its target in the first channel simply follows the list, clones the next channel, and tries the walk again there &mdash; which is the "search order, first match" rule from a few paragraphs back, restated as what actually happens one channel at a time.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 130" role="img" aria-labelledby="mbu-d2t">
+        <title id="mbu-d2t">The mount table's single to entry for a union is a chain of channels, followed until a walk succeeds</title>
+        <text x="16" y="18" class="dim">mount-table entry: from "/doc" &rarr; to &hellip;</text>
+
+        <rect x="16" y="30" width="140" height="42" class="stroke-soft fill-soft"/>
+        <text x="26" y="56" class="big dim mono">channel A</text>
+
+        <path d="M156 51 L212 51" class="stroke-soft dash"/>
+        <path d="M204 47 L212 51 L204 55" class="stroke-soft dash"/>
+        <text x="167" y="43" class="dim">miss</text>
+
+        <rect x="212" y="30" width="140" height="42" class="stroke-soft fill-soft"/>
+        <text x="222" y="56" class="big dim mono">channel B</text>
+
+        <path d="M352 51 L408 51" class="stroke-soft dash"/>
+        <path d="M400 47 L408 51 L400 55" class="stroke-soft dash"/>
+        <text x="363" y="43" class="dim">miss</text>
+
+        <rect x="408" y="30" width="136" height="42" class="stroke-red"/>
+        <text x="418" y="56" class="big red mono">channel C &mdash; match</text>
+
+        <text x="16" y="112" class="dim">One mount-table entry, one chain &mdash; not three separate entries.</text>
+      </svg>
+      <figcaption><b>The list <em>is</em> the union.</b> There's no separate bookkeeping structure for "this is a union directory" &mdash; it's the ordinary bind/mount substitution mechanism, applied to a chain of channels instead of one.</figcaption>
+    </figure>
+
+    <h2 data-anchor="mbu-h-unmount">Undoing it: <code>unmount</code></h2>
+    <pre><code><span class="ty">int</span> <span class="fn">unmount</span>(<span class="ty">char</span> *name, <span class="ty">char</span> *old);</code></pre>
+    <p data-anchor="mbu-p10"><code>unmount</code> reverses a <code>bind</code> or <code>mount</code>, and its two arguments give it two distinct behaviors. Pass a <code>name</code> &mdash; evaluated exactly as <code>bind</code>'s <code>name</code> argument would be &mdash; and only the specific binding that would attach that result to <code>old</code> is undone; any other members of a union sitting at <code>old</code> are left exactly as they were. Pass zero for <code>name</code>, or omit it entirely at the command line, and <em>everything</em> currently bound or mounted at <code>old</code> is removed in one call &mdash; the whole union, however many members it has.</p>
+    <pre><code><span class="cm"># undo just this one binding, leaving the rest of the union at /mips/lib/libc.a alone</span>
+<span class="kw">unmount</span> /n/dump/1992/0716/mips/lib/libc.a /mips/lib/libc.a
+
+<span class="cm"># undo EVERYTHING bound or mounted at this point</span>
+<span class="kw">unmount</span> /mips/lib/libc.a</code></pre>
+
+    <div class="callout note" data-anchor="mbu-callout-unmount">
+      <span class="callout-label">The one-argument form is not "undo my last bind"</span>
+      It reads that way, but it removes every member of the union at <code>old</code>, not just the most recent one. If you only want to peel off what you just added, pass both arguments &mdash; the same <code>name</code> and <code>old</code> you bound or mounted with.
+    </div>
+
+    <p data-anchor="mbu-p11">One more constraint, documented plainly as a note on <code>mount</code>(2): the call does not return until it has successfully attached to the server on the other end of <code>fd</code>, which means the process calling <code>mount</code> cannot be the same process serving that connection &mdash; posting one end for a server to answer and mounting the other end has to happen from two separate processes, or the server side has to already be running before the <code>mount</code> is attempted.</p>
+
+    <hr>
+
+    <h2 data-anchor="mbu-h-close">Same two calls, all the way down</h2>
+    <p data-anchor="mbu-p12">Notice what didn't happen in this chapter: no new system call, no new file, no new protocol message. <code>bind</code> and <code>mount</code> plus one five-bit flag account for every union directory on a running system, including <code>/bin</code>, and every line a <code>namespace</code>(6) file or <code>ns</code>(1)'s output ever prints is one of these same two calls with one of these same four position/eligibility bits spelled out as a letter. The next chapter turns to the other half of the equation this book has been assuming so far &mdash; not what a name space is built <em>from</em>, but how it's inherited, copied, or started empty across <code>rfork</code> and process creation, and what <code>/proc</code> looks like from the inside of the processes it's tracking.</p>
+
+    <p class="cm" data-anchor="mbu-sources" style="margin-top:2rem;">Sources: <code>bind</code>(1) &middot; <code>bind, mount, unmount</code>(2) &middot; <code>namespace</code>(6) &middot; <code>ns</code>(1) &middot; <em>Plan 9 from Bell Labs</em> (Pike, Presotto, Thompson, Trickey, Winterbottom).</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="04-file-servers.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="06-process-namespaces.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

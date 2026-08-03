@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File Servers — Plan 9</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="plan-9">
+
+<header class="book-bar">
+  <span class="bar-title">Plan 9</span>
+  <nav class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open">
+      <p class="chapter-num">04</p>
+      <p class="chapter-kicker">Part 2 &middot; Mechanism</p>
+      <h1 class="chapter-title">File Servers</h1>
+      <p class="chapter-dek">Who actually answers the thirteen messages from the last chapter: kernel devices reached through <code>#</code>, user-level servers built on <code>lib9p</code>, the <code>/srv</code> registry that connects a running server to a name space, and what separates a file-server interface that merely works from one that's good.</p>
+    </div>
+
+    <p class="lede" data-anchor="fs-lede">The last chapter closed with a promise: the next one is entirely about programs that answer 9P's thirteen messages. Here it is. Every <code>Twalk</code>, every <code>Tread</code>, every <code>Twstat</code> you've seen so far assumed a server on the other end already knew how to reply &mdash; this chapter is about what that server actually is, and it turns out to be one of exactly two things: code baked into the kernel, or an ordinary process. Both speak the identical protocol. What differs is distance.</p>
+
+    <h2 data-anchor="fs-h-two-kinds">Two places to answer from</h2>
+    <p data-anchor="fs-p1">A <strong>kernel device driver</strong> is a 9P server whose messages are dispatched as local procedure calls rather than marshaled onto a wire &mdash; no framing, no <code>Tversion</code>, no transport at all, just a function table the kernel calls directly. Four of the thirteen messages (<code>Nop</code>, <code>Session</code>, <code>Flush</code>, <code>Error</code>) have no subroutine equivalent inside a device driver, precisely because they exist to manage a connection, and a local procedure call has no connection to manage.</p>
+    <p data-anchor="fs-p2">A <strong>user-level server</strong> is an ordinary process. It might be a hundred lines of C linked against <code>lib9p</code>, or a shell script wrapping some other program &mdash; from a client's point of view it is indistinguishable from a kernel device, because the client never sees the implementation, only the twelve requests and their replies. That indistinguishability is the entire point: chapter&nbsp;1's claim that local and remote resources are reached identically rests on kernel devices and user-level servers being genuinely interchangeable at the protocol boundary, not merely similar.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 175" role="img" aria-labelledby="fs-d1t">
+        <title id="fs-d1t">A kernel device answers by local procedure call; a user-level server answers the same messages over a pipe or network connection</title>
+        <text x="16" y="22">Kernel device &mdash; local call</text>
+        <rect x="16" y="34" width="150" height="34" class="stroke fill-soft"/>
+        <text x="26" y="56" class="big mono">#c, #p, #s &hellip;</text>
+        <path d="M166 51 L246 51" class="stroke"/>
+        <path d="M238 47 L246 51 L238 55" class="stroke"/>
+        <text x="176" y="44" class="dim">function call</text>
+
+        <text x="16" y="112">User-level server &mdash; over a wire</text>
+        <rect x="16" y="124" width="150" height="34" class="stroke fill-soft"/>
+        <text x="26" y="146" class="big mono">ramfs, exportfs &hellip;</text>
+        <path d="M166 141 L246 141" class="stroke"/>
+        <path d="M238 137 L246 141 L238 145" class="stroke"/>
+        <text x="176" y="134" class="dim">9P messages, pipe or net</text>
+
+        <rect x="246" y="70" width="298" height="34" class="stroke-red"/>
+        <text x="256" y="92" class="big red">open / read / write / &hellip;</text>
+        <path d="M254 68 L254 51" class="stroke-soft dash"/>
+        <path d="M254 104 L254 141" class="stroke-soft dash"/>
+      </svg>
+      <figcaption><b>Same thirteen messages, two distances.</b> A client's <code>open</code>/<code>read</code>/<code>write</code> lands on identical protocol whether it's answered by a compiled-in driver or a process at the other end of a pipe.</figcaption>
+    </figure>
+
+    <h2 data-anchor="fs-h-hash">The <code>#</code> notation: bootstrapping without a name space yet</h2>
+    <p data-anchor="fs-p3">By convention, every kernel device is eventually bound to a conventional path &mdash; <code>#c</code> becomes <code>/dev</code>, <code>#p</code> becomes <code>/proc</code>. But <code>bind</code> itself needs something already reachable to bind <em>from</em>, and at the very start of a process's life nothing is bound yet. The <code>#</code> notation is how a device is reached before any name space exists to reach it through: a file name beginning with <code>#</code> followed by one device character names the root of that driver's own tree directly, with no lookup through any directory at all. Passing such a name to a system call performs an <code>attach</code> straight to the corresponding driver; any characters between the device letter and the next <code>/</code> are passed through as the attach's <code>aname</code> &mdash; <code>#I2</code>, for instance, selects IP protocol stack instance 2.</p>
+    <pre><code>bind -a '#t' /dev      <span class="dim"># graft the serial-port device's root into /dev</span>
+bind '#c'    /dev      <span class="dim"># the console device &mdash; what init does for you at boot</span>
+bind '#p'    /proc     <span class="dim"># the process device</span>
+bind '#s'    /srv      <span class="dim"># the srv registry itself is a device, too</span></code></pre>
+    <p data-anchor="fs-p4">You will rarely type one of these yourself. <code>init</code>(8) performs the conventional binds automatically at boot, via <code>newns</code> reading a <code>namespace</code>(6) description file &mdash; the mechanism chapter&nbsp;2 already introduced. By the time an ordinary shell prompt appears, <code>/dev</code>, <code>/proc</code>, and <code>/srv</code> already exist as conventional paths; the <code>#</code> forms are the bootstrap underneath them, not something day-to-day programs reach for. (Typed directly to <code>rc</code>, <code>#</code> also needs quoting &mdash; it's <code>rc</code>'s comment character.)</p>
+
+    <h2 data-anchor="fs-h-shapes">Two shapes of kernel device</h2>
+    <p data-anchor="fs-p5">Device drivers range from trivially flat to genuinely structured. The console device, <code>#c</code>, is the flat case: a one-level directory of small, independently meaningful files &mdash; <code>cons</code> for typed input and console output, <code>consctl</code> for control commands, <code>pid</code>/<code>ppid</code>/<code>user</code>/<code>hostowner</code> for identity, <code>time</code>/<code>random</code>/<code>zero</code>/<code>null</code>/<code>reboot</code> rounding it out &mdash; each one a plain file answering ordinary <code>open</code>/<code>read</code>/<code>write</code>, never a multiplexed control call. The process device, <code>#p</code>, is the two-level case: the top level lists one numbered directory per live process, and each pid's directory exposes <code>ctl</code>, <code>status</code>, <code>mem</code>, <code>fd</code>, <code>ns</code>, <code>note</code>, <code>text</code>, and more &mdash; the exact file tree that lets <code>ps</code>, a debugger, and process control all be plain file I/O rather than dedicated system calls, as chapter&nbsp;2 already showed.</p>
+
+    <table data-anchor="fs-table-devices">
+      <thead>
+        <tr><th>Device</th><th>Conventional mount</th><th>Shape</th><th>Serves</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>#c</code></td><td><code>/dev</code></td><td>one level, flat</td><td>console, identity, misc.</td></tr>
+        <tr><td><code>#p</code></td><td><code>/proc</code></td><td>two levels, per-pid</td><td>process control &amp; inspection</td></tr>
+        <tr><td><code>#s</code></td><td><code>/srv</code></td><td>one level, flat</td><td>the server registry (next section)</td></tr>
+        <tr><td><code>#d</code></td><td><code>/fd</code></td><td>one level, flat</td><td>the calling process's own open file descriptors</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="fs-h-srv">The <code>/srv</code> registry: how a server gets found</h2>
+    <p data-anchor="fs-p6">A user-level server has no conventional place in the tree the way a kernel device does &mdash; it's just a process holding one end of a pipe. <code>srv</code>, kernel device <code>#s</code> conventionally bound at <code>/srv</code>, is the bulletin board that connects the two: a process creates a file such as <code>/srv/myserv</code> and writes into it the decimal text of an already-open file descriptor, typically one end of a pipe to a <code>lib9p</code> server it just started. Any other process can then <code>open</code> <code>/srv/myserv</code> to get its own reference to that same open file &mdash; which is exactly what <code>mount /srv/myserv /some/point</code> does under the hood. The registry entry holds a reference to the file even while nobody has it open; removing the entry releases that reference. Writing a second number into the same server file, or reusing an existing name, is an error.</p>
+    <pre><code>pipe(p);
+fd = create("/srv/namedpipe", OWRITE, 0666);
+fprint(fd, "%d", p[0]);   <span class="dim">// post one end of the pipe under /srv</span>
+close(fd); close(p[0]);
+
+<span class="dim">// any other process:</span>
+mount(open("/srv/namedpipe", ORDWR), -1, "/n/x", MREPL, "");</code></pre>
+    <p data-anchor="fs-p7">The command-line tool <code>srv</code>(4) &mdash; a different thing from the <code>srv</code>(3) kernel device, though it's built on it &mdash; dials a remote 9P service, runs the version/attach exchange, and posts the resulting connection at <code>/srv/name</code> so any local process can mount it. The <code>9fs</code> script wraps that plus a conventional mount onto <code>/n/<var>system</var></code> into one command, which is the ordinary way a Plan&nbsp;9 user reaches another machine's files at all.</p>
+
+    <div class="callout note" data-anchor="fs-callout-srv-names">
+      <span class="callout-label">Two things named "srv," one layered on the other</span>
+      <code>srv</code>(3) is the kernel device &mdash; the registry mechanism of posting an fd under a name. <code>srv</code>(4) is the command &mdash; dial, then use that mechanism to publish the result. Plenty of code posts directly to <code>/srv</code> without going through the command at all.
+    </div>
+
+    <h2 data-anchor="fs-h-lib9p">Writing one: the <code>lib9p</code> serving loop</h2>
+    <p data-anchor="fs-p8">A user-level server built against <code>lib9p</code> (<code>#include &lt;9p.h&gt;</code>) doesn't hand-roll a read loop. It fills in a <code>Srv</code> struct with one function pointer per 9P transaction, then calls <code>srv(Srv*)</code>, which reads T-messages from an <code>infd</code>, dispatches each to the matching function, and writes the R-message to <code>outfd</code>. Every service function must eventually call <code>respond(Req *r, char *error)</code> exactly once &mdash; a nil error string means success &mdash; after which <code>r</code> and anything it pointed to are considered freed.</p>
+    <pre><code>typedef struct Srv {
+	Tree*	tree;              <span class="dim">// non-nil: lib9p resolves walk/perm/dirread itself</span>
+
+	void	(*attach)(Req *r);
+	void	(*open)(Req *r);
+	void	(*create)(Req *r);
+	void	(*read)(Req *r);
+	void	(*write)(Req *r);
+	void	(*remove)(Req *r);
+	void	(*flush)(Req *r);
+	void	(*stat)(Req *r);
+	void	(*wstat)(Req *r);
+	void	(*walk)(Req *r);   <span class="dim">// only called when tree is nil</span>
+	&hellip;
+} Srv;
+
+int  srv(Srv *s);
+void threadpostmountsrv(Srv *s, char *name, char *mtpt, int flag);
+void respond(Req *r, char *error);   <span class="dim">// error==nil means success</span></code></pre>
+    <p data-anchor="fs-p9"><code>threadpostmountsrv</code> is the usual way to actually launch one: it allocates a pipe, optionally posts one end at <code>/srv/<var>name</var></code> via the registry above, forks a child that calls <code>srv()</code> on that end, and optionally mounts the other end at <code>mtpt</code> in the caller's own name space. One call does &ldquo;start serving, publish it, graft it into my view&rdquo; &mdash; which is why so many Plan&nbsp;9 commands built this way (<code>ramfs</code>, <code>cdfs</code>, <code>webfs</code>) are so small.</p>
+
+    <div class="callout warning" data-anchor="fs-callout-single-thread">
+      <span class="callout-label">The loop is single-threaded &mdash; by design</span>
+      <code>srv</code>'s service loop does not read the next request until the current one has been answered. A service function that blocks &mdash; on real I/O, a lock, another process &mdash; stalls every other client on that connection. The intended fix isn't to make the loop concurrent; it's to hand a slow operation to a separate process and let <em>that</em> process call <code>respond</code> later. <code>flush</code> exists specifically so a client can cancel or hurry along a request left pending that way.
+    </div>
+
+    <h2 data-anchor="fs-h-tree">Two ways to hold the tree</h2>
+    <p data-anchor="fs-p10"><code>lib9p</code> offers a server two strategies for representing what it exposes, chosen by whether <code>Srv.tree</code> is set. With a nonzero <strong>File/Tree</strong> (built with the companion <code>9p-file</code> API &mdash; <code>alloctree</code>, <code>createfile</code>, <code>removefile</code>, <code>walkfile</code>, <code>opendirfile</code>), <code>lib9p</code> resolves <code>walk</code> itself, checks permissions on <code>open</code>/<code>create</code>/<code>remove</code>/<code>wstat</code>, and serves directory reads &mdash; the server's own functions are only called for <code>read</code>/<code>write</code>/<code>create</code>/<code>remove</code> on actual files. That earns its keep when the hierarchy is genuinely dynamic and worth keeping in memory: <code>ramfs</code>, an in-memory file store, is the canonical example.</p>
+    <p data-anchor="fs-p11">Leave <code>tree</code> zero and the server takes on more work &mdash; implementing <code>walk</code> itself (or handing it to the <code>walkandclone</code> helper with <code>walk1</code>/<code>clone</code> callbacks) and generating directory listings on demand via <code>dirread9p</code>. That's the better trade when the tree is cheap to compute and doesn't need to be remembered: <code>cdfs</code> listing an audio CD's tracks, or <code>nntpfs</code> listing newsgroups, gain nothing from maintaining a File tree that has to be kept in sync with something that already has its own source of truth &mdash; and they lose the reference-counting bookkeeping the File API imposes, which its own manual page calls, without irony, &ldquo;cumbersome.&rdquo;</p>
+
+    <h2 data-anchor="fs-h-exportfs">exportfs: exporting a name space, not a file system</h2>
+    <p data-anchor="fs-p12"><code>exportfs</code> answers a different question than <code>ramfs</code> or <code>cdfs</code>: not &ldquo;serve some data as files,&rdquo; but &ldquo;let a remote machine see part of my already-assembled name space.&rdquo; It is itself an ordinary 9P server, but it has no File tree backing it at all &mdash; every request it receives is re-executed as an ordinary system call against the local name space it was started in, and the result relayed back over the connection. Nothing about 9P needed to change to support this; a server can always choose to answer by delegating to the local kernel instead of maintaining its own storage.</p>
+    <p data-anchor="fs-p13">Its canonical use is the <code>cpu</code>(1) command. A <code>cpu</code> server dials back to the user's own terminal, starts <code>exportfs</code> there, and mounts the result on <code>/mnt/term</code> &mdash; so device files that only make sense on the terminal (the actual console, the actual mouse) stay reachable from processes running on the faster, remote compute server, without those processes needing to know they're remote at all. <code>import</code>(4) is the general-purpose command built on the same idea for any two machines, not just a <code>cpu</code> session.</p>
+
+    <h2 data-anchor="fs-h-good-interface">What makes a file-server interface good</h2>
+    <p data-anchor="fs-p14"><code>consolefs</code> is a small, complete example worth reading closely, because it shows the design instincts rather than just stating them. It presents each configured serial console as up to three small files &mdash; <code>console</code>, <code>consolectl</code>, <code>consolestat</code> &mdash; instead of one file overloaded with an ioctl-style side channel. It broadcasts console output to every reader that has the file open, so a shared serial line behaves like a shared terminal rather than a single-reader stream. And it announces every open and close of a console to the other current readers as a plain bracketed text line (<code>[+boris, vlad, barney]</code>) &mdash; multi-reader coordination expressed as file content, not as a new system call or a lock API.</p>
+    <p data-anchor="fs-p15">That last pattern &mdash; a plain data file paired with a same-named <code>ctl</code> file for commands &mdash; recurs across nearly every well-designed Plan&nbsp;9 server: <code>/net/tcp/<var>n</var>/{data,ctl}</code>, <code>/dev/{cons,consctl}</code>, <code>consolefs</code>'s own <code>{console,consolectl}</code>. It's the concrete mechanism behind chapter&nbsp;1's claim that Plan&nbsp;9 routes control operations themselves through ordinary file I/O: writing text to a <code>ctl</code> file is <code>cat</code>-and-<code>echo</code> reachable, needs no client library, and composes with every other file-oriented tool in the system for free.</p>
+
+    <div class="callout key-idea" data-anchor="fs-callout-good-design">
+      <span class="callout-label">The recurring shape of a good design</span>
+      One small, stable directory per logical resource. Control gets its own file, separate from data. A design decision shows up as a <em>name</em> &mdash; a numbered connection directory, a per-pid directory, a per-console directory &mdash; not as a new operation. And the tree is generated on the fly unless it's genuinely worth keeping in memory, because a generated tree needs no bookkeeping and can't drift out of sync with whatever it's a view of.
+    </div>
+
+    <hr>
+
+    <h2 data-anchor="fs-h-close">What file servers buy the rest of the book</h2>
+    <p data-anchor="fs-p16">Kernel devices and user-level servers are where the file trees actually live &mdash; the things a name space, built by <code>bind</code> and <code>mount</code>, points <em>at</em>. This chapter has been about the tree's source; the next one is about the operators that graft several such trees together into the single coherent view a process sees, including the one question this chapter deliberately deferred: when a union directory has several component trees bound at one point, which of them actually receives a newly created file.</p>
+
+    <p class="cm" data-anchor="fs-sources" style="margin-top:2rem;">Sources: <code>intro</code>(3) &middot; <code>cons</code>(3) &middot; <code>proc</code>(3) &middot; <code>srv</code>(3) &middot; <code>srv</code>(4) &middot; <code>exportfs</code>(4) &middot; <code>consolefs</code>(4) &middot; <code>9p</code>(3) &middot; <code>9p-file</code>(3) &middot; <em>Plan 9 from Bell Labs</em> (Pike, Presotto, Thompson, Trickey, Winterbottom).</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="03-9p-protocol.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="05-mount-bind-union.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

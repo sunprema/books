@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Plan 9 Model — Plan 9</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="plan-9">
+
+<header class="book-bar">
+  <span class="bar-title">Plan 9</span>
+  <nav class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open">
+      <p class="chapter-num">01</p>
+      <p class="chapter-kicker">Part 1 &middot; Introduction</p>
+      <h1 class="chapter-title">The Plan&nbsp;9 Model</h1>
+      <p class="chapter-dek">Three ideas, stated plainly, that compose into a distributed operating system. Everything later in this book is one of these three ideas worked out in detail.</p>
+    </div>
+
+    <p class="lede" data-anchor="p9m-lede">Skip the checklist reading. The interesting claim in Plan&nbsp;9 isn't any one of its three design principles &mdash; it's that each one is load-bearing for the next. Take one away and the other two stop paying for themselves. So that's how we'll build the model: one piece, then the next piece bolted on, then the moment they click together.</p>
+
+    <h2 data-anchor="p9m-h-resources">Pillar one: resources are files</h2>
+    <p data-anchor="p9m-p1">Start with the plainest of the three ideas. In Plan&nbsp;9, a resource &mdash; a disk file, sure, but also a window, a network connection, a running process, the mouse, a remote machine's console &mdash; is named and reached as a file or a directory tree of files. You <code>open</code> it, you <code>read</code> and <code>write</code> it, you <code>close</code> it. That's the entire verb set.</p>
+    <p data-anchor="p9m-p2">Unix already told you files were a good idea for <em>files</em>. Plan&nbsp;9's contribution is refusing to stop there. Where Unix reaches for a special-case system call &mdash; <code>ioctl</code> for device quirks, <code>socket</code>/<code>connect</code>/<code>setsockopt</code> for networking, a raft of <code>/proc</code> pseudo-files bolted on decades later for process introspection &mdash; Plan&nbsp;9 asks first whether the operation can just be a file operation instead. Usually it can.</p>
+    <p data-anchor="p9m-p3">The clearest demonstration is networking, because sockets feel so load-bearing in every other system. Under Plan&nbsp;9's <code>/net</code>, a protocol has a directory (<code>/net/tcp</code>); reserving a connection means reading its <code>clone</code> file, which hands back a connection number; that number is itself a directory with a <code>ctl</code> file and a <code>data</code> file. Dialing out is a write to <code>ctl</code>. Sending and receiving are writes and reads on <code>data</code>. No new system call, no separate namespace of file descriptors versus socket descriptors &mdash; just files.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="p9m-d1t">
+        <title id="p9m-d1t">Dialing a TCP connection is four ordinary file operations on /net/tcp</title>
+        <text x="16" y="24" class="dim mono">/net/tcp/clone</text>
+        <rect x="16" y="34" width="140" height="34" class="stroke fill-soft"/>
+        <text x="26" y="56" class="big">read &rarr; "n"</text>
+
+        <path d="M156 51 L230 51" class="stroke"/>
+        <path d="M222 47 L230 51 L222 55" class="stroke"/>
+
+        <text x="238" y="24" class="dim mono">/net/tcp/n/ctl</text>
+        <rect x="238" y="34" width="150" height="34" class="stroke fill-soft"/>
+        <text x="248" y="56" class="big">write "connect …"</text>
+
+        <path d="M388 51 L462 51" class="stroke"/>
+        <path d="M454 47 L462 51 L454 55" class="stroke"/>
+
+        <text x="470" y="24" class="dim mono">/net/tcp/n/data</text>
+        <rect x="462" y="34" width="82" height="34" class="stroke-red"/>
+        <text x="472" y="56" class="big red">bytes</text>
+
+        <path d="M16 100 L544 100" class="stroke-soft dash"/>
+        <text x="16" y="122">clone a connection</text>
+        <text x="238" y="122">command its ctl file</text>
+        <text x="462" y="122" class="red">read/write its data file</text>
+      </svg>
+      <figcaption><b>No <code>socket(2)</code> call anywhere.</b> Reserving, configuring, and using a network connection is <code>read</code>, <code>write</code>, <code>read</code>, <code>write</code> &mdash; the same four verbs you'd use on a plain file.</figcaption>
+    </figure>
+
+    <div class="callout key-idea" data-anchor="p9m-callout-control">
+      <span class="callout-label">Key idea</span>
+      The detail that actually matters isn't that Plan&nbsp;9 has more files than Unix &mdash; it's that Plan&nbsp;9 routes <em>control</em> operations through files too, not just data. A <code>ctl</code> file taking a command string, rather than a side-channel <code>ioctl</code>, is what makes the file interface sufficient on its own. That sufficiency is what pillar two gets to depend on.
+    </div>
+
+    <h2 data-anchor="p9m-h-protocol">Pillar two: one protocol reaches all of them</h2>
+    <p data-anchor="p9m-p4">Here's the payoff for keeping the interface down to open/read/write/close: you only need <em>one</em> protocol to carry those operations over a wire. Plan&nbsp;9 calls it 9P. It's a small set of request/response message pairs &mdash; walk a name, open a file, read some bytes, write some bytes, and so on &mdash; and it's what a client speaks to a server, full stop. It doesn't matter whether that server is the kernel serving a local device, or a file server across the building, or a file server across the country.</p>
+    <p data-anchor="p9m-p5">This is worth sitting with, because it's easy to read past as a throwaway detail. 9P isn't a remote-file-access protocol with a separate local fast path that happens to look similar &mdash; local devices <em>are</em> 9P servers, just ones the kernel happens to implement in-process for speed. A client program reading <code>/dev/cons</code> and a client program reading a file on a file server three hops away are, as far as the program can tell, doing the identical thing. There's exactly one client-side idea of "talk to a resource," and it's 9P.</p>
+    <p data-anchor="p9m-p6">Two more properties worth knowing before we move on, because they shape everything downstream: 9P operates on whole file <em>systems</em>, not isolated files &mdash; it includes the messages to walk a name down through a hierarchy, so the protocol itself understands directory structure, not just byte streams. And it works at the granularity of bytes, not fixed-size blocks, which is a real difference from block-oriented network file protocols like NFS. We'll get precise about the actual message types &mdash; <code>Tversion</code>, <code>Tattach</code>, <code>Twalk</code>, and the rest &mdash; in the next chapter; for now, hold onto the shape: one protocol, byte-granular, hierarchy-aware, spoken identically whether the far end is a kernel driver or a machine across a network.</p>
+
+    <h2 data-anchor="p9m-h-namespace">Pillar three: your own private namespace</h2>
+    <p data-anchor="p9m-p7">Now the piece that actually surprises people coming from Unix. In a conventional system there is one file tree, shared by every process on the machine, with maybe a chroot jail bolted on for the rare case that needs isolation. Plan&nbsp;9 inverts that: <strong>every process has its own private namespace</strong> &mdash; its own view of what's mounted where &mdash; and a shared global tree isn't even on offer.</p>
+    <p data-anchor="p9m-p8">A namespace is built, not given. You start (typically) by inheriting one from your parent process, and then you <em>bind</em> and <em>mount</em> pieces of file hierarchies &mdash; served locally by the kernel or remotely by a 9P server &mdash; at whatever points in the tree you want them. Nothing about this needs a new system call for each new kind of resource: adding something to your world is a bind or a mount, using the same two operations regardless of what's on the other end.</p>
+
+    <pre><code><span class="cm">; ns</span>                          <span class="cm"># list this process's namespace</span>
+<span class="kw">bind</span> -a /386/bin /bin
+<span class="kw">bind</span> -a /rc/bin  /bin
+<span class="kw">bind</span> '#c' /dev
+<span class="kw">bind</span> '#d' /fd
+<span class="kw">mount</span> -A /srv/boot /n/other</code></pre>
+    <p class="cm" style="margin-top:-.8rem" data-anchor="p9m-ns-note">Illustrative shape only &mdash; the exact lines vary by machine and session. <code>#c</code>, <code>#d</code> name kernel-served device trees; <code>/n/other</code> is mounted from a 9P connection registered under <code>/srv</code>.</p>
+
+    <p data-anchor="p9m-p9">This is where the three pillars visibly click together. Pillar one made every resource file-shaped. Pillar two made "talk to a resource" a single uniform operation regardless of distance. Pillar three is what that uniformity buys you: because reaching a local device and reaching a remote file server go through the identical client-side call, a namespace can graft the two together with no seam. You can bind a local device tree and mount a file server three networks away into <em>adjacent</em> directories, and nothing about the mechanism changes at the boundary.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="p9m-d2t">
+        <title id="p9m-d2t">Three disjoint services, each speaking 9P, joined by bind and mount into one process namespace</title>
+        <rect x="16"  y="20" width="140" height="34" class="stroke fill-soft"/>
+        <text x="26"  y="42" class="big">kernel device</text>
+        <rect x="210" y="20" width="140" height="34" class="stroke fill-soft"/>
+        <text x="220" y="42" class="big">file server A</text>
+        <rect x="404" y="20" width="140" height="34" class="stroke fill-soft"/>
+        <text x="414" y="42" class="big">file server B</text>
+
+        <text x="70"  y="72" class="dim mono">9P</text>
+        <text x="264" y="72" class="dim mono">9P</text>
+        <text x="458" y="72" class="dim mono">9P</text>
+        <path d="M86 54 L86 90"   class="stroke-soft"/>
+        <path d="M280 54 L280 90" class="stroke-soft"/>
+        <path d="M474 54 L474 90" class="stroke-soft"/>
+
+        <rect x="16" y="96" width="528" height="40" class="stroke-red"/>
+        <text x="26" y="120" class="big red">this process's private name space</text>
+
+        <path d="M86 96 L86 136"   class="stroke-soft dash"/>
+        <path d="M280 96 L280 136" class="stroke-soft dash"/>
+        <path d="M474 96 L474 136" class="stroke-soft dash"/>
+        <text x="40"  y="160">/dev</text>
+        <text x="250" y="160">/bin</text>
+        <text x="450" y="160">/n/other</text>
+        <text x="16"  y="182" class="dim">Same bind/mount mechanism, whether the far end is the kernel or a machine three networks away.</text>
+      </svg>
+      <figcaption><b>The namespace is the assembly point.</b> Pillar one supplies the file shape, pillar two supplies one uniform way to reach it, pillar three is the client-side join.</figcaption>
+    </figure>
+
+    <h2 data-anchor="p9m-h-conventions">Local names, global conventions</h2>
+    <p data-anchor="p9m-p10">If every process's namespace can be different, how does anything reliably work? The overview paper's own answer is a small piece of everyday language: compare "my house" to a house's precise postal address. The address is universal, but nobody talks that way &mdash; you say "my house," which means something different depending on who's speaking, and that's not a bug, it's how the phrase is useful at all.</p>
+    <p data-anchor="p9m-p11"><code>/dev/cons</code> works the same way. It always names "my terminal" &mdash; but what it actually resolves to depends on whose namespace is asking. <code>/bin/date</code> always names "the correct <code>date</code> to run," but which binary that is depends on the architecture of the machine doing the running. Plan&nbsp;9 has <em>local</em> names governed by <em>global</em> conventions: a program always knows where to look, and the conventions are precisely what keep "where to look" meaningful across every machine in the installation &mdash; without ever requiring that two machines' namespaces contain the same things.</p>
+
+    <div class="callout warning" data-anchor="p9m-callout-global">
+      <span class="callout-label">Not the same as a global namespace</span>
+      It's tempting to hear "consistent conventions everywhere" and round it off to "one shared file tree." Resist that. Plan&nbsp;9 explicitly rejects a uniform global namespace as the model &mdash; the whole design point is that the <em>view</em> is local and assembled per-process, while only the <em>path names</em> and what-they're-for are what's held in common.
+    </div>
+
+    <h3 data-anchor="p9m-h-window">A worked example: the window system as a namespace</h3>
+    <p data-anchor="p9m-p12">Plan&nbsp;9's window system, 8&frac12;, is not a special kernel subsystem &mdash; it's an ordinary 9P file server, serving files like <code>/dev/cons</code>, <code>/dev/mouse</code>, and <code>/dev/bitblt</code>. Each window gets its own namespace, with its own private copies of those files bound in. That's the whole trick behind two things that would otherwise need separate mechanisms: first, changes you make to one window's namespace &mdash; say, substituting a file from a backup snapshot while debugging &mdash; are invisible to every other window, so experimenting is safe by construction. Second, and more strikingly, a program running in a window on a <em>remote</em> machine reads and writes exactly the same <code>/dev/cons</code>, <code>/dev/mouse</code>, <code>/dev/bitblt</code> paths as one running locally. It does not know, and has no way to ask, whether those files are local &mdash; the 9P connection back to the window is already sitting in its namespace before the program starts, doing the work pillar two promised.</p>
+    <p data-anchor="p9m-p13">That's the entire model, demonstrated in miniature: the same conventional name resolving to a different concrete resource depending purely on which namespace is doing the asking &mdash; with no code in the application aware that anything was substituted.</p>
+
+    <hr>
+
+    <h2 data-anchor="p9m-h-close">Why this is the right order to learn it in</h2>
+    <p data-anchor="p9m-p14">One more thing worth being explicit about before we leave the model and start opening it up. Each pillar is what makes the next one cheap:</p>
+    <ul data-anchor="p9m-list-close">
+      <li><strong>Files first</strong> &mdash; because every resource already looks like open/read/write/close, there is a small, fixed interface for a wire protocol to carry.</li>
+      <li><strong>One protocol second</strong> &mdash; because that interface is small and uniform, 9P can be the <em>only</em> way to reach a resource, local or remote, with no special-casing.</li>
+      <li><strong>Namespace third</strong> &mdash; because reaching anything goes through the same protocol, assembling a personal view of the system is just binding and mounting, with no kernel change required for a new kind of resource.</li>
+    </ul>
+    <p data-anchor="p9m-p15">Everything else in this book &mdash; namespace construction in more depth, the 9P wire format itself, how to write a file server, the bind/mount/union operators, how namespaces travel across <code>rfork</code>, plumbing as a file server used for message-passing, and security built almost entirely out of namespace restriction &mdash; is one of these three pillars, examined closely. Keep this composition in view as we go; it's the thing that turns a checklist of features into an actual architecture.</p>
+
+    <p class="cm" data-anchor="p9m-sources" style="margin-top:2rem;">Sources: <em>Plan 9 from Bell Labs</em> (Pike, Presotto, Thompson, et&nbsp;al.) &middot; <em>The Use of Name Spaces in Plan 9</em>.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="02-namespaces.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

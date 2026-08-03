@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Namespaces — Plan 9</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="plan-9">
+
+<header class="book-bar">
+  <span class="bar-title">Plan 9</span>
+  <nav class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open">
+      <p class="chapter-num">02</p>
+      <p class="chapter-kicker">Part 2 &middot; Mechanism</p>
+      <h1 class="chapter-title">Namespaces</h1>
+      <p class="chapter-dek">Pillar three, taken apart. What a name space actually is, the two calls that build one, how it survives &mdash; or doesn't &mdash; a fork, and the payoff for building your system this way instead of adding a syscall per resource.</p>
+    </div>
+
+    <p class="lede" data-anchor="ns-lede">Chapter one told you every process gets its own private view of the file hierarchy. Fine &mdash; but "its own view" is doing a lot of work in that sentence. A view built how, out of what, and does it survive the next line of code you run? Those are implementation questions, and Plan&nbsp;9's answers turn out to be almost embarrassingly small: two system calls, one flag argument, and a handful of bits on <code>rfork</code>. Everything this chapter's title promises &mdash; customization, transparency, the disappearance of whole categories of syscall &mdash; falls out of that small a mechanism.</p>
+
+    <h2 data-anchor="ns-h-what">What a name space is</h2>
+    <p data-anchor="ns-p1">A name space is a per-process attribute: a single rooted hierarchy of file names, assembled by binding and mounting service trees at chosen points in that hierarchy. That's the whole definition. The important word is <em>per-process</em> &mdash; there is no second, global tree sitting behind it that this is a view <em>of</em>. A conventional kernel keeps one mount table for the whole machine; Plan&nbsp;9 keeps one name space per process (or, as we'll see in a moment, per small group of processes), full stop.</p>
+    <p data-anchor="ns-p2">This has a consequence worth stating plainly, because it's easy to read past: the assembled result &mdash; which servers are bound where, in what order &mdash; lives entirely on the client side. A file server answering 9P requests has no idea it's mounted at <code>/n/other</code> for you and at <code>/mnt/backup</code> for someone else, or that a third process hasn't mounted it at all. The server just serves its own hierarchy; the <em>assembly</em> is something each client does independently, in its own kernel-resident bookkeeping. That's a deliberate departure from name-space designs (Sprite is the usual point of comparison) that keep the composed view on the server or share it across clients.</p>
+
+    <h2 data-anchor="ns-h-operators">The two operators: bind and mount</h2>
+    <p data-anchor="ns-p3">If a name space is "assembled," something has to do the assembling. Two system calls do all of it:</p>
+    <pre><code><span class="ty">int</span> <span class="fn">bind</span>(<span class="ty">char</span> *name, <span class="ty">char</span> *old, <span class="ty">int</span> flag);
+<span class="ty">int</span> <span class="fn">mount</span>(<span class="ty">int</span> fd, <span class="ty">int</span> afd, <span class="ty">char</span> *old, <span class="ty">int</span> flag, <span class="ty">char</span> *aname);</code></pre>
+    <p data-anchor="ns-p4"><code>bind</code> is the cheaper of the two, and it's worth understanding first because <code>mount</code> is really "<code>bind</code>, plus a server on the other end." <code>bind</code> takes something already visible <em>somewhere</em> in your current name space &mdash; <code>name</code>, a file or a directory &mdash; and makes it <em>also</em> visible at another point, <code>old</code>. No network, no server, no new connection: it's pure rearrangement of names you can already reach. And it's resolved once, at call time &mdash; <code>name</code> is evaluated the instant you call <code>bind</code>, not re-evaluated every time something later looks up <code>old</code>.</p>
+    <p data-anchor="ns-p5"><code>mount</code> is what actually reaches outside your existing name space. <code>fd</code> is an open, already-connected file descriptor &mdash; a pipe or a network connection to something that speaks 9P &mdash; and after a successful <code>mount</code>, the entire file tree that server exports appears rooted at <code>old</code>. The kernel component that makes this work is called, a little confusingly, the <em>mount device</em>: it's the sole translator between the ordinary <code>open</code>/<code>read</code>/<code>write</code>/<code>close</code> calls your program makes and the 9P messages that actually cross <code>fd</code>. It does the marshaling, the buffering, the multiplexing of many callers onto one connection &mdash; it is, in fact, the only integral RPC mechanism anywhere in Plan&nbsp;9. Chapter&nbsp;3 opens that box up; for now, the point is narrower: <code>mount</code> is how a 9P connection <em>becomes</em> part of your name space.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="ns-d1t">
+        <title id="ns-d1t">bind rearranges names already in the name space; mount grafts in a fresh 9P connection</title>
+        <text x="16" y="20" class="dim">bind(name, old, flag)</text>
+        <rect x="16" y="30" width="150" height="32" class="stroke fill-soft"/>
+        <text x="24" y="51" class="big mono">/386/bin</text>
+        <path d="M166 46 L330 46" class="stroke"/>
+        <path d="M322 42 L330 46 L322 50" class="stroke"/>
+        <text x="180" y="40" class="dim">also visible at</text>
+        <rect x="330" y="30" width="150" height="32" class="stroke-red"/>
+        <text x="338" y="51" class="big red mono">/bin</text>
+        <text x="16" y="82" class="dim">no server involved &mdash; both names already in this name space</text>
+
+        <path d="M16 100 L544 100" class="stroke-soft dash"/>
+
+        <text x="16" y="122" class="dim">mount(fd, afd, old, flag, aname)</text>
+        <rect x="16" y="132" width="120" height="32" class="stroke fill-soft"/>
+        <text x="24" y="153" class="big mono">fd &rarr; 9P server</text>
+        <path d="M136 148 L330 148" class="stroke"/>
+        <path d="M322 144 L330 148 L322 152" class="stroke"/>
+        <text x="150" y="142" class="dim">tree rooted at</text>
+        <rect x="330" y="132" width="150" height="32" class="stroke-red"/>
+        <text x="338" y="153" class="big red mono">/n/other</text>
+      </svg>
+      <figcaption><b>Same shape, different reach.</b> <code>bind</code> rearranges the name space you already have; <code>mount</code> is the only call that brings a new 9P connection into it.</figcaption>
+    </figure>
+
+    <p data-anchor="ns-p6">Both calls take a <code>flag</code> that decides how the newly-visible thing joins whatever is already sitting at <code>old</code>: the default, <code>MREPL</code>, replaces it outright; <code>MBEFORE</code> and <code>MAFTER</code> instead splice the new directory onto the front or back of a <em>union directory</em> at <code>old</code>, searched in that order; <code>MCREATE</code> can be added to any of these to mark that element as where a later <code>create</code> in the union should land. That's the full vocabulary &mdash; the next chapter, <em>Mount, Bind, and Union Directories</em>, is entirely about what these flags buy you and how union lookup actually resolves. For this chapter, file away that the operators exist and what each one attaches; the interesting content for right now is what happens to all of this across a fork.</p>
+
+    <h2 data-anchor="ns-h-inherit">Inheritance: shared, copied, or empty</h2>
+    <p data-anchor="ns-p7">Here's the part that trips up people arriving from other systems. Elsewhere, <code>fork()</code> has one well-known meaning for whatever-you're-forking: usually a copy, sometimes copy-on-write, but a copy. Plan&nbsp;9's plain <code>fork()</code> does something different for the name space specifically &mdash; it <strong>shares</strong> it. Parent and child end up as two processes pointing at the <em>same</em> name-space object, not two independent copies that happen to start out identical. Bind something in the child, and the parent sees it too, immediately, because there was never a second name space to keep in sync &mdash; there's only ever been the one.</p>
+    <p data-anchor="ns-p8">The actual control lives in <code>rfork</code>'s flag argument, and <code>fork()</code> itself is nothing more than a fixed call to it:</p>
+    <pre><code><span class="fn">rfork</span>(RFFDG|RFREND|RFPROC)    <span class="cm">// == plain fork(): child SHARES the parent's name space</span>
+<span class="fn">rfork</span>(RFNAMEG |RFPROC)       <span class="cm">// child gets a private COPY, independent from that point on</span>
+<span class="fn">rfork</span>(RFCNAMEG|RFPROC)       <span class="cm">// child starts with an EMPTY name space &mdash; nothing mounted</span></code></pre>
+    <p data-anchor="ns-p9"><code>RFNAMEG</code> and <code>RFCNAMEG</code> are mutually exclusive, and between them they cover the two things "isolate the child" could mean: give it a snapshot to diverge from (<code>RFNAMEG</code>), or give it nothing and make it build its own from scratch by mounting something onto it (<code>RFCNAMEG</code>). There's a related flag, <code>RFNOMNT</code>, that can be set on a fresh name space to forbid any further <code>mount</code> calls and block dereferencing kernel-device names beginning with <code>#</code> inside it &mdash; a way to build a name space that, once handed to something, can't be pried open further. That's a security-relevant move on its own, and we'll come back to it once the security chapter has the rest of the vocabulary in place.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 180" role="img" aria-labelledby="ns-d2t">
+        <title id="ns-d2t">Plain fork shares one name-space object; rfork RFNAMEG copies it into two independent ones</title>
+        <text x="16" y="20">Plain fork() &mdash; shared</text>
+        <rect x="120" y="30" width="320" height="34" class="stroke fill-red"/>
+        <text x="132" y="52" class="big on-ink">one name space object</text>
+        <path d="M180 64 L180 90" class="stroke-soft"/>
+        <path d="M380 64 L380 90" class="stroke-soft"/>
+        <text x="150" y="106">parent</text>
+        <text x="350" y="106">child</text>
+        <text x="16" y="128" class="dim">a bind by either is visible to both &mdash; there was only ever one</text>
+
+        <path d="M16 146 L544 146" class="stroke-soft dash"/>
+
+        <text x="16" y="168" class="red">rfork(RFNAMEG) &mdash; copied, then independent</text>
+      </svg>
+      <figcaption><b>Same call, two outcomes.</b> Whether a bind in the child reaches the parent depends entirely on which flag you passed &mdash; not on whether you called <code>fork</code> or <code>rfork</code>.</figcaption>
+    </figure>
+
+    <div class="callout key-idea" data-anchor="ns-callout-group">
+      <span class="callout-label">Key idea &mdash; the name-space group</span>
+      Because sharing really is "one object, two references" and not "two copies kept synchronized," Plan&nbsp;9's own manual pages use a precise term for it: a set of processes sharing a name space this way is a <em>name-space group</em>. <code>bind</code> and <code>mount</code> are documented as modifying the name space of "the current process and other processes in its name space group" &mdash; which is exactly the mechanism that lets, say, two shells in the same window stay in lock-step on every rebind, with no synchronization protocol at all. There's nothing to synchronize; there's one thing.
+    </div>
+
+    <h2 data-anchor="ns-h-boot">Where a name space starts: namespace(6) and ns(1)</h2>
+    <p data-anchor="ns-p10">A process doesn't get its name space handed down from nowhere. At login, <code>init</code> builds the first one from a <em>name-space description file</em> &mdash; interpreted by the <code>newns</code>/<code>addns</code> library routines &mdash; where each line is one operation: <code>mount</code>, <code>bind</code>, <code>import</code>, <code>cd</code>, <code>unmount</code>, <code>clear</code> (equivalent to <code>rfork(RFCNAMEG)</code>, start over empty), or <code>.&nbsp;path</code> to splice in another such file. The option letters match the shell commands you'd type by hand:</p>
+    <pre><code><span class="cm"># shape of a namespace(6) description file</span>
+<span class="kw">mount</span> -a tcp!fileserver!564 /root
+<span class="kw">bind</span> -a /root/386/bin /bin
+<span class="kw">bind</span> -a /root/rc/bin  /bin
+<span class="kw">bind</span> '#c' /dev
+<span class="kw">cd</span> /usr/glenda</code></pre>
+    <p class="cm" style="margin-top:-.8rem" data-anchor="ns-p10note">Illustrative shape only &mdash; a real description file is site- and machine-specific.</p>
+    <p data-anchor="ns-p11">Treat that file as a <em>bootstrap</em>, not a policy that stays in force. Once a process is running, <code>bind</code>, <code>mount</code>, and <code>unmount</code> are ordinary system calls it (or anything sharing its name-space group) can call at any later moment &mdash; most of the customization this chapter is building up to happens by a running process rearranging its own already-live name space, not by re-invoking <code>init</code>. To actually look at what a process ended up with, there's <code>ns</code>: it reads <code>/proc/pid/ns</code> and prints back a shell script's worth of <code>bind</code>/<code>mount</code>/<code>import</code> lines that could, in principle, reconstruct that exact name space &mdash; the nearest thing Plan&nbsp;9 has to a name-space inspector, and worth keeping in your back pocket for every example from here on.</p>
+
+    <h2 data-anchor="ns-h-buys">What building it this way buys you</h2>
+    <p data-anchor="ns-p12">None of the mechanism above is interesting purely as mechanism. It earns the chapter by paying for three things that other systems solve with more moving parts.</p>
+
+    <h3 data-anchor="ns-h-custom">Customization, with no new mechanism</h3>
+    <p data-anchor="ns-p13">Binaries for a given CPU architecture live in an architecture-named directory &mdash; <code>/mips/bin</code>, <code>/386/bin</code>, and so on. Every machine binds the one it actually needs to the conventional name <code>/bin</code>; a directory of your own private binaries is typically unioned in ahead of it with <code>-a</code>/<code>-b</code>. A shell script that runs <code>/bin/date</code> never has to ask what architecture it's on. Compare this to the usual solution to "where are my commands": an environment variable listing directories to search in order. Plan&nbsp;9's shell, <code>rc</code>, doesn't have one &mdash; there's no <code>$PATH</code> in it at all, because the problem <code>PATH</code> exists to solve is solved once, structurally, by the name space, instead of per-shell-instance by a variable every script has to trust is set correctly.</p>
+
+    <h3 data-anchor="ns-h-transparent">Transparency, as a side effect</h3>
+    <p data-anchor="ns-p14">The window system, <code>8&frac12;</code>, is not special kernel code &mdash; it's an ordinary 9P server, serving files like <code>/dev/cons</code>, <code>/dev/mouse</code>, and <code>/dev/bitblt</code>. Every window gets its own private copies of those names, bound into that window's own name space. A client program addressing <code>/dev/cons</code> has no way to ask, and no need to ask, whether that window &mdash; and therefore that file &mdash; is being served locally or by a machine three networks away; the 9P connection is already sitting in its name space before the program starts. This is the exact mechanism that lets Plan&nbsp;9 run X11 as just another <code>8&frac12;</code> client, often on a big remote machine, with a measured cost of roughly 10% in graphics performance versus running on a bare local Plan&nbsp;9 box &mdash; not a special remote-display protocol, just <code>mount</code> doing what it always does.</p>
+
+    <h3 data-anchor="ns-h-nosyscall">The special-case system calls that disappear</h3>
+    <p data-anchor="ns-p15">Process control is the sharpest example. Unix spreads it across <code>kill</code>, <code>ptrace</code>, and a pile of <code>/proc</code> conventions bolted on later. On Plan&nbsp;9 it's plain text I/O on files under <code>/proc/pid</code>:</p>
+    <pre><code><span class="fn">cat</span> /proc/*/status                <span class="cm"># a crude ps</span>
+<span class="fn">echo</span> stop &gt;/proc/17/ctl           <span class="cm"># suspend process 17 &mdash; no ptrace() anywhere</span>
+<span class="fn">db</span> /proc/27/text /proc/27/mem     <span class="cm"># attach a debugger, local or (via import) remote</span></code></pre>
+    <p data-anchor="ns-p16"><code>ps</code> itself is close to a reformatted <code>cat /proc/*/status</code>; a debugger opens <code>text</code> and <code>mem</code> directly, with no <code>ptrace</code>-shaped call in sight. And because these are just names in a name space, they extend across a network for free: <code>import host [remotepath] mountpoint</code> dials a remote machine, starts a 9P server there for the requested subtree, calls <code>mount</code> to attach the resulting connection locally, and exits &mdash; the remote process keeps serving after <code>import</code> itself is gone. <code>import lab.pc /a: /n/dos</code> reaches a floppy drive with no local hardware for it; <code>import helix /proc</code> followed by <code>db /proc/27/text /proc/27/mem</code> is a remote debugger session, and it works cross-architecture because <code>db</code> reads the target's byte order from the executable header on <code>text</code> rather than assuming its own.</p>
+    <p data-anchor="ns-p17">The same pattern is what the <code>cpu</code> command is built from: instead of moving you into a wholly distinct remote name space (the way <code>rlogin</code> does) or keeping one uniform name space while forcing execution to stay put (the way NFS does), <code>cpu</code> re-imports the pieces of your terminal's local name space that a shell actually needs &mdash; terminal-resident devices &mdash; into a new process on a fast remote CPU server, while CPU-local resources like its own file-system connection stay local. The result doesn't feel like logging into another machine. It feels like your processor got faster.</p>
+
+    <div class="callout warning" data-anchor="ns-callout-pitfall">
+      <span class="callout-label">Two habits worth unlearning</span>
+      Coming from a <code>fork()</code>-means-copy background, it's easy to assume isolation is the default and sharing is the special case. For name spaces on Plan&nbsp;9 it's the reverse: plain <code>fork()</code> <em>shares</em>; <code>RFNAMEG</code> is what you reach for to copy. And don't read a namespace(6) file as a live policy &mdash; it describes how a name space starts, not how it stays; almost everything interesting in this chapter (rebinding for debugging, <code>import</code>, <code>cpu</code>) happens by a running process editing its own name space long after boot.
+    </div>
+
+    <hr>
+
+    <h2 data-anchor="ns-h-close">So what did we actually gain?</h2>
+    <p data-anchor="ns-p18">Two system calls, evaluated eagerly, joined by one flag argument, propagated across <code>fork</code> according to three explicit bits. That's genuinely the entire mechanism. And yet it's enough to make a search path a structural property instead of an environment variable, make a remote window indistinguishable from a local one to the program running in it, and turn process control, remote debugging, and even "log in to a faster machine" into ordinary file operations instead of dedicated syscalls each demanding their own kernel support. The next chapter goes underneath this: <code>bind</code> and <code>mount</code> are really just convenient front doors onto 9P, the protocol that actually moves the messages once <code>mount</code> has grafted a connection in. Understand this chapter's two calls, and the wire format in the next one has nothing left to be mysterious about &mdash; it's just what <code>mount</code> was quietly speaking underneath you the whole time.</p>
+
+    <p class="cm" data-anchor="ns-sources" style="margin-top:2rem;">Sources: <em>The Use of Name Spaces in Plan 9</em> (Pike, Presotto, Thompson, Trickey, Winterbottom) &middot; <code>bind</code>(2) &middot; <code>fork</code>(2) &middot; <code>namespace</code>(6) &middot; <code>ns</code>(1).</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="01-the-plan-9-model.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="03-9p-protocol.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

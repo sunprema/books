@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plumbing — Plan 9</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="plan-9">
+
+<header class="book-bar">
+  <span class="bar-title">Plan 9</span>
+  <nav class="bar-links">
+    <a href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="chapter-open">
+      <p class="chapter-num">07</p>
+      <p class="chapter-kicker">Part 2 &middot; Mechanism</p>
+      <h1 class="chapter-title">Plumbing</h1>
+      <p class="chapter-dek">Chapter&nbsp;6 closed on a promise: an inter-application message bus, built, of course, as a file server. This chapter cashes it in. Everything the plumber needs already exists in this book &mdash; files as the uniform interface (ch.&nbsp;1), a namespace to mount it into (ch.&nbsp;2), 9P to talk to it (ch.&nbsp;3), and the user-level file-server pattern itself (ch.&nbsp;4). Plumbing invents no new mechanism at all; it is what falls out when you apply the existing ones to a genuinely new problem: routing messages between interactive programs.</p>
+    </div>
+
+    <p class="lede" data-anchor="pl-lede">The problem is small and familiar: a compiler prints <code>rmstar.c:32: syntax error</code>, and you want your editor to open <code>rmstar.c</code> at line&nbsp;32 without retyping either. The usual answers &mdash; teach every program its own table of "what to do with this kind of text," or make the user cut, copy, and paste by hand &mdash; don't scale and don't generalize. Plan&nbsp;9 centralizes the decision instead: one program, the <b>plumber</b>, receives messages from any application and decides, from the message's own content and a set of configurable rules, where it goes &mdash; without the sender naming a recipient and without the user carrying the data there themselves.</p>
+
+    <h2 data-anchor="pl-h-arch">A router with no wires &mdash; just files</h2>
+    <p data-anchor="pl-p1">The plumber is a user-level file server, mounted by convention at <code>/mnt/plumb</code>. A program that wants to send a message writes it to <code>/mnt/plumb/send</code>; a program that wants to receive messages reads them from a <b>port</b> &mdash; another file under <code>/mnt/plumb</code>, such as <code>/mnt/plumb/edit</code>, which by convention is where text editors read requests to open a file. Nothing here is a socket, a signal, or a new system call. It's <code>write</code> and <code>read</code> on files that happen to be served by a program instead of a disk, exactly the pattern chapter&nbsp;4 already established for every other Plan&nbsp;9 service.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 145" role="img" aria-labelledby="pl-d1t">
+        <title id="pl-d1t">Shell, acme, and mail all write to send; the plumber decides which port, if any, receives the message</title>
+
+        <rect x="16" y="14" width="90" height="26" class="stroke-soft fill-soft"/>
+        <text x="26" y="32" class="dim mono">shell</text>
+        <rect x="16" y="62" width="90" height="26" class="stroke-soft fill-soft"/>
+        <text x="26" y="80" class="dim mono">acme</text>
+        <rect x="16" y="110" width="90" height="26" class="stroke-soft fill-soft"/>
+        <text x="26" y="128" class="dim mono">mail</text>
+
+        <path d="M106 27 L138 27 L138 72 L172 72" class="stroke-soft"/>
+        <path d="M106 75 L172 75" class="stroke-soft"/>
+        <path d="M106 123 L138 123 L138 78 L172 78" class="stroke-soft"/>
+        <path d="M164 74 L172 75.5 L164 77" class="stroke-soft"/>
+        <text x="112" y="66" class="dim mono">send</text>
+
+        <rect x="172" y="18" width="110" height="110" class="stroke fill-soft"/>
+        <text x="188" y="66" class="big">plumber</text>
+        <text x="188" y="82" class="dim mono">(rules)</text>
+
+        <path d="M282 40 L318 40 L318 27 L338 27" class="stroke"/>
+        <path d="M330 23 L338 27 L330 31" class="stroke"/>
+        <path d="M282 73 L338 75" class="stroke-red"/>
+        <path d="M330 71 L338 75 L330 79" class="stroke-red"/>
+        <path d="M282 106 L318 106 L318 123 L338 123" class="stroke"/>
+        <path d="M330 119 L338 123 L330 127" class="stroke"/>
+
+        <rect x="338" y="14" width="120" height="26" class="stroke-soft fill-soft"/>
+        <text x="348" y="32" class="dim mono">web</text>
+        <rect x="338" y="62" width="120" height="26" class="stroke-red fill-red"/>
+        <text x="348" y="80" class="on-ink mono">edit</text>
+        <rect x="338" y="110" width="120" height="26" class="stroke-soft fill-soft"/>
+        <text x="348" y="128" class="dim mono">image</text>
+
+        <text x="16" y="9" class="dim" style="font-size:9.5px">/mnt/plumb/send</text>
+        <text x="464" y="66" class="red" style="font-size:9.5px">acme's click</text>
+        <text x="464" y="78" class="red" style="font-size:9.5px">matched here</text>
+      </svg>
+      <figcaption><b>Ports are files, not addresses.</b> A sender never names <code>edit</code> directly &mdash; the rules decide. Every program that has <code>/mnt/plumb/edit</code> open gets a copy; a program that hasn't isn't sent anything until it opens the port.</figcaption>
+    </figure>
+
+    <h2 data-anchor="pl-h-msg">The message: six header lines and a blob</h2>
+    <p data-anchor="pl-p2">A plumb message is a fixed six-line textual header, one property per line in a set order, followed by a free-format data section with no terminating newline. Any header line may be blank except the last, which must be an accurate byte count of the data &mdash; only the data section is allowed to contain embedded newlines of its own.</p>
+    <table data-anchor="pl-table-fields" style="table-layout:fixed">
+      <colgroup><col style="width:14%"><col style="width:86%"></colgroup>
+      <thead><tr><th>Field</th><th>Holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>src</code></td><td>the sending application's name</td></tr>
+        <tr><td><code>dst</code></td><td>a destination port, if the sender already knows one</td></tr>
+        <tr><td><code>wdir</code></td><td>working directory, used to resolve a relative file name in the data</td></tr>
+        <tr><td><code>type</code></td><td>a MIME-like tag, e.g. <code>text</code> &mdash; the only type currently interpreted</td></tr>
+        <tr><td><code>attr</code></td><td>blank-separated <code>name=value</code> pairs, quoted as in <code>rc</code>(1)</td></tr>
+        <tr><td><code>ndata</code></td><td>the byte length of the data section that follows</td></tr>
+        <tr><td><code>data</code></td><td>the payload itself &mdash; a filename, a URL, arbitrary bytes</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="pl-p3">Here is a real message &mdash; it tells the editor to open <code>/usr/rob/src/mem.c</code> at line&nbsp;27:</p>
+    <pre><code>src   plumbtest
+dst   edit
+wdir  /usr/rob/src
+type  text
+attr  addr=27
+ndata 5
+data  mem.c</code></pre>
+    <p data-anchor="pl-p4">The C library wraps this in a struct instead of making every client parse text by hand:</p>
+    <pre><code><span class="kw">typedef</span> <span class="kw">struct</span> Plumbmsg  Plumbmsg;
+<span class="kw">typedef</span> <span class="kw">struct</span> Plumbattr Plumbattr;
+
+<span class="kw">struct</span> Plumbmsg {
+	<span class="ty">char</span> *src;    <span class="cm">/* source application */</span>
+	<span class="ty">char</span> *dst;    <span class="cm">/* destination port */</span>
+	<span class="ty">char</span> *wdir;   <span class="cm">/* working directory */</span>
+	<span class="ty">char</span> *type;   <span class="cm">/* type of data, e.g. "text" */</span>
+	Plumbattr *attr;
+	<span class="ty">int</span>  ndata;
+	<span class="ty">char</span> *data;
+};
+
+<span class="kw">struct</span> Plumbattr {
+	<span class="ty">char</span> *name;
+	<span class="ty">char</span> *value;
+	Plumbattr *next;
+};</code></pre>
+    <p data-anchor="pl-p5"><code>plumb</code>(2) supplies <code>plumbopen</code>, <code>plumbsend</code>, <code>plumbrecv</code>, <code>plumbpack</code>/<code>plumbunpack</code>, and attribute helpers (<code>plumblookup</code>, <code>plumbaddattr</code>, <code>plumbdelattr</code>) so a client builds, sends, and parses messages against this struct rather than hand-rolling the wire format. From the shell, the <code>plumb</code>(1) command does the same job: <code>plumb mem.c</code> sends a message built from its arguments, with <code>-s</code>/<code>-d</code>/<code>-t</code>/<code>-a</code>/<code>-w</code> to set fields explicitly and <code>-i</code> to take the data from standard input.</p>
+
+    <h2 data-anchor="pl-h-rules">Rules: patterns, then actions</h2>
+    <p data-anchor="pl-p6">The plumber's behavior comes entirely from a rules file (default <code>$home/lib/plumbing</code>), not from code compiled into it. The file is a sequence of blank-line-separated <b>rule sets</b>; each contains one or more one-line <i>patterns</i> followed by one or more one-line <i>actions</i>. Lines starting with <code>#</code> are comments, and an <code>include&nbsp;file</code> line splices in a shared fragment, searched first relative to the plumber's own directory and then in <code>/sys/lib/plumb</code> &mdash; the same library-of-rules idea a house name space (ch.&nbsp;5) uses for shared bindings.</p>
+    <p data-anchor="pl-p7">Every rule, pattern or action, has the same three-part shape: <code>object&nbsp;verb&nbsp;[arguments]</code>. A pattern's object names a message field (<code>src</code>, <code>dst</code>, <code>wdir</code>, <code>type</code>, <code>data</code>, <code>attr</code>) or <code>arg</code>, the current rule's own argument; an action's object is always the keyword <code>plumb</code>. Rule sets are tried top to bottom against an incoming message; the first whose patterns <i>all</i> succeed fires, and the rest are ignored. If none fires, the write to <code>send</code> fails &mdash; unless the message already names an existing <code>dst</code> port, in which case it's emitted there unchanged.</p>
+    <table data-anchor="pl-table-verbs" style="table-layout:fixed">
+      <colgroup><col style="width:34%"><col style="width:66%"></colgroup>
+      <thead><tr><th>Rule</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>field is arg</code></td><td>pattern &mdash; exact text match</td></tr>
+        <tr><td><code>field isdir</code></td><td>pattern &mdash; field names an existing directory; sets <code>$dir</code></td></tr>
+        <tr><td><code>field isfile</code></td><td>pattern &mdash; field names an existing file; sets <code>$file</code></td></tr>
+        <tr><td><code>data matches re</code></td><td>pattern &mdash; regex match; sets <code>$0</code>, <code>$1</code>, &hellip; to the match and submatches</td></tr>
+        <tr><td><code>attr add name=val</code></td><td>rewrite &mdash; append an attribute (always succeeds)</td></tr>
+        <tr><td><code>attr delete name</code></td><td>rewrite &mdash; remove an attribute if present (always succeeds)</td></tr>
+        <tr><td><code>field set value</code></td><td>rewrite &mdash; overwrite a field's value (always succeeds)</td></tr>
+        <tr><td><code>plumb to port</code></td><td>action &mdash; name the message's destination port</td></tr>
+        <tr><td><code>plumb client cmd</code></td><td>action &mdash; if no reader, start <code>cmd</code>, hold the message for it</td></tr>
+        <tr><td><code>plumb start cmd</code></td><td>action &mdash; if no reader, start <code>cmd</code>, discard the message</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="pl-p8">Rewrite rules (<code>add</code>, <code>delete</code>, <code>set</code>) always succeed &mdash; they aren't tests, so put them after the matching patterns in a rule set, or they'll mutate the message before it's even confirmed to be the right kind.</p>
+
+    <div class="callout note" data-anchor="pl-callout-order">
+      <span class="callout-label"><code>plumb to</code> is the one rule evaluated out of order</span>
+      If an incoming message already has a <code>dst</code> set, a rule set only matches when its own <code>plumb to</code> names that same port &mdash; the sender's stated destination constrains which rule sets are even eligible, rather than being just another field the patterns happen to check.
+    </div>
+
+    <h2 data-anchor="pl-h-click">Finding the file inside the sentence</h2>
+    <p data-anchor="pl-p9">If the user selected exactly <code>rmstar.c</code>, a plain <code>data matches</code> rule against the whole string would be enough. But usually they just point &mdash; a mouse click somewhere inside <code>make nightmare&gt;horse.gif</code> &mdash; and the plumber has to figure out which substring was meant. The sending program marks this case with a <code>click</code> attribute: a numeric offset into the data giving the cursor position. When it's present, <code>data matches</code> rules stop requiring a whole-string match and instead find the <i>longest leftmost match that touches the click position</i>.</p>
+    <p data-anchor="pl-p10">A rule set commonly uses <i>two</i> <code>matches</code> patterns for exactly this reason, and both must match the identical substring for the set to succeed:</p>
+    <pre><code>data matches '[a-zA-Z0-9_\-./]+'
+data matches '([a-zA-Z0-9_\-./]+)\.(jpe?g|gif|bit)'</code></pre>
+    <p data-anchor="pl-p11">The first, loose pattern grabs every filename-ish character around the click &mdash; it would happily match <code>horse.gift</code>. The second, stricter pattern demands a known image suffix; matched against <code>horse.gift</code> it can only match the shorter <code>horse.gif</code> prefix, so the two patterns disagree on where the string ends and the rule set fails &mdash; correctly refusing to treat a sentence ending in "the horse.gift" as a picture file. Once a click has been resolved to a substring this way, the plumber deletes the <code>click</code> attribute before the message goes out; the recipient never sees it.</p>
+
+    <h2 data-anchor="pl-h-worked">Worked example: from compiler error to open editor</h2>
+    <p data-anchor="pl-p12">Put the pieces together on the motivating example. A build fails and prints <code>rmstar.c:32: syntax error</code>; the user points at it in a terminal window and invokes <b>plumb</b>. The terminal emulator sends the surrounding text as a message, with <code>type=text</code> and a <code>click</code> attribute marking the cursor.</p>
+
+    <figure class="diagram-fig">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="pl-d2t">
+        <title id="pl-d2t">rmstar.c:32: is matched, verified as a file, rewritten, and dispatched to the edit port</title>
+
+        <rect x="16" y="34" width="110" height="46" class="stroke fill-soft"/>
+        <text x="24" y="54" class="big mono">rmstar.c:32:</text>
+        <text x="24" y="70" class="dim mono" style="font-size:9.5px">type=text, click=n</text>
+
+        <rect x="150" y="34" width="110" height="46" class="stroke fill-soft"/>
+        <text x="160" y="54" class="big">matches +</text>
+        <text x="160" y="70" class="dim mono" style="font-size:9.5px">arg isfile rmstar.c</text>
+
+        <rect x="284" y="34" width="110" height="46" class="stroke fill-soft"/>
+        <text x="292" y="54" class="big">rewrite</text>
+        <text x="292" y="70" class="dim mono" style="font-size:9.5px">data=rmstar.c, addr=32</text>
+
+        <rect x="418" y="34" width="110" height="46" class="stroke-red fill-red"/>
+        <text x="426" y="54" class="big on-ink">to edit</text>
+        <text x="426" y="70" class="on-ink mono" style="font-size:9.5px">editor jumps to line 32</text>
+
+        <path d="M126 57 L150 57" class="stroke"/>
+        <path d="M142 53 L150 57 L142 61" class="stroke"/>
+        <path d="M260 57 L284 57" class="stroke"/>
+        <path d="M276 53 L284 57 L276 61" class="stroke"/>
+        <path d="M394 57 L418 57" class="stroke"/>
+        <path d="M410 53 L418 57 L410 61" class="stroke"/>
+
+        <text x="16" y="112" class="dim">Only the substring the click touches survives; the rest of the line is discarded, not sent.</text>
+      </svg>
+      <figcaption><b>One rule set, four things happening to one message.</b> Matching, verifying, and rewriting all happen before any action fires &mdash; the dispatched message names only <code>rmstar.c</code> with an <code>addr=32</code> attribute, not the original error text.</figcaption>
+    </figure>
+
+    <p data-anchor="pl-p13">The rule set doing this work looks close to the one in the manual for exactly this case:</p>
+    <pre><code><span class="cm"># existing files, possibly tagged by an address, go to the editor</span>
+data matches '([.a-zA-Z0-9_/\-]*[a-zA-Z0-9_/\-])('$addr')?'
+arg isfile $1
+data set $1
+attr add addr=$3
+plumb to edit
+plumb client window $editor</code></pre>
+    <p data-anchor="pl-p14">The first line's regex extracts a plausible file path (plus an optional trailing address like <code>:32</code>); <code>arg isfile $1</code> confirms it actually exists in <code>wdir</code>. The rewrites that follow replace the data with the bare filename and attach the line number as an <code>addr</code> attribute. Finally, <code>plumb to edit</code> names the port, and <code>plumb client window $editor</code> covers the case where no editor is running yet: start one, and hand it the message once it opens <code>edit</code> for itself.</p>
+
+    <h2 data-anchor="pl-h-startclient">Starting a program versus waiting for one</h2>
+    <p data-anchor="pl-p15">If the named port already has a reader &mdash; some running program has <code>/mnt/plumb/edit</code> open &mdash; the message is delivered immediately and any <code>client</code>/<code>start</code> action in the rule set is simply not needed. If nothing has the port open yet, the plumber falls back to whichever of the two startup actions the rule set specifies, and the choice between them matters:</p>
+    <ul data-anchor="pl-list-startclient">
+      <li><code>plumb start cmd</code> runs <code>cmd</code> and <b>discards</b> the message &mdash; fire-and-forget, appropriate when the command is self-sufficient (it takes what it needs from its own arguments).</li>
+      <li><code>plumb client cmd</code> runs <code>cmd</code> but <b>retains</b> the message, delivering it once that program opens the port itself &mdash; required when the program needs the message's structured fields, such as the <code>addr</code> attribute above, rather than just a bare filename on its command line.</li>
+    </ul>
+    <p data-anchor="pl-p16">Ports themselves come and go the same way file servers usually don't: the set of ports is created dynamically, one per unique destination named by a <code>plumb to</code> rule anywhere in the active rules. But a port, once created, is <i>never</i> deleted &mdash; if a later edit to the rules file removes every rule mentioning it, the port file persists; it just stops receiving anything.</p>
+
+    <div class="callout key-idea" data-anchor="pl-callout-liverules">
+      <span class="callout-label">The rules file is itself a live file</span>
+      <code>/mnt/plumb/rules</code> reads back the text of the currently active rule set. Appending to it &mdash; with an ordinary text editor, or <code>echo &gt;&gt;</code> &mdash; adds new rule sets immediately, no restart. Opening it with truncation clears the rules entirely. This is the same trick chapter&nbsp;4's synthetic file trees use everywhere: configuration as a writable file instead of a daemon you signal or a service you restart.
+    </div>
+
+    <h2 data-anchor="pl-h-delivery">Delivery is fast because it doesn't wait</h2>
+    <p data-anchor="pl-p17">If several clients have the same port open, each gets its own independent copy &mdash; the plumber fans a message out, it doesn't pick one winner. And a write to <code>send</code> succeeds as soon as the message is <i>queued</i> for its destination, not once some reader has actually consumed it, so a slow or absent recipient never blocks the sender.</p>
+
+    <div class="callout warning" data-anchor="pl-callout-noack">
+      <span class="callout-label">Queued is not the same as delivered</span>
+      There is no acknowledgment of receipt &mdash; only of the write succeeding. If the intended reader exits while messages are still queued for it, those messages are simply gone, and the sender has no way to find out. The design deliberately favors not blocking the user interface over guaranteeing delivery; for a UI mechanism rather than a general reliable IPC channel, that trade has held up well in practice, but it is a real limitation, not a detail to gloss over.
+    </div>
+
+    <h2 data-anchor="pl-h-why">Why a file server, of everything</h2>
+    <p data-anchor="pl-p18">It would be easy to read the plumber as an odd, bespoke piece of infrastructure bolted onto the system. It's closer to the opposite: nothing about it required new technology, because everything it needed &mdash; a synthetic file tree, 9P as the transport, a namespace to mount it into &mdash; already existed for other reasons. Two consequences fall out of building it that way instead of as a dedicated IPC service:</p>
+    <p data-anchor="pl-p19">First, plumbing crosses the network for free. Because the plumber is just another Plan&nbsp;9 file server, its files can be exported and mounted exactly like any other (ch.&nbsp;4), so a window system and the applications it talks to can live on separate machines and still share one plumber instance, with no extra protocol. Second, its access control is the file permission system chapter&nbsp;3 already gave every 9P file &mdash; no one else can open your private plumbing ports, because they're files owned like any other, not a global bus with its own separate authorization model bolted on.</p>
+    <p data-anchor="pl-p20">The one honest limitation, documented in the plumber's own manual page as a bug rather than papered over: its name space is effectively fixed once it starts running, so rules that reference files under a service mounted <i>after</i> the plumber came up are hard to make work reliably. A namespace, once handed to a long-running server, isn't something that server keeps re-consulting for what's new in it.</p>
+
+    <hr>
+
+    <p data-anchor="pl-p21">Everything in this chapter reduces to one idea applied at a slightly larger scale than usual: a program that serves files, whose files happen to encode "what should happen to this piece of data," addressed and secured by exactly the namespace and protocol machinery already in place. File permissions are as far as that access control goes, though &mdash; the plumber trusts whatever name space and identity a process already has. The next chapter asks the question this one quietly assumes an answer to: what establishes that identity in the first place, and what happens when a namespace alone isn't enough to prove who's asking.</p>
+
+    <p class="cm" data-anchor="pl-sources" style="margin-top:2rem;">Sources: <em>Plumbing and Other Utilities</em> (Pike) &middot; <code>plumber</code>(4) &middot; <code>plumb</code>(6) &middot; <code>plumb</code>(1) &middot; <code>plumb</code>(2).</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="06-process-namespaces.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="08-security-model.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
