@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building the Simulator — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="deterministic-simulation-testing">
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="bts-intro">
+      <p class="eyebrow">Chapter 04 &middot; Part II — Building It</p>
+      <h1>Building the Simulator</h1>
+      <p class="lead" data-anchor="bts-lead">Chapter 3 drew the box labeled <b>simulation</b> and left it deliberately
+      closed — a set of ports on one side, seeded adapters on the other, and a promise that whatever ran inside was
+      deterministic. Fair enough for an architecture chapter. But "deterministic" isn't a property you get by
+      wishing for it; it's a property of a specific, buildable machine. Open the box. Inside is almost always the
+      same three moving parts: a queue that holds the future, a way of running many things at once without needing
+      the operating system's help, and a family of small, honest lies about the network, the disk, the machine, and
+      the clock. Build those three things well and the promise from Chapter 3 — replay this seed, get this exact
+      run, forever — just falls out of the mechanism. Build them carelessly and the promise quietly stops being
+      true, usually with no error message to tell you so.</p>
+    </section>
+
+    <section data-anchor="bts-queue">
+      <h2>The engine room: one queue, sorted by time</h2>
+      <p data-anchor="bts-p1">Start with the simplest possible question: how does a simulator know what happens
+      next? Not "next" in wall-clock time — there is no wall clock in here — but next in the story the simulation is
+      telling. The answer, in essentially every deterministic simulator anyone has built, is a
+      <em class="term-def">discrete-event scheduler</em>: a priority queue of pending events, each stamped with a
+      timestamp, always sorted so the earliest is on top. The loop is almost embarrassingly small. Pop the earliest
+      event. Set the clock to its timestamp — jump, don't count up to it. Run whatever handler is attached to that
+      event. That handler does its work and, as a side effect, schedules zero or more new events further out on the
+      timeline. Repeat.<sup>1</sup></p>
+      <p data-anchor="bts-p2">Notice what just happened to "time." It stopped being a thing the host machine's
+      wristwatch tells you and became a <em>position in a queue</em>. If nothing is scheduled for the next four
+      simulated hours, the simulator doesn't sit there for four hours, or even four milliseconds — it sets the clock
+      to the next timestamp and keeps going. This is the mechanism behind FoundationDB's roughly 10-to-1 ratio of
+      simulated time to real time, and it's also why a 30-second timeout, inside a simulation, costs the scheduler
+      nothing but a single queue pop: the clock simply jumps ahead 30 seconds and whatever was waiting on it fires
+      right on schedule.<sup>1,9</sup></p>
+
+      <figure class="diagram-fig" data-anchor="bts-fig-engine">
+        <svg class="diagram" viewBox="0 0 560 220" role="img" aria-labelledby="bts-d1-title">
+          <title id="bts-d1-title">A seeded ready-queue picks which actor runs next; that actor's wait() calls push events onto a timestamp-ordered event queue; popping the earliest event resumes an actor, closing the loop</title>
+          <text x="16" y="16" class="dim">two queues, one seed &mdash; this loop is the entire "engine"</text>
+
+          <rect x="16" y="34" width="150" height="46" class="stroke fill-soft"/>
+          <text x="30" y="54" class="mono">ready-queue</text>
+          <text x="30" y="70" class="dim">seed-shuffled, not FIFO</text>
+
+          <path d="M166 57 L232 57" class="stroke"/>
+          <path d="M224 52 L232 57 L224 62" class="stroke"/>
+
+          <rect x="232" y="34" width="96" height="46" class="stroke fill-ink"/>
+          <text x="250" y="62" class="on-ink big">actor</text>
+
+          <path d="M328 57 L394 57" class="stroke"/>
+          <path d="M386 52 L394 57 L386 62" class="stroke"/>
+          <text x="332" y="46" class="dim mono">wait()</text>
+
+          <rect x="394" y="34" width="150" height="46" class="stroke-red fill-bg"/>
+          <text x="404" y="54" class="mono red">event queue</text>
+          <text x="404" y="70" class="dim">sorted by timestamp</text>
+
+          <path d="M544 80 C 544 150, 90 150, 90 80" class="stroke-soft"/>
+          <path d="M96 87 L90 80 L84 87" class="stroke-soft"/>
+          <text x="130" y="168" class="dim">pop earliest &rarr; resume the actor waiting on it &rarr; back to the ready-queue</text>
+
+          <text x="16" y="200" class="dim">every branch point above &mdash; which actor runs, which timestamp lands first &mdash; is a draw from the same seeded PRNG</text>
+        </svg>
+        <figcaption><b>Two queues, one seed.</b> The ready-queue decides which actor gets to run right now; that
+        actor's own <code class="inl">wait()</code> is what lands a new entry on the event queue. Nothing here is a
+        real OS thread, and nothing here consults a real clock.</figcaption>
+      </figure>
+
+      <p data-anchor="bts-p3">There's a second queue hiding in that description, and it matters just as much as the
+      first. Real distributed systems run many logical processes at once — nodes, connections, background tasks —
+      and a simulator has to decide, on every step, <em>which one goes next</em>. Simulators like madsim (and
+      RisingWave, which is built on it) keep a ready-queue of every runnable task and deliberately drain it in a
+      near-random order — closer to "first-in-random-out" than strict FIFO — rather than always resuming things in
+      the order they became ready. That's not an implementation accident; it's the whole point. A simulator that
+      always resumes actor A before actor B will never, ever find the bug that only happens when B gets there
+      first. Seed-shuffling the ready-queue is what turns "one deterministic run" into "many different deterministic
+      runs, each one still perfectly replayable."<sup>6</sup></p>
+
+      <figure class="figbox" data-widget="event-queue" data-seed="90210" data-anchor="bts-widget-queue">
+        <canvas></canvas>
+        <div class="controls">
+          <label>Seed <input class="seed-input" type="number" value="90210" style="width:7em"></label>
+          <button type="button" class="btn step">Step &rarr;</button>
+          <button type="button" class="btn replay">&#8635; Replay same seed</button>
+          <button type="button" class="btn reseed">New seed</button>
+        </div>
+        <p class="readout"></p>
+        <figcaption>This is the loop from the diagram above, actually running. Press <b>Step</b> a dozen times, note
+        the order events popped in, then press <b>Replay same seed</b> and step through again — the order never
+        moves. <b>New seed</b> is the only button that touches real randomness; everything after it is exact.</figcaption>
+      </figure>
+
+      <pre class="tab" data-anchor="bts-snippet-loop"><span class="cm">// two queues working together, per the diagram above</span>
+ready = <span class="fn">seeded_shuffle</span>(runnable_coroutines)   <span class="cm">// order drawn from the seed</span>
+<span class="kw">for</span> task <span class="kw">in</span> ready:
+  task.<span class="fn">resume</span>()                 <span class="cm">// runs only until its next await/wait()</span>
+  <span class="cm">// resuming may push new network/disk/timer events below</span>
+
+<span class="kw">loop</span>:
+  event = event_queue.<span class="fn">pop_min</span>() <span class="cm">// earliest timestamp wins, always</span>
+  clock = event.timestamp       <span class="cm">// jump, never sleep</span>
+  effects = handlers[event.kind](state, event)
+  <span class="kw">for</span> e <span class="kw">in</span> effects: event_queue.<span class="fn">push</span>(e)</pre>
+
+      <div class="callout key" data-anchor="bts-callout-queue">
+        <span class="tag">Key idea</span>
+        The scheduler doesn't know anything about networks, disks, or crashes. It knows exactly one thing: pop the
+        earliest timestamp, run its handler, repeat. Every fault type in the rest of this chapter is just a
+        different kind of event a handler decides to schedule.
+      </div>
+    </section>
+
+    <section data-anchor="bts-actors">
+      <h2>Actors, state machines, and why none of this needs a real thread</h2>
+      <p data-anchor="bts-p4">The engine room raises an obvious question: if there's no real OS thread scheduler in
+      here, what is being "resumed" and "suspended" every time the loop turns? The answer is something you've
+      probably already used without thinking about it this way: an <code class="inl">async</code> function. When a
+      language compiles an <code class="inl">async</code>/<code class="inl">await</code> function — or,
+      equivalently, one of FoundationDB's Flow <code class="inl">ACTOR</code> functions — it doesn't produce a
+      normal subroutine. It produces a small object, a <em class="term-def">state machine</em>, that holds the
+      function's local variables plus a marker for exactly where it's paused. Calling it again doesn't start over;
+      it resumes from that marker. Suspension only ever happens at an explicit point the code names —
+      <code class="inl">await</code>, or Flow's <code class="inl">wait()</code> — never in the middle of an ordinary
+      statement the way a real OS could interrupt a thread at any instruction at all.<sup>11,2</sup></p>
+      <p data-anchor="bts-p5">That one property — <em>suspend only where you say so</em> — is the whole trick.
+      Because the simulator itself is the thing deciding which suspended coroutine to resume next (by draining its
+      seeded ready-queue), and because a coroutine can only ever be resumed at one of its own named suspension
+      points, the entire interleaving of dozens of concurrent "actors" — each one usually standing in for one
+      simulated node, connection, or background task — becomes a pure function of the seed. There's no real thread
+      scheduler left anywhere in the loop that could inject a timing decision the seed didn't make.<sup>2,1</sup></p>
+
+      <div class="reflect" data-anchor="bts-reflect-box">
+        <h4>But if the network, the disk, and the clock in this whole chapter are all fake, how is any of this
+        telling us something true?</h4>
+        <p>Because "fake" is doing very specific, narrow work here. The <em>environment</em> is substituted — the
+        actual bytes on the wire, the actual sectors on a platter, the actual reading of a hardware clock. The
+        <em>application code</em> running on top of it is not. An actor in this simulation is the same compiled
+        code, making the same decisions, holding the same state, that would run in production — it just can't tell
+        that the "network" answering its <code class="inl">wait()</code> is a scheduled event instead of a NIC. And
+        every one of the "lies" the rest of this chapter builds — a dropped packet, a torn write, a node that pauses
+        for half a second — is a thing a real machine can genuinely do. The simulator's job isn't to invent
+        physically impossible behavior; it's to make the rare-but-real behaviors happen on command, and often, so
+        the one line of code that mishandles them doesn't have to wait for a data center to get unlucky first.</p>
+      </div>
+    </section>
+
+    <section data-anchor="bts-network">
+      <h2>Simulating the network: delay, loss, duplication, reordering, partitions</h2>
+      <p data-anchor="bts-p6">A simulated network is, underneath, almost insultingly simple: a connection is two
+      in-memory buffers instead of a socket, and every decision about what happens to a packet is a scheduled event
+      or a boolean check, driven by the same seeded PRNG as everything else. FoundationDB's simulator (Sim2) hands
+      out <code class="inl">Sim2Conn</code> objects in place of real sockets; when a packet is "sent," the simulator
+      schedules its delivery as a future event, with the delay drawn straight from the seed — that's latency,
+      handled. Reordering and duplication are just what happens naturally when independent packets on the same or
+      different connections get independently-random delays: two packets sent in order can easily be scheduled to
+      arrive out of order, and nothing has to specially code that in.<sup>3</sup></p>
+      <p data-anchor="bts-p7">Partitions and packet loss work the same way, one level up: before delivering a
+      packet, a connection consults a shared "clogging" table for the link between its two endpoints, and simply
+      refuses delivery if that link is currently clogged. A network partition, at this level, is nothing more
+      exotic than a boolean flipping to <code class="inl">true</code> for a while.<sup>3</sup> TigerBeetle's VOPR
+      does the equivalent job in its own vocabulary — it drops packets, reorders them, and partitions the network,
+      all tuned by the same per-run seed that also drives its storage faults.<sup>4</sup></p>
+
+      <pre class="tab" data-anchor="bts-snippet-net"><span class="cm">// FDB Sim2, paraphrased: a "connection" is two buffers plus one check</span>
+<span class="kw">function</span> <span class="fn">deliver</span>(conn, packet):
+  <span class="kw">if</span> clogging.<span class="fn">disconnected</span>(conn.from, conn.to):
+    <span class="kw">return</span>                       <span class="cm">// dropped &mdash; this IS a partition, here</span>
+  delay = rng.<span class="fn">next_delay</span>()       <span class="cm">// seeded latency</span>
+  <span class="fn">schedule_at</span>(clock + delay, () =&gt; conn.to.inbox.<span class="fn">push</span>(packet))</pre>
+
+      <p data-anchor="bts-p8">One distinction is worth being precise about, because it's the difference between a
+      fault model that finds real bugs and one that only finds toy ones: a <b>symmetric</b> partition (the link is
+      down, in both directions, full stop) is not the same fault as an <b>asymmetric</b> one, where a node can send
+      but not receive, or vice versa. Real networks do this — a firewall rule, a one-way routing failure, a NIC that
+      can transmit but whose receive queue is stuck. And asymmetric partitions can reach failure modes a
+      symmetric-only model never will.</p>
+
+      <figure class="diagram-fig" data-anchor="bts-fig-asym">
+        <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="bts-d2-title">
+          <title id="bts-d2-title">Replica A can send messages to B and C but cannot receive from them; A keeps starting view changes that B and C follow, and the cluster never settles</title>
+          <text x="16" y="16" class="dim">A can send, but nothing gets back to A &mdash; a livelock, not a crash</text>
+
+          <circle cx="90" cy="100" r="34" class="stroke fill-ink"/>
+          <text x="90" y="106" class="on-ink big" text-anchor="middle">A</text>
+
+          <circle cx="330" cy="56" r="30" class="stroke fill-soft"/>
+          <text x="330" y="62" class="big" text-anchor="middle">B</text>
+          <circle cx="330" cy="144" r="30" class="stroke fill-soft"/>
+          <text x="330" y="150" class="big" text-anchor="middle">C</text>
+
+          <path d="M122 88 L300 60" class="stroke"/>
+          <path d="M292 56 L300 60 L294 66" class="stroke"/>
+          <text x="170" y="58" class="dim mono">DoViewChange</text>
+
+          <path d="M122 112 L300 138" class="stroke"/>
+          <path d="M292 134 L300 138 L294 144" class="stroke"/>
+          <text x="170" y="150" class="dim mono">DoViewChange</text>
+
+          <path d="M300 70 L128 96" class="stroke-red"/>
+          <text x="200" y="90" class="red mono">&times; blocked</text>
+          <path d="M300 130 L128 104" class="stroke-red"/>
+          <text x="200" y="120" class="red mono">&times; blocked</text>
+
+          <text x="16" y="176" class="dim">A never learns the cluster moved on &mdash; so A starts another view change, forever</text>
+        </svg>
+        <figcaption><b>TigerBeetle's own example.</b> A 3-replica cluster where A is asymmetrically partitioned —
+        it can send to B and C, but nothing comes back — can livelock: A keeps starting view changes that B and C
+        dutifully follow, and the cluster never settles back into normal, request-serving status. A symmetric
+        (fully-severed) partition model would never reach this state at all.<sup>5</sup></figcaption>
+      </figure>
+
+      <div class="callout warn" data-anchor="bts-callout-asym">
+        <span class="tag">Watch out</span>
+        If your fault model can only sever a link both ways at once, you are testing a real but narrower slice of
+        what networks actually do. Give your simulator the ability to clog one direction of a link independently of
+        the other — it's a small change to the "clogging" check above, and it's the difference between finding a
+        livelock and never being able to.
+      </div>
+    </section>
+
+    <section data-anchor="bts-disk">
+      <h2>Simulating the disk: more than just "unavailable"</h2>
+      <p data-anchor="bts-p9">It's tempting to model a disk fault the same crude way people first model a network
+      fault — up or down — but a real disk fails in more specific, more interesting ways than that, and a simulator
+      that only knows "unavailable" will never exercise the code paths written for the others.</p>
+
+      <table class="grid" data-anchor="bts-table-disk">
+        <tr><th>Simulated disk fault</th><th>What it mimics</th></tr>
+        <tr><td>Partial / torn write</td><td>Power is lost mid-flush; only some of the bytes or sectors in a write actually land on the platter before the disk cache empties.<sup>12,3</sup></td></tr>
+        <tr><td>Corruption of durable data</td><td>Bit rot, a firmware bug, or a misdirected write silently changes bytes that were already successfully written and acknowledged.<sup>4</sup></td></tr>
+        <tr><td>Added latency</td><td>A busy, throttled, or degraded drive taking far longer than usual to service an operation.</td></tr>
+        <tr><td>Disk full (ENOSPC)</td><td>The write call is intercepted and made to return an out-of-space error on demand — no need to actually fill a real disk to test how the caller handles it.<sup>12</sup></td></tr>
+      </table>
+
+      <p data-anchor="bts-p10">FoundationDB deliberately reaches for the first row on this table specifically
+      because it mirrors real hardware: the corruption it injects on a simulated crash targets <em>unsynchronized</em>
+      writes, the ones a real disk's cache hadn't finished flushing yet — exactly the data a real machine loses when
+      the power drops mid-write.<sup>3</sup> TigerBeetle's VOPR took a similar path from a different starting point:
+      it originally only produced torn writes indirectly, as a side effect of simulating a crash mid-operation, and
+      was later extended to inject read and write corruption directly on the storage path — independent of any
+      crash — at seed-controlled probabilities, which is a strictly larger fault surface than "crashes sometimes
+      tear a write."<sup>4</sup></p>
+
+      <p data-anchor="bts-p11">Notice, too, that FoundationDB doesn't stop at one disk on one machine. The same run
+      can inject fail-stop failures and reboots at the level of a single machine, a whole rack, or an entire
+      simulated data center, layered together with the network faults from the previous section — so one simulated
+      run can plausibly reproduce a correlated, multi-machine outage, not just one node quietly dropping out while
+      everything else hums along.<sup>3,13</sup></p>
+
+      <div class="callout key" data-anchor="bts-callout-disk">
+        <span class="tag">Key idea</span>
+        "The disk failed" isn't one fault — it's a family of them, and each member of the family exercises different
+        code. A durability bug and a corruption bug and an out-of-space bug are three different bugs; a simulator
+        that only knows how to make the disk vanish will only ever find one kind.
+      </div>
+    </section>
+
+    <section data-anchor="bts-lifecycle">
+      <h2>Process and node lifecycle: crash, pause, reboot, slow, reconfigure</h2>
+      <p data-anchor="bts-p12">Everything above happens <em>to</em> data in flight or at rest. This section is about
+      what happens to the process itself. A <em class="term-def">crash-stop</em> fault is the blunt one — a node
+      simply disappears, mid-operation, with whatever was in memory gone and whatever was on simulated disk exposed
+      to exactly the partial-write faults from the section above. A <em class="term-def">reboot</em> is the more
+      interesting cousin: the process comes back, and now has to recover from whatever state its disk was actually
+      left in — which is precisely why the disk-corruption faults need to be wired to the crash faults, not treated
+      as unrelated dials.</p>
+      <p data-anchor="bts-p13">Two subtler lifecycle faults deserve equal billing, because they don't crash anything
+      at all — they just make a process behave strangely while it keeps running. Antithesis's taxonomy names both:
+      <b>thread pausing</b> simulates one individual thread unexpectedly taking a long time, by pausing it for a
+      short, seed-chosen span, so that threads interleave differently on every run without any code changing at
+      all. <b>CPU modulation</b> goes a layer deeper still — it changes the simulated processor's effective clock
+      speed, and the relative cost of different low-level operations, which perturbs the order concurrent work
+      completes in without touching a single line of the guest's source.<sup>7,8</sup> Both are, in the end, just
+      more finely-grained versions of the same idea from the engine room: perturb <em>which event lands first</em>,
+      seeded and on purpose, instead of hoping a real machine happens to schedule things unluckily.</p>
+      <p data-anchor="bts-p14">Configuration change is the lifecycle fault that's easiest to forget precisely
+      because it isn't dramatic — a node's tuning parameters, feature flags, or cluster membership changing while
+      the system is running. It matters for the same reason everything else in this chapter matters: production
+      configuration changes happen concurrently with real traffic and real faults, and a simulator that only ever
+      changes configuration between clean, quiescent runs will never exercise the code path that has to handle a
+      config flip landing mid-request.</p>
+    </section>
+
+    <section data-anchor="bts-time">
+      <h2>Time semantics: timers, deadlines, leases, and clocks that jump</h2>
+      <p data-anchor="bts-p15">Come back to the engine room one more time. A lease expiring in ten seconds, a
+      request's deadline, a heartbeat timeout — none of these are special to the scheduler. They're just another
+      entry in the same timestamp-ordered queue as a network delivery or a disk write completing. That's not a
+      simplification for this book; it's the actual mechanism. Because a lease's expiry is <em>data in the same
+      queue</em> as everything else, the simulator can jump straight to the instant it fires, inject a fault exactly
+      at that boundary — a lease renewal that lands one tick too late — or place two competing deadlines in a dead
+      heat and see which one the real code resolves first.<sup>1,9</sup></p>
+      <p data-anchor="bts-p16">Clock <em>skew</em> is a related but distinct fault from clock <em>jumps</em>. A
+      shared "virtual time" for the whole simulated system (Antithesis's approach) means a clock-skip fault moves
+      every node's view of time together, which is the right model for testing "what happens when the whole
+      system's clock suddenly jumps forward" — a leap second, a bad NTP sync, a VM pause on the host. Testing skew —
+      one node's clock running fast or slow <em>relative to the others</em> — needs the simulator to give each
+      simulated node its own, independently-adjustable clock instead of one shared one; both are real hardware
+      behaviors, and they exercise different assumptions in your code.<sup>7</sup></p>
+
+      <p data-anchor="bts-p17">One last, very practical question, since this chapter has been about building the
+      thing: where does the interception actually happen in real code? Two answers show up in the wild. Some
+      runtimes go beneath the application's own async layer entirely — one documented approach for async Rust
+      overrides the libc symbols a runtime ultimately calls through, <code class="inl">getrandom</code>/
+      <code class="inl">getentropy</code> for randomness and <code class="inl">clock_gettime</code> for time — so
+      determinism is enforced below the application, not just at its ports. Others build it into the runtime
+      itself: Tokio exposes a first-class "paused" clock mode where simulated time only advances on an explicit
+      <code class="inl">sleep()</code> call, so code that asks <code class="inl">tokio::time::Instant</code> for the
+      time — rather than the OS's <code class="inl">std::time::Instant</code> — automatically observes the
+      controlled clock, no port required.<sup>10</sup></p>
+
+      <div class="challenges" data-anchor="bts-challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="bts-ch1">Suppose a simulator's ready-queue always resumes actor A before actor B when
+          both are runnable at the same simulated instant — no seed involved, just a fixed rule. Sketch a two-actor
+          bug (in words) that this simulator could run for a million different seeds and still never find. What has
+          to change about the ready-queue to fix it?</li>
+          <li data-anchor="bts-ch2">You're adding fault injection to an existing network simulator that can only
+          sever a link symmetrically. Using the TigerBeetle example in this chapter as a template, describe the
+          smallest change to the "clogging" check that would let it express an asymmetric partition instead.</li>
+          <li data-anchor="bts-ch3">A teammate says: "we don't need a disk-full fault — our storage engine already
+          has an integration test where we filled a real disk." What does the ENOSPC-interception technique from
+          this chapter buy you that a real, physically-filled test disk doesn't?</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="bts-sources-footer">
+        Sources: <sup>1</sup> FoundationDB documentation, <em>Simulation and Testing</em>.
+        <sup>2</sup> FoundationDB documentation, <em>Flow</em>.
+        <sup>3</sup> Pierre Zemb, <em>Diving into FoundationDB's Simulation Framework</em>.
+        <sup>4</sup> TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+        <sup>5</sup> TigerBeetle, <em>Simulation Testing For Liveness</em>.
+        <sup>6</sup> RisingWave, <em>Deterministic Simulation: A New Era of Distributed System Testing</em> (Part 1).
+        <sup>7</sup> Antithesis, <em>Types of faults</em>.
+        <sup>8</sup> Antithesis, <em>Fault injection</em> (overview).
+        <sup>9</sup> Workers IO, <em>Deterministic Simulation Testing</em>.
+        <sup>10</sup> S2, <em>Deterministic simulation testing for async Rust</em>.
+        <sup>11</sup> Wikipedia, <em>Async/await</em>.
+        <sup>12</sup> OneUptime, <em>How to Create Fault Injection Testing</em>.
+        <sup>13</sup> Zhou et al., <em>FoundationDB: A Distributed Key Value Store</em> (SIGMOD Record 2022).
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-architectures-for-dst.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-workloads-and-state-space-exploration.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
+</html>

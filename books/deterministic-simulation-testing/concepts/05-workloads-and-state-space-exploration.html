@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workloads &amp; State-Space Exploration — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="deterministic-simulation-testing">
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="wsse-intro">
+      <p class="eyebrow">Chapter 05 &middot; Part III — Exploring &amp; Judging</p>
+      <h1>Workloads &amp; State-Space Exploration</h1>
+      <p class="lead" data-anchor="wsse-lead">Chapter 4 finished the machine. There's a queue sorted by time, a
+      pack of actors that suspend and resume on command, and a network, a disk, and a clock that all lie to the
+      application in small, controllable, physically-plausible ways. Turn it on right now and&hellip; nothing
+      happens. A discrete-event simulator with nothing scheduled is just an expensive way to idle. Something has to
+      walk in and <em>do things</em> &mdash; issue transfers, write records, kill a node, delay a packet &mdash; and
+      that something is the <em class="term-def">workload</em>. This chapter is about the two questions that follow
+      from having a machine that can run <em>any</em> hostile timeline: what do we make it do, and out of the
+      practically infinite number of hostile timelines available, which ones are actually worth the CPU?</p>
+    </section>
+
+    <section data-anchor="wsse-workloads">
+      <h2>Two ways to fill the machine: generated versus hand-authored</h2>
+      <p data-anchor="wsse-p1">The most direct way to exercise a simulator is to write down, by hand, the exact
+      sequence of operations you're worried about &mdash; upgrade the cluster while a transaction is in flight, kill
+      the leader one tick after it accepts a write, that kind of thing. Call this a <b>hand-authored scenario</b>.
+      It's precise, it's readable, and it's how you encode "we already know this matters." But it only ever tests
+      what you already thought to write down. The other way is to describe the <em>shape</em> of a workload &mdash;
+      "pick two random accounts and transfer a random amount between them, ten thousand times" &mdash; and let a
+      pseudo-random generator, seeded like everything else in this book, fill in the details differently on every
+      run. Call this a <b>generative</b> (or property-based) workload. FoundationDB structures both the same way: a
+      <code class="inl">Workload</code> is a small class with a <b>SETUP</b> phase that loads initial data, an
+      <b>EXECUTION</b> phase that issues load, and a <b>CHECK</b> phase that verifies an invariant and reports
+      metrics &mdash; and a simulation run boots the cluster, runs every workload's SETUP one after another, then
+      lets every workload's EXECUTION run <em>concurrently</em>, so several generative workloads collide in time
+      exactly the way independent real clients would.<sup>1,2</sup></p>
+
+      <pre class="tab" data-anchor="wsse-snippet-workload"><span class="cm">// modeled on FoundationDB's SETUP / EXECUTION / CHECK workload phases</span>
+<span class="kw">class</span> <span class="ty">TransferWorkload</span>(Workload):
+  <span class="kw">def</span> <span class="fn">setup</span>(self, cluster, rng):
+    self.accounts = cluster.<span class="fn">create_accounts</span>(rng.<span class="fn">randint</span>(<span class="num">10</span>, <span class="num">1000</span>))
+
+  <span class="kw">def</span> <span class="fn">execution</span>(self, cluster, rng):
+    <span class="cm">// generative: a different, but seed-reproducible, sequence every run</span>
+    <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(rng.<span class="fn">randint</span>(<span class="num">100</span>, <span class="num">10000</span>)):
+      src, dst = rng.<span class="fn">sample</span>(self.accounts, <span class="num">2</span>)
+      cluster.<span class="fn">transfer</span>(src, dst, rng.<span class="fn">randint</span>(<span class="num">1</span>, <span class="num">100</span>))
+
+  <span class="kw">def</span> <span class="fn">check</span>(self, cluster):
+    <span class="kw">assert</span> cluster.<span class="fn">total_balance</span>() == self.initial_total  <span class="cm">// the oracle</span></pre>
+
+      <p data-anchor="wsse-p2">Don't hear this as "generative workloads win." A hand-authored scenario is how you
+      pin down a specific regression forever &mdash; the exact sequence that broke last Tuesday, replayed on every
+      CI run until the heat death of the repository. A generative workload is how you find <em>next</em> Tuesday's
+      bug, the one nobody has written down yet because nobody has thought of it yet. You want both, for the same
+      reason a physicist wants both a specific experiment designed to test one hypothesis and a particle accelerator
+      that just smashes things together and sees what falls out.</p>
+    </section>
+
+    <section data-anchor="wsse-dials">
+      <h2>One seed, four dials</h2>
+      <p data-anchor="wsse-p3">Here's the idea this whole book keeps coming back to, now made completely literal.
+      Everything that makes one simulation run different from the next &mdash; which workload runs, what data it
+      touches, which faults fire and when, what the cluster even looks like &mdash; is a decision made by pulling
+      numbers out of one pseudo-random generator, seeded by one integer. The workload's own choices (which accounts,
+      which amounts, how many operations) are not exempt from this; they're drawn from the very same seed as the
+      network delay and the disk corruption from the last chapter. That's the whole trick behind "replay this exact
+      run": there was never anything to remember except one number.</p>
+
+      <figure class="diagram-fig" data-anchor="wsse-fig-dials">
+        <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="wsse-d1-title">
+          <title id="wsse-d1-title">A seed drives configuration, workload, and fault schedule; those drive a deterministic execution; the execution is judged by an oracle; a failing verdict persists the seed, the dials, and the trace</title>
+          <text x="16" y="16" class="dim">the shape every chapter in Part III shares</text>
+
+          <rect x="16" y="50" width="100" height="48" class="stroke-red fill-bg"/>
+          <text x="30" y="70" class="mono red">seed</text>
+          <text x="30" y="86" class="dim">one integer</text>
+
+          <path d="M116 74 L148 74" class="stroke"/>
+          <path d="M140 70 L148 74 L140 78" class="stroke"/>
+
+          <rect x="148" y="50" width="100" height="48" class="stroke fill-soft"/>
+          <text x="158" y="68" class="big">dials</text>
+          <text x="158" y="84" class="dim mono">config &middot; workload &middot; faults</text>
+
+          <path d="M248 74 L280 74" class="stroke"/>
+          <path d="M272 70 L280 74 L272 78" class="stroke"/>
+
+          <rect x="280" y="50" width="100" height="48" class="stroke fill-ink"/>
+          <text x="292" y="68" class="on-ink big">deterministic</text>
+          <text x="292" y="84" class="on-ink dim">execution</text>
+
+          <path d="M380 74 L412 74" class="stroke"/>
+          <path d="M404 70 L412 74 L404 78" class="stroke"/>
+
+          <rect x="412" y="50" width="132" height="48" class="stroke-red fill-bg"/>
+          <text x="424" y="68" class="mono red">oracle</text>
+          <text x="424" y="84" class="dim">verdict: pass / fail</text>
+
+          <path d="M528 98 C 528 150, 60 150, 60 98" class="stroke-soft dash"/>
+          <path d="M66 105 L60 98 L54 105" class="stroke-soft"/>
+          <text x="90" y="168" class="dim">on FAIL &mdash; persist the seed, the dials, and the full trace: that triple is the whole bug report</text>
+          <text x="380" y="130" class="dim">on PASS &mdash; roll a new seed, do it again</text>
+        </svg>
+        <figcaption><b>One seed, four dials, one verdict.</b> Configuration, workload, and fault schedule are three
+        readings off the same instrument, not three separate concerns &mdash; which is exactly why a single number
+        can reproduce all three at once. The rest of this chapter is about what goes into the "dials" box and how
+        to choose a seed worth spending CPU on.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="wsse-explosion">
+      <h2>The space is too big to walk</h2>
+      <p data-anchor="wsse-p4">Now the uncomfortable arithmetic. Every one of those dials is really several
+      independent choices, and independent choices multiply, not add. Suppose your simulator can pick from 3 cluster
+      topologies, 3 replication modes, 4 storage engines, a workload with just 5 meaningfully-different shapes, and a
+      fault schedule with a modest 10 interesting places to inject something &mdash; each with, say, 4 fault types
+      worth trying. That's already <code class="inl">3 &times; 3 &times; 4 &times; 5 &times; 10 &times; 4 =</code> a
+      few thousand <em>combinations</em>, before you've touched the actual scheduling question of which order dozens
+      of concurrent actors interleave in, which is its own combinatorial factor on top. This is the same "state
+      explosion problem" that has limited exhaustive model checkers since the 1980s: the reachable state space of a
+      system with several concurrent processes grows exponentially in the number of processes, and no realistic
+      amount of CPU time walks it in full.<sup>5</sup> A DST harness is not exempt from this arithmetic just because
+      it calls its states "simulation runs" instead of "model-checker states."</p>
+
+      <table class="grid" data-anchor="wsse-table-dims">
+        <tr><th>Dimension</th><th>Example choices</th><th>Why it can't be dropped</th></tr>
+        <tr><td>Cluster topology</td><td>datacenters, machines per DC</td><td>Correlated, multi-machine outages need a topology to be correlated <em>and</em> multi-machine over.</td></tr>
+        <tr><td>Replication / storage</td><td>replication mode, storage engine</td><td>A bug in one storage engine's crash-recovery path is invisible if every run uses another.</td></tr>
+        <tr><td>Workload shape</td><td>which generative workloads run, how large</td><td>Different call patterns exercise different code paths and different contention.</td></tr>
+        <tr><td>Fault schedule</td><td>which faults, at which simulated instants</td><td>The same fault at a different moment (mid-recovery vs. idle) is a different bug.</td></tr>
+        <tr><td>Interleaving</td><td>which actor the scheduler resumes next</td><td>This is the factor concurrency bugs actually live in &mdash; see Chapter 4.</td></tr>
+      </table>
+
+      <p data-anchor="wsse-p5">So the honest goal was never "cover the state space." It's "sample the state space
+      in a way that's biased toward the parts likely to contain a bug, without giving up the ability to replay
+      whatever you find." Everything from here to the end of the chapter is a technique for doing exactly that.</p>
+    </section>
+
+    <section data-anchor="wsse-sampling">
+      <h2>Sampling on purpose: coverage, novelty, and buggification</h2>
+      <p data-anchor="wsse-p6">Pure uniform randomness is a start, but it wastes most of its budget re-visiting the
+      common case. Two complementary fixes show up across the field. The first is <b>coverage-guided steering</b>:
+      instead of resampling blindly, watch which lines of code (or, for a whole distributed system, which
+      combinations of scheduling decisions, network events, and injected faults) a run actually touched, and bias
+      the next run toward territory the search hasn't reached yet. Antithesis frames its own version of this as
+      applying fuzzing's central trick &mdash; observe coverage, steer toward the unexplored &mdash; to an entire
+      cluster of real processes at once, by mutating scheduling and fault decisions rather than input bytes; the
+      vendor's own framing is that this turns an otherwise-exponential search into something closer to
+      polynomial.<sup>6,7</sup></p>
+
+      <p data-anchor="wsse-p7">The second fix is more surgical, and it's FoundationDB's contribution to the
+      vocabulary: <em class="term-def">buggification</em>. A developer marks one specific line as "an interesting
+      place to misbehave" with a macro called <code class="inl">BUGGIFY</code>: "this commit could plausibly fail
+      here 1% of the time," or "this call could plausibly take ten seconds instead of ten milliseconds." Two things
+      make this more than a fancy <code class="inl">if (random() &lt; p)</code>. First, <em>which</em> BUGGIFY call
+      sites are even active is itself decided once per simulation run, drawn from that run's seed &mdash; so a given
+      run either explores that corner or it doesn't, deterministically, and a different seed makes the opposite
+      choice. Second, the outcome being selected is always something the system's contract already allows &mdash; a
+      spurious-but-legal error a client is supposed to retry, a slow response within an already-documented timeout
+      &mdash; not a violation of the contract itself. The point isn't to break the rules; it's to make the code hit
+      the rare-but-legal corners of its own rules on command instead of waiting years for production to get
+      unlucky.<sup>1</sup></p>
+
+      <pre class="tab" data-anchor="wsse-snippet-buggify"><span class="cm">// BUGGIFY-style: whether this call site is even "live" this run</span>
+<span class="cm">// is itself decided once, from the run's seed -- not re-rolled per call</span>
+<span class="kw">if</span> <span class="fn">buggify_enabled</span>(<span class="str">"slow_commit"</span>, seed, p=<span class="num">0.01</span>):
+  <span class="kw">def</span> <span class="fn">maybe_delay</span>(rng):
+    <span class="kw">if</span> rng.<span class="fn">random</span>() &lt; <span class="num">0.01</span>:
+      <span class="fn">simulated_sleep</span>(<span class="num">10.0</span>)  <span class="cm">// rare, legal, seed-reproducible</span></pre>
+
+      <div class="callout key" data-anchor="wsse-callout-prob">
+        <span class="tag">Key idea</span>
+        A 1-in-100 probability does not mean "unlikely to matter." Run a hundred thousand seeds overnight &mdash; a
+        continuous seed farm, like the fleet of machines TigerBeetle's VOPR runs around the clock, does exactly
+        this<sup>9,10</sup> &mdash; and the 1-in-100 corner fires roughly a thousand times. The probability
+        controls how often <em>one</em> run visits the corner; the seed count controls how often it gets visited at
+        all. Low per-run probability and high overall coverage are not in tension &mdash; that's the entire reason
+        cheap, fast simulated time (Chapter 4) matters as much as it does.
+      </div>
+    </section>
+
+    <section data-anchor="wsse-swarm">
+      <h2>Swarm testing: vary the whole cluster, not just the operations</h2>
+      <p data-anchor="wsse-p8">There's a subtlety in random testing that's easy to miss: giving every run access to
+      <em>every</em> feature isn't obviously the best way to find bugs, and it can actively be the worst way.
+      Groce et al.'s 2012 <em>swarm testing</em> paper found that deliberately <b>omitting</b> a random subset of
+      available features from each individual test &mdash; rather than letting every test draw from the full set
+      &mdash; measurably increases both coverage and fault-finding: in one week-long experiment against a collection
+      of C compilers, swarm testing found 42% more distinct crashing bugs than the same random tester's heavily
+      hand-tuned default configuration. The mechanism is intuitive once you see it: some features actively mask or
+      crowd out the behavior that triggers a different bug &mdash; a <code class="inl">pop</code> call can prevent a
+      stack's overflow-detection logic from ever firing, purely by keeping the stack short.<sup>4</sup></p>
+
+      <p data-anchor="wsse-p9">Applied to a whole DST harness, "swarm" stops meaning just "which operations this
+      test calls" and starts meaning "which slice of the entire system this run even is." FoundationDB's
+      <code class="inl">SimulatedCluster</code> does exactly this at cluster scope: each run draws its own random
+      topology (1&ndash;5 datacenters, 1&ndash;10+ machines each), its own storage engine (memory / ssd / redwood),
+      and its own replication mode (single / double / triple) from the seed &mdash; so no two runs, even back to
+      back, are exploring quite the same corner of the system.<sup>3</sup> Generalize that pattern and you get the
+      swarm-testing menu for a DST harness:</p>
+
+      <table class="grid" data-anchor="wsse-table-swarm">
+        <tr><th>Swarm dimension</th><th>What varies per run</th></tr>
+        <tr><td>Cluster topology</td><td>datacenter count, machines per datacenter, rack layout</td></tr>
+        <tr><td>Replication</td><td>replication factor, single / double / triple redundancy</td></tr>
+        <tr><td>Feature flags</td><td>which optional code paths are compiled in or enabled this run</td></tr>
+        <tr><td>Workload mix</td><td>which generative workloads run together, and at what relative weight</td></tr>
+        <tr><td>Fault profile</td><td>which fault families are active this run, and their rates</td></tr>
+      </table>
+
+      <figure class="figbox" data-widget="swarm-sampler" data-seed="4104" data-anchor="wsse-widget-swarm">
+        <canvas></canvas>
+        <div class="controls">
+          <label>Seed <input class="seed-input" type="number" value="4104" style="width:7em"></label>
+          <button type="button" class="btn replay">&#8635; Replay same seed</button>
+          <button type="button" class="btn reseed">Roll new run</button>
+        </div>
+        <p class="readout"></p>
+        <figcaption>Each "Roll new run" draws one combination from the swarm-dimension table above, straight from
+        a seed &mdash; press <b>Replay same seed</b> and the exact same combination comes back. Keep rolling and
+        watch the coverage grid on the right fill in: that's swarm testing's whole promise, made visible &mdash;
+        many different slices of the system, each one still perfectly reproducible on its own.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="wsse-shrinking">
+      <h2>Shrinking: from a monster seed to a one-line bug report</h2>
+      <p data-anchor="wsse-p10">A seed that took ten million events and forty simulated minutes to fail is a
+      terrible thing to hand to a teammate. Somewhere in those ten million events, usually, is a handful that
+      actually matter, buried in a mountain that doesn't. <em class="term-def">Shrinking</em> is the automated
+      process of finding that handful. Classic property-based testing (QuickCheck's original approach) does this
+      structurally: once a failing input is found, try smaller variants &mdash; shorter lists, smaller numbers via
+      something close to binary search, dropped substructures &mdash; re-running the property on each candidate and
+      keeping whatever smaller variant still fails, converging on a local minimum.<sup>8</sup></p>
+
+      <p data-anchor="wsse-p11">But a DST run isn't really a data structure you can chop pieces out of and hope for
+      the best &mdash; it's a <em>causal</em> sequence, where event 900 might only exist because event 12 happened
+      first. Delete event 12 by itself and you don't get a smaller version of the same bug; you get a run that was
+      never reachable at all. This is exactly the problem an alternative shrinking strategy &mdash; used by Python's
+      Hypothesis, Haskell's falsify, Racket's RackCheck &mdash; sidesteps, and it happens to be the natural fit for
+      DST specifically: instead of shrinking the generated structure, shrink the <em>underlying sequence of random
+      choices</em> that produced it, then replay the same generator on the shortened sequence. Because a DST run's
+      entire execution is already "generated" from one seed's stream of scheduling and fault decisions, minimizing a
+      failing run is naturally this kind of choice-sequence shrinking: trim the seed's decision stream &mdash; fewer
+      faults, an earlier-firing timeout, a shorter schedule &mdash; and replay through the same deterministic
+      machine to confirm the bug survives. Every candidate, by construction, is still a legal execution, because it
+      was produced by the same generator that produced the original.<sup>8</sup></p>
+
+      <pre class="tab" data-anchor="wsse-snippet-shrink"><span class="cm">// shrink the seed's choice sequence, not a serialized fault list --</span>
+<span class="cm">// every candidate replays through the same generator, so it's always legal</span>
+<span class="kw">function</span> <span class="fn">shrink</span>(choices, still_fails):
+  best = choices
+  <span class="kw">for</span> candidate <span class="kw">in</span> <span class="fn">delta_debug_candidates</span>(best):
+    <span class="kw">if</span> still_fails(<span class="fn">replay</span>(candidate)):
+      best = candidate   <span class="cm">// keep shrinking from here</span>
+  <span class="kw">return</span> best</pre>
+
+      <div class="reflect" data-anchor="wsse-reflect-box">
+        <h4>How do you know the shrunk-down run is really the same bug, and not some other, unrelated failure?</h4>
+        <p>You don't, automatically &mdash; that's why the loop replays every candidate and checks it still trips
+        <em>the same oracle failure</em>, not just "some" failure, before accepting it as smaller. This is also
+        precisely why choice-sequence shrinking earns its keep over blind structural deletion: because every
+        candidate is a real replay of a real (shorter) seed through the real deterministic machine, "does it still
+        fail the same way" is a question the simulator can just answer, cheaply, the same way it answers it for any
+        other seed. The manual fallback, when you don't have an automated shrinker at all, is the same intuition by
+        hand &mdash; if a bug needs a list of 500 items, try 5, then 2, then 1, and see how far the failure
+        follows you down.<sup>11</sup></p>
+      </div>
+
+      <div class="callout warn" data-anchor="wsse-callout-shrink-warn">
+        <span class="tag">Watch out</span>
+        A minimized seed is a debugging aid, not automatically a good regression test. The whole point of Chapter 1's
+        promise is that the <em>original</em> failing seed, unmodified, becomes a permanent, replayable CI case &mdash;
+        keep it. The shrunk version is what a human reads to understand the bug; don't let "we minimized it" quietly
+        become "we only kept the minimized one."
+      </div>
+    </section>
+
+    <section data-anchor="wsse-challenges-section">
+      <div class="challenges" data-anchor="wsse-challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="wsse-ch1">A teammate proposes running every generative workload with every feature flag
+          enabled on every seed, reasoning "more coverage per run is strictly better." Using the stack-overflow
+          example from the swarm testing section, explain in your own words why that reasoning can be wrong.</li>
+          <li data-anchor="wsse-ch2">Sketch, in words, why a BUGGIFY-style fault (fires with probability <i>p</i>,
+          decided once per run from the seed) is easier to reason about than a fault that re-rolls its own dice on
+          every single call site invocation within one run. What would the re-rolling version make harder to
+          replay?</li>
+          <li data-anchor="wsse-ch3">You have a failing seed that took 40 minutes and touched three simulated
+          datacenters. Structural shrinking (delete random chunks, see if it still fails) keeps producing
+          "shrunk" runs that error out before reaching the original bug at all. What does that symptom tell you
+          about the shrinker you're using, and what would you switch to?</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="wsse-sources-footer">
+        Sources: <sup>1</sup> FoundationDB documentation, <em>Simulation and Testing</em>.
+        <sup>2</sup> Zhou et al., <em>FoundationDB: A Distributed Key Value Store</em> (SIGMOD Record 2022).
+        <sup>3</sup> Pierre Zemb, <em>Diving into FoundationDB's Simulation Framework</em>.
+        <sup>4</sup> Groce, Zhang, Eide, Chen, Regehr, <em>Swarm Testing</em> (ISSTA 2012).
+        <sup>5</sup> Clarke &amp; Klieber, <em>Model Checking and the State Explosion Problem</em>.
+        <sup>6</sup> Antithesis, <em>Deterministic simulation testing: how it works and when to use it</em>.
+        <sup>7</sup> Antithesis, <em>How is Antithesis different?</em>
+        <sup>8</sup> HypothesisWorks/hypothesis, <em>Strategies that shrink</em>.
+        <sup>9</sup> TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+        <sup>10</sup> TigerBeetle, <em>HACKING.md</em> (Continuous Fuzzing Orchestrator).
+        <sup>11</sup> Antithesis documentation, <em>Bug report</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-building-the-simulator.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-oracles.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
+</html>
