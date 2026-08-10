@@ -1061,7 +1061,104 @@
         "src-oracle-problem-survey"
       ]
     },
-    "fault-models": {},
+    "fault-models": {
+      "researched": "2026-08-10",
+      "claims": [
+        {
+          "text": "Cristian's classical fault-tolerance taxonomy orders failure classes by how constrained the failing component's misbehavior is: a crash/fail-stop failure (the component just halts) is the mildest and easiest to reason about; omission failures (it silently drops some steps or messages) and timing failures (it's correct but late) are progressively less constrained; arbitrary/Byzantine failures (it can do anything, including act maliciously) are the least constrained and hardest to tolerate. Each stronger class of tolerance subsumes the weaker ones, which is why the taxonomy is usually drawn as a hierarchy rather than a flat list.",
+          "sources": ["src-cristian-fault-tolerant"]
+        },
+        {
+          "text": "Within the \"component halts\" family, there are still two materially different models: crash-stop, where a process that fails is gone for good and never resumes, and crash-recovery, where a process may crash and later restart, rejoining the computation — often by reconstructing its pre-crash state from stable storage. An algorithm proven correct only under crash-stop assumptions can be unsafe under crash-recovery, because a process that comes back can replay stale in-flight actions or observe a partially-written log the crash-stop model never had to account for.",
+          "sources": ["src-tropars-failure-detectors-notes", "src-cristian-fault-tolerant"]
+        },
+        {
+          "text": "This distinction is directly load-bearing for what a DST fault model needs to inject: a harness that only ever kills a node once and leaves it dead is exercising crash-stop behavior — membership shrinks, quorums recompute, and that's the whole test. A harness that reboots a node mid-run and requires it to rejoin correctly is exercising crash-recovery, and it is the only kind of fault that ever runs a system's write-ahead-log replay, snapshot recovery, or re-election-after-rejoin code paths — code that a crash-stop-only fault model would never touch at all.",
+          "sources": ["src-tropars-failure-detectors-notes"]
+        },
+        {
+          "text": "Antithesis organizes its injectable faults into a small number of named categories that make a useful table for surveying the whole space: network faults (partitions — symmetric and asymmetric, packet loss, latency, duplication, reordering, bandwidth throttling), node faults (graceful shutdown vs. ungracefully terminating/crashing a node, or hanging it), clock faults (jitter/skew, discontinuous jumps forward or backward, simulating daylight-saving transitions and leap seconds), thread pausing (stalling one thread for a seed-chosen interval so concurrent threads interleave differently run to run), and CPU modulation (changing the simulated processor's effective clock speed and the relative cost of different low-level operations for the whole guest at once).",
+          "sources": ["src-antithesis-fault-taxonomy", "src-antithesis-fault-types"]
+        },
+        {
+          "text": "Thread pausing and CPU modulation are a different kind of fault from the other three categories: they don't simulate an external dependency misbehaving, they perturb *timing itself*, cluster-wide, without changing a single line of the guest's code — which is what lets them surface interleaving-dependent bugs that a purely network/disk/clock-focused fault model would never reach, because nothing about those bugs involves a dependency failing at all.",
+          "sources": ["src-antithesis-fault-taxonomy", "src-antithesis-fault-types"]
+        },
+        {
+          "text": "The POSIX fsync() contract most engineers assume — \"a successful call means everything written since the last successful call is now durable\" — is not the contract Linux actually implements: on a writeback error, the kernel can drop the dirty pages from the page cache rather than keep retrying them, so a second fsync() call can return success without ever having flushed the data that failed the first time. PostgreSQL assumed the stronger, wrong contract for essentially its entire history; the bug was reported to pgsql-hackers in 2018, and because the write-then-fsync pattern is close to universal, the same trap sat underneath most other databases built on buffered I/O too.",
+          "sources": ["src-danluu-fsyncgate", "src-lwn-postgres-fsync"]
+        },
+        {
+          "text": "PostgreSQL's fix, backported to every supported release, was not to retry more cleverly but to PANIC the whole process on an fsync() failure — treating \"the OS reported a write error\" as unrecoverable and forcing a crash-recovery replay from the write-ahead log, rather than trying to press on with a page cache that might now silently disagree with disk. This is a textbook \"durability lie\": the interface says success, the platform's actual guarantee is narrower, and the only safe response once you know that is to treat the lie as a crash.",
+          "sources": ["src-postgres-wiki-fsync-errors", "src-danluu-fsyncgate"]
+        },
+        {
+          "text": "Durability lies aren't confined to fsync error handling: Pillai et al.'s study of six popular Linux file systems (OSDI 2014) found that the \"persistence properties\" applications implicitly depend on — whether a rename() is atomic on crash, whether writes to different files can be reordered, whether a file's data is guaranteed to reach disk before its metadata — vary widely across file systems that all nominally implement the same POSIX interface. An application's crash-consistency protocol that was only ever tested on one file system can be silently unsafe on another, which is why a DST storage-fault model needs to inject reordered and partial *metadata* updates, not only corrupted or missing data blocks.",
+          "sources": ["src-pillai-osdi14-crash-consistency"]
+        },
+        {
+          "text": "A full disk is a distinct fault from a slow or absent one, and it is usually mishandled differently: the standard deterministic technique is to intercept the write call itself and have it return ENOSPC on demand, rather than needing to actually fill a real disk, so the injection is exact and instantaneous. The reason it deserves its own slot in a fault model rather than folding into \"disk unavailable\" is that ENOSPC handling paths are frequently the least-exercised branch in a storage layer — the disk is technically working, every other operation succeeds, and only the specific write that would exceed capacity fails, which is a narrower and easier-to-miss condition to code correctly for than \"the disk is entirely gone.\"",
+          "sources": ["src-enospc-fault-injection"]
+        },
+        {
+          "text": "Not every high-blast-radius production failure is a network, disk, or clock fault at all: the October 2025 AWS US-EAST-1 outage was triggered by a latent race condition in DynamoDB's own DNS-management automation — two independent \"DNS Enactor\" processes updating the same service's records concurrently, where a stale plan overwrote a newer one and was then deleted by cleanup automation, wiping the DNS records for a core internal endpoint outright. Because dozens of other AWS services (EC2, IAM, Lambda among them) resolve that endpoint internally, the fault cascaded to over 140 downstream services — a single DNS/configuration fault with a blast radius classic network-partition or node-crash fault models don't cover at all.",
+          "sources": ["src-aws-dns-outage-register"]
+        },
+        {
+          "text": "\"Gray failure\" — a partial failure with differential observability, where some components see the system as healthy while others experience it as failed — is the general shape DNS, configuration, and dependency faults tend to take: a config push that only breaks one code path, a dependency that returns stale-but-plausible data instead of erroring, a health check that keeps passing because it checks something the actual outage didn't touch. A fault model built only around clean binary up/down faults for network, disk, and process will systematically miss this category, because the defining feature of a gray failure is that nothing looks obviously down to the check that would normally catch it.",
+          "sources": ["src-gray-failure-hotos"]
+        },
+        {
+          "text": "Cristian's hierarchy gives fault realism a concrete boundary rather than a matter of taste: injecting a failure class stronger than what a system's own design explicitly claims to tolerate — e.g. injecting arbitrary data corruption or malicious message forgery (Byzantine failures) into a system that only claims to be crash-fault-tolerant — doesn't surface a new bug, it just reconfirms a limitation the system's authors already knew about and accepted. A fault model earns adversarial power by staying at or just past the edge of the system's stated failure assumptions, not by escalating to a strictly harder class the system was never designed to survive.",
+          "sources": ["src-cristian-fault-tolerant"]
+        },
+        {
+          "text": "The other axis of fault realism is correlation, not just severity: FoundationDB deliberately injects failures at machine, rack, and whole-datacenter granularity within the same simulated run, so a single run can plausibly reproduce a correlated multi-machine outage (a rack losing power, a top-of-rack switch failing) rather than only ever killing one independently-chosen node at a time. Real outages cluster — shared power, shared network gear, a single bad deploy hitting every replica at once — and a fault model that only samples independent single-node faults will under-explore exactly the correlated scenarios that cause the worst real incidents.",
+          "sources": ["src-fdb-sigmod-paper", "src-pierrezemb-fdb-sim"]
+        },
+        {
+          "text": "The same \"stay inside the contract\" discipline that shapes buggification (injecting only rare-but-legal outcomes a system is already obligated to handle correctly) is the general design rule for every fault category in this chapter: a network fault should look like a delay, drop, or reorder a real network can actually produce; a storage fault should look like a torn write or an ENOSPC a real disk can actually return; a clock fault should look like skew or a jump an NTP daemon or DST transition can actually cause. Faults that violate physics or the platform's documented contract outright (impossible message ordering, a write acknowledged and then never durable with no crash in between) don't test the system — they test a system that could never exist.",
+          "sources": ["src-fdb-testing-docs", "src-fdb-sigmod-paper"]
+        }
+      ],
+      "snippets": [
+        {
+          "lang": "text",
+          "code": "// crash-stop: gone for good, no recovery path is ever exercised\nfunction crashStop(node):\n  node.kill()\n  cluster.remove(node)               // membership just shrinks\n\n// crash-recovery: the only kind of fault that runs recovery code at all\nfunction crashRecover(node, rng):\n  node.kill()\n  simulated_sleep(rng.next_offset()) // down for a seeded interval\n  node.restart_from(node.stable_storage)  // WAL replay / snapshot load\n  cluster.rejoin(node)",
+          "note": "Illustrative — the point is which code paths each mode can even reach, not a specific system's API.",
+          "sources": ["src-tropars-failure-detectors-notes"]
+        },
+        {
+          "lang": "text",
+          "code": "fault = {\n  kind: \"disk_write_error\",\n  legal: true,        // ENOSPC is a documented, contractual return value\n  severity: \"crash\",  // stays within what the system already claims to tolerate\n}\n// vs. a fault that would fail the \"stays in contract\" test:\nfault_absurd = {\n  kind: \"disk_returns_wrong_data_silently_and_reports_success\",\n  legal: false,       // violates the platform's own documented guarantees\n  severity: \"byzantine\",\n}",
+          "note": "Illustrative — a fault model's job is to sample generously from the first shape and rarely, if ever, from the second, unless the system under test explicitly claims Byzantine tolerance.",
+          "sources": ["src-cristian-fault-tolerant", "src-fdb-testing-docs"]
+        }
+      ],
+      "pitfalls": [
+        "Treating a single, permanent 'kill -9' as full crash coverage — it only ever exercises crash-stop behavior; a system's WAL replay, snapshot recovery, and rejoin-after-restart logic is untested until the fault model actually reboots nodes mid-run (crash-recovery).",
+        "Injecting a stronger failure class than the system claims to tolerate (arbitrary corruption or forged messages into a merely crash-fault-tolerant system) and reporting the resulting break as a bug — Cristian's hierarchy says this was never in scope; it reconfirms a known limitation instead of finding a new one.",
+        "Modeling only network, disk, and clock faults and skipping DNS, configuration, and dependency faults — some of the highest-blast-radius real production outages (the October 2025 AWS DynamoDB DNS outage among them) are exactly this category, and a fault model that never touches it has a large, unexamined blind spot.",
+        "Assuming fsync()/write success implies durability in the strong sense most engineers expect — the actual kernel contract can be narrower (a failed writeback's pages simply dropped, not retried), so 'it returned success' and 'it's on disk' are not the same claim without verifying which contract the platform actually offers.",
+        "Injecting every fault at maximum severity, independently and simultaneously, and calling the result 'adversarial' — real failures correlate (shared power, shared network gear, one bad deploy hitting every replica together); a fault model that never samples correlated, multi-node faults under-explores the scenarios that cause the worst real incidents.",
+        "Collapsing every storage problem into one 'disk unavailable' fault — a full disk, a torn write, silent corruption of already-durable bytes, and file-system-specific reordering of metadata updates are different bugs waiting for different code paths, and a fault model that only ever removes the disk entirely leaves most of that surface untested."
+      ],
+      "furtherReading": [
+        "src-cristian-fault-tolerant",
+        "src-tropars-failure-detectors-notes",
+        "src-antithesis-fault-taxonomy",
+        "src-antithesis-fault-types",
+        "src-danluu-fsyncgate",
+        "src-lwn-postgres-fsync",
+        "src-postgres-wiki-fsync-errors",
+        "src-pillai-osdi14-crash-consistency",
+        "src-enospc-fault-injection",
+        "src-aws-dns-outage-register",
+        "src-gray-failure-hotos",
+        "src-fdb-sigmod-paper",
+        "src-pierrezemb-fdb-sim"
+      ]
+    },
     "debugging-and-developer-workflow": {},
     "limits-and-complementary-techniques": {},
     "hands-on-capstone": {}
@@ -1071,6 +1168,7 @@
     "Antithesis's product surface and exact terminology for its fault-injection taxonomy",
     "language/framework-specific determinism tooling (Rust trait ecosystems, Elixir/BEAM scheduler guarantees) referenced in the capstone",
     "Antithesis's exact Always/Sometimes property terminology and SDK surface",
-    "Elle's and Knossos's relative performance/scale claims (tool-specific, likely to keep improving)"
+    "Elle's and Knossos's relative performance/scale claims (tool-specific, likely to keep improving)",
+    "Specifics of the October 2025 AWS US-EAST-1/DynamoDB DNS outage (root-cause details may be revised as AWS and third parties publish further postmortems)"
   ]
 }

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fault Models — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="deterministic-simulation-testing">
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="flt-intro">
+      <p class="eyebrow">Chapter 07 &middot; Part III — Exploring &amp; Judging</p>
+      <h1>Fault Models</h1>
+      <p class="lead" data-anchor="flt-lead">Two chapters ago we built a machine that can inject almost anything
+      &mdash; drop a packet, tear a write, skip a clock forward, starve a thread. That's a toolbox, not a plan.
+      "Inject faults" is not a fault model any more than "use tools" is a blueprint. A <em class="term-def">fault
+      model</em> is the deliberate, written-down answer to a much narrower question: <em>which</em> faults, in
+      <em>which</em> combinations, does this system actually need to survive &mdash; and which ones would just be
+      you wasting a seed farm on a scenario that could never happen? Get the model too narrow and your simulator
+      finds nothing your unit tests wouldn't have. Get it too wide and it finds nothing <em>useful</em>, because
+      "the disk returns the wrong answer and also claims success and also this violates causality" isn't a bug
+      report, it's a system that couldn't exist. This chapter is about drawing that line correctly.</p>
+    </section>
+
+    <section data-anchor="flt-hierarchy">
+      <h2>Not all failures are created equal: Cristian's hierarchy</h2>
+      <p data-anchor="flt-p1">Start with the oldest, cleanest idea in this space. Flaviu Cristian's 1991 taxonomy
+      of distributed-system failures orders them by how <em>constrained</em> the broken component's misbehavior is
+      allowed to be.<sup>1</sup> At the mild end: a <b>crash</b> (or "fail-stop") failure &mdash; the component just
+      halts, cleanly, and does nothing else wrong. One notch up: an <b>omission</b> failure &mdash; it's still
+      behaving correctly when it behaves at all, but it silently skips some steps or drops some messages. Another
+      notch: a <b>timing</b> failure &mdash; every answer it gives is correct, just late. And at the far end, the
+      failure class with essentially no constraints at all: <b>arbitrary</b>, or <b>Byzantine</b>, failure &mdash;
+      the component can send wrong data, contradict itself to different observers, or actively lie. Each class
+      sits strictly inside the next: anything a crash failure can do, an omission failure can also do, and so on
+      up the chain.</p>
+
+      <p data-anchor="flt-p2">Why does an old taxonomy from a systems-theory paper matter to a chapter about
+      picking which faults to inject? Because it hands you the one honest yardstick for the question this whole
+      chapter keeps circling: <em>is this fault realistic, or is it excessive?</em> A fault is realistic exactly
+      when it stays inside the failure class the system under test actually claims to tolerate. Push past that
+      boundary and you haven't found a new bug &mdash; you've re-derived a limitation the system's own designers
+      already knew about and accepted. We'll come back to this as the organizing principle for the whole chapter;
+      first, the taxonomy needs one more split that Cristian's paper treats almost in passing, but that matters
+      enormously for how you build a simulator.</p>
+    </section>
+
+    <section data-anchor="flt-crashstop">
+      <h2>Crash-stop versus crash-recovery: does the process come back?</h2>
+      <p data-anchor="flt-p3">Inside the "component halts" family sit two models that look almost identical on
+      paper and are worlds apart in practice. Under <b>crash-stop</b>, a process that fails is gone for good
+      &mdash; it never resumes, the cluster just has to route around a permanently missing member. Under
+      <b>crash-recovery</b>, a process may crash and later restart, rejoining the computation by reconstructing
+      whatever it can from stable storage.<sup>2</sup> An algorithm proven safe under crash-stop assumptions can be
+      unsafe under crash-recovery, because a process that comes back can replay a stale in-flight action or wake up
+      staring at a log that was only half-written when the lights went out &mdash; states the crash-stop model
+      never had to account for, because in that model, once you're gone, you simply don't get a vote anymore.</p>
+
+      <p data-anchor="flt-p4">Here's the part that's easy to miss when you're building the fault injector rather
+      than reading about it in a paper: <em>this distinction decides which of your own code paths ever get run at
+      all</em>. A harness that only ever kills a node once and leaves it dead is testing crash-stop, full stop
+      &mdash; membership shrinks, quorums recompute, and that's the entire story. It is <em>structurally
+      incapable</em> of ever running your write-ahead-log replay, your snapshot-recovery routine, or your
+      rejoin-after-restart protocol, because none of that code executes unless something actually comes back.
+      Only a crash-recovery fault &mdash; kill the process, wait a seeded interval, restart it, force it to rejoin
+      &mdash; ever exercises that machinery. If your fault model never reboots a node, an entire, often
+      safety-critical subsystem of your codebase is running at 0% coverage no matter how many seeds you burn.</p>
+
+      <pre class="tab" data-anchor="flt-snippet-crashmodes"><span class="cm">// crash-stop: gone for good, no recovery path is ever exercised</span>
+<span class="kw">function</span> <span class="fn">crashStop</span>(node):
+  node.<span class="fn">kill</span>()
+  cluster.<span class="fn">remove</span>(node)               <span class="cm">// membership just shrinks</span>
+
+<span class="cm">// crash-recovery: the only kind of fault that runs recovery code at all</span>
+<span class="kw">function</span> <span class="fn">crashRecover</span>(node, rng):
+  node.<span class="fn">kill</span>()
+  <span class="fn">simulated_sleep</span>(rng.<span class="fn">next_offset</span>())   <span class="cm">// down for a seeded interval</span>
+  node.<span class="fn">restart_from</span>(node.stable_storage)     <span class="cm">// WAL replay / snapshot load</span>
+  cluster.<span class="fn">rejoin</span>(node)</pre>
+
+      <div class="callout key" data-anchor="flt-callout-crashmodes">
+        <span class="tag">Key idea</span>
+        A fault model that only ever asks "can it survive losing a node?" is answering a crash-stop question. The
+        much harder, much more valuable question &mdash; "can it survive losing a node <em>and then getting it
+        back</em>?" &mdash; is a crash-recovery question, and it's the one that finds the WAL-replay bug, the
+        double-recovery bug, and the split-brain-on-rejoin bug. If your fault model never reboots anything, you've
+        only ever asked the easy half of the question.
+      </div>
+    </section>
+
+    <section data-anchor="flt-taxonomy">
+      <h2>A table worth having: five categories of injectable fault</h2>
+      <p data-anchor="flt-p5">With that framing in hand, here's the survey. Antithesis, whose entire product is
+      built around injecting faults into an unmodified guest OS at the hypervisor boundary, organizes what it
+      injects into five named categories &mdash; and having a fixed vocabulary for "the kinds of things that can go
+      wrong" turns out to be one of the more useful artifacts a DST program can adopt wholesale.<sup>3</sup></p>
+
+      <table class="grid" data-anchor="flt-table-taxonomy">
+        <tr><th>Category</th><th>What it perturbs</th><th>Concrete faults</th></tr>
+        <tr><td>Network</td><td>Message delivery between nodes</td>
+          <td>Partition (symmetric &amp; asymmetric), packet loss, latency, duplication, reordering, bandwidth throttling</td></tr>
+        <tr><td>Node</td><td>Whether a process is running at all</td>
+          <td>Graceful shutdown, ungraceful crash/termination, hang (running but unresponsive)</td></tr>
+        <tr><td>Clock</td><td>What time the system thinks it is</td>
+          <td>Jitter/skew, discontinuous jumps forward or back, DST transitions, leap seconds</td></tr>
+        <tr><td>Thread pausing</td><td>The order concurrent work interleaves in</td>
+          <td>Stall one thread for a seed-chosen interval, letting others race ahead of it</td></tr>
+        <tr><td>CPU modulation</td><td>Relative timing of low-level operations, cluster-wide</td>
+          <td>Change simulated clock speed and the relative cost of different operations</td></tr>
+      </table>
+
+      <p data-anchor="flt-p6">Notice the last two rows are a different <em>kind</em> of fault from the first three.
+      Network, node, and clock faults simulate an external dependency misbehaving &mdash; something the code, in
+      principle, could check for and handle. Thread pausing and CPU modulation don't touch any dependency at all;
+      they perturb <em>timing itself</em>, cluster-wide, without changing one line of the guest's code.<sup>3</sup>
+      That's precisely what lets them find bugs the first three categories structurally cannot: an interleaving-
+      dependent race that has nothing to do with the network, the disk, or the clock being wrong &mdash; only with
+      two threads racing each other in an order nobody happened to test.</p>
+    </section>
+
+    <section data-anchor="flt-storage">
+      <h2>Storage semantics: the disk lies more often than you'd like</h2>
+      <p data-anchor="flt-p7">The network-and-node half of the table gets most of the attention because
+      partitions are dramatic and easy to picture. The storage half is quieter and, in practice, meaner &mdash;
+      because the contract a disk actually offers is narrower than the one most application code assumes, and
+      the gap between the two is exactly where "durability lies" live.</p>
+
+      <p data-anchor="flt-p8">Take the single most-assumed guarantee in all of durable storage:
+      <code class="inl">fsync()</code> returned success, therefore my data is safe. The contract most engineers
+      carry around in their heads is "everything written since the last <em>successful</em> call is now durable."
+      That is <em>not</em> the contract Linux actually implements. On a writeback error, the kernel is permitted to
+      drop the offending dirty pages from the page cache rather than keep retrying them &mdash; which means a
+      second <code class="inl">fsync()</code> call can return success without ever having flushed the bytes that
+      failed the first one.<sup>4</sup> PostgreSQL assumed the stronger, wrong contract for essentially its entire
+      history. The bug &mdash; now known as "fsyncgate" &mdash; was reported to the project's mailing list in 2018,
+      after two decades in production; because the write-then-fsync pattern is close to universal, the same trap
+      sat underneath most other databases built on buffered I/O too.<sup>4,5</sup></p>
+
+      <div class="callout warn" data-anchor="flt-callout-fsync">
+        <span class="tag">Watch out</span>
+        The fix PostgreSQL shipped was not "retry more cleverly." It was to <b>PANIC</b> the entire process the
+        instant <code class="inl">fsync()</code> reports an error &mdash; treat the OS's own report of a write
+        failure as unrecoverable, crash on purpose, and force a full write-ahead-log replay on restart, rather than
+        keep running against a page cache that might now silently disagree with what's actually on disk.<sup>5</sup>
+        That is the correct general response to a durability lie once you know the interface's contract is narrower
+        than you assumed: treat the lie as a crash, and let crash-recovery do its job.
+      </div>
+
+      <p data-anchor="flt-p9">The lie isn't limited to error handling, either. Pillai et al.'s 2014 study tested
+      the "persistence properties" applications quietly depend on &mdash; is <code class="inl">rename()</code>
+      atomic on crash? can writes to two different files be reordered? does a file's data reach disk before its
+      metadata does? &mdash; across six popular Linux file systems, all of which nominally implement the same
+      POSIX interface. The properties varied widely.<sup>6</sup> An application's crash-consistency protocol tested
+      against only one file system can be silently unsafe on another. Which is the concrete design implication for
+      your simulator: a storage fault model that only ever corrupts or removes <em>data</em> blocks is missing
+      half the picture. It also needs to reorder and partially apply <em>metadata</em> updates &mdash; the exact
+      class of fault that decides whether <code class="inl">rename()</code> looks atomic after a crash.</p>
+
+      <p data-anchor="flt-p10">One more storage fault deserves its own line item rather than folding into "disk
+      unavailable": running out of space. The standard deterministic technique is to intercept the write call
+      itself and have it return <code class="inl">ENOSPC</code> on demand &mdash; no need to actually fill a real
+      disk, the injection is exact and instantaneous.<sup>7</sup> It earns a separate slot because it's usually
+      mishandled differently than a dead disk: every <em>other</em> operation on that disk keeps succeeding, only
+      the one write that would exceed capacity fails, which is a narrower, easier-to-miss condition for a storage
+      layer to get right than "the disk is entirely gone."</p>
+
+      <table class="grid" data-anchor="flt-table-storage">
+        <tr><th>Durability lie</th><th>What the code assumes</th><th>What can actually happen</th></tr>
+        <tr><td>fsync() success</td><td>All writes since the last successful call are durable</td>
+          <td>A failed writeback's pages can be dropped, not retried &mdash; a later success proves nothing about them</td></tr>
+        <tr><td>rename() atomicity</td><td>The old name or the new name, never a broken in-between</td>
+          <td>Atomicity is file-system-specific, not a POSIX guarantee</td></tr>
+        <tr><td>Write ordering</td><td>Writes land in program order</td>
+          <td>Different files' writes can reach disk out of the order they were issued</td></tr>
+        <tr><td>"Disk unavailable"</td><td>One fault covers the disk being broken</td>
+          <td>Full, torn, corrupted, and slow are four different faults with four different code paths</td></tr>
+      </table>
+    </section>
+
+    <section data-anchor="flt-clock-config">
+      <h2>Clocks, DNS, configuration, and dependencies: the fault model's blind spot</h2>
+      <p data-anchor="flt-p11">Clock faults belong squarely in the taxonomy table above &mdash; skew, discontinuous
+      jumps, DST transitions, leap seconds, all straightforward to reason about once you know to inject them. What's
+      easy to leave out entirely, because it doesn't fit neatly next to "network" or "disk," is the fault category
+      that some of the worst real production incidents actually come from: DNS, configuration, and dependency
+      failures.</p>
+
+      <p data-anchor="flt-p12">A concrete, recent example. The October 2025 AWS US-EAST-1 outage was not a
+      network partition or a disk failure at all &mdash; it was a latent race condition inside DynamoDB's own
+      DNS-management automation. Two independent "DNS Enactor" processes updated the same service's records
+      concurrently; a stale plan overwrote a newer one, and cleanup automation then deleted it, wiping the DNS
+      records for a core internal endpoint outright. Because dozens of other AWS services &mdash; EC2, IAM, Lambda
+      among them &mdash; resolve that endpoint internally, the fault cascaded to more than 140 downstream
+      services.<sup>8</sup> No node crashed. No packet was dropped on any link that mattered. The system simply
+      forgot, for a while, where one of its own most-depended-on components lived &mdash; and a fault model built
+      only around network partitions, node crashes, and disk corruption has no vocabulary for that at all.</p>
+
+      <p data-anchor="flt-p13">This is the same shape of problem the "gray failure" idea from the very first
+      chapter warned about: a partial failure with differential observability, where some part of the system sees
+      things as healthy while another part experiences them as broken.<sup>9</sup> A stale DNS entry, a config push
+      that only breaks one code path, a dependency returning plausible-but-wrong data instead of erroring cleanly
+      &mdash; these don't look like an "up" or "down" fault to a health check built around binary liveness. If your
+      fault model can only express "the dependency is reachable" or "the dependency is gone," it will systematically
+      miss the failure mode that's arguably the most dangerous one in production: the dependency that's technically
+      there, technically responding, and quietly wrong.</p>
+    </section>
+
+    <section data-anchor="flt-realism">
+      <h2>Fault realism: staying adversarial without becoming absurd</h2>
+      <p data-anchor="flt-p14">Which brings the chapter back to the question it opened with. A simulator that can
+      inject anything will, left unguided, waste most of its search budget on combinations that could never occur
+      &mdash; and worse, on combinations that don't even test anything real. Two disciplines keep a fault model
+      adversarial without letting it drift into absurdity.</p>
+
+      <p data-anchor="flt-p15">The first is Cristian's hierarchy again, now doing real work: <b>stay inside the
+      failure class the system claims to tolerate.</b> If a system is documented as crash-fault-tolerant, injecting
+      arbitrary data corruption or forged messages &mdash; Byzantine failures &mdash; doesn't surface a bug. It
+      reconfirms, expensively, something the system's own designers already told you: it wasn't built to survive
+      that. A fault model earns its adversarial power by pushing right up against the edge of what the system
+      claims, not by leaping to a strictly harder class it was never designed for.<sup>1</sup></p>
+
+      <p data-anchor="flt-p16">The second discipline is about <em>correlation</em>, not severity. FoundationDB's
+      simulator deliberately injects failures at machine, rack, <em>and</em> whole-datacenter granularity within
+      the same run, so a single simulation can plausibly reproduce a correlated multi-machine outage &mdash; a
+      rack losing power, a top-of-rack switch failing &mdash; rather than only ever killing one independently
+      chosen node at a time.<sup>10,11</sup> Real outages cluster: shared power, shared network gear, one bad
+      deploy landing on every replica simultaneously. A fault model that only ever samples independent single-node
+      faults is under-exploring precisely the correlated scenarios that cause the worst real incidents &mdash; while
+      a fault model that goes to the opposite extreme, hitting every category in the table at maximum severity,
+      simultaneously, every run, isn't more adversarial for it. It's mostly just sampling states no real system
+      would ever land in, at the expense of seeds that could have found something true.</p>
+
+      <div class="callout key" data-anchor="flt-callout-buggify-recap">
+        <span class="tag">Key idea</span>
+        Recall <b>buggification</b> from the workloads chapter: FoundationDB restricts its rarest injected outcomes
+        to results the code is already contractually obligated to handle &mdash; a documented possible error return,
+        a legal-but-unusual delay &mdash; rather than inventing a fault outside the system's own contract.<sup>10</sup>
+        That's the same discipline this chapter has been building toward, generalized across every category in the
+        table: a network fault should look like something a real network can produce; a storage fault, something a
+        real disk can return; a clock fault, something a real NTP daemon or DST transition can cause. A fault that
+        violates the platform's own documented contract outright &mdash; a write acknowledged and then never durable
+        with no crash anywhere in between &mdash; doesn't test your system. It tests a system that couldn't exist.
+      </div>
+
+      <p data-anchor="flt-p17">Put the two disciplines together and "fault realism" stops being a vague aesthetic
+      judgment and becomes a checklist you can actually apply to a fault before you wire it in: <em>Is this within
+      the failure class the system claims to tolerate? Could it plausibly co-occur with the other faults active in
+      this run, the way real failures correlate in production?</em> Answer yes to both, and you have adversarial
+      power worth spending seeds on. Answer no to either, and you've built a very expensive way to rediscover
+      something you already knew.</p>
+
+      <div class="reflect" data-anchor="flt-reflect">
+        <h4>If your simulator has never rebooted a node, what exactly has it been testing?</h4>
+        <p>Crash-stop behavior, and only crash-stop behavior &mdash; membership shrinking, quorums recomputing,
+        nothing more. Every line of recovery code you've written &mdash; WAL replay, snapshot loading, rejoin
+        protocols &mdash; has been sitting at zero coverage the entire time, no matter how many seeds ran overnight,
+        because none of it can execute unless something actually comes back. It's worth checking, right now, whether
+        your own fault model has quietly been asking only the easy half of this chapter's central question.</p>
+      </div>
+    </section>
+
+    <section data-anchor="flt-challenges-section">
+      <div class="challenges" data-anchor="flt-challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="flt-ch1">A teammate proposes a "maximally adversarial" fault profile: every category in
+          the taxonomy table active at maximum severity, on every node, every run. Using this chapter's two
+          disciplines (contract-boundary and correlation), explain why this is probably a worse fault model than
+          one that varies severity and correlates faults more like a real outage would.</li>
+          <li data-anchor="flt-ch2">Sketch a crash-recovery fault for a system you know well: what has to be true
+          of its stable storage for a restarted node to safely rejoin? Now name one bug class (from this chapter or
+          earlier ones) that only a reboot &mdash; never a permanent kill &mdash; could ever surface.</li>
+          <li data-anchor="flt-ch3">The AWS DNS outage in this chapter cascaded because many services resolved one
+          internal endpoint. Design a DNS/configuration fault for a system you're familiar with: what's the
+          equivalent single point whose DNS entry or config value, if it silently vanished or went stale, would
+          cascade the same way?</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="flt-sources-footer">
+        Sources: <sup>1</sup> Cristian, <em>Understanding Fault-Tolerant Distributed Systems</em> (CACM, 1991).
+        <sup>2</sup> Lecture notes, <em>Studying Distributed Systems: About Abstractions</em> (crash-stop vs. crash-recovery).
+        <sup>3</sup> Antithesis documentation, <em>Fault Injection</em> &amp; <em>Types of Faults</em>.
+        <sup>4</sup> Dan Luu, <em>Fsyncgate: Errors on fsync Are Unrecoverable</em>; LWN.net, <em>PostgreSQL's fsync() Surprise</em>.
+        <sup>5</sup> PostgreSQL wiki, <em>Fsync Errors</em>.
+        <sup>6</sup> Pillai et al., <em>All File Systems Are Not Created Equal</em> (OSDI 2014).
+        <sup>7</sup> OneUptime, <em>How to Create Fault Injection Testing</em> (ENOSPC injection).
+        <sup>8</sup> The Register, <em>A Single DNS Race Condition Brought AWS to Its Knees</em> (Oct. 2025 postmortem).
+        <sup>9</sup> Huang et al., <em>Gray Failure: The Achilles' Heel of Cloud-Scale Systems</em> (HotOS 2017).
+        <sup>10</sup> Zhou et al., <em>FoundationDB: A Distributed Key Value Store</em> (SIGMOD Record 2022); FoundationDB documentation, <em>Simulation and Testing</em>.
+        <sup>11</sup> Pierre Zemb, <em>Diving into FoundationDB's Simulation Framework</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-oracles.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-debugging-and-developer-workflow.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
+</html>
