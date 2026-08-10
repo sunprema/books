@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architectures for DST — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="adst-intro">
+      <p class="eyebrow">Chapter 03 &middot; Part II — Building It</p>
+      <h1>Architectures for DST</h1>
+      <p class="lead" data-anchor="adst-lead">Chapter 2 was the contract: hand every leak — the clock, the RNG, the
+      scheduler, the network, the disk — to the seed, or the replay guarantee quietly stops being true. Fine. But a
+      contract is just words until somebody signs the plumbing. Where, physically, in a real codebase, does "hand it
+      to the seed" actually happen? It turns out there are only two honest answers, and they disagree about almost
+      everything except the goal.</p>
+      <p data-anchor="adst-p1">One answer says: teach the <em>application</em> the trick. Rewrite it so every place
+      it reaches for the clock, the RNG, the network, the disk, it reaches through a door you built — and put a
+      simulator behind that door instead of the real world. The other says: don't touch the application at all. Build
+      a sandbox so convincing that an ordinary, unmodified program can't tell it isn't running on real hardware — and
+      control the sandbox's clock, RNG, and scheduler instead. Call the first <em class="term-def">simulation-first</em>
+      and the second <em class="term-def">virtualization-first</em>. This chapter is about the trade-off between them,
+      and about how you'd design a system, from day one, to make the first option even possible.</p>
+    </section>
+
+    <section data-anchor="adst-simfirst">
+      <h2>Simulation-first: teach the application one trick</h2>
+      <p data-anchor="adst-p2">Here's the trick, and it's worth being precise about it, because it's easy to
+      mishear this as "mock everything." That is not the idea. The idea is to run <em>as much real, unmodified
+      application logic as possible</em>, and replace the environment only at a small number of well-defined
+      boundaries. FoundationDB's core logic depends on two abstract interfaces — <code class="inl">INetwork</code>
+      for networking and <code class="inl">IAsyncFile</code> for disk — instead of calling the OS directly. In
+      production those interfaces resolve to <code class="inl">Net2</code>, built on Boost.ASIO, talking to a real
+      kernel. In simulation the very same interfaces resolve to <code class="inl">Sim2</code>/<code class="inl">SimFile</code>,
+      where every decision — does this read succeed, how long does it take, does this connection just die — is a
+      seeded dice roll. The database code in between never finds out which side of the door it's talking to.<sup>1,3</sup></p>
+      <p data-anchor="adst-p3">That swap is only cheap because of a second, deeper choice: FoundationDB's core is
+      written in <b>Flow</b>, an actor-based extension to C++11. An <code class="inl">ACTOR</code> function
+      <code class="inl">wait()</code>s on a future without blocking anything else — it compiles down to a cooperative
+      state machine, not an OS thread. The <em>same Flow source</em> compiles to the real production binary, and,
+      linked against the simulator instead, becomes the single-threaded process that runs against simulated network
+      and disk. Production logic and simulated logic are not two implementations that might drift apart — they are
+      one file.<sup>2,1</sup></p>
+
+      <figure class="diagram-fig" data-anchor="adst-fig-swap">
+        <svg class="diagram" viewBox="0 0 560 210" role="img" aria-labelledby="adst-d1-title">
+          <title id="adst-d1-title">The same core application logic connects through one set of ports to either real production adapters or seeded simulated adapters, wired in from outside the core</title>
+          <text x="16" y="16" class="dim">one core, two wirings — chosen from outside the core, never inside it</text>
+
+          <rect x="230" y="78" width="100" height="54" class="stroke fill-ink"/>
+          <text x="248" y="109" class="big on-ink">CORE</text>
+
+          <path d="M230 90 L110 40" class="stroke-soft"/>
+          <path d="M118 38 L110 40 L114 47" class="stroke-soft"/>
+          <path d="M230 104 L110 90" class="stroke-soft"/>
+          <path d="M118 88 L110 90 L114 97" class="stroke-soft"/>
+          <path d="M230 118 L110 138" class="stroke-soft"/>
+          <path d="M118 136 L110 138 L116 144" class="stroke-soft"/>
+
+          <rect x="16" y="24" width="94" height="24" class="stroke fill-soft"/>
+          <text x="24" y="40" class="mono">Clock port</text>
+          <rect x="16" y="74" width="94" height="24" class="stroke fill-soft"/>
+          <text x="24" y="90" class="mono">Net port</text>
+          <rect x="16" y="124" width="94" height="24" class="stroke fill-soft"/>
+          <text x="24" y="140" class="mono">Disk port</text>
+
+          <path d="M330 90 L462 40" class="stroke-soft"/>
+          <path d="M454 38 L462 40 L458 47" class="stroke-soft"/>
+          <path d="M330 104 L462 90" class="stroke-soft"/>
+          <path d="M454 88 L462 90 L458 97" class="stroke-soft"/>
+          <path d="M330 118 L462 138" class="stroke-soft"/>
+          <path d="M454 136 L462 138 L456 144" class="stroke-soft"/>
+
+          <rect x="462" y="24" width="82" height="24" class="stroke-red fill-bg"/>
+          <text x="470" y="40" class="mono red">Real</text>
+          <rect x="462" y="74" width="82" height="24" class="stroke-red fill-bg"/>
+          <text x="470" y="90" class="mono red">Real</text>
+          <rect x="462" y="124" width="82" height="24" class="stroke-red fill-bg"/>
+          <text x="470" y="140" class="mono red">Real</text>
+
+          <text x="16" y="180" class="dim">production wires the left ports to Real adapters &mdash; simulation wires the same ports to Sim adapters, seeded</text>
+        </svg>
+        <figcaption><b>The core has no idea which wiring it got.</b> It only ever calls the port. Whether that
+        port resolves to a Boost.ASIO socket or a seeded dice roll is a decision made entirely outside the box
+        labeled CORE.</figcaption>
+      </figure>
+
+      <p data-anchor="adst-p4">FoundationDB is not alone in this shape — it just got there first and loudest.
+      TigerBeetle's entire I/O layer sits behind one abstract interface, implemented in production with
+      <code class="inl">io_uring</code> on Linux (or <code class="inl">kqueue</code> on macOS) and swapped for an
+      in-memory deterministic implementation inside its simulator, "the VOPR." TigerBeetle keeps that layer
+      single-threaded and in userspace by design — the project's own reasoning is that this is simultaneously the
+      simplest implementation <em>and</em> the one that makes determinism possible at all.<sup>4,5</sup> And
+      <b>madsim</b> brings the same idea to async Rust: it ships simulated drop-in replacements for common runtime
+      and networking crates, modeled on Tokio's own API surface, so application code written against those APIs runs
+      unmodified against either the real Tokio runtime in production or madsim's simulated time, network, and task
+      scheduler in tests — every simulated random choice pulled from one global seeded generator.<sup>6</sup></p>
+
+      <div class="callout key" data-anchor="adst-callout-simfirst">
+        <span class="tag">Key idea</span>
+        Simulation-first is not "replace the system under test with a fake." It is the opposite: run the real
+        system, unmodified, and replace only the small set of doors it uses to touch the outside world. The bigger
+        those doors, the more of your actual bugs the simulator can find.
+      </div>
+    </section>
+
+    <section data-anchor="adst-virtfirst">
+      <h2>Virtualization-first: don't touch the application at all</h2>
+      <p data-anchor="adst-p5">Simulation-first has one real cost: somebody has to build (or already have built)
+      that whole ports-and-adapters skeleton, in a language whose concurrency model even makes single-threaded
+      determinism possible. Most existing systems don't have that skeleton, and rewriting one to get it is not a
+      testing add-on — it's a rearchitecture. Antithesis exists because of that gap, and it takes the structurally
+      opposite bet: instead of asking the application to expose doors, run the entire unmodified system — arbitrary
+      containers, in any language — inside a custom <em class="term-def">deterministic hypervisor</em>, built by
+      heavily modifying FreeBSD's <code class="inl">bhyve</code>.<sup>7,8</sup></p>
+      <p data-anchor="adst-p6">The hypervisor hides every real source of entropy from the guest. It substitutes a
+      fake clock and a fake random-number generator for the ones the guest OS would normally hand out, and it
+      separately controls the guest's own thread scheduler — which doubles as a fault-injection mechanism for free,
+      since deliberately starving or reordering a thread is just a scheduling decision made one layer down. The
+      mechanism that makes this deterministic-and-controllable at the hardware boundary is the x86
+      <code class="inl">VMCALL</code> instruction — a roll-your-own hypercall facility that lets the hypervisor
+      intercept and answer the guest's system calls at the VM boundary, rather than inside the application at
+      all.<sup>7</sup></p>
+
+      <figure class="diagram-fig" data-anchor="adst-fig-hv">
+        <svg class="diagram" viewBox="0 0 560 172" role="img" aria-labelledby="adst-d2-title">
+          <title id="adst-d2-title">An unmodified guest system runs on top of a deterministic hypervisor, which intercepts every system call at the VM boundary via VMCALL and answers it from a seeded clock, RNG, and scheduler</title>
+          <text x="16" y="16" class="dim">nothing inside the guest was rewritten &mdash; the door is one layer further down</text>
+
+          <rect x="130" y="26" width="300" height="46" class="stroke fill-soft"/>
+          <text x="150" y="54" class="big">Guest: unmodified app, any language</text>
+
+          <path d="M280 72 L280 96" class="stroke-red"/>
+          <path d="M276 90 L280 96 L284 90" class="stroke-red"/>
+          <text x="292" y="90" class="mono red">VMCALL</text>
+
+          <rect x="90" y="100" width="380" height="46" class="stroke-red fill-bg"/>
+          <text x="106" y="121" class="mono red">deterministic hypervisor (modified bhyve)</text>
+          <text x="106" y="137" class="dim">fake clock &middot; fake RNG &middot; controlled thread scheduler</text>
+
+          <rect x="180" y="150" width="200" height="20" class="stroke fill-ink"/>
+          <text x="210" y="165" class="mono on-ink">one pinned physical core</text>
+        </svg>
+        <figcaption><b>The interception point moved down a floor.</b> Simulation-first puts the door inside the
+        application's own source. Virtualization-first puts it at the VM boundary, so no source has to change.</figcaption>
+      </figure>
+
+      <p data-anchor="adst-p7">One more deliberate trade shows up here that's easy to miss: each guest instance runs
+      on a single pinned physical core. That sounds like giving up performance for nothing, until you notice these
+      are test instances, not production replicas — a single-core run costs nothing that matters to a test. Antithesis
+      recovers throughput a completely different way: run enormous numbers of independent single-core instances in
+      parallel across a fleet, each one exploring a different region of the state space, instead of trying to make
+      any one run faster.<sup>7,9</sup> Simulation-first buys its speed by decoupling simulated time from the
+      wristwatch inside one process (recall Chapter 2's 10-to-1 ratio); virtualization-first buys it by fanning
+      out across many processes instead.</p>
+
+      <div class="callout warn" data-anchor="adst-callout-virt-cost">
+        <span class="tag">Watch out</span>
+        "No code changes required" does not mean "no engineering cost." Someone still has to build the deterministic
+        hypervisor — Antithesis's own account of doing it treats this as a genuinely hard systems problem, not a
+        weekend project.<sup>7</sup> The cost didn't disappear; it moved from every adopting team's codebase into
+        one team's hypervisor.
+      </div>
+    </section>
+
+    <section data-anchor="adst-middle">
+      <h2>A middle path: intercept the syscalls, touch nothing else</h2>
+      <p data-anchor="adst-p8">There's a third point on this spectrum, sitting between "rewrite the application" and
+      "virtualize the whole machine": intercept system calls on an otherwise unmodified binary. Meta's <b>Hermit</b>
+      sandboxes ordinary Linux x86_64 programs and intercepts the syscalls they make — in some cases replacing the
+      kernel's answer outright, in others forwarding the call to the real kernel and then sanitizing what comes back
+      — to make time, thread interleaving, and randomness deterministic without either rewriting the application's
+      source or virtualizing an entire guest OS.<sup>10</sup> It gives up some of a full hypervisor's fidelity
+      (it's still running on the host kernel, not a fully isolated guest) in exchange for a much lighter footprint
+      than standing up bhyve.</p>
+    </section>
+
+    <section data-anchor="adst-tradeoffs">
+      <h2>Choosing one: the actual trade-offs</h2>
+      <p data-anchor="adst-p9">None of these three is strictly better — each one is a different answer to "who pays,
+      and in what currency."</p>
+      <table class="grid" data-anchor="adst-table-tradeoffs">
+        <tr><th>Dimension</th><th>Simulation-first (FoundationDB, TigerBeetle, madsim)</th><th>Virtualization-first (Antithesis)</th></tr>
+        <tr><td>Fidelity</td><td>Very high for the logic inside the ports — but only for what's abstracted; a leak anywhere is a real leak<sup>1,4</sup></td><td>Very high for whole-system behavior, including dependencies you didn't write; coarser control naming an internal app-level fault<sup>7</sup></td></tr>
+        <tr><td>Implementation cost</td><td>Paid by every adopting team, up front — real ports/adapters, real DI, often a rewrite<sup>1,4,6</sup></td><td>Paid once, by whoever builds the hypervisor; adopting teams pay comparatively little<sup>7</sup></td></tr>
+        <tr><td>Throughput strategy</td><td>Decouple simulated time from wall-clock time inside one fast process<sup>1</sup></td><td>Pin one core per guest, run a large fleet of guests in parallel<sup>7,9</sup></td></tr>
+        <tr><td>Dependency control</td><td>Only your own code is simulated; a real third-party binary you can't recompile is out of reach</td><td>Arbitrary unmodified containers, any language, any dependency, run as-is<sup>7</sup></td></tr>
+        <tr><td>Language/runtime fit</td><td>Needs a concurrency model that <em>can</em> be made single-threaded and cooperative (Flow, madsim's async Rust, TigerBeetle's userspace I/O)<sup>2,6,5</sup></td><td>Language-agnostic — the guest OS is what's virtualized, not a runtime</td></tr>
+        <tr><td>Best fit</td><td>A system you're building (or can afford to rearchitect) from early on</td><td>An existing system you can't or won't rewrite around ports and adapters</td></tr>
+      </table>
+      <p class="hint" data-anchor="adst-table-hint">Hermit sits between the middle two rows: lighter than a full
+      hypervisor, but — like virtualization-first — requires no source rewrite, at the cost of running on the host
+      kernel rather than a fully isolated guest.<sup>10</sup></p>
+    </section>
+
+    <section data-anchor="adst-design">
+      <h2>Designing a system so simulation-first is even an option</h2>
+      <p data-anchor="adst-p10">If you're building new, or can afford to rearchitect, simulation-first is the
+      cheaper, higher-fidelity option in the long run — but only if the codebase is shaped correctly from the start.
+      The shape has a name, and it predates DST by decades: <b>hexagonal architecture</b>, or "ports and adapters,"
+      as Alistair Cockburn originally defined it. The core logic depends only on a named <em class="term-def">port</em>
+      — an interface expressing a purposeful conversation, like "a clock" or "a network" — never on any specific
+      technology behind it. One or more <em class="term-def">adapters</em> plug into each port for a specific
+      implementation.<sup>11</sup></p>
+      <p data-anchor="adst-p11"><b>Dependency injection</b> is the wiring discipline that makes this actually
+      swappable: adapters are connected to ports from <em>outside</em> the core — typically once, at process
+      startup — so the core never constructs or reaches for a concrete implementation itself. That single property
+      is exactly what a simulation-first DST harness depends on: swap a real adapter for a simulated one without
+      touching a single line of the core logic under test.<sup>1,6</sup></p>
+
+      <pre class="tab" data-anchor="adst-snippet-ports"><span class="cm">// the core never imports a concrete Clock, RNG, Network, or Storage —</span>
+<span class="cm">// only the port (interface) each one is defined by</span>
+<span class="kw">interface</span> <span class="ty">Clock</span>   { now() -&gt; Time }
+<span class="kw">interface</span> <span class="ty">Random</span>  { next() -&gt; f64 }
+<span class="kw">interface</span> <span class="ty">Network</span> { send(peer, msg); recv() -&gt; Msg }
+<span class="kw">interface</span> <span class="ty">Storage</span> { write(key, val); read(key) -&gt; val }
+
+<span class="cm">// two adapters per port, wired in at startup, never inside the core</span>
+production := <span class="fn">App</span>(RealClock(), OsRandom(),        TcpNetwork(),     DiskStorage())
+simulation := <span class="fn">App</span>(SimClock(),  SeededRandom(seed), SimNetwork(seed), SimStorage(seed))</pre>
+
+      <figure class="figbox" data-widget="adapter-swap" data-anchor="adst-widget-swap">
+        <canvas></canvas>
+        <div class="controls">
+          <button type="button" class="btn wire" data-mode="production">Wire: Production</button>
+          <button type="button" class="btn wire" data-mode="simulation">Wire: Simulation</button>
+        </div>
+        <p class="readout"></p>
+        <figcaption>The core box in the middle never changes. Only the four adapters plugged into its ports change
+        — and that swap happens entirely outside the core, at startup, exactly like the two <code class="inl">App(...)</code>
+        lines above.</figcaption>
+      </figure>
+
+      <p data-anchor="adst-p12">Two more habits fall directly out of the same discipline. First: <b>explicit clocks
+      and RNGs</b>, passed in as arguments or constructor parameters, never grabbed ambiently from a global —
+      "what time is it" and "give me a random number" have to be questions the core asks its <em>Clock</em> and
+      <em>Random</em> ports, never questions it answers by calling a language runtime's built-ins directly. Second:
+      <b>no hidden global state</b> — no singleton holding a real socket, no static timer thread started at import
+      time, no background goroutine touching the OS clock on its own schedule. Every one of those is a door that
+      bypasses the ports entirely, and Chapter 2 already named what happens next: the determinism contract has an
+      eighth-leak problem, and hidden global state is where the ninth one hides.</p>
+
+      <div class="callout warn" data-anchor="adst-callout-leak">
+        <span class="tag">Watch out</span>
+        One raw socket call, one direct <code class="inl">os.random()</code>, one background timer thread reached
+        for out of convenience instead of through a port — and the whole system's determinism leaks through that one
+        spot, silently, the same way one uncontrolled clock read broke replay in Chapter 2. Architecture doesn't
+        prevent this by being clever; it prevents it by making the direct path harder to reach for than the port.
+      </div>
+    </section>
+
+    <section data-anchor="adst-reflect">
+      <div class="reflect" data-anchor="adst-reflect-box">
+        <h4>But if virtualization-first needs no code changes, why would anyone choose simulation-first?</h4>
+        <p>Because "no code changes" isn't the same as "no cost" — it's a different bill, sent to a different
+        address. Building your own deterministic hypervisor (or adopting one) is a serious systems undertaking, and
+        even once it exists, coarser control at the syscall/VM boundary makes it harder to name an internal,
+        application-specific fault precisely — you can starve a thread or drop a packet, but you can't as easily
+        say "fail exactly this write, inside exactly this transaction." Simulation-first pays its cost earlier, in
+        architecture, and gets that precision back: the fault injection happens at the exact port the application's
+        own logic calls, so you can name faults in the application's own vocabulary. Neither bill is smaller — they're
+        just due at different times, to different teams, for a different kind of precision.</p>
+      </div>
+    </section>
+
+    <section data-anchor="adst-challenges">
+      <div class="challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="adst-ch1">You're adding DST to an existing service. It has one Postgres client created
+          once at startup and imported as a module-level singleton everywhere it's used. Is this closer to a
+          five-minute fix or a rearchitecture — and why?</li>
+          <li data-anchor="adst-ch2">A teammate proposes wrapping the existing production binary in Antithesis's
+          hypervisor <em>and</em> spending a quarter rewriting the storage layer behind an <code class="inl">IAsyncFile</code>-style
+          port. What does the second half of that plan actually buy you that the first half doesn't already
+          provide?</li>
+          <li data-anchor="adst-ch3">Why does pinning each Antithesis guest to a single physical core make sense
+          for a <em>test</em> instance in a way it never would for a production replica?</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="adst-sources-footer">
+        Sources: <sup>1</sup> FoundationDB documentation, <em>Simulation and Testing</em>.
+        <sup>2</sup> FoundationDB documentation, <em>Flow</em>.
+        <sup>3</sup> Jingyu Zhou, <em>One Little Secret of How FoundationDB Simulates Disk I/O Failures</em>.
+        <sup>4</sup> TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+        <sup>5</sup> TigerBeetle, <em>A Programmer-Friendly I/O Abstraction Over io_uring and kqueue</em>.
+        <sup>6</sup> madsim-rs/madsim (project documentation).
+        <sup>7</sup> Antithesis, <em>So you think you want to write a deterministic hypervisor?</em>
+        <sup>8</sup> FreeBSD Foundation, <em>Antithesis: Pioneering Deterministic Hypervisors with FreeBSD and Bhyve</em>.
+        <sup>9</sup> Antithesis, product overview.
+        <sup>10</sup> Meta, <em>Hermit</em> (project documentation).
+        <sup>11</sup> Alistair Cockburn, <em>Hexagonal Architecture</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-the-determinism-contract.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-building-the-simulator.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
+</html>

@@ -98,3 +98,98 @@ BookWidgets.register('replay-strip', function(box, W){
   W.onRelayout(draw);
   draw();
 });
+
+/* adapter-swap: the core box never changes; only the four adapters wired
+   into its ports do. Static (no animation) — draws once per mode switch,
+   which is itself the point: nothing about the core is in motion. */
+BookWidgets.register('adapter-swap', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var C = W.theme();
+  var readout = box.querySelector('.readout');
+  var mode = 'production';
+
+  var PORTS = ['Clock', 'Random', 'Network', 'Storage'];
+  var ADAPTERS = {
+    production: ['RealClock', 'OsRandom', 'TcpNetwork', 'DiskStorage'],
+    simulation: ['SimClock', 'SeededRandom(seed)', 'SimNetwork(seed)', 'SimStorage(seed)']
+  };
+
+  function draw(){
+    if(!W.fitCanvas(cv)) return;
+    var ctx = cv.getContext('2d'), w = cv.__w, h = cv.__h;
+    ctx.clearRect(0, 0, w, h);
+
+    var rowH = h / (PORTS.length + 1), coreW = w * 0.22, coreX = w * 0.5 - coreW / 2;
+    var portX = w * 0.06, portW = w * 0.2;
+    var adapterX = w * 0.76, adapterW = w * 0.2;
+
+    ctx.font = '11px "SF Mono",Menlo,Consolas,monospace';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText('wiring: ' + mode, 10, 16);
+
+    ctx.fillStyle = C.ink;
+    ctx.fillRect(coreX, rowH * 0.5, coreW, rowH * PORTS.length);
+    ctx.fillStyle = C.paper;
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 12px "SF Mono",Menlo,Consolas,monospace';
+    ctx.save();
+    ctx.translate(coreX + coreW / 2, rowH * 0.5 + rowH * PORTS.length / 2);
+    ctx.fillText('CORE', 0, 4);
+    ctx.restore();
+
+    var adapters = ADAPTERS[mode];
+    var accent = mode === 'simulation' ? C.accent : C.soft;
+
+    PORTS.forEach(function(port, i){
+      var y = rowH * (i + 1);
+
+      ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+      ctx.fillStyle = C.grid;
+      ctx.fillRect(portX, y - 10, portW, 20);
+      ctx.fillStyle = C.ink;
+      ctx.font = '11px "SF Mono",Menlo,Consolas,monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(port + ' port', portX + 8, y + 4);
+
+      ctx.beginPath();
+      ctx.moveTo(portX + portW, y);
+      ctx.lineTo(coreX, y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(coreX + coreW, y);
+      ctx.lineTo(adapterX, y);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = mode === 'simulation' ? 2 : 1;
+      ctx.stroke();
+
+      ctx.fillStyle = accent;
+      ctx.globalAlpha = 0.12;
+      ctx.fillRect(adapterX, y - 10, adapterW, 20);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = accent; ctx.lineWidth = 1;
+      ctx.strokeRect(adapterX, y - 10, adapterW, 20);
+      ctx.fillStyle = accent;
+      ctx.font = '10px "SF Mono",Menlo,Consolas,monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(adapters[i], adapterX + 6, y + 4);
+    });
+
+    if(readout){
+      readout.textContent = mode === 'production'
+        ? 'Production wiring: real adapters, real entropy, not replayable.'
+        : 'Simulation wiring: every adapter’s decisions are drawn from one seed — same core, replayable run.';
+    }
+  }
+
+  var buttons = box.querySelectorAll('.wire');
+  Array.prototype.forEach.call(buttons, function(btn){
+    btn.addEventListener('click', function(){
+      mode = btn.getAttribute('data-mode') === 'simulation' ? 'simulation' : 'production';
+      draw();
+    });
+  });
+
+  W.onRelayout(draw);
+  draw();
+});
