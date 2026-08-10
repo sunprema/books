@@ -64,6 +64,34 @@
       "title": "Wikipedia — Flaky test",
       "kind": "reference",
       "accessed": "2026-08-10"
+    },
+    {
+      "id": "src-fdb-flow-doc",
+      "url": "https://apple.github.io/foundationdb/flow.html",
+      "title": "FoundationDB documentation — Flow (actor-based concurrency for C++11)",
+      "kind": "official-docs",
+      "accessed": "2026-08-10"
+    },
+    {
+      "id": "src-tigerbeetle-vopr",
+      "url": "https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vopr.md",
+      "title": "TigerBeetle documentation — Deterministic Simulation Testing (the VOPR)",
+      "kind": "official-docs",
+      "accessed": "2026-08-10"
+    },
+    {
+      "id": "src-eatonphil-dst",
+      "url": "https://notes.eatonphil.com/2024-08-20-deterministic-simulation-testing.html",
+      "title": "Phil Eaton, \"What's the big deal about Deterministic Simulation Testing?\"",
+      "kind": "article",
+      "accessed": "2026-08-10"
+    },
+    {
+      "id": "src-lamport-clocks",
+      "url": "https://lamport.azurewebsites.net/pubs/time-clocks.pdf",
+      "title": "Lamport, \"Time, Clocks, and the Ordering of Events in a Distributed System\" (CACM, 1978)",
+      "kind": "paper",
+      "accessed": "2026-08-10"
     }
   ],
   "structure": {
@@ -122,7 +150,62 @@
         "src-flaky-test-wikipedia"
       ]
     },
-    "the-determinism-contract": {},
+    "the-determinism-contract": {
+      "researched": "2026-08-10",
+      "claims": [
+        { "text": "A deterministic simulator works by identifying every place a real system depends on something outside its own logic — the wall clock, timers, the OS's random-number generator, the thread/process scheduler, network packet delivery, and disk I/O — and replacing each one with a simulated equivalent driven by a single recorded seed, so that a given seed reproduces the identical run every time.",
+          "sources": ["src-fdb-testing-docs", "src-antithesis-dst-overview", "src-tigerbeetle-vopr"] },
+        { "text": "FoundationDB's simulator conducts a deterministic simulation of an entire cluster inside a single-threaded OS process; determinism is what makes a simulated run perfectly repeatable, and simulated time runs decoupled from wall-clock time — in practice at roughly a 10-to-1 ratio of real to simulated time — so failures that would take hours to unfold can be explored in seconds.",
+          "sources": ["src-fdb-testing-docs"] },
+        { "text": "FoundationDB achieves single-threaded deterministic scheduling through Flow, its actor-based concurrency extension to C++11: an ACTOR function uses wait() to suspend on a Future without blocking other actors, and the same Flow source compiles both to the production binary and, when linked against the simulator, to code that runs against simulated network and disk — so the same logic that ships is the logic being scheduled deterministically in tests.",
+          "sources": ["src-fdb-flow-doc", "src-fdb-testing-docs"] },
+        { "text": "TigerBeetle's simulator (\"the VOPR\") stubs out all non-deterministic parts of the system — the clock, network, and disk operations — and is deterministic based on a random seed and the exact Git commit, so that when a simulation run produces a failure, the seed and commit hash together let engineers replay the exact same run to debug it locally.",
+          "sources": ["src-tigerbeetle-vopr"] },
+        { "text": "TigerBeetle's simulator also checks storage determinism directly: replicas' on-disk data files are designed to be byte-for-byte identical across caught-up nodes in the cluster, and dedicated storage checkers verify this holds across simulated runs — turning \"did every replica converge to the same state\" into something a simulation can assert on, not just observe.",
+          "sources": ["src-tigerbeetle-vopr"] },
+        { "text": "Antithesis's deterministic hypervisor substitutes a fake clock and a fake random-number generator for the ones the guest OS would normally provide, and separately controls the guest's own thread scheduler — which doubles as a fault-injection mechanism, since starving a thread on purpose is just a controlled scheduling decision.",
+          "sources": ["src-antithesis-dst-overview"] },
+        { "text": "Antithesis simulates one shared wall clock — \"virtual time\" — for the entire guest system rather than a per-node clock, so a clock-skip fault moves every node's view of time together; separately, clock-jitter faults probe assumptions around timeouts, daylight-saving transitions, and leap seconds without needing real ones to occur.",
+          "sources": ["src-antithesis-fault-taxonomy"] },
+        { "text": "The distinction that makes simulation testing work is not \"no randomness\" but controlled randomness: FoundationDB deliberately randomizes cluster size and configuration, the workload, fault-injection parameters, tuning parameters, and which rare-but-legal \"buggification\" points are active on every run — but every one of those choices is drawn from a PRNG seeded by one recorded number, so replaying that seed replays the identical sequence of choices.",
+          "sources": ["src-fdb-sigmod-paper"] },
+        { "text": "Deterministic replay's guarantee is conditional on the code, not on the seed alone: TigerBeetle ties reproducibility to the seed plus the exact Git commit, because replaying an old seed against changed code can walk a different path through the same pseudo-random stream and never reach the state where the original bug occurred.",
+          "sources": ["src-tigerbeetle-vopr"] },
+        { "text": "In practice, teams treat a freshly captured DST failure as perishable rather than permanent: because inserting or reordering even one random draw anywhere upstream shifts every later value the PRNG stream produces, a routine code change can silently invalidate a seed's path back to the original bug — so the recommended move is to convert the failing seed into a concrete, hand-written regression test (pinning the scenario itself) rather than depend on the seed continuing to reproduce it indefinitely.",
+          "sources": ["src-eatonphil-dst"] },
+        { "text": "A discrete-event simulation does not advance a clock continuously; a scheduler holds pending events in a queue ordered by timestamp and advances simulated time in jumps, straight to the next event's timestamp, so \"time\" inside the simulation is a property of the program's own logical schedule rather than of the wall clock the host machine happens to be running on.",
+          "sources": ["src-fdb-testing-docs"] },
+        { "text": "Distributed systems have a decades-older answer to the same problem of ordering events without a shared clock: Lamport's 1978 logical clocks assign every event a counter, incremented locally and carried on every outgoing message, satisfying the clock condition that if event a causally happens-before event b then C(a) < C(b) — though the converse does not hold, since two concurrent events can still receive either relative order.",
+          "sources": ["src-lamport-clocks"] }
+      ],
+      "snippets": [
+        { "lang": "text",
+          "code": "loop:\n  event = queue.pop_min()      // earliest timestamp, not \"soonest wall-clock\"\n  clock = event.timestamp     // jump the logical clock forward, no sleeping\n  effects = handlers[event.kind](state, event)\n  for e in effects: queue.push(e)   // new events scheduled relative to `clock`",
+          "note": "Illustrative discrete-event scheduler loop — the shape FoundationDB's Flow-driven simulator and TigerBeetle's VOPR both follow: a priority queue keyed by logical time, not a real timer.",
+          "sources": ["src-fdb-testing-docs", "src-tigerbeetle-vopr"] },
+        { "lang": "text",
+          "code": "rng = PRNG(seed)             // one seed, recorded before the run starts\nclock.set(rng.next_offset()) // simulated wall clock, not gettimeofday()\nscheduler.order(rng)         // which actor/event runs next\nnetwork.decide(rng)          // delay, drop, duplicate, reorder this packet?\ndisk.decide(rng)             // latency, partial write, corruption this op?",
+          "note": "Illustrative only — the point is that every 'random' decision in the run, across every simulated subsystem, draws from the same single seeded stream, which is what makes the whole run reproducible from one number.",
+          "sources": ["src-fdb-sigmod-paper", "src-antithesis-dst-overview"] }
+      ],
+      "pitfalls": [
+        "Reading 'the simulator is deterministic' as 'nothing random happens' — determinism and randomness aren't opposites here; the run is deterministic exactly so that a wide variety of pseudo-random schedules, faults, and workloads can be explored and then replayed on demand.",
+        "Letting any code path reach around the injected clock/RNG/scheduler — a raw OS random call, a hardware timestamp-counter read, hash-map iteration order seeded from a process-random hash seed, a background OS timer or GC thread — each reintroduces a real source of entropy the simulator doesn't control, and replay breaks silently, with no error to point at.",
+        "Assuming a captured seed will keep reproducing a bug forever — replay is only guaranteed against the exact code (often the exact commit) it was captured against, because a change upstream of the failure can shift where later PRNG draws land in the stream.",
+        "Recording only logs or traces without also recording the seed, configuration, workload, and fault schedule that produced them — a trace tells you what happened once; the seed plus inputs are what let you make it happen again.",
+        "Conflating wall-clock realism with correctness — a simulated clock that jumps discontinuously between events is doing its job; code that silently assumes time advances smoothly and in small increments is exposing a bug the simulation is specifically designed to find."
+      ],
+      "furtherReading": [
+        "src-fdb-testing-docs",
+        "src-fdb-flow-doc",
+        "src-tigerbeetle-vopr",
+        "src-antithesis-dst-overview",
+        "src-antithesis-fault-taxonomy",
+        "src-eatonphil-dst",
+        "src-lamport-clocks",
+        "src-fdb-sigmod-paper"
+      ]
+    },
     "architectures-for-dst": {},
     "building-the-simulator": {},
     "workloads-and-state-space-exploration": {},
