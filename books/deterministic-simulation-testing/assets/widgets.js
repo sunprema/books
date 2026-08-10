@@ -310,3 +310,108 @@ BookWidgets.register('event-queue', function(box, W){
   W.onRelayout(draw);
   draw();
 });
+
+/* swarm-sampler: each "Roll new run" draws one combination of five
+   independent swarm dimensions (topology, replication, storage engine,
+   workload mix, fault profile) from a seed -- exactly like FoundationDB's
+   SimulatedCluster picking a random topology/replication/storage engine
+   per run. "Replay same seed" redraws the identical combination; only the
+   "Roll new run" button touches real randomness (picking which seed to
+   explore next), same convention as replay-strip. A small coverage grid
+   accumulates which combinations have been visited this session, making
+   swarm testing's "many different slices, each one reproducible" claim
+   visible rather than asserted. */
+BookWidgets.register('swarm-sampler', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var p = W.params(box);
+  var C = W.theme();
+  var seedInput = box.querySelector('.seed-input');
+  var readout = box.querySelector('.readout');
+  var seed = p.seed || 4104;
+
+  var DIMS = [
+    { label: 'topology',   opts: ['1 DC', '3 DC', '5 DC'] },
+    { label: 'replication', opts: ['single', 'double', 'triple'] },
+    { label: 'storage',    opts: ['memory', 'ssd', 'redwood'] },
+    { label: 'workload',   opts: ['transfer', 'queue', 'mixed'] },
+    { label: 'faults',     opts: ['calm', 'lossy', 'chaotic'] }
+  ];
+
+  var visited = {};
+  var combo;
+
+  function draw_combo(s){
+    var roll = W.rng(s);
+    return DIMS.map(function(d){
+      return d.opts[Math.floor(roll() * d.opts.length) % d.opts.length];
+    });
+  }
+
+  function reset(s){
+    seed = s;
+    combo = draw_combo(seed);
+    visited[combo.join('|')] = true;
+  }
+
+  function draw(){
+    if(!W.fitCanvas(cv)) return;
+    var ctx = cv.getContext('2d'), w = cv.__w, h = cv.__h;
+    ctx.clearRect(0, 0, w, h);
+
+    ctx.font = '11px "SF Mono",Menlo,Consolas,monospace';
+    ctx.fillStyle = C.ink; ctx.textAlign = 'left';
+    ctx.fillText('seed ' + seed, 12, 16);
+
+    var dialW = (w * 0.62 - 12) / DIMS.length, dialX0 = 8, top = 34, dialH = h - top - 26;
+    DIMS.forEach(function(d, i){
+      var x = dialX0 + i * dialW;
+      ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+      ctx.strokeRect(x, top, dialW - 8, dialH);
+      ctx.fillStyle = C.soft;
+      ctx.font = '9px "SF Mono",Menlo,Consolas,monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(d.label, x + (dialW - 8) / 2, top + 14);
+      ctx.fillStyle = C.accent;
+      ctx.font = 'bold 10px "SF Mono",Menlo,Consolas,monospace';
+      var val = combo[i];
+      ctx.fillText(val, x + (dialW - 8) / 2, top + dialH / 2 + 4);
+    });
+
+    var gridX0 = w * 0.68, gridTop = 30, cell = Math.max(5, Math.min(9, (w - gridX0 - 10) / 27));
+    ctx.font = '9px "SF Mono",Menlo,Consolas,monospace';
+    ctx.fillStyle = C.ink; ctx.textAlign = 'left';
+    ctx.fillText('coverage', gridX0, 18);
+    var cols = Math.max(6, Math.floor((w - gridX0 - 10) / (cell + 2)));
+    var keys = Object.keys(visited);
+    keys.forEach(function(k, i){
+      var cx = gridX0 + (i % cols) * (cell + 2);
+      var cy = gridTop + Math.floor(i / cols) * (cell + 2);
+      if(cy + cell > h - 6) return;
+      ctx.fillStyle = k === combo.join('|') ? C.accent : C.soft;
+      ctx.fillRect(cx, cy, cell, cell);
+    });
+
+    if(readout){
+      readout.textContent = combo.join(' · ') + '  —  ' + keys.length +
+        ' distinct combination' + (keys.length === 1 ? '' : 's') + ' visited this session';
+    }
+  }
+
+  var replayBtn = box.querySelector('.replay');
+  var reseedBtn = box.querySelector('.reseed');
+  if(seedInput) seedInput.addEventListener('change', function(){
+    var v = parseInt(seedInput.value, 10);
+    if(isFinite(v)){ reset(v); draw(); }
+  });
+  if(replayBtn) replayBtn.addEventListener('click', function(){ reset(seed); draw(); });
+  if(reseedBtn) reseedBtn.addEventListener('click', function(){
+    var v = Math.floor(Math.random() * 1000000);
+    if(seedInput) seedInput.value = v;
+    reset(v);
+    draw();
+  });
+
+  reset(seed);
+  W.onRelayout(draw);
+  draw();
+});
