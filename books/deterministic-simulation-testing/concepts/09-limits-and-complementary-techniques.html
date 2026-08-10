@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limits &amp; Complementary Techniques — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="deterministic-simulation-testing">
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="lct-intro">
+      <p class="eyebrow">Chapter 09 &middot; Part IV — Living With It</p>
+      <h1>Limits &amp; Complementary Techniques</h1>
+      <p class="lead" data-anchor="lct-lead">Every tool this book has built so far does one job: take the
+      terrifying combinatorics of a distributed system's failure modes and shrink them down to something one
+      person can explore on a laptop, on demand, forever. That's a genuine superpower, and by now you should
+      believe it. But a simulator that faithfully catches everything you thought to put inside it will just as
+      faithfully stay silent about everything you didn't &mdash; and silence looks exactly like safety until
+      the day it isn't. This chapter draws that boundary honestly: what a deterministic simulator structurally
+      cannot tell you, no matter how well you build it, and what you still have to run &mdash; alongside it,
+      not instead of it &mdash; before you get to believe the system is actually safe.</p>
+    </section>
+
+    <section data-anchor="lct-boundary">
+      <h2>The boundary the simulator can't see past</h2>
+      <p data-anchor="lct-p1">Go back to chapter 3's central move: you take the real application, and at a
+      handful of well-chosen seams &mdash; the clock, the RNG, the network, the disk &mdash; you swap the real
+      thing for a seeded stand-in. Everything on the near side of those seams is real code, exercised for real,
+      and simulation's authority over it is total. Everything on the <em>far</em> side &mdash; the actual
+      kernel, the actual disk firmware, the actual network card, a third-party service you only ever reach
+      through an adapter &mdash; was never run at all. It was replaced. A simulator cannot find a bug in
+      something it never executed, and that's not a flaw to fix; it's the definition of the technique.</p>
+
+      <p data-anchor="lct-p2">FoundationDB's own documentation says this plainly, and it's worth taking at face
+      value from the project that has leaned on simulation harder than almost anyone: simulation is not able to
+      reliably detect performance issues, such as an imperfect load-balancing algorithm, and it is unable to
+      test third-party libraries or dependencies &mdash; or even first-party code that wasn't written against
+      Flow, the actor framework simulation is tightly integrated with.<sup>1</sup> Notice the shape of that
+      admission: it isn't "simulation has a bug." It's "simulation, working exactly as designed, has a
+      boundary" &mdash; and FoundationDB's response wasn't to widen the boundary until it disappeared. It was to
+      minimize how much of the system lives outside it, by avoiding external dependencies wherever it reasonably
+      could.<sup>1</sup></p>
+
+      <p data-anchor="lct-p3">The performance blind spot deserves its own moment, because the mechanism is
+      almost elegant. A discrete-event simulator (chapter 4) advances its clock by jumping straight to the next
+      scheduled event whenever nothing is happening &mdash; that's exactly what lets a night of simulation
+      explore vastly more of the state space than the same wall-clock hours would allow in the real world. But
+      that trick has a cost: the simulator's notion of "elapsed time" was never built to be a faithful stand-in
+      for real latency or real throughput under real contention. The very feature that makes simulation fast at
+      finding correctness bugs is the same feature that makes it unreliable for judging whether the system is
+      <em>fast enough</em>.<sup>1,2</sup> A clean simulated run is evidence about correctness. It is not evidence
+      about performance, and treating it as such is a category error, not an optimistic rounding.</p>
+
+      <div class="callout warn" data-anchor="lct-callout-boundary">
+        <span class="tag">Watch out</span>
+        "We didn't simulate it" and "we tested it and it was fine" are not the same sentence, even when they're
+        said in the same breath. A third-party payment API, a managed message queue, a cloud provider's load
+        balancer &mdash; anything reached only through an adapter is, by construction, outside what your seeds
+        have ever exercised.
+      </div>
+
+      <figure class="diagram-fig" data-anchor="lct-fig-boundary">
+        <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="lct-d1-title">
+          <title id="lct-d1-title">DST explores a huge number of seeded, replayable runs at low fidelity to the real world; production runs exactly one timeline at full fidelity — the two are complementary, not substitutes</title>
+          <text x="16" y="20">Deterministic simulation</text>
+          <rect x="16" y="30" width="150" height="34" class="stroke fill-soft"/>
+          <rect x="176" y="30" width="150" height="34" class="stroke fill-soft"/>
+          <rect x="336" y="30" width="150" height="34" class="stroke fill-soft"/>
+          <text x="26" y="52" class="big">seed #4471</text>
+          <text x="186" y="52" class="big">seed #9012</text>
+          <text x="346" y="52" class="big">seed #2288</text>
+          <text x="16" y="82" class="dim">thousands of runs / night &middot; each one replayable &middot; a chosen approximation of reality</text>
+
+          <path d="M16 100 L544 100" class="stroke-soft"/>
+
+          <text x="16" y="128" class="red">Real hardware / production</text>
+          <rect x="16" y="138" width="470" height="34" class="stroke-red"/>
+          <text x="26" y="160" class="big red">one timeline &mdash; real kernel, real disk, real network, real load</text>
+          <text x="16" y="188" class="dim">one run &mdash; usually not replayable &mdash; full fidelity by definition</text>
+        </svg>
+        <figcaption>Breadth versus fidelity. Simulation buys you thousands of cheap, replayable timelines at the
+        price of being an approximation; production gives you exactly one timeline, but it's the real one.
+        Neither side of this line makes the other optional.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="lct-gap">
+      <h2>The simulation gap, and why fidelity isn't free</h2>
+      <p data-anchor="lct-p4">Robotics and autonomous-vehicle testing have a name for this that's worth
+      borrowing: the <b>reality gap</b>, or sim-to-real gap &mdash; the mismatch between what a simulator's
+      physics and sensor models predict and what the real hardware actually does. The same structural idea
+      applies here, and this book will call it the <b>simulation gap</b>: your simulated network, disk, and
+      scheduler are chosen abstractions with a cost model that approximates reality, and the simulation gap is
+      exactly the set of real-world behaviors that abstraction was never built to reproduce.<sup>3</sup> A
+      higher-fidelity simulator narrows that gap, but fidelity is never free &mdash; every extra behavior you
+      model is more implementation to write, more surface to keep correct, and more assumptions about the real
+      world baked into code that itself needs to be right.</p>
+
+      <p data-anchor="lct-p5">Chapter 7 told the story of "fsyncgate" &mdash; the Linux kernel behavior where a
+      failed <code class="inl">fsync()</code> can silently mark the affected dirty pages clean, so a later retry
+      reports success without the original write ever having been made durable &mdash; and of Pillai et al.'s
+      2014 study, which found hundreds of crash-vulnerabilities by testing how real filesystems actually behave
+      against the POSIX contract applications assumed.<sup>4</sup> Notice where that knowledge came from: nobody
+      simulated their way to the discovery that <code class="inl">fsync()</code> lies. Someone had to run real
+      code against a real kernel and watch it lie. A simulated disk can faithfully <em>replay</em> a lie once a
+      human has told it the lie exists; it cannot discover a lie it was never told about. The fault menu chapter
+      7 built is only as good as the real-world observation that populated it &mdash; and that observation has
+      to come from outside the simulator, every time.</p>
+
+      <p data-anchor="lct-p6">Real hardware exposes fault classes a simulated or even containerized environment
+      can't produce at all, for a mundane reason: some faults need a real thing to fail. Jepsen's own tooling
+      documentation notes that containers &mdash; LXC and Docker alike &mdash; can't change their system clock,
+      so testing anything that depends on clock skew requires running nodes as separate physical machines or
+      full VMs instead.<sup>5</sup> The fault doesn't merely go untested in a container; it structurally cannot
+      exist there, because there's no real clock underneath to desynchronize. The same logic reaches all the way
+      down: real disk controllers, real NICs, real CPUs under real thermal and power constraints can all fail in
+      ways nobody wrote into any fault model, because nobody has observed them yet.</p>
+
+      <div class="callout key" data-anchor="lct-callout-gap">
+        <span class="tag">Key idea</span>
+        A simulator can only inject the faults someone already knew to describe to it. Discovering new fault
+        classes is not a simulation problem at all &mdash; it's an observation problem, and it only gets solved
+        by pointing something at the real world: real hardware, a real kernel, real production traffic.
+      </div>
+    </section>
+
+    <section data-anchor="lct-map">
+      <h2>A map of complementary techniques</h2>
+      <p data-anchor="lct-p7">None of this is an argument against simulation &mdash; chapters 1 through 8 made
+      the case for why it earns its place. It's an argument for a <em>map</em>: five techniques, each covering
+      ground the others structurally can't, deliberately overlapping at the edges rather than pretending any one
+      of them is sufficient alone.</p>
+
+      <table class="grid" data-anchor="lct-table-map">
+        <tr><th>Technique</th><th>Structurally catches</th><th>Structurally misses</th></tr>
+        <tr><td>Deterministic simulation (this book)</td>
+          <td>Concurrency/correctness bugs across a huge simulated state space, exactly replayable</td>
+          <td>Real performance, third-party black boxes, real hardware/OS behavior nobody told it about</td></tr>
+        <tr><td>Real-cluster performance testing</td>
+          <td>Actual throughput, latency under real contention, real load-balancing behavior</td>
+          <td>The deep, rare interleavings and fault combinations DST explores by the thousand</td></tr>
+        <tr><td>Hardware fault testing (Jepsen-style nemeses)</td>
+          <td>Real clock skew, real kernel/NIC/disk faults, faults that need real hardware to exist at all</td>
+          <td>DST's state-space breadth; slow and comparatively expensive per run</td></tr>
+        <tr><td>Production observability &amp; chaos-in-prod</td>
+          <td>The actual live system under actual live traffic; unknown-unknowns no model anticipated</td>
+          <td>A controlled, minimized, replayable trace &mdash; a production failure is often gone the moment it's over</td></tr>
+        <tr><td>Formal methods (TLA+ and similar)</td>
+          <td>Exhaustive correctness over an abstracted model, before a line of implementation exists</td>
+          <td>Implementation bugs &mdash; a correct spec can still have an incorrect implementation &mdash; and any performance signal at all</td></tr>
+      </table>
+
+      <p data-anchor="lct-p8">Datadog's engineering team ran exactly this pipeline end to end while validating
+      Courier, their message-queuing service, and the story is the cleanest illustration this chapter has of
+      the techniques actually meeting in the middle. A TLA+ model of the protocol let their checker explore
+      5,515,710 distinct reachable states without finding a violation of a "no lost messages" property &mdash;
+      but staying tractable meant abstracting away real implementation details, including the specific
+      concurrency-control mechanism the real storage layer used underneath.<sup>6</sup> A lightweight
+      discrete-event simulation then predicted realistic performance under node-failure scenarios &mdash;
+      something the formal model had no way to surface, since it doesn't reason about performance at all &mdash;
+      and revealed an oscillating-throughput pattern caused by CPU load redistributing across surviving nodes.
+      Finally, chaos testing against the real, running implementation confirmed that production behavior
+      actually matched what the simulation had predicted.<sup>6</sup> Three techniques, three different
+      questions: formal modeling asked "can this go wrong at all?", simulation asked "how much would it cost if
+      it did?", and chaos testing asked "does the real system actually behave the way both models assumed?" Drop
+      any one of the three and that particular question goes back to being unanswered, not answered by whichever
+      technique remains.</p>
+    </section>
+
+    <section data-anchor="lct-roadmap">
+      <h2>Cost, ROI, and an incremental roadmap for an existing service</h2>
+      <p data-anchor="lct-p9">Everything in this book reads more naturally as a green-field design decision than
+      a retrofit, and that's not an accident of presentation &mdash; retrofitting DST onto a system that already
+      ships is genuinely harder than designing for it from day one. Every hidden source of nondeterminism has to
+      be found and routed through a seed-controlled seam, and missing even one &mdash; a stray real-time call, an
+      unseeded library RNG buried three dependencies down &mdash; can quietly undermine determinism for the whole
+      system, not just the code path that used it.<sup>7</sup> Tools that simulate at the hypervisor or OS
+      boundary instead of the source level (chapter 3's deterministic-hypervisor architecture) sidestep that
+      retrofit entirely, at the cost of a coarser, black-box fault surface &mdash; the same trade-off chapter 3
+      drew between simulation-first and virtualization-first, now viewed specifically through an adoption-cost
+      lens rather than a fidelity one.</p>
+
+      <p data-anchor="lct-p10">The payoff, when it lands, can be substantial: WarpStream has reported simulating
+      roughly 280 logical hours of their system's behavior within about 6 hours of real wall-clock time using a
+      deterministic hypervisor.<sup>8</sup> Treat that as illustrative of the throughput advantage simulated,
+      accelerated time gives state-space exploration &mdash; not as a universal constant. It's one workload, on
+      one team's infrastructure, at one point in that tool's development; your own ratio will depend entirely on
+      how much of your system's real time is spent waiting versus computing.</p>
+
+      <figure class="diagram-fig" data-anchor="lct-fig-roadmap">
+        <svg class="diagram" viewBox="0 0 560 130" role="img" aria-labelledby="lct-d2-title">
+          <title id="lct-d2-title">An incremental adoption roadmap: wrap one seam, seed a workload with an oracle, add a fault menu and CI smoke tier, then widen the surface while layering in the complementary techniques</title>
+          <rect x="8"   y="34" width="126" height="42" class="stroke fill-soft"/>
+          <rect x="150" y="34" width="126" height="42" class="stroke fill-soft"/>
+          <rect x="292" y="34" width="126" height="42" class="stroke fill-soft"/>
+          <rect x="434" y="34" width="126" height="42" class="stroke-red"/>
+          <text x="16"  y="52" class="big">Wrap one</text>
+          <text x="16"  y="66" class="big">seam</text>
+          <text x="158" y="52" class="big">Seed +</text>
+          <text x="158" y="66" class="big">oracle</text>
+          <text x="300" y="52" class="big">Fault menu +</text>
+          <text x="300" y="66" class="big">CI smoke tier</text>
+          <text x="442" y="52" class="big red">Widen, then layer</text>
+          <text x="442" y="66" class="big red">in the other four</text>
+
+          <path d="M134 55 L150 55" class="stroke"/><path d="M144 51 L150 55 L144 59" class="stroke"/>
+          <path d="M276 55 L292 55" class="stroke"/><path d="M286 51 L292 55 L286 59" class="stroke"/>
+          <path d="M418 55 L434 55" class="stroke"/><path d="M428 51 L434 55 L428 59" class="stroke"/>
+
+          <text x="8" y="16" class="dim">ch.3</text>
+          <text x="150" y="16" class="dim">ch.5 &amp; 6</text>
+          <text x="292" y="16" class="dim">ch.7 &amp; 8</text>
+          <text x="434" y="16" class="dim">this chapter</text>
+          <text x="8" y="112" class="dim">start with the subsystem whose bugs cost the most</text>
+        </svg>
+        <figcaption>Same shape as building a simulator from scratch (chapters 3&ndash;8), run once per subsystem
+        instead of once for the whole service &mdash; and the last step is where the rest of this chapter's map
+        comes back in.</figcaption>
+      </figure>
+
+      <p data-anchor="lct-p11">Concretely: pick the subsystem whose bugs are most expensive &mdash; the one
+      handling money, consensus, or data you can't afford to lose &mdash; and wrap only that one behind a
+      port/adapter boundary with an explicit injected clock and RNG (chapter 3). Seed a small generative workload
+      against it and write exactly one safety oracle worth trusting (chapters 5 and 6) before adding anything
+      fancier. Add a small, realistic fault menu grounded in faults you already know are real (chapter 7), and
+      wire the whole thing into CI as a fast smoke tier (chapter 8) so it earns its keep on every merge. Only
+      then widen the simulated surface module by module &mdash; the same incremental, boundary-by-boundary
+      substitution the "strangler fig" pattern uses for legacy-system migrations generally, aimed here at
+      simulation coverage instead of a rewrite<sup>9</sup> &mdash; while layering the other four techniques from
+      this chapter's map back in around the growing simulated core: real-cluster performance testing before a
+      launch, hardware fault testing for anything that touches real disks or real clocks, a formal spec for the
+      one invariant you'd be most embarrassed to get wrong, and production observability running underneath all
+      of it, permanently, as the ground-truth check that nothing above was fooling itself.</p>
+
+      <div class="reflect" data-anchor="lct-reflect">
+        <h4>If a system passes a thousand nights of DST and has never once been exercised in production or on
+        real hardware, do you actually know it's safe?</h4>
+        <p>No &mdash; not fully, and not for a subtle reason. It's the plain one this chapter opened with: a
+        thousand simulated nights only ever tell you about the thousand nights' worth of world the simulator was
+        built to model. Real hardware, a real kernel, real third-party dependencies, and real production traffic
+        patterns are, by construction, outside that model. A clean DST run is strong evidence about correctness
+        inside the boundary. It is silent &mdash; not reassuring, silent &mdash; about everything outside it.</p>
+      </div>
+    </section>
+
+    <section data-anchor="lct-challenges-section">
+      <div class="challenges" data-anchor="lct-challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="lct-ch1">Think of a real production incident you know of that was caused by real
+          hardware, OS, or third-party behavior &mdash; not a race condition or a scheduling bug. Would a
+          deterministic simulator, however well built, have had any realistic chance of finding it before it
+          happened? Write down exactly why or why not, in terms of which side of the simulation boundary the
+          cause lived on.</li>
+          <li data-anchor="lct-ch2">Take a system you actually work on and fill in this chapter's five-row
+          technique map for it: for each of DST, real-cluster performance testing, hardware fault testing,
+          production observability, and formal methods, name one concrete bug class from that system each
+          technique would catch, and one it would structurally miss.</li>
+          <li data-anchor="lct-ch3">Sketch a one-page incremental adoption roadmap for a real, already-shipping
+          service: name the first subsystem you'd wrap behind a port/adapter boundary, the first oracle you'd
+          write for it, and which one of this chapter's four complementary techniques you'd layer in
+          second &mdash; and defend why that one, and not one of the other three, earns the second slot.</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="lct-sources-footer">
+        Sources: <sup>1</sup> FoundationDB documentation, <em>Known Limitations</em>; FoundationDB
+        documentation, <em>Simulation and Testing</em>.
+        <sup>2</sup> FoundationDB documentation, <em>Simulation and Testing</em>; FoundationDB documentation,
+        <em>Known Limitations</em>.
+        <sup>3</sup> FoundationDB documentation, <em>Known Limitations</em> (simulation-gap framing adapted from
+        the reality-gap concept in simulation-based testing generally).
+        <sup>4</sup> LWN.net, <em>PostgreSQL's fsync() Surprise</em>; Dan Luu, <em>Fsyncgate: Errors on fsync Are
+        Unrecoverable</em>; PostgreSQL wiki, <em>Fsync Errors</em>; Pillai et al., <em>All File Systems Are Not
+        Created Equal</em> (OSDI 2014).
+        <sup>5</sup> jepsen-io/jepsen, <em>doc/lxc.md</em>; Kingsbury &amp; Alvaro, <em>The Verification of a
+        Distributed System</em> (ACM Queue, 2016).
+        <sup>6</sup> Datadog Engineering, <em>How we use formal modeling, lightweight simulations, and chaos
+        testing to design reliable distributed systems</em>.
+        <sup>7</sup> Amplify Partners, <em>A Deterministic Simulation Testing (DST) primer</em>; S2, <em>Deterministic
+        simulation testing for async Rust</em>.
+        <sup>8</sup> WarpStream, <em>Deterministic Simulation Testing for Our Entire SaaS</em>.
+        <sup>9</sup> Alistair Cockburn, <em>Hexagonal Architecture</em>; Martin Fowler, <em>StranglerFigApplication</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-debugging-and-developer-workflow.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-hands-on-capstone.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
