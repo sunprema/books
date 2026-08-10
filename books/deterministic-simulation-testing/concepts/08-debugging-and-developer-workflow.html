@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging &amp; Developer Workflow — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="deterministic-simulation-testing">
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="dbg-intro">
+      <p class="eyebrow">Chapter 08 &middot; Part IV — Living With It</p>
+      <h1>Debugging &amp; Developer Workflow</h1>
+      <p class="lead" data-anchor="dbg-lead">Here's the thing nobody tells you when they hand you a working
+      deterministic simulator: replay was never the hard part. Replay is a solved problem the moment you've done
+      the work of chapters 2 through 4 &mdash; hand the same seed to the same code and you get the same run, full
+      stop. The hard part starts <em>after</em> that: you're staring at a run that fails in the same exact way,
+      on demand, as many times as you like, and you still have to figure out <em>why</em>. A perfectly replayable
+      crime scene is not a solved crime. This chapter is about the tools that turn "I can make it happen again"
+      into "I know what happened and I can prove it" &mdash; and, just as important, into a form of the bug that
+      never has to be found again.</p>
+    </section>
+
+    <section data-anchor="dbg-bundle">
+      <h2>The failure artifact: what you actually have to keep</h2>
+      <p data-anchor="dbg-p1">When a simulation run fails, the temptation is to grab whatever's on screen &mdash;
+      a stack trace, an assertion message, the last few log lines &mdash; and call it a bug report. Don't. None
+      of that is the artifact. The artifact is the whole bundle that made the run reproducible in the first
+      place: the <b>seed</b>, the <b>configuration</b> it drew (topology, replication, storage engine &mdash; see
+      chapter 5's swarm dials), the <b>workload</b>, the <b>fault schedule</b>, the full <b>event trace</b>, any
+      <b>logs</b>, and the <b>assertion/invariant history</b> up to the moment things went wrong. A log line tells
+      you what happened once. The bundle is what lets you make it happen again, on your own machine, right
+      now.<sup>1</sup></p>
+
+      <figure class="diagram-fig" data-anchor="dbg-fig-bundle">
+        <svg class="diagram" viewBox="0 0 560 130" role="img" aria-labelledby="dbg-d1-title">
+          <title id="dbg-d1-title">A failing run's artifact bundle — seed, config, workload, fault schedule, trace, logs, assertions — replays to the identical failure on any machine that has it</title>
+          <rect x="16"  y="20" width="200" height="88" class="stroke fill-soft"/>
+          <text x="28" y="38" class="big">Failure bundle</text>
+          <text x="28" y="56" class="mono">seed &middot; config &middot; workload</text>
+          <text x="28" y="72" class="mono">fault schedule &middot; trace</text>
+          <text x="28" y="88" class="mono">logs &middot; assertion history</text>
+
+          <path d="M216 64 L340 64" class="stroke"/>
+          <path d="M332 60 L340 64 L332 68" class="stroke"/>
+          <text x="222" y="56" class="dim">replay</text>
+
+          <rect x="344" y="20" width="200" height="88" class="stroke-red"/>
+          <text x="356" y="38" class="big red">Identical failure</text>
+          <text x="356" y="58" class="mono">same crash</text>
+          <text x="356" y="74" class="mono">same trace</text>
+          <text x="356" y="90" class="mono">any machine, any time</text>
+        </svg>
+        <figcaption>Keep the bundle, not the symptom. The symptom is downstream of the bundle and reproduces
+        automatically once the bundle is intact.</figcaption>
+      </figure>
+
+      <p data-anchor="dbg-p2">TigerBeetle's VOPR ties this bundle to exactly two numbers: the random seed, and
+      the Git commit the simulation ran against. Find a bug, and you get both back plus a precise trace of how to
+      reproduce it locally &mdash; <code class="inl">zig build vopr -- &lt;seed&gt;</code> against that same
+      commit reruns the identical failure.<sup>2</sup> The commit matters as much as the seed, because &mdash; as
+      chapter 2 warned &mdash; a change anywhere upstream of the failure can shift where later draws from the
+      PRNG stream land, and a seed replayed against different code can walk an entirely different, innocent
+      path.</p>
+
+      <p data-anchor="dbg-p3">FoundationDB's correctness service, Joshua, reruns one specific failing test by
+      setting the <code class="inl">JOSHUA_SEED</code> environment variable to the recorded value.<sup>3</sup>
+      In practice the reproducibility contract turns out to have a third ingredient beyond seed and commit: the
+      exact <em>build environment</em>. A binary compiled against <code class="inl">libstdc++</code> instead of
+      <code class="inl">libc++</code>, or built inside a different container image than the one the original
+      failure ran in, isn't guaranteed to reproduce bit-for-bit &mdash; subtle differences in floating-point
+      behavior, hashing, or memory layout can desync the replay before it ever reaches the bug.<sup>3</sup></p>
+
+      <div class="callout warn" data-anchor="dbg-callout-env">
+        <span class="tag">Watch out</span>
+        "Same seed" quietly means "same seed, same commit, <em>same build</em>." Chapter 2 already taught you the
+        first two. The third is easy to forget until a bug reproduces on the CI runner and refuses to reproduce
+        on your laptop, and the actual difference turns out to be a compiler flag, not the bug.
+      </div>
+    </section>
+
+    <section data-anchor="dbg-observability">
+      <h2>Determinism-preserving observability: logging without moving the schedule</h2>
+      <p data-anchor="dbg-p4">Chapter 1 opened with a warning about Heisenbugs: attach a debugger or sprinkle in
+      some logging, and a real concurrency bug can vanish, because the instrumentation itself perturbs the OS
+      thread scheduler's timing just enough to dodge the race. It would be reasonable to assume the same curse
+      applies inside a simulator. It doesn't &mdash; and the reason why is worth sitting with, because it's the
+      cleanest payoff this whole book has to offer.</p>
+
+      <p data-anchor="dbg-p5">A deterministic simulator's schedule isn't a function of OS timing at all. It's a
+      function of the seeded PRNG stream, full stop (chapter 2). An observability call that only <em>reads</em>
+      state and writes it out &mdash; without drawing from that PRNG stream, without blocking on real I/O,
+      without reading the real wall clock &mdash; cannot perturb the schedule, for the simple reason that it was
+      never part of what the schedule depends on in the first place. You can watch the crime scene as closely as
+      you like without smudging it, as long as your flashlight doesn't touch anything the schedule is actually
+      made of.</p>
+
+      <p data-anchor="dbg-p6">FoundationDB builds exactly this guarantee into its own tooling.
+      <code class="inl">tr.debugTransaction()</code> combined with <code class="inl">debugRandom()</code> turns
+      on detailed tracing for one specific transaction inside a simulation run <em>without changing the
+      deterministic randomness stream that produced the original failure</em> &mdash; the trace is read off the
+      run, never fed back into it. Separately, <code class="inl">fdbserver --print-sim-time</code> surfaces the
+      <em>simulated</em> clock, not the wall clock, when a run appears to hang &mdash; because inside a
+      discrete-event simulation, the simulated clock is the only one whose value means anything at all.<sup>4</sup></p>
+
+      <pre class="tab" data-anchor="dbg-snippet-safelog"><span class="cm">// unsafe: reads the real wall clock and the host RNG -- both are outside</span>
+<span class="cm">// the seed's control, so this desyncs the very run you're trying to debug</span>
+<span class="kw">function</span> <span class="fn">logUnsafe</span>(msg):
+  <span class="fn">print</span>(<span class="fn">real_gettimeofday</span>(), msg, <span class="fn">host_random</span>())
+
+<span class="cm">// safe: reads only the simulated clock and writes text out -- consumes</span>
+<span class="cm">// no entropy, blocks on nothing, so the schedule that follows is untouched</span>
+<span class="kw">function</span> <span class="fn">logSafe</span>(sim, msg):
+  <span class="fn">print</span>(sim.clock.<span class="fn">now</span>(), msg)   <span class="cm">// sim.clock is the same virtual clock</span>
+                                    <span class="cm">// every other decision in the run uses</span></pre>
+
+      <div class="callout key" data-anchor="dbg-callout-observability">
+        <span class="tag">Key idea</span>
+        The instrument only becomes a Heisenbug again if it reaches around the injected clock/RNG/scheduler the
+        same way any other leak would (chapter 2's leak pitfall, come back to bite you) &mdash; a logging helper
+        that quietly calls a real timestamp function, or that happens to draw from the same RNG the simulation
+        itself uses and shifts every later value downstream. Determinism-preserving observability isn't a
+        special trick. It's just chapter 2's determinism contract, applied to your own debug code with the same
+        discipline you'd apply to the system under test.
+      </div>
+    </section>
+
+    <section data-anchor="dbg-timetravel">
+      <h2>Time travel, checkpoints, and causal slicing: reading less of the trace</h2>
+      <p data-anchor="dbg-p7">A failing run can carry thousands of events. Reading them start to finish is the
+      slowest possible way to find a bug, and it's also unnecessary, for a reason specific to how these
+      simulators are built: everything runs single-threaded, in one process, with all state sitting in memory.
+      That makes a full checkpoint at any event boundary just a snapshot &mdash; cheap enough to take often. A
+      general record-and-replay debugger on a real multi-threaded program can only ever step forward from the
+      start. A deterministic simulator lets you seek to any event index in an already-recorded failure and resume
+      from there, or re-diverge from there with a different decision &mdash; genuine time travel, made practical
+      by the same single-threaded discipline that makes replay possible at all.<sup>5</sup></p>
+
+      <p data-anchor="dbg-p8">The other way to read less of the trace is to not read the causally irrelevant
+      parts of it in the first place. Academic <b>causal slicing</b> and dynamic-slicing techniques for
+      concurrent and message-passing programs reconstruct only the events that are actually connected to the
+      failure &mdash; by data dependency, control dependency, or (for a distributed system) causal message
+      ordering &mdash; and discard the rest.<sup>6</sup> Most of a long trace, it turns out, has nothing to do
+      with any one bug; slicing is what tells you which handful of events do.</p>
+
+      <p data-anchor="dbg-p9">Antithesis's <b>causality analysis</b> feature automates the same question a
+      different way: starting from one observed bug timeline, it rewinds to a series of earlier moments and, from
+      each one, re-explores forward multiple times with different fuzzer decisions, tracking what fraction of
+      those re-explorations still hit the same bug. Plotted as bug-probability over time, a sharp jump at a given
+      moment identifies the event that <em>causally mattered</em> &mdash; the tool is finding the cause by
+      search, not asking a human to eyeball a thousand-event trace and guess which one counted.<sup>7</sup> It's
+      the same distinction chapter 6 drew between a symptom and an oracle, aimed inward at the debugging process
+      itself: "this crashed" is a symptom; "this specific earlier event is what made the crash likely" is a
+      diagnosis.</p>
+    </section>
+
+    <section data-anchor="dbg-bisect">
+      <h2>Binary search through execution: minimizing the failure</h2>
+      <p data-anchor="dbg-p10">Chapter 5 introduced shrinking as a way to hand off a smaller, cleaner bug before
+      you ever look at it. The same idea, run interactively, is one of the single best debugging techniques for a
+      long DST trace. Andreas Zeller and Ralf Hildebrandt's <b>delta debugging</b> algorithm, <code
+      class="inl">ddmin</code>, automates exactly the "binary search through execution" intuition: split a
+      failing case into halves, test each half (and its complement) against the failure, keep whichever half
+      still fails, and recurse &mdash; converging on a case where removing any single remaining element makes the
+      failure vanish. Their original evaluation minimized a Mozilla crash from 95 recorded user actions down to
+      3, and 896 lines of failure-inducing HTML down to a single line, fully automatically.<sup>8</sup></p>
+
+      <p data-anchor="dbg-p11">Applied to a DST failure, the object you bisect should be the seed's underlying
+      <em>choice sequence</em> &mdash; the stream of scheduling, fault, and workload decisions the PRNG actually
+      produced &mdash; not the derived event trace directly. That's chapter 5's "integrated shrinking" principle
+      again, generalized from an automated pre-commit pass into your own interactive debugging loop: every
+      bisection candidate is replayed through the same generator and simulator, so it's guaranteed to be a legal
+      execution, never an impossible trace stitched together by hand.<sup>9</sup> A run that takes thousands of
+      events to fail typically isolates its minimal cause in on the order of log&#8322;n replays &mdash; not a
+      linear read of the whole thing.</p>
+
+      <figure class="figbox" data-widget="bisect-culprit" data-seed="5566" data-n="16" data-anchor="dbg-widget-bisect">
+        <canvas></canvas>
+        <div class="controls">
+          <label>Seed <input class="seed-input" type="number" value="5566" style="width:7em"></label>
+          <button type="button" class="btn bisect">Bisect &rarr;</button>
+          <button type="button" class="btn replay">&#8635; Replay same seed</button>
+          <button type="button" class="btn reseed">New seed</button>
+        </div>
+        <p class="readout"></p>
+        <figcaption>A 16-event trace hides one culprit. The only thing "Bisect" ever learns is pass/fail on a
+        candidate range &mdash; never the culprit's identity directly &mdash; exactly like replaying a fault
+        schedule against real code. Watch how few presses it takes.</figcaption>
+      </figure>
+
+      <pre class="tab" data-anchor="dbg-snippet-bisect"><span class="cm">// bisect the SEED'S CHOICE SEQUENCE, not the derived trace -- every</span>
+<span class="cm">// candidate is replayed through the real generator, so it's always legal</span>
+<span class="kw">function</span> <span class="fn">bisect</span>(choices, reproduces):
+  <span class="kw">while</span> <span class="fn">len</span>(choices) &gt; 1:
+    mid = <span class="fn">len</span>(choices) / 2
+    left, right = choices[:mid], choices[mid:]
+    <span class="kw">if</span> reproduces(<span class="fn">replay</span>(left)):  choices = left
+    <span class="kw">elif</span> reproduces(<span class="fn">replay</span>(right)): choices = right
+    <span class="kw">else</span>: <span class="kw">return</span> choices          <span class="cm">// both halves needed -- this IS the minimal cause</span>
+  <span class="kw">return</span> choices                  <span class="cm">// ~log2(n) replays, not a linear trace read</span></pre>
+    </section>
+
+    <section data-anchor="dbg-regression">
+      <h2>From minimized failure to permanent regression</h2>
+      <p data-anchor="dbg-p12">A minimized reproducer isn't just faster to read &mdash; it's less likely to get
+      accidentally fixed. A small, causally-tight failure gives an unrelated later change less surrounding code
+      to coincidentally touch; a sprawling 10,000-event trace gives it plenty. That's the same discipline chapter
+      5 introduced for handing off a clean bug report, now doing double duty as a debugging aid, not just a
+      courtesy to whoever reads it next.<sup>10</sup></p>
+
+      <p data-anchor="dbg-p13">But a minimized <em>seed</em> is still only conditionally reproducible &mdash;
+      conditional on the exact code, and now you know, conditional on the exact build. The standard practice
+      across every DST-using team this book has drawn from is the same: treat a freshly minimized failure as raw
+      material, not as the permanent artifact. Convert the minimized fault schedule and workload shape into a
+      concrete, hand-written regression scenario that gets checked in and runs on every future build &mdash;
+      rather than trusting the original seed number to keep finding the bug as the codebase moves on underneath
+      it.<sup>11</sup></p>
+
+      <div class="reflect" data-anchor="dbg-reflect">
+        <h4>If your only record of a fixed bug is the seed that found it, do you actually have a regression test?</h4>
+        <p>Not really &mdash; not a durable one. A routine refactor upstream, months later, can shift where later
+        PRNG draws land in the stream and quietly walk that seed past the state where the bug used to live. No
+        test fails, because the "test" was never pinned to the scenario; it was only ever pinned to a number.
+        Turning the seed into a named, hand-written scenario is what makes the fix stay fixed.</p>
+      </div>
+    </section>
+
+    <section data-anchor="dbg-ci">
+      <h2>CI strategy: three cadences, three jobs</h2>
+      <p data-anchor="dbg-p14">Zoom out from any one debugging session and the question becomes: when does all
+      of this actually run? Every real DST program this book has drawn from answers with the same shape &mdash;
+      not one testing cadence, but (at least) three, each doing a job the others structurally cannot.</p>
+
+      <table class="grid" data-anchor="dbg-table-cadence">
+        <tr><th>Cadence</th><th>Job</th><th>Concrete example</th></tr>
+        <tr><td>Per-PR smoke DST</td><td>Fast, gates every merge</td>
+          <td>RisingWave: 16 seeds in parallel per test, full PR suite inside &sim;20 minutes, leaning on
+          simulated time running 4&ndash;5&times; faster than real time</td></tr>
+        <tr><td>Nightly / continuous seed farm</td><td>Deep, runs in the background</td>
+          <td>FoundationDB's Joshua runs ensembles around the clock &mdash; every code probe (BUGGIFY site) is
+          expected to be hit at least once per night; TigerBeetle's CFO runs a dedicated fleet continuously,
+          published to a public devhub, with a <code class="inl">fuzz</code> label to steer extra attention at
+          one PR</td></tr>
+        <tr><td>Pre-release burst</td><td>Deepest, occasional</td>
+          <td>TigerBeetle's fuzzing fleet runs 24/7 on &sim;1024 dedicated cores at &sim;700&times; simulated-time
+          acceleration &mdash; on the order of two millennia of cluster faults-and-recoveries explored every
+          single day</td></tr>
+      </table>
+
+      <p data-anchor="dbg-p15">The three cadences trade off exactly what you'd expect: the per-PR tier is fast
+      and necessarily shallow, because a developer is sitting there waiting on it. The continuous tier is deep
+      but has latency &mdash; a bug it finds may already be a day old by the time anyone sees it. The pre-release
+      burst is the deepest of all, at the cost of only running occasionally. Run only one of the three and you
+      get a specific, predictable failure mode: per-PR-only means the search is structurally too shallow to find
+      most of what DST exists for; nightly-only means real bugs sit undetected in the mainline for a day or more;
+      skipping the pre-release burst forgoes the single deepest pass right when it matters most, immediately
+      before shipping.<sup>12,13</sup></p>
+
+      <div class="callout key" data-anchor="dbg-callout-triage">
+        <span class="tag">Key idea</span>
+        Notice what all three tiers share: every one of them still ends at a seed, a commit, and (per the section
+        above) a build environment &mdash; the same three-part bundle a single developer needs to reproduce one
+        failure locally. A fleet of a thousand cores and a laptop replaying one seed are running the exact same
+        machinery. Scale changes how much of the state space you search, not what a failure, once found, is made
+        of.
+      </div>
+
+      <p class="sources" data-anchor="dbg-triage-note">Failure triage, in practice, is mostly a visibility
+      problem: TigerBeetle's public devhub dashboard and PR-level <code class="inl">fuzz</code> labels exist
+      specifically so a found failure has somewhere obvious to land, and a developer can point the fleet at their
+      own change on demand rather than waiting for the next scheduled sweep to (maybe) stumble onto it.</p>
+    </section>
+
+    <section data-anchor="dbg-challenges-section">
+      <div class="challenges" data-anchor="dbg-challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="dbg-ch1">A teammate wants to add a debug <code class="inl">print()</code> statement
+          inside a simulated actor to chase down a rare failure. Write down the exact check you'd want them to
+          run before trusting that the print is determinism-preserving &mdash; what, specifically, is it allowed
+          to touch, and what would silently break the guarantee?</li>
+          <li data-anchor="dbg-ch2">Play with the bisection widget above until you've isolated a culprit event on
+          three different seeds. Now write, in one sentence, why the widget's "oracle" is only ever allowed to
+          answer pass/fail on a range &mdash; never "here's the culprit" directly &mdash; and why that constraint
+          is exactly what makes it a faithful model of replaying a real fault schedule.</li>
+          <li data-anchor="dbg-ch3">Sketch a three-cadence CI strategy for a DST-testable system you know: what
+          runs on every PR, what runs continuously in the background, and what would justify a dedicated
+          pre-release burst? Name one bug class from an earlier chapter (a crash-recovery bug, a livelock, a
+          durability lie) that the per-PR tier is structurally too shallow to ever find on its own.</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="dbg-sources-footer">
+        Sources: <sup>1</sup> Antithesis, <em>Deterministic Simulation Testing</em>; FoundationDB documentation,
+        <em>Simulation and Testing</em>; TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+        <sup>2</sup> TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+        <sup>3</sup> FoundationDB/fdb-joshua, README (FoundationDB Correctness service).
+        <sup>4</sup> apple/foundationdb wiki, <em>Debugging in FDB</em>.
+        <sup>5</sup> Wikipedia, <em>Time travel debugging</em>; FoundationDB documentation, <em>Simulation and Testing</em>.
+        <sup>6</sup> <em>DrDebug: Deterministic-Replay-Based Cyclic Debugging with Dynamic Slicing</em>.
+        <sup>7</sup> Antithesis documentation, <em>Causality analysis</em>.
+        <sup>8</sup> Zeller &amp; Hildebrandt, <em>Simplifying and Isolating Failure-Inducing Input</em>.
+        <sup>9</sup> HypothesisWorks/hypothesis, <em>Strategies that shrink</em>.
+        <sup>10</sup> Antithesis documentation, <em>Bug report</em>.
+        <sup>11</sup> Phil Eaton, <em>What's the big deal about Deterministic Simulation Testing?</em>
+        <sup>12</sup> RisingWave, <em>Applying Deterministic Simulation: The RisingWave Story</em> (Part 2);
+        FoundationDB documentation, <em>Internal Dev Tools</em>; FoundationDB/fdb-joshua, README.
+        <sup>13</sup> TigerBeetle, <em>HACKING.md</em> (Continuous Fuzzing Orchestrator); TigerBeetle,
+        <em>A Tale Of Four Fuzzers</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-fault-models.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-limits-and-complementary-techniques.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
+</html>

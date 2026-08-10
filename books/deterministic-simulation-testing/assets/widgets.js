@@ -587,3 +587,109 @@ BookWidgets.register('history-checker', function(box, W){
   W.onRelayout(draw);
   draw();
 });
+
+/* bisect-culprit: a real (if tiny) delta-debugging run. A fixed-length
+   trace of N events hides exactly one culprit, chosen from the seed; the
+   only thing the widget's oracle ever reports is yes/no -- "does the bug
+   still reproduce in this candidate range?" -- exactly the shape of
+   replaying a fault schedule against real code, never the culprit's
+   identity directly. Each "Bisect" press halves the surviving range the
+   way ddmin halves a failing input, so a trace of N events isolates its
+   minimal cause in ceil(log2(N)) replays instead of a linear read of all
+   of them. "Replay same seed" resets to the same culprit and confirms the
+   same number of steps finds it again; only "New seed" touches
+   Math.random(), same convention as every other widget in this book. */
+BookWidgets.register('bisect-culprit', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var p = W.params(box);
+  var C = W.theme();
+  var seedInput = box.querySelector('.seed-input');
+  var readout = box.querySelector('.readout');
+  var seed = p.seed || 5566;
+  var N = p.n || 16;
+
+  var culprit, lo, hi, steps, done;
+
+  function reset(s){
+    seed = s;
+    var roll = W.rng(seed);
+    culprit = Math.floor(roll() * N);
+    lo = 0; hi = N - 1; steps = 0; done = false;
+  }
+
+  function bisect(){
+    if(done) return;
+    var mid = lo + Math.floor((hi - lo) / 2);
+    steps++;
+    if(culprit <= mid){ hi = mid; } else { lo = mid + 1; }
+    if(lo === hi) done = true;
+    draw();
+  }
+
+  function draw(){
+    if(!W.fitCanvas(cv)) return;
+    var ctx = cv.getContext('2d'), w = cv.__w, h = cv.__h;
+    ctx.clearRect(0, 0, w, h);
+
+    ctx.font = '11px "SF Mono",Menlo,Consolas,monospace';
+    ctx.fillStyle = C.ink; ctx.textAlign = 'left';
+    ctx.fillText('seed ' + seed + '  ·  ' + steps + ' replay' + (steps === 1 ? '' : 's'), 10, 16);
+
+    var padX = 14, top = 32, boxH = Math.min(38, h - top - 30);
+    var gap = 3, boxW = (w - 2 * padX - (N - 1) * gap) / N;
+
+    for(var i = 0; i < N; i++){
+      var x = padX + i * (boxW + gap);
+      var inRange = i >= lo && i <= hi;
+      var isCulprit = done && i === culprit;
+      ctx.fillStyle = isCulprit ? C.accent : (inRange ? C.grid : C.paper);
+      ctx.globalAlpha = isCulprit ? 1 : (inRange ? 0.9 : 0.35);
+      ctx.fillRect(x, top, boxW, boxH);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = isCulprit ? C.accent : C.grid;
+      ctx.lineWidth = isCulprit ? 2 : 1;
+      ctx.strokeRect(x, top, boxW, boxH);
+      if(isCulprit){
+        ctx.fillStyle = C.paper;
+        ctx.font = 'bold 10px "SF Mono",Menlo,Consolas,monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('#' + i, x + boxW / 2, top + boxH / 2 + 4);
+      }
+    }
+
+    ctx.font = '10px "SF Mono",Menlo,Consolas,monospace';
+    ctx.fillStyle = C.soft; ctx.textAlign = 'left';
+    ctx.fillText('N=' + N + ' events, still-candidate range: ' + (hi - lo + 1), padX, top + boxH + 18);
+
+    if(readout){
+      if(done){
+        readout.textContent = 'isolated event #' + culprit + ' as the minimal cause in ' + steps +
+          ' replays — ceil(log2(' + N + ')) = ' + Math.ceil(Math.log2(N)) +
+          '. Press Replay to confirm the same seed finds it the same way every time.';
+      } else {
+        readout.textContent = (hi - lo + 1) + ' of ' + N + ' events still candidates — press Bisect to ' +
+          'replay one half and let the oracle (pass/fail only, never "which one") rule it in or out.';
+      }
+    }
+  }
+
+  var bisectBtn = box.querySelector('.bisect');
+  var replayBtn = box.querySelector('.replay');
+  var reseedBtn = box.querySelector('.reseed');
+  if(seedInput) seedInput.addEventListener('change', function(){
+    var v = parseInt(seedInput.value, 10);
+    if(isFinite(v)){ reset(v); draw(); }
+  });
+  if(bisectBtn) bisectBtn.addEventListener('click', bisect);
+  if(replayBtn) replayBtn.addEventListener('click', function(){ reset(seed); draw(); });
+  if(reseedBtn) reseedBtn.addEventListener('click', function(){
+    var v = Math.floor(Math.random() * 1000000);
+    if(seedInput) seedInput.value = v;
+    reset(v);
+    draw();
+  });
+
+  reset(seed);
+  W.onRelayout(draw);
+  draw();
+});
