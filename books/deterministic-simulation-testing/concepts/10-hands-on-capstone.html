@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hands-On Capstone — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="deterministic-simulation-testing">
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="cap-intro">
+      <p class="eyebrow">Chapter 10 &middot; Part V — Capstone</p>
+      <h1>Hands-On Capstone</h1>
+      <p class="lead" data-anchor="cap-lead">Nine chapters of this notebook have been circling the same claim
+      from different angles: control every source of nondeterminism, and a run stops being a sighting and
+      becomes a recipe. It's time to stop taking that on faith and go build the thing. This chapter walks you
+      through a small, complete project — a tiny replicated key-value store, wrapped in your own deterministic
+      simulator — from the four ports, through a planted bug, to a permanent regression test. Nothing here is
+      hypothetical scaffolding; every technique is the same one chapters 2 through 8 already gave you a name
+      for. The only thing new is that this time, <em>you're</em> the one turning the crank.</p>
+    </section>
+
+    <section data-anchor="cap-scope">
+      <h2>What you're building</h2>
+      <p data-anchor="cap-p1">Pick one of three small, well-understood systems — a replicated key-value store, a
+      job queue, or a payment ledger — and build a toy version with real replication logic, wrapped in a
+      simulator you write yourself. This chapter walks the key-value store, because its correctness properties
+      are exactly the ones chapter 6 already gave you vocabulary for: no committed write is ever lost, every
+      client sees one consistent view of the keyspace, and once faults stop, the cluster eventually elects a
+      leader and starts serving requests again — safety and liveness, both, on a system small enough to fit in
+      one sitting.<sup>1</sup> If you'd rather build the job queue or the ledger, every step below still applies
+      almost word for word — only the workload and the oracle's specific invariant change.</p>
+
+      <p data-anchor="cap-p2">Keep the scope honest: three nodes, one leader, followers that replicate the
+      leader's writes, and a client that issues <code class="inl">PUT</code>/<code class="inl">GET</code>
+      operations. That's small enough to hold in your head, and — this is the part that matters — small enough
+      that when the simulator finds a bug, you'll be able to actually see why, instead of drowning in a real
+      system's incidental complexity. This is deliberately the same move chapter 3 described for FoundationDB
+      and TigerBeetle, just aimed at a toy instead of a production database: keep the application logic real,
+      and simulate only the environment around it.</p>
+
+      <div class="callout key" data-anchor="cap-callout-scope">
+        <span class="tag">Key idea</span>
+        The point of this capstone isn't the key-value store. Nobody needs another toy KV store. The point is
+        the simulator wrapped around it, and the muscle memory of watching a seed turn a "why did this fail
+        once in CI" shrug into a three-line, permanently reproducible bug report.
+      </div>
+    </section>
+
+    <section data-anchor="cap-ports">
+      <h2>The four ports, one more time</h2>
+      <p data-anchor="cap-p3">Chapter 3 named the seam: your store's logic should depend on interfaces for
+      <b>Clock</b>, <b>Network</b>, <b>Storage</b>, and <b>Random</b> — never on a concrete <code
+      class="inl">std::time::Instant::now()</code>, a raw socket, a file handle, or the OS's random-number
+      generator directly. In Rust, that's naturally four traits, with two implementations of each: a real
+      adapter for production, and a seeded, simulated adapter for tests.</p>
+
+      <pre class="tab" data-anchor="cap-snippet-ports"><span class="kw">trait</span> <span class="ty">Clock</span> {
+    <span class="kw">fn</span> <span class="fn">now</span>(&amp;self) -&gt; Instant;
+    <span class="kw">async fn</span> <span class="fn">sleep</span>(&amp;self, d: Duration);
+}
+
+<span class="kw">trait</span> <span class="ty">Network</span> {
+    <span class="kw">async fn</span> <span class="fn">send</span>(&amp;self, to: NodeId, msg: Msg) -&gt; <span class="ty">Result</span>&lt;()&gt;;
+    <span class="kw">async fn</span> <span class="fn">recv</span>(&amp;self) -&gt; Msg;
+}
+
+<span class="kw">trait</span> <span class="ty">Storage</span> {
+    <span class="kw">async fn</span> <span class="fn">append</span>(&amp;mut self, entry: LogEntry) -&gt; <span class="ty">Result</span>&lt;()&gt;;
+    <span class="kw">async fn</span> <span class="fn">read</span>(&amp;self, idx: <span class="ty">u64</span>) -&gt; <span class="ty">Option</span>&lt;LogEntry&gt;;
+}
+
+<span class="kw">trait</span> <span class="ty">Random</span> {
+    <span class="kw">fn</span> <span class="fn">next_u64</span>(&amp;mut self) -&gt; <span class="ty">u64</span>;
+}
+
+<span class="cm">// production: RealClock, TcpNetwork, DiskStorage, OsRandom</span>
+<span class="cm">// simulation:  SimClock,  SimNetwork(seed), SimStorage(seed), SeededRandom(seed)</span>
+<span class="cm">// your store's own logic imports only the four traits above — never a concrete type</span></pre>
+
+      <p data-anchor="cap-p4">You don't have to write those simulated adapters from nothing, either. MadSim — a
+      real, publicly available Rust crate — is an async runtime that mirrors Tokio's own API surface closely
+      enough that application code written against it runs unmodified against either the real Tokio runtime in
+      production or MadSim's seeded, simulated time/network/task scheduler in tests, borrowing the same
+      simulation-first idea straight from FoundationDB.<sup>2</sup> And you don't have to imagine what "a
+      Raft-replicated key-value store on MadSim" looks like finished, either: MadRaft is a public teaching lab —
+      derived from MIT's 6.824 Raft and KV-store assignments — that builds exactly this capstone's project on
+      top of MadSim, specifically to teach deterministic simulation testing hands-on.<sup>3</sup> Read its
+      source once you've built your own version; seeing a second, independent implementation of the same idea
+      is one of the fastest ways to notice what you got right.</p>
+
+      <div class="callout warn" data-anchor="cap-callout-elixir">
+        <span class="tag">Building it in Elixir instead</span>
+        The BEAM gives you something Rust doesn't: every process is already an isolated, message-passing state
+        machine, and supervision trees already give you crash/restart for free. What it doesn't hand you
+        off-the-shelf is a MadSim-style deterministic scheduler — you'd need to control message delivery order
+        and the virtual clock yourself, the same simulation-first discipline as the Rust version, just applied
+        at the process-mailbox boundary instead of an async-trait boundary. Treat it as the harder, more
+        educational path: you'll come away understanding exactly which part of "deterministic" a language
+        runtime gives you for free, and which part is always on you.
+      </div>
+    </section>
+
+    <section data-anchor="cap-loop">
+      <h2>The loop this whole book has been building toward</h2>
+      <p data-anchor="cap-p5">Every chapter so far has been one piece of a single pipeline. This capstone is
+      where you finally assemble all of it and watch the pieces hand off to each other for real.</p>
+
+      <figure class="diagram-fig" data-anchor="cap-fig-pipeline">
+        <svg class="diagram" viewBox="0 0 560 210" role="img" aria-labelledby="cap-d1-title">
+          <title id="cap-d1-title">Seed, configuration, workload, and fault schedule feed a deterministic execution; an oracle renders a verdict; on failure, everything on the left plus the trace is persisted, which is what makes the failure replayable and shrinkable</title>
+
+          <rect x="8"   y="16" width="120" height="34" class="stroke fill-soft"/>
+          <rect x="140" y="16" width="120" height="34" class="stroke fill-soft"/>
+          <rect x="8"   y="58" width="120" height="34" class="stroke fill-soft"/>
+          <rect x="140" y="58" width="120" height="34" class="stroke fill-soft"/>
+          <text x="18"  y="37" class="big">seed</text>
+          <text x="150" y="37" class="big">config</text>
+          <text x="18"  y="79" class="big">workload</text>
+          <text x="150" y="79" class="big">fault schedule</text>
+
+          <path d="M264 46 L300 46" class="stroke"/><path d="M294 42 L300 46 L294 50" class="stroke"/>
+          <rect x="300" y="24" width="140" height="60" class="stroke-thick fill-bg"/>
+          <text x="310" y="48" class="big">deterministic</text>
+          <text x="310" y="62" class="big">execution</text>
+          <text x="310" y="76" class="dim">ch.4 &middot; ch.7</text>
+
+          <path d="M440 54 L470 54" class="stroke"/><path d="M464 50 L470 54 L464 58" class="stroke"/>
+          <rect x="470" y="24" width="82" height="60" class="stroke-thick fill-soft"/>
+          <text x="480" y="48" class="big">oracle</text>
+          <text x="480" y="62" class="big">verdict</text>
+          <text x="480" y="76" class="dim">ch.6</text>
+
+          <path d="M511 84 L511 120" class="stroke-red dash"/>
+          <text x="470" y="112" class="red big">FAIL</text>
+
+          <rect x="8" y="122" width="544" height="70" class="stroke-red"/>
+          <text x="18" y="142" class="red big">persist: seed + config + workload + fault schedule + trace</text>
+          <text x="18" y="160" class="mono dim">MADSIM_TEST_SEED=1629626496</text>
+          <text x="18" y="176" class="dim">this is the whole bug report &mdash; and the whole regression test (ch.2, ch.8)</text>
+        </svg>
+        <figcaption>The pipeline every chapter of this book has been drawing pieces of. Seed, configuration,
+        workload, and fault schedule feed one deterministic execution; the oracle renders a verdict; and on a
+        FAIL, everything on the left plus the execution trace gets persisted — which is the entire reason the
+        failure can be replayed tomorrow, or shrunk, or turned into a test that runs forever.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="cap-workload">
+      <h2>The workload and the reference oracle</h2>
+      <p data-anchor="cap-p6">Structure your workload the way chapter 5 described FoundationDB doing it — three
+      phases, SETUP / EXECUTION / CHECK — and write the CHECK phase before you write anything fancier than a
+      single-node store. The oracle is a plain, single-threaded reference map: apply every client operation to
+      it in the order the client issued them, then compare the reference map's final state against whatever the
+      real replicated cluster ends up holding. That's a shadow-implementation oracle, the same style TigerBeetle's
+      VOPR uses to check every state transition against a trusted model as it happens.<sup>4</sup></p>
+
+      <pre class="tab" data-anchor="cap-snippet-workload"><span class="kw">struct</span> <span class="ty">ReplicationWorkload</span> { reference: BTreeMap&lt;Key, Value&gt; }
+
+<span class="kw">impl</span> <span class="ty">Workload</span> <span class="kw">for</span> <span class="ty">ReplicationWorkload</span> {
+    <span class="kw">fn</span> <span class="fn">setup</span>(&amp;mut self, cluster: &amp;mut Cluster, rng: &amp;mut <span class="kw">dyn</span> Random) {
+        cluster.<span class="fn">elect_initial_leader</span>();
+    }
+
+    <span class="kw">async fn</span> <span class="fn">execution</span>(&amp;mut self, cluster: &amp;mut Cluster, rng: &amp;mut <span class="kw">dyn</span> Random) {
+        <span class="kw">for</span> _ <span class="kw">in</span> 0..rng.<span class="fn">next_u64</span>() % 500 {
+            <span class="kw">let</span> (k, v) = (<span class="fn">random_key</span>(rng), <span class="fn">random_value</span>(rng));
+            <span class="kw">if</span> <span class="kw">let</span> <span class="ty">Ok</span>(()) = cluster.<span class="fn">put</span>(k, v).<span class="kw">await</span> {
+                self.reference.<span class="fn">insert</span>(k, v); <span class="cm">// only record what was actually ACKED</span>
+            }
+        }
+    }
+
+    <span class="kw">fn</span> <span class="fn">check</span>(&amp;self, cluster: &amp;Cluster) {
+        <span class="kw">for</span> (k, expected) <span class="kw">in</span> &amp;self.reference {
+            <span class="mac">assert_eq!</span>(cluster.<span class="fn">get</span>(*k), <span class="ty">Some</span>(*expected),
+                <span class="str">"lost a write the client was told succeeded"</span>); <span class="cm">// the oracle, ch.6</span>
+        }
+    }
+}</pre>
+
+      <p data-anchor="cap-p7">Notice what that CHECK is and isn't. It isn't "the process didn't crash" — chapter
+      6 already warned you that's one of the weakest oracles available, because most correctness bugs in a
+      distributed system don't crash anything.<sup>5</sup> It's a direct, specific safety property: <em>every
+      write the client was told succeeded is still there.</em> That's the one property this capstone is built to
+      violate on purpose.</p>
+    </section>
+
+    <section data-anchor="cap-plant">
+      <h2>Planting a bug on purpose</h2>
+      <p data-anchor="cap-p8">Here's the deliberate mistake: make the leader acknowledge the client's write as
+      soon as it appends the entry to <em>its own</em> log, without waiting for a majority of followers to
+      append it too. It looks fine in every quiet run — the followers usually catch up within microseconds, long
+      before anything else happens. It is also a textbook example of exactly the class of bug Jepsen-style fault
+      injection has found in real systems again and again: a configuration that acknowledges a write the cluster
+      hasn't actually made durable yet.<sup>6</sup> The bug needs three things to line up before it shows itself,
+      and none of them are rare in isolation — which is precisely why nobody would find this by hand.</p>
+
+      <figure class="diagram-fig" data-anchor="cap-fig-timeline">
+        <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="cap-d2-title">
+          <title id="cap-d2-title">Timeline of the planted bug: the leader acks a client write before a majority has it, then crashes before replicating, a stale follower is elected leader, and the client's next read returns the old value</title>
+
+          <path d="M20 30 L540 30" class="stroke-soft"/>
+          <circle cx="40"  cy="30" r="4" class="fill-ink"/>
+          <circle cx="150" cy="30" r="4" class="fill-red"/>
+          <circle cx="260" cy="30" r="4" class="fill-ink"/>
+          <circle cx="370" cy="30" r="4" class="fill-ink"/>
+          <circle cx="500" cy="30" r="4" class="fill-red"/>
+
+          <text x="20"  y="16" class="big">PUT(k,42)</text>
+          <text x="100" y="16" class="big red">leader ACKs (bug: no majority yet)</text>
+          <text x="230" y="16" class="big">leader crashes</text>
+          <text x="330" y="16" class="big">partition heals</text>
+          <text x="420" y="16" class="big red">GET(k) &rarr; 17, not 42</text>
+
+          <rect x="20"  y="48" width="150" height="34" class="stroke fill-soft"/>
+          <text x="28" y="69" class="mono">client &rarr; leader</text>
+          <rect x="190" y="48" width="150" height="34" class="stroke-red"/>
+          <text x="198" y="69" class="mono red">leader: local log only</text>
+          <rect x="360" y="48" width="180" height="34" class="stroke fill-soft"/>
+          <text x="368" y="69" class="mono">stale follower &rarr; new leader</text>
+
+          <text x="20" y="104" class="dim">a lost committed write &mdash; the oracle's exact assertion, ch.6</text>
+          <rect x="20" y="112" width="520" height="46" class="stroke-red dash"/>
+          <text x="30" y="132" class="red big">what the oracle catches:</text>
+          <text x="30" y="148" class="mono dim">reference[k] == 42, cluster.get(k) == 17  &rarr;  assertion fails</text>
+        </svg>
+        <figcaption>Three ordinary-looking ingredients — an early ack, a crash, a partition healing at the wrong
+        moment — and none of them is individually surprising. Lined up in this exact order, they lose a write
+        the client was told had succeeded.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="cap-find">
+      <h2>Find it: run the swarm</h2>
+      <p data-anchor="cap-p9">You will almost never find this bug by running the test once. You find it the way
+      chapter 5 described FoundationDB doing it, and the way MadRaft's own tooling makes a one-line habit: run
+      the same test under hundreds of different seeds and let each one draw its own random timing, its own
+      random crash point, its own random partition schedule.<sup>7</sup></p>
+
+      <pre class="tab" data-anchor="cap-snippet-swarm"><span class="cm"># the same test, 100 different seeds, one command</span>
+$ MADSIM_TEST_NUM=100 cargo test --release replicate_under_partition
+
+<span class="cm"># a failing run prints its own bug report -- nothing to write down by hand</span>
+thread <span class="str">'...'</span> panicked at <span class="str">'lost a write the client was told succeeded'</span>
+MADSIM_TEST_SEED=1629626496</pre>
+
+      <p data-anchor="cap-p10">That single environment variable is the entire find. One seed, out of the
+      hundred you ran, happened to draw the exact combination of timings that exposes the early-ack bug — and
+      the moment it printed, the sighting stopped being a one-off and became a number you can hand to anyone,
+      including your future self.</p>
+    </section>
+
+    <section data-anchor="cap-shrink">
+      <h2>Shrink it</h2>
+      <p data-anchor="cap-p11">Seed 1629626496 reproduces the bug, but the run behind it might carry hundreds of
+      client operations and dozens of scheduling decisions — almost all of them irrelevant. Don't read that trace
+      top to bottom. Bisect it, the same integrated-shrinking idea chapter 5 introduced and chapter 8 turned into
+      a developer habit: shrink the seed's own underlying choice sequence — fewer operations, an earlier crash,
+      a shorter fault schedule — and replay each candidate through the real generator, so every candidate you try
+      is guaranteed to still be a legal execution, never a hand-edited trace that couldn't actually have
+      happened.<sup>8</sup></p>
+
+      <pre class="tab" data-anchor="cap-snippet-shrink"><span class="cm">// shrink the CHOICE SEQUENCE, not the derived trace -- every candidate</span>
+<span class="cm">// replays through the real generator, so it's always a legal execution</span>
+<span class="kw">function</span> <span class="fn">shrink</span>(choices, still_fails):
+  best = choices
+  <span class="kw">for</span> candidate <span class="kw">in</span> <span class="fn">smaller_variants</span>(best):
+    <span class="kw">if</span> still_fails(<span class="fn">replay</span>(candidate)):
+      best = candidate  <span class="cm">// keep shrinking from here</span>
+  <span class="kw">return</span> best  <span class="cm">// converges to: 1 write, 1 crash, 1 partition, 1 stale election</span></pre>
+
+      <p data-anchor="cap-p12">Done well, this converges to almost exactly the four-event timeline the diagram
+      above already drew: one write, one early ack, one crash, one stale election. That minimal trace is not
+      just easier to read — it <em>is</em> the bug, stripped of everything that was never a cause.</p>
+    </section>
+
+    <section data-anchor="cap-replay-fix">
+      <h2>Replay it, fix it, and make it stay fixed</h2>
+      <p data-anchor="cap-p13">Before touching a line of the fix, replay the shrunk seed once more and watch it
+      fail the identical way — this is the cheapest confidence check available to you, and it's worth doing on
+      principle: it confirms the bug you're about to fix is the bug you actually found, not a different one that
+      happens to trip the same assertion.</p>
+
+      <pre class="tab" data-anchor="cap-snippet-replay">$ MADSIM_TEST_SEED=1629626496 cargo test replicate_under_partition
+<span class="cm"># same panic, same line, every time -- that's the whole point</span></pre>
+
+      <p data-anchor="cap-p14">The fix is exactly what the bug's shape suggests: don't ack the client until a
+      <em>majority</em> of the cluster has durably appended the entry, not just the leader. Rerun the shrunk seed
+      once more; it should now pass, because a stale follower missing that write can no longer win an election
+      without first catching up. Then run the full swarm again — hundreds of fresh seeds, not just the one you
+      already know about — because a fix aimed at one seed's exact timeline can still leave a neighboring
+      variant of the same bug undiscovered.</p>
+
+      <p data-anchor="cap-p15">Now do the one step it's easiest to skip: pin the scenario. Per chapters 2 and 8,
+      a seed's reproducibility is a property of the seed <em>and</em> the exact code it ran against — a routine,
+      unrelated change upstream can silently shift where later random draws land in the stream and walk right
+      past the bug without ever reproducing it again.<sup>9</sup> So don't rely on the seed alone. Write the
+      shrunk scenario down as a small, explicit, hand-authored test — "leader acks before majority, then crashes,
+      then a stale follower is elected" — that runs on every future change, independent of whether
+      <code class="inl">MADSIM_TEST_SEED=1629626496</code> still finds it. The seed got you here. The checked-in
+      test is what keeps this exact bug from ever shipping again.</p>
+
+      <table class="grid" data-anchor="cap-table-recap">
+        <tr><th>Step</th><th>What you did</th><th>Which chapter it's from</th></tr>
+        <tr><td>Wrap the seams</td><td>Clock / Network / Storage / Random behind traits</td><td>ch. 3</td></tr>
+        <tr><td>Build the simulator</td><td>event queue, simulated network + disk, crash/restart</td><td>ch. 4</td></tr>
+        <tr><td>Generate the workload</td><td>SETUP / EXECUTION / CHECK, seeded operations</td><td>ch. 5</td></tr>
+        <tr><td>Write the oracle</td><td>reference map, "no lost committed write"</td><td>ch. 6</td></tr>
+        <tr><td>Choose the fault</td><td>early ack, crash, partition, stale election</td><td>ch. 7</td></tr>
+        <tr><td>Find, shrink, replay</td><td>swarm of seeds &rarr; bisect &rarr; confirm</td><td>ch. 5 &amp; ch. 8</td></tr>
+        <tr><td>Fix and pin</td><td>quorum ack, then a checked-in regression test</td><td>ch. 2 &amp; ch. 8</td></tr>
+      </table>
+
+      <div class="reflect" data-anchor="cap-reflect">
+        <h4>If you'd skipped the oracle and just watched for crashes, would you have ever found this bug?</h4>
+        <p>No. The planted bug never crashes anything — the leader dies cleanly, the cluster elects a new leader
+        cleanly, and the store keeps serving requests the whole time. Every symptom you'd normally watch for
+        stays green. The only thing that ever notices is a reference model that remembers what the client was
+        actually promised, and checks it. That's the whole lesson of chapter 6, arriving here as something you
+        watched happen to your own code instead of something you read about someone else's.</p>
+      </div>
+    </section>
+
+    <section data-anchor="cap-challenges-section">
+      <div class="challenges" data-anchor="cap-challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="cap-ch1">Build it. Pick Rust with MadSim (or hand-roll your own four adapters), or
+          take the harder, more educational Elixir path from this chapter's sidebar. Get the honest version
+          working first — majority-ack, no planted bug — before you break anything on purpose.</li>
+          <li data-anchor="cap-ch2">Plant a second bug of a completely different shape: a liveness bug instead
+          of a safety one, like chapter 6's stuck-view-change livelock, where the cluster never crashes and
+          never loses data — it just quietly stops making progress forever. Notice that your safety oracle from
+          this chapter cannot catch it; you'll need a bound-on-"eventually" liveness check instead.</li>
+          <li data-anchor="cap-ch3">Swap the target: rebuild this same pipeline around a job queue (invariant:
+          no job is ever executed twice, or ever silently dropped) or a payment ledger (invariant: the sum of
+          balances is conserved across every transfer, even mid-fault). Keep the four ports, the SETUP/EXECUTION/
+          CHECK workload shape, and the find-shrink-replay-fix-pin loop identical — only the oracle's specific
+          assertion should change.</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="cap-sources-footer">
+        Sources: <sup>1</sup> Kingsbury &amp; Alvaro, <em>The Verification of a Distributed System</em> (ACM
+        Queue, 2016); Lamport, <em>Proving Liveness Properties of Concurrent Programs</em>; TigerBeetle,
+        <em>Simulation Testing For Liveness</em>.
+        <sup>2</sup> madsim-rs/madsim, GitHub.
+        <sup>3</sup> madsim-rs/MadRaft, GitHub (README).
+        <sup>4</sup> TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+        <sup>5</sup> Barr, Harman, McMinn, Shahbaz &amp; Yoo, <em>The Oracle Problem in Software Testing: A
+        Survey</em>; FoundationDB documentation, <em>Simulation and Testing</em>.
+        <sup>6</sup> Kingsbury &amp; Alvaro, <em>The Verification of a Distributed System</em> (ACM Queue, 2016).
+        <sup>7</sup> FoundationDB documentation, <em>Simulation and Testing</em>; madsim-rs/MadRaft, GitHub.
+        <sup>8</sup> Zeller &amp; Hildebrandt, <em>Simplifying and Isolating Failure-Inducing Input</em>;
+        HypothesisWorks/hypothesis, <em>Strategies that shrink</em>.
+        <sup>9</sup> Phil Eaton, <em>What's the big deal about Deterministic Simulation Testing?</em>;
+        TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-limits-and-complementary-techniques.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="home" href="../index.html">Contents</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
