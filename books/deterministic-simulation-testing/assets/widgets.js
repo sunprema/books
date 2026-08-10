@@ -415,3 +415,175 @@ BookWidgets.register('swarm-sampler', function(box, W){
   W.onRelayout(draw);
   draw();
 });
+
+/* history-checker: a miniature linearizability checker, run for real in the
+   browser rather than just described. Generates a history of 5 concurrent
+   client operations on one register from a seed; each op gets a real-time
+   interval [start,end] and a linearization point drawn inside that interval,
+   which -- by construction -- makes the *raw* generated history always
+   linearizable (the whole trick behind "seed everything"). With some
+   probability, one read's observed value is then corrupted to a value no
+   write ever wrote, which -- also by construction -- makes it provably NOT
+   linearizable. "Check history" brute-forces every real-time-consistent
+   permutation looking for one legal sequential order that reproduces every
+   read; this is the same shape Knossos-style checkers use (see the chapter's
+   pseudocode), just small enough to run instantly on 5 operations. The point
+   of the widget is the gap between the raw timeline (which looks the same
+   either way to the eye) and the verdict (which requires actually running
+   the search) -- eyeballing a history is not an oracle; the search is. */
+BookWidgets.register('history-checker', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var p = W.params(box);
+  var C = W.theme();
+  var C2 = W.colors({ good: '--en|#2f6f4f', bad: '--accent-2|#944118' });
+  var seedInput = box.querySelector('.seed-input');
+  var readout = box.querySelector('.readout');
+  var checkBtn = box.querySelector('.check');
+  var seed = p.seed || 7331;
+  var N = 5;
+  var ops, verdict, culprit, witness;
+
+  function permutations(arr){
+    if(arr.length <= 1) return [arr];
+    var out = [];
+    for(var i = 0; i < arr.length; i++){
+      var rest = arr.slice(0, i).concat(arr.slice(i + 1));
+      var subs = permutations(rest);
+      for(var j = 0; j < subs.length; j++) out.push([arr[i]].concat(subs[j]));
+    }
+    return out;
+  }
+  var ALL_PERMS = permutations([0, 1, 2, 3, 4]);
+
+  function realTimeConsistent(perm){
+    for(var a = 0; a < perm.length; a++){
+      for(var b = a + 1; b < perm.length; b++){
+        var oa = ops[perm[a]], ob = ops[perm[b]];
+        if(oa.end < ob.start) continue;   // fine, a really is before b
+        if(ob.end < oa.start) return false; // b must be before a -- wrong order
+      }
+    }
+    return true;
+  }
+  function replay(perm, skipIdx){
+    var cur = 0;
+    for(var i = 0; i < perm.length; i++){
+      var op = ops[perm[i]];
+      if(op.type === 'W') cur = op.value;
+      else if(perm[i] !== skipIdx && op.observed !== cur) return false;
+    }
+    return true;
+  }
+  function findWitness(skipIdx){
+    for(var i = 0; i < ALL_PERMS.length; i++){
+      var perm = ALL_PERMS[i];
+      if(realTimeConsistent(perm) && replay(perm, skipIdx)) return perm;
+    }
+    return null;
+  }
+
+  function gen(s){
+    var roll = W.rng(s);
+    ops = [];
+    for(var i = 0; i < N; i++){
+      var start = roll() * 5.4;
+      var dur = 0.7 + roll() * 1.5;
+      var type = (i === 0) ? 'W' : (i === 1) ? 'R' : (roll() < 0.5 ? 'W' : 'R');
+      var op = { type: type, start: start, end: start + dur };
+      if(type === 'W') op.value = 1 + Math.floor(roll() * 9);
+      ops.push(op);
+    }
+    var lp = ops.map(function(op){ return op.start + roll() * (op.end - op.start); });
+    var order = ops.map(function(_, i){ return i; }).sort(function(a, b){ return lp[a] - lp[b]; });
+    var cur = 0;
+    order.forEach(function(idx){
+      var op = ops[idx];
+      if(op.type === 'W') cur = op.value;
+      else op.observed = cur;   // correct-by-construction read
+    });
+    var readIdxs = ops.map(function(_, i){ return i; }).filter(function(i){ return ops[i].type === 'R'; });
+    if(roll() < 0.45 && readIdxs.length){
+      var target = readIdxs[Math.floor(roll() * readIdxs.length) % readIdxs.length];
+      ops[target].observed = 99;   // no write ever writes 99 -- guaranteed illegal
+    }
+    verdict = null; culprit = -1; witness = null;
+  }
+
+  function check(){
+    witness = findWitness(-1);
+    if(witness){ verdict = 'pass'; }
+    else{
+      verdict = 'fail';
+      for(var i = 0; i < ops.length; i++){
+        if(ops[i].type !== 'R') continue;
+        if(findWitness(i)){ culprit = i; break; }
+      }
+    }
+    draw();
+  }
+
+  function draw(){
+    if(!W.fitCanvas(cv)) return;
+    var ctx = cv.getContext('2d'), w = cv.__w, h = cv.__h;
+    ctx.clearRect(0, 0, w, h);
+
+    var maxEnd = Math.max.apply(null, ops.map(function(o){ return o.end; }));
+    var padL = 96, padR = 16, top = 26, rowH = Math.min(30, (h - top - 34) / N);
+
+    ctx.font = '11px "SF Mono",Menlo,Consolas,monospace';
+    ctx.fillStyle = C.ink; ctx.textAlign = 'left';
+    ctx.fillText('seed ' + seed + '  ·  register x, one key', 8, 14);
+
+    ops.forEach(function(op, i){
+      var y = top + i * rowH;
+      var x0 = padL + (op.start / maxEnd) * (w - padL - padR);
+      var x1 = padL + (op.end / maxEnd) * (w - padL - padR);
+
+      ctx.font = '10px "SF Mono",Menlo,Consolas,monospace';
+      ctx.fillStyle = C.soft; ctx.textAlign = 'right';
+      ctx.fillText('op' + i, padL - 8, y + rowH * 0.62);
+
+      var isCulprit = verdict === 'fail' && i === culprit;
+      ctx.fillStyle = isCulprit ? C2.bad : (verdict === 'pass' ? C2.good : (op.type === 'W' ? C.accent : C.grid));
+      ctx.globalAlpha = (op.type === 'W' || verdict) ? 0.9 : 0.55;
+      ctx.fillRect(x0, y + 4, Math.max(3, x1 - x0), rowH - 10);
+      ctx.globalAlpha = 1;
+
+      ctx.fillStyle = (op.type === 'W' && !verdict) ? C.paper : C.ink;
+      ctx.font = '10px "SF Mono",Menlo,Consolas,monospace';
+      ctx.textAlign = 'left';
+      var label = op.type === 'W' ? ('W(x)=' + op.value) : ('R(x)→' + op.observed);
+      ctx.fillText(label, x0 + 4, y + rowH * 0.62);
+    });
+
+    if(readout){
+      if(!verdict){
+        readout.textContent = 'a raw history — press "Check history" to run the oracle; the bars alone don’t tell you if this is legal.';
+      } else if(verdict === 'pass'){
+        readout.textContent = 'LINEARIZABLE — witness order: ' + witness.map(function(i){ return 'op' + i; }).join(' → ');
+      } else {
+        readout.textContent = 'NOT LINEARIZABLE — no legal order reproduces op' + culprit + '’s read; every other read can still be explained.';
+      }
+    }
+  }
+
+  if(seedInput) seedInput.addEventListener('change', function(){
+    var v = parseInt(seedInput.value, 10);
+    if(isFinite(v)){ seed = v; gen(seed); draw(); }
+  });
+  if(checkBtn) checkBtn.addEventListener('click', check);
+  var replayBtn = box.querySelector('.replay');
+  var reseedBtn = box.querySelector('.reseed');
+  if(replayBtn) replayBtn.addEventListener('click', function(){ gen(seed); draw(); });
+  if(reseedBtn) reseedBtn.addEventListener('click', function(){
+    var v = Math.floor(Math.random() * 1000000);
+    if(seedInput) seedInput.value = v;
+    seed = v;
+    gen(seed);
+    draw();
+  });
+
+  gen(seed);
+  W.onRelayout(draw);
+  draw();
+});

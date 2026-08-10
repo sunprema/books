@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oracles: Deciding Whether a Run Is Correct — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="deterministic-simulation-testing">
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="orc-intro">
+      <p class="eyebrow">Chapter 06 &middot; Part III — Exploring &amp; Judging</p>
+      <h1>Oracles: Deciding Whether a Run Is Correct</h1>
+      <p class="lead" data-anchor="orc-lead">Last chapter we built something that can, on command, generate an
+      almost unlimited supply of hostile timelines &mdash; different topologies, different workloads, different
+      faults landing at different simulated instants, all of it reproducible from one seed. Turn that machine
+      loose overnight and it will hand you back ten million completed runs by morning. Now ask the question we've
+      been quietly dodging: ten million runs of <em>what</em>, exactly? Nothing about "the simulation finished" or
+      "the process didn't crash" tells you whether any of those ten million runs was <em>correct</em>. Something
+      has to look at what happened and render a verdict. That something is called an
+      <em class="term-def">oracle</em>, and this chapter is entirely about how you build one you can trust.</p>
+    </section>
+
+    <section data-anchor="orc-symptom">
+      <h2>A crash is a symptom. It is not a verdict.</h2>
+      <p data-anchor="orc-p1">In software testing generally, this is an old and famous headache called the
+      <em class="term-def">oracle problem</em>: given a test case, how do you decide, mechanically, whether the
+      output was correct? For a calculator, easy &mdash; check <code class="inl">2+2</code> against <code
+      class="inl">4</code>. For a distributed key-value store running ten thousand concurrent transfers under
+      packet loss and disk corruption, "the expected output" isn't a number you can write down in advance. Nobody
+      hand-computes what a correct execution trace should look like.<sup>1</sup> So DST harnesses default to the
+      cheapest oracle available &mdash; did the process crash, did it hang, did anything throw &mdash; and that
+      default is dangerously weak, in both directions.</p>
+
+      <p data-anchor="orc-p2">A crash <em>is</em> a signal, but notice what produced it: some assertion, somewhere,
+      already knew what "bad" looked like and caught it. The crash is the symptom an oracle already built into the
+      code produced; it was never the oracle itself. Flip it around and the real danger shows up: a run that
+      neither crashes nor hangs is not proof of anything, unless something was actively watching for the specific
+      bad outcome you're trying to provoke. Most of the correctness bugs that matter in a distributed system &mdash;
+      a write silently vanishing, an ID reused, two replicas quietly disagreeing &mdash; do not crash anything.
+      They just produce a wrong answer that looks, to an unwatched process, exactly like a right one. "It didn't
+      crash" is the weakest oracle on the table, and it's also the one every naive test suite ships with by
+      default.</p>
+
+      <figure class="diagram-fig" data-anchor="orc-fig-watch">
+        <svg class="diagram" viewBox="0 0 560 210" role="img" aria-labelledby="orc-d1-title">
+          <title id="orc-d1-title">An oracle does not watch in one place; it watches continuously during execution, at the end of the run against the full history, and again after faults are healed to check the system recovers</title>
+          <text x="16" y="16" class="dim">three places to watch, not one</text>
+
+          <path d="M20 60 L540 60" class="stroke"/>
+          <text x="20" y="78" class="dim mono">execution &rarr;</text>
+
+          <circle cx="90" cy="60" r="4" class="fill-red"/>
+          <circle cx="150" cy="60" r="4" class="fill-red"/>
+          <circle cx="230" cy="60" r="4" class="fill-red"/>
+          <circle cx="300" cy="60" r="4" class="fill-red"/>
+          <text x="90" y="42" class="dim mono">assert</text>
+          <text x="230" y="42" class="dim mono">assert</text>
+
+          <rect x="330" y="40" width="120" height="40" class="stroke fill-soft"/>
+          <text x="342" y="58" class="mono">history check</text>
+          <text x="342" y="72" class="dim">safety, on the full log</text>
+
+          <path d="M460 60 L480 60" class="stroke-soft dash"/>
+          <text x="486" y="64" class="dim mono">t &rarr;</text>
+
+          <rect x="20" y="120" width="200" height="34" class="stroke-soft fill-bg dash"/>
+          <text x="30" y="141" class="dim">faults healed &mdash; partitions cleared</text>
+
+          <path d="M220 137 L260 137" class="stroke"/>
+          <path d="M252 133 L260 137 L252 141" class="stroke"/>
+
+          <rect x="260" y="118" width="150" height="40" class="stroke-red fill-bg"/>
+          <text x="272" y="136" class="mono red">liveness watchdog</text>
+          <text x="272" y="150" class="dim">must eventually converge</text>
+
+          <text x="20" y="186" class="dim">Local assertions run continuously and catch corruption where it
+          happens. A history check runs once, at the end, against everything recorded. A liveness watchdog only
+          starts the clock once the faults it's judging have actually been healed &mdash; see the rest of this
+          chapter for why each one exists and none of the three can substitute for the others.</text>
+        </svg>
+        <figcaption><b>An oracle is not one check.</b> It's (at least) three, watching at different times for
+        different kinds of wrongness &mdash; and mixing them up is a reliable source of both false alarms and
+        missed bugs.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="orc-assertions">
+      <h2>The cheapest oracle: local assertions and runtime invariants</h2>
+      <p data-anchor="orc-p3">The most direct oracle you can write is one that runs continuously, inside the code,
+      checking something that must always hold: a balance that must never go negative, a data structure that must
+      never contain a cycle, a counter that must never decrease. FoundationDB leans on exactly this &mdash; most of
+      its synthetic workloads carry built-in assertions verifying invariants that only correct transaction
+      atomicity and isolation can maintain, and the workload's <b>CHECK</b> phase, run at the end of a simulated
+      run, is where these get walked and verified.<sup>1,2</sup> The version below is modeled on that pattern: a
+      workload that maintains a linked chain of records and, in CHECK, walks the whole chain looking for exactly
+      the kind of corruption a broken isolation guarantee would produce.</p>
+
+      <pre class="tab" data-anchor="orc-snippet-assert"><span class="kw">class</span> <span class="ty">ChainIntegrityWorkload</span>(Workload):
+  <span class="kw">def</span> <span class="fn">check</span>(self, cluster):
+    <span class="cm">// a local, always-on invariant check -- an assertion, not a search</span>
+    node = cluster.<span class="fn">get</span>(self.head_key)
+    seen = <span class="fn">set</span>()
+    <span class="kw">while</span> node <span class="kw">is not</span> <span class="kw">None</span>:
+      <span class="kw">assert</span> node.key <span class="kw">not in</span> seen, <span class="str">"cycle detected -- isolation was violated"</span>
+      seen.<span class="fn">add</span>(node.key)
+      node = cluster.<span class="fn">get</span>(node.next_key) <span class="kw">if</span> node.next_key <span class="kw">else</span> <span class="kw">None</span>
+    <span class="kw">assert</span> <span class="fn">len</span>(seen) == self.expected_length, <span class="str">"chain is broken or truncated"</span></pre>
+
+      <p data-anchor="orc-p4">The appeal of a local assertion is that it catches corruption <em>at the point it
+      happens</em>, or close to it, instead of forcing you to reconstruct what went wrong from a downstream symptom
+      three thousand events later. The limit is right there in the name: it's <em>local</em>. An assertion only
+      catches what you thought, in advance, to write down as "this must always be true." It has nothing to say
+      about a whole class of bugs that only show up when you look at the <em>entire</em> history of what a
+      distributed system did &mdash; which is the next, much harder, oracle.</p>
+    </section>
+
+    <section data-anchor="orc-safety">
+      <h2>End-to-end safety: does the whole history make sense?</h2>
+      <p data-anchor="orc-p5">Lamport's classic split gives every correctness property one of two shapes.<sup>3</sup>
+      A <em class="term-def">safety property</em> says something bad never happens &mdash; no lost committed write,
+      no double-spend, no two clients handed the same "unique" ID, no response delivered out of the order it was
+      promised. A safety violation is provable from a <em>finite</em> prefix of the run: the instant the second
+      client gets the same ID, safety is already broken, full stop, no matter what happens afterward. That's what
+      makes safety properties checkable at all: you're always looking for one bad thing that either did or didn't
+      occur in a fixed, already-recorded history.</p>
+
+      <p data-anchor="orc-p6">The richest and hardest safety property most systems care about is
+      <b>linearizability</b>: that the whole messy, concurrent history of operations against the system &mdash;
+      overlapping in real time, arriving out of order, some of them left dangling by a crashed client &mdash; looks,
+      to every observer, exactly as if each operation took effect atomically at some single instant between when it
+      was invoked and when its response came back. Checking that isn't a lookup; it's a search. A
+      <b>history-checking</b> tool takes the recorded log of every operation's start time, end time, and observed
+      result, and asks: does there exist <em>at least one</em> legal sequential order &mdash; one operation at a
+      time, consistent with everyone's real-time bounds &mdash; that reproduces every single observed result?
+      Jepsen's <code class="inl">Knossos</code> checker does exactly this against a single-threaded reference
+      model.<sup>4,5</sup></p>
+
+      <pre class="tab" data-anchor="orc-snippet-lin"><span class="kw">function</span> <span class="fn">is_linearizable</span>(history, model):
+  <span class="cm">// history: {op, start_time, end_time, invoked_args, observed_result}[]</span>
+  <span class="kw">for</span> order <span class="kw">in</span> <span class="fn">real_time_consistent_permutations</span>(history):
+    state = model.<span class="fn">initial</span>()
+    <span class="kw">for</span> op <span class="kw">in</span> order:
+      (state, expected) = model.<span class="fn">apply</span>(state, op.invoked_args)
+      <span class="kw">if</span> expected != op.observed_result:
+        <span class="kw">break</span>  <span class="cm">// this order doesn't work, try the next one</span>
+    <span class="kw">else</span>:
+      <span class="kw">return</span> PASS(witness=order)
+  <span class="kw">return</span> FAIL(<span class="str">"no legal order reproduces every observed result"</span>)</pre>
+
+      <figure class="figbox" data-widget="history-checker" data-seed="7331" data-anchor="orc-widget-history">
+        <canvas></canvas>
+        <div class="controls">
+          <label>Seed <input class="seed-input" type="number" value="7331" style="width:7em"></label>
+          <button type="button" class="btn check">Check history</button>
+          <button type="button" class="btn replay">&#8635; Replay same seed</button>
+          <button type="button" class="btn reseed">Roll new history</button>
+        </div>
+        <p class="readout"></p>
+        <figcaption>Five operations on one register, drawn from a seed. Press <b>Check history</b> to actually run
+        the search above against them &mdash; notice the raw bars look equally plausible whether the answer turns
+        out to be PASS or FAIL. That gap is the entire chapter in miniature: eyeballing a history is not an
+        oracle. Running the search is.</figcaption>
+      </figure>
+
+      <p data-anchor="orc-p7">That brute-force search does not scale: Knossos-style checkers commonly time out or
+      run out of memory once a history passes a few hundred operations, because the number of real-time-consistent
+      orderings to search grows combinatorially with history length &mdash; the same state-explosion arithmetic
+      from the last chapter, here applied to orderings instead of schedules. That's what motivated
+      <code class="inl">Elle</code> (Kingsbury &amp; Alvaro, 2021): instead of searching for an order, Elle infers a
+      dependency graph among the client-observed transactions and looks for a <em>cycle</em> in it &mdash; a cycle
+      is a proof that no legal order can exist, found by graph traversal instead of permutation search. Elle checks
+      histories of hundreds of thousands of transactions in tens of seconds, three or four orders of magnitude past
+      what a search-based checker reaches.<sup>6</sup></p>
+
+      <table class="grid" data-anchor="orc-table-safety">
+        <tr><th>Safety property</th><th>What "bad" looks like</th></tr>
+        <tr><td>No lost committed writes</td><td>A write the system acknowledged is later simply gone.</td></tr>
+        <tr><td>No double-spend / uniqueness</td><td>Two clients are handed the same "exclusive" ID, balance, or lock.</td></tr>
+        <tr><td>Ordering</td><td>A response arrives implying an order the real-time record can't support.</td></tr>
+        <tr><td>Linearizability / serializability</td><td>No single legal sequential order explains every observed result.</td></tr>
+      </table>
+    </section>
+
+    <section data-anchor="orc-liveness">
+      <h2>Liveness and recovery: the other half of correctness</h2>
+      <p data-anchor="orc-p8">Everything so far checks that nothing bad happened. It says nothing about whether
+      anything <em>good</em> ever happens again. A cluster that partitions itself in half and then simply freezes,
+      forever, refusing every request &mdash; but never corrupting a single record &mdash; passes every safety
+      check in the previous section with flying colors. It is also completely useless, and DST needs an oracle for
+      that failure mode too.</p>
+
+      <div class="callout key" data-anchor="orc-callout-liveness-def">
+        <span class="tag">Key idea</span>
+        Lamport's other half of the split: a <b>liveness property</b> asserts that something good eventually
+        happens &mdash; the system converges, recovers, serves the next request. Unlike a safety violation, a
+        liveness violation can never be proven from a finite prefix: there is, formally, always more time left for
+        the good thing to still occur. Which means an implementable liveness oracle can't wait for "eventually"
+        &mdash; it has to pick a concrete bound and call the run stuck if the good thing hasn't happened by
+        then.<sup>3</sup> That bound is an engineering decision with a real trade-off, not a technicality: too
+        short, and correct-but-slow recovery reads as a false bug; too long, and a genuine stall burns CPU for
+        hours before anyone notices.
+      </div>
+
+      <p data-anchor="orc-p9">Two independent systems converge on the same shape of answer. FoundationDB checks
+      recoverability by returning its simulated hardware environment &mdash; after injecting whatever failures were
+      needed to break availability &mdash; to a state where recovery should be possible, then verifying the cluster
+      actually gets there.<sup>1</sup> TigerBeetle's VOPR simulator runs two explicit modes: a <b>safety</b> mode
+      that fuzzes faults continuously and checks invariants as it goes, and, once a run's safety-mode timeout
+      expires without the cluster answering every outstanding client request, a <b>liveness</b> mode that first
+      heals every non-correlated fault &mdash; clears partitions, lets the cluster settle &mdash; and only then
+      checks whether it actually recovers. Healing before checking is what separates "stuck because of a genuinely
+      unrecoverable fault, like a permanent partition with no reachable majority" from a real liveness bug in the
+      recovery path itself.<sup>7</sup></p>
+
+      <p data-anchor="orc-p10">A concrete bug that shape of check was built to catch: a replica broadcasts a
+      view-change message and, hearing back from no one, keeps re-triggering further view changes on its own
+      &mdash; a livelock where the cluster never settles back into normal operation and never processes another
+      transaction. No safety property is ever violated; nothing bad happens. The system just quietly stops doing
+      anything good, forever, and only a liveness watchdog notices.<sup>7</sup></p>
+
+      <div class="callout warn" data-anchor="orc-callout-liveness-warn">
+        <span class="tag">Watch out</span>
+        A cluster correctly refusing to make progress during a fault it genuinely cannot survive &mdash; a true
+        network split with no majority on either side &mdash; is not a liveness bug. A liveness oracle that checks
+        for recovery <em>before</em> the faults causing the stall are actually healed will flood you with false
+        positives. Heal first, then start the clock.
+      </div>
+    </section>
+
+    <section data-anchor="orc-reference">
+      <h2>When there's no simple invariant: reference models and metamorphic checks</h2>
+      <p data-anchor="orc-p11">Sometimes the correct answer genuinely can't be written as one assertion or one
+      safety property &mdash; the logic under test is itself the specification, and there's no independent
+      formula to check it against. Two more techniques cover that gap.</p>
+
+      <p data-anchor="orc-p12">A <em class="term-def">reference model</em> (or <em class="term-def">shadow
+      implementation</em>) is a second, deliberately simpler and independently-trusted model of what the system is
+      allowed to do, run alongside the real one and checked against it continuously rather than only at the end.
+      TigerBeetle's VOPR runs a <code class="inl">StateChecker</code> that hooks into every simulated replica and
+      checks each state transition against a reference model the instant it happens, using cryptographic hash
+      chaining to prove causality between transitions &mdash; a divergence is caught at the transition that caused
+      it, not discovered later as a downstream symptom.<sup>8</sup> This is the same idea as the workload
+      <code class="inl">CHECK</code> phase from earlier in the chapter, generalized: instead of one hand-written
+      invariant, an entire independent model of correct behavior runs the whole time.</p>
+
+      <p data-anchor="orc-p13"><em class="term-def">Metamorphic testing</em> sidesteps the oracle problem
+      differently, for cases where you don't know either the "true" model or a clean invariant, but you do know how
+      the output <em>should relate</em> to a transformed version of the input. The textbook example: you may not
+      know the exact numeric output of <code class="inl">sin(x)</code>, but you know it must equal
+      <code class="inl">sin(&pi; &minus; x)</code> for any <code class="inl">x</code> &mdash; if it doesn't, the
+      implementation is wrong, and you never had to know the "correct" value of either call.<sup>9</sup> The DST
+      analog: take a run that reached some final state, replay the same committed operations through a
+      <em>different</em> valid fault schedule or interleaving, and check the two runs land on the same final
+      application state &mdash; neither run's intermediate trace has to be independently "known correct" for the
+      comparison itself to be a real oracle.</p>
+
+      <table class="grid" data-anchor="orc-table-oracles">
+        <tr><th>Technique</th><th>What it needs</th><th>What it misses</th></tr>
+        <tr><td>Local assertion</td><td>An invariant you thought to write down</td><td>Anything you didn't think of</td></tr>
+        <tr><td>History / linearizability check</td><td>A recorded log with real-time bounds</td><td>Cost, at scale, without a graph-based checker</td></tr>
+        <tr><td>Reference model / shadow</td><td>An independently-trusted simpler model</td><td>Bugs the reference model shares with the real system</td></tr>
+        <tr><td>Metamorphic relation</td><td>A known relationship between transformed runs</td><td>Only as strong as the relation you picked</td></tr>
+        <tr><td>Liveness watchdog</td><td>Faults actually healed, plus a bound for "eventually"</td><td>Says nothing about whether the result was correct, only that one arrived</td></tr>
+      </table>
+
+      <p data-anchor="orc-p14">One vendor has turned this whole chapter into an SDK surface. Antithesis exposes two
+      kinds of test properties: an <b>Always</b> property, which must hold every time the assertion executes
+      anywhere across the run &mdash; the SDK form of the local invariant from the first section &mdash; and a
+      <b>Sometimes</b> property, which only needs to be observed true at least once across the entire session.
+      Sometimes properties aren't really correctness oracles by themselves; they're coverage oracles, confirming a
+      rare fault combination or code path was actually exercised at all during a run, since a check that never
+      fires can't meaningfully be said to have passed.<sup>10</sup></p>
+
+      <div class="reflect" data-anchor="orc-reflect">
+        <h4>If a run never crashes and never trips an assertion, have you verified anything &mdash; or only failed
+        to look?</h4>
+        <p>Only the second, unless one of the oracles in this chapter was actually watching for the specific bad
+        thing you care about. This is worth sitting with, because it's the same trap in a new outfit every time:
+        "we ran it and nothing broke" is a description of your test suite's blind spots, not evidence of
+        correctness, right up until you can name the safety property, the liveness bound, or the reference model
+        that was actually checking. An oracle that isn't specific to a claim isn't an oracle for that claim.</p>
+      </div>
+    </section>
+
+    <section data-anchor="orc-challenges-section">
+      <div class="challenges" data-anchor="orc-challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="orc-ch1">In the history-checker widget, the raw timeline of bars looks equally
+          plausible whether the underlying history turns out to be linearizable or not &mdash; you have to press
+          "Check history" to find out. Explain, in your own words, why that's true of real production logs too, not
+          just this toy widget.</li>
+          <li data-anchor="orc-ch2">A teammate says, "the overnight seed farm ran ten thousand seeds and nothing
+          crashed, so the release is safe." Using the symptom-vs-oracle distinction, name at least two classes of
+          bug that claim would miss entirely, and what oracle would need to be added to catch each one.</li>
+          <li data-anchor="orc-ch3">Sketch a metamorphic relation for a job queue: pick some transformation of the
+          input (e.g. submitting the same jobs in a different order, or duplicating a job) and state what should
+          stay true about the output regardless of that transformation, the way <code class="inl">sin(x) =
+          sin(&pi;&minus;x)</code> stays true regardless of the numeric value involved.</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="orc-sources-footer">
+        Sources: <sup>1</sup> FoundationDB documentation, <em>Simulation and Testing</em>.
+        <sup>2</sup> Zhou et al., <em>FoundationDB: A Distributed Key Value Store</em> (SIGMOD Record 2022).
+        <sup>3</sup> Lamport (with Owicki), <em>Proving Liveness Properties of Concurrent Programs</em> (TOPLAS 1982).
+        <sup>4</sup> Kingsbury &amp; Alvaro, <em>The Verification of a Distributed System</em> (ACM Queue, 2016).
+        <sup>5</sup> jepsen-io/knossos, <em>Verifies the linearizability of experimentally accessible histories</em>.
+        <sup>6</sup> Kingsbury &amp; Alvaro, <em>Elle: Inferring Isolation Anomalies from Experimental Observations</em> (PVLDB 2021).
+        <sup>7</sup> TigerBeetle, <em>Simulation Testing For Liveness</em>.
+        <sup>8</sup> TigerBeetle documentation, <em>Deterministic Simulation Testing (the VOPR)</em>.
+        <sup>9</sup> Wikipedia, <em>Metamorphic testing</em>.
+        <sup>10</sup> Antithesis documentation, <em>Properties</em> &amp; <em>Assertions</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-workloads-and-state-space-exploration.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-fault-models.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
+</html>
