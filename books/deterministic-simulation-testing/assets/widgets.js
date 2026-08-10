@@ -193,3 +193,120 @@ BookWidgets.register('adapter-swap', function(box, W){
   W.onRelayout(draw);
   draw();
 });
+
+/* event-queue: the engine room itself. A timestamp-ordered priority queue
+   drains one event at a time; "Step" always pops the earliest entry, jumps
+   the clock straight to it (never sleeps), and — deterministically, from
+   the same seed — may push zero, one, or two new events as that handler's
+   effects. Same seed pressed the same number of times produces the exact
+   same sequence of pops, in the exact same order, every time. */
+BookWidgets.register('event-queue', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var p = W.params(box);
+  var C = W.theme();
+  var seedInput = box.querySelector('.seed-input');
+  var readout = box.querySelector('.readout');
+  var seed = p.seed || 90210;
+
+  var KINDS = [
+    { k: 'net',   label: 'network deliver', spawns: [0, 1] },
+    { k: 'disk',  label: 'disk op done',     spawns: [0, 1] },
+    { k: 'timer', label: 'lease/deadline',   spawns: [0, 1, 1] },
+    { k: 'wake',  label: 'actor wakes',      spawns: [0, 0, 1] }
+  ];
+
+  var roll, clock, queue, popped, seq;
+
+  function reset(s){
+    seed = s;
+    roll = W.rng(seed);
+    clock = 0;
+    queue = [];
+    popped = 0;
+    seq = 0;
+    for(var i = 0; i < 6; i++) push(roll() * 4);
+  }
+
+  function push(dt){
+    var kind = KINDS[Math.floor(roll() * KINDS.length) % KINDS.length];
+    seq++;
+    queue.push({ t: clock + 0.3 + dt, kind: kind, id: seq });
+    queue.sort(function(a, b){ return a.t - b.t; });
+    if(queue.length > 9) queue.length = 9;
+  }
+
+  function step(){
+    if(!queue.length) return;
+    var ev = queue.shift();
+    clock = ev.t;
+    popped++;
+    var spawns = ev.kind.spawns;
+    var n = spawns[Math.floor(roll() * spawns.length) % spawns.length];
+    for(var i = 0; i < n; i++) push(roll() * 3);
+    draw();
+  }
+
+  function draw(){
+    if(!W.fitCanvas(cv)) return;
+    var ctx = cv.getContext('2d'), w = cv.__w, h = cv.__h;
+    ctx.clearRect(0, 0, w, h);
+
+    ctx.font = '11px "SF Mono",Menlo,Consolas,monospace';
+    ctx.fillStyle = C.ink; ctx.textAlign = 'left';
+    ctx.fillText('seed ' + seed + '  ·  ' + popped + ' popped', 12, 16);
+    ctx.font = 'bold 15px "SF Mono",Menlo,Consolas,monospace';
+    ctx.fillStyle = C.accent;
+    ctx.fillText('clock = ' + clock.toFixed(2), 12, 36);
+
+    var top = 52, rowH = Math.max(16, Math.min(24, (h - top - 8) / Math.max(1, queue.length)));
+    var maxT = queue.length ? queue[queue.length - 1].t : 1;
+    var barX = 90, barW = w - barX - 70;
+
+    queue.forEach(function(ev, i){
+      var y = top + i * rowH;
+      var frac = maxT > 0 ? (ev.t - clock) / (maxT - clock + 0.0001) : 0;
+      var bw = Math.max(3, frac * barW);
+
+      ctx.font = '10px "SF Mono",Menlo,Consolas,monospace';
+      ctx.fillStyle = i === 0 ? C.accent : C.soft;
+      ctx.textAlign = 'right';
+      ctx.fillText('t=' + ev.t.toFixed(2), barX - 8, y + rowH * 0.65);
+
+      ctx.fillStyle = i === 0 ? C.accent : C.grid;
+      ctx.globalAlpha = i === 0 ? 1 : 0.55;
+      ctx.fillRect(barX, y + 3, bw, rowH - 8);
+      ctx.globalAlpha = 1;
+
+      ctx.fillStyle = i === 0 ? C.paper : C.ink;
+      ctx.textAlign = 'left';
+      ctx.fillText(ev.kind.label, barX + 6, y + rowH * 0.65);
+    });
+
+    if(readout){
+      readout.textContent = queue.length
+        ? 'next: ' + queue[0].kind.label + ' at t=' + queue[0].t.toFixed(2) +
+          ' — press Step to pop it (the clock will jump straight there)'
+        : 'queue empty — press Replay to refill from this seed';
+    }
+  }
+
+  var stepBtn = box.querySelector('.step');
+  var replayBtn = box.querySelector('.replay');
+  var reseedBtn = box.querySelector('.reseed');
+  if(seedInput) seedInput.addEventListener('change', function(){
+    var v = parseInt(seedInput.value, 10);
+    if(isFinite(v)){ reset(v); draw(); }
+  });
+  if(stepBtn) stepBtn.addEventListener('click', step);
+  if(replayBtn) replayBtn.addEventListener('click', function(){ reset(seed); draw(); });
+  if(reseedBtn) reseedBtn.addEventListener('click', function(){
+    var v = Math.floor(Math.random() * 1000000);
+    if(seedInput) seedInput.value = v;
+    reset(v);
+    draw();
+  });
+
+  reset(seed);
+  W.onRelayout(draw);
+  draw();
+});
