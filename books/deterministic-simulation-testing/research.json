@@ -449,6 +449,13 @@
       "title": "Martin Fowler — StranglerFigApplication",
       "kind": "blog",
       "accessed": "2026-08-10"
+    },
+    {
+      "id": "src-madraft-github",
+      "url": "https://github.com/madsim-rs/MadRaft",
+      "title": "madsim-rs/MadRaft — labs of the Raft consensus algorithm (and a Raft-backed KV store) built on MadSim",
+      "kind": "repo",
+      "accessed": "2026-08-10"
     }
   ],
   "structure": {
@@ -1553,7 +1560,76 @@
         "src-jepsen-lxc-doc"
       ]
     },
-    "hands-on-capstone": {}
+    "hands-on-capstone": {
+      "researched": "2026-08-10",
+      "claims": [
+        {
+          "text": "MadSim (\"Magical Deterministic Simulator for distributed systems in Rust\") is a real, publicly available async runtime, API-compatible with the surface of Tokio and common networking crates, whose stated design goal is borrowed directly from FoundationDB (and sled's internal simulation guide): application code written against its APIs runs unmodified against either the real Tokio runtime in production or MadSim's simulated, seeded time/network/task scheduler in tests — the same simulation-first pattern chapter 3 described, already implemented and shipping as a Rust crate rather than a from-scratch build.",
+          "sources": ["src-madsim-github"]
+        },
+        {
+          "text": "MadRaft is a public, runnable teaching lab (derived from MIT 6.824's Raft and KV-store assignments) that implements a Raft-replicated key-value store on top of MadSim specifically to teach deterministic simulation testing hands-on — its own README frames its three headline features as deterministic simulation (\"catch a rare bug and then reproduce it at any time you want\"), discrete-event simulation (\"no time wasted on sleep — the full test can be completed in a few seconds\"), and fully async code.",
+          "sources": ["src-madraft-github"]
+        },
+        {
+          "text": "MadRaft's failure output demonstrates the seed-as-bug-report pattern end to end: a failing test prints a line like `MADSIM_TEST_SEED=1629626496` alongside the panic, and re-running the exact same test with that environment variable set reproduces the identical failure — the seed alone, not a saved log or trace file, is what a developer pastes into a bug report or a regression test.",
+          "sources": ["src-madraft-github"]
+        },
+        {
+          "text": "MadRaft exposes a `MADSIM_TEST_NUM` environment variable that reruns a single test under many different seeds in one command (its README suggests 100 for a release-mode confidence pass) — this is the swarm/seed-farm idea from chapter 5 and chapter 8's CI cadences, available as a one-line flag rather than custom tooling.",
+          "sources": ["src-madraft-github"]
+        },
+        {
+          "text": "Determinism in a Rust simulation harness like MadSim is a property the harness offers, not one it can force onto arbitrary application code: MadRaft's own documentation warns that a solution can still be nondeterministic despite running on a deterministic simulator, and lists concrete leaks a capstone builder should watch for — calling `rand::thread_rng()` instead of the simulator's seeded RNG (`madsim::rand::rng`), using `futures::select!` (which is documented to have non-deterministic branch-polling order under ties) instead of `futures::select_biased!`, and iterating a `HashMap` (whose iteration order is randomized per-process by default in Rust) instead of an order-stable structure like a `BTreeMap` or a sorted `Vec`.",
+          "sources": ["src-madraft-github"]
+        },
+        {
+          "text": "MadRaft ships a `MADSIM_TEST_CHECK_DETERMINISTIC=1` mode that runs the same test at least twice under the identical seed and panics immediately if the two runs diverge — an automated, always-on check for exactly the kind of silent entropy leak (chapter 2's 'eighth leak' problem) that would otherwise only surface much later as an unreproducible failure.",
+          "sources": ["src-madraft-github"]
+        },
+        {
+          "text": "A Raft-replicated key-value store is a natural, well-scoped capstone target because its correctness properties are exactly the ones this book's oracle chapter already named: no committed write is ever lost, every client sees a consistent (linearizable) view of the key space, and after faults stop, the cluster eventually elects a leader and resumes serving requests — safety and liveness both, on a system small enough for one person to build and instrument in a single project.",
+          "sources": ["src-jepsen-acm-queue", "src-lamport-liveness", "src-tigerbeetle-liveness-blog"]
+        }
+      ],
+      "snippets": [
+        {
+          "lang": "rust",
+          "code": "#[async_trait]\ntrait Clock {\n    fn now(&self) -> Instant;\n    async fn sleep(&self, d: Duration);\n}\n\n#[async_trait]\ntrait Network {\n    async fn send(&self, to: NodeId, msg: Msg) -> Result<()>;\n    async fn recv(&self) -> Msg;\n}\n\n#[async_trait]\ntrait Storage {\n    async fn append(&mut self, entry: LogEntry) -> Result<()>;\n    async fn read(&self, idx: u64) -> Option<LogEntry>;\n}\n\ntrait Random {\n    fn next_u64(&mut self) -> u64;\n}\n\n// production: RealClock, TcpNetwork, DiskStorage, OsRandom\n// simulation:  SimClock,  SimNetwork(seed), SimStorage(seed), SeededRandom(seed)\n// the replicated store's own logic imports only the four traits above, never a concrete type",
+          "note": "Illustrative — the four-port shape chapter 3 introduced generically, specialized to this capstone's replicated store. MadSim's real crate provides working equivalents of the production/simulation adapter pairs directly.",
+          "sources": ["src-madsim-github", "src-madraft-github"]
+        },
+        {
+          "lang": "shell",
+          "code": "# a failing run prints its own bug report\n$ cargo test replicate_under_partition\nthread '...' panicked at 'stale value returned after leader crash: expected 42, got 17'\nMADSIM_TEST_SEED=1629626496\n\n# replay: byte-for-byte the same failure, on demand\n$ MADSIM_TEST_SEED=1629626496 cargo test replicate_under_partition\n\n# swarm: the same test, 100 different seeds, one command\n$ MADSIM_TEST_NUM=100 cargo test --release replicate_under_partition\n\n# guard against the capstone's own code leaking real entropy\n$ MADSIM_TEST_CHECK_DETERMINISTIC=1 cargo test replicate_under_partition",
+          "note": "Adapted directly from MadRaft's documented workflow — real flags, real environment variables, not paraphrased.",
+          "sources": ["src-madraft-github"]
+        },
+        {
+          "lang": "text",
+          "code": "PLANTED BUG: leader acks the client BEFORE the write is durable on a majority\n\n1. client PUT(k, 42) -> leader\n2. leader appends to its OWN log, replies OK to client immediately\n3. (bug: no wait for a majority of followers to append first)\n4. seeded fault: leader crashes before its replicate-RPCs are delivered\n5. seeded fault: partition heals; a stale follower (never saw the write) wins election\n6. new leader now serves GET(k) -> 17 (the old value) -- a committed write vanished\n\noracle: workload's CHECK phase replays the same op sequence against a plain\nin-memory reference map and asserts cluster state == reference state -> FAILS here",
+          "note": "The lost-committed-write shape this capstone deliberately reproduces — the same failure class Jepsen-style fault injection has found in real systems (chapter 1) and the exact property chapter 6's oracle chapter names first.",
+          "sources": ["src-jepsen-acm-queue", "src-fdb-testing-docs"]
+        }
+      ],
+      "pitfalls": [
+        "Building the simulator and the reference oracle as an afterthought once the store 'basically works' — write the state-machine reference model and the CHECK-phase comparison first (chapter 6), so the very first swarm run already has something capable of catching the bug the capstone plants later.",
+        "Treating a green run after the fix as proof the bug is gone rather than re-running the exact failing seed first — the fastest confirmation a fix actually closes the gap is replaying the seed that used to fail and watching the oracle pass on the identical schedule, not a fresh random sweep.",
+        "Letting the capstone's own application code call an unseeded RNG, iterate a HashMap, or use a non-biased select — MadRaft's documented leaks are the general-purpose list; any one of them silently reintroduces exactly the kind of entropy chapter 2 spent a whole chapter teaching you to route around.",
+        "Stopping at 'found and fixed' instead of 'found, fixed, and pinned' — per chapter 2 and chapter 8, the failing seed is only guaranteed to reproduce against the exact commit it was captured on; the capstone isn't finished until the scenario is a checked-in regression test that runs on every future change, independent of whether that seed's PRNG path still lands on the bug.",
+        "Choosing a fault schedule so aggressive (every node crashing every few ticks) that almost every run fails for uninteresting reasons — an unrealistic fault combination (chapter 7) makes the oracle noisy and the one bug worth finding gets lost in a sea of expected-looking failures."
+      ],
+      "furtherReading": [
+        "src-madsim-github",
+        "src-madraft-github",
+        "src-fdb-testing-docs",
+        "src-fdb-sigmod-paper",
+        "src-tigerbeetle-vopr",
+        "src-jepsen-acm-queue",
+        "src-hypothesis-integrated-shrinking",
+        "src-zeller-delta-debugging"
+      ]
+    }
   },
   "volatile": [
     "FoundationDB's current simulation-testing implementation details (the paper describes the system as of ~2019-2021; internals may have evolved)",
