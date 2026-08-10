@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why Conventional Testing Fails — Deterministic Simulation Testing</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="pick">seed&gt;</span> Deterministic Simulation Testing</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section data-anchor="wctf-intro">
+      <p class="eyebrow">Chapter 01 &middot; Part I — The Problem &amp; The Idea</p>
+      <h1>Why Conventional Testing Fails</h1>
+      <p class="lead" data-anchor="wctf-lead">Here is a question worth sitting with: your unit tests are green, your
+      integration suite is green, QA signed off, and the thing still falls over in production at 3 a.m., in a way
+      nobody can reproduce. Why? Not "why did it break" — systems break, that's fine — but why didn't <em>any</em>
+      of the testing we did tell us it could?</p>
+      <p data-anchor="wctf-p1">The honest answer is a little uncomfortable: most of what we call "testing" was
+      invented for a world where a program is one thread doing one thing at a time, and where running it twice
+      does the same thing twice. A distributed system violates both of those assumptions constantly, on purpose —
+      that's what makes it distributed. So before we build a simulator to fix this, let's actually feel out why the
+      old tools can't.</p>
+    </section>
+
+    <section data-anchor="wctf-heisenbug">
+      <h2>Heisenbugs: the bug that vanishes when you look at it</h2>
+      <p data-anchor="wctf-p2">Physicists have a name for a measurement that disturbs the very thing it's measuring
+      — the Heisenberg uncertainty principle. Programmers stole the joke: a <em class="term-def">Heisenbug</em> is a
+      concurrency bug that changes behavior when you try to observe it. Attach a debugger, add a log line, even just
+      slow the program down a little to watch it — and the timing shifts just enough that the race no longer lines
+      up. The bug isn't gone. Your flashlight moved it.</p>
+      <p data-anchor="wctf-p3">This isn't folklore. Researchers built a tool called CHESS specifically because
+      Heisenbugs were eating engineering time at Microsoft: instead of hoping a bug's timing recurs, CHESS took
+      direct control of the thread scheduler and <em>drove</em> the program through interleavings on purpose. It
+      found bugs in code that had already been tested extensively by conventional means — and, crucially, once
+      found this way, each bug reproduced on demand, because the scheduler was no longer left to chance.<sup>1</sup></p>
+      <p data-anchor="wctf-p4">Why does ordinary testing miss what a controlled scheduler catches so easily? Count
+      it out. Two threads, each taking just two steps, already interleave four different ways. Run a normal test
+      and you get <em>one</em> of those orderings — whichever one your OS scheduler, your CPU, and the phase of the
+      moon happened to produce that millisecond. Real systems aren't two threads with two steps; they're dozens of
+      threads, processes, and network messages, each with many steps, and the count of possible orderings grows
+      combinatorially — on the order of n<sup>k</sup> for n threads taking k steps each.<sup>1</sup> Ordinary testing
+      doesn't explore that space. It samples one path from it, blindly, and hopes the bug happens to live there.</p>
+
+      <figure class="diagram-fig" data-anchor="wctf-fig-interleavings">
+        <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="wctf-d1-title">
+          <title id="wctf-d1-title">Two threads with two steps each already produce four possible interleavings; an ordinary test run walks only one of them, and the bug can be hiding in any of the others</title>
+          <text x="16" y="18" class="dim">2 threads &times; 2 steps = 4 interleavings (real systems: many threads &times; many steps)</text>
+
+          <circle cx="30" cy="105" r="5" class="stroke fill-soft"/>
+          <text x="12" y="128" class="dim">start</text>
+
+          <path d="M35 102 L175 52" class="stroke"/>
+          <path d="M35 108 L175 158" class="stroke-soft"/>
+          <circle cx="180" cy="50" r="5" class="stroke fill-soft"/>
+          <circle cx="180" cy="160" r="5" class="stroke-soft fill-soft"/>
+
+          <path d="M185 47 L375 25" class="stroke"/>
+          <path d="M185 53 L375 75" class="stroke-soft"/>
+          <path d="M185 157 L375 130" class="stroke-soft"/>
+          <path d="M185 163 L375 180" class="stroke-red dash"/>
+
+          <rect x="378" y="12" width="150" height="26" class="stroke fill-ink"/>
+          <text x="388" y="29" class="big on-ink">ordinary test run</text>
+
+          <rect x="378" y="62" width="150" height="26" class="stroke-soft"/>
+          <text x="388" y="79" class="big dim">unexplored</text>
+
+          <rect x="378" y="117" width="150" height="26" class="stroke-soft"/>
+          <text x="388" y="134" class="big dim">unexplored</text>
+
+          <rect x="378" y="167" width="150" height="26" class="stroke-red"/>
+          <text x="388" y="184" class="big red">the bug hides here</text>
+        </svg>
+        <figcaption><b>A test walks one path; the bug can be waiting on any of the others.</b> More interleavings
+        don't make a bug rarer to a real user hitting them all day — only rarer for a test that samples one ordering
+        at a time.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="wctf-flaky">
+      <h2>Flaky tests: the smoke alarm you keep unplugging</h2>
+      <p data-anchor="wctf-p5">A <em class="term-def">flaky test</em> is one that passes and fails on the same code,
+      with no changes in between. The usual suspects are exactly the ingredients of a distributed system: race
+      conditions between concurrent operations, timing assumptions like a hard-coded sleep that's "usually" long
+      enough, unseeded randomness, and dependence on a live network or external service whose latency simply
+      isn't the same twice.<sup>2</sup></p>
+      <p data-anchor="wctf-p6">Here's the trap: a flaky test isn't noise to be filtered out. It's a real bug,
+      caught in the act, that you're choosing not to look at. "Retry until green," quarantining the test, deleting
+      it — every one of those makes the CI dashboard calmer and tells you strictly less about your system than you
+      knew yesterday.</p>
+      <div class="callout warn" data-anchor="wctf-callout-flaky">
+        <span class="tag">Watch out</span>
+        A test that fails 1 run in 400 isn't "mostly reliable." It's a bug with a 1-in-400 reproduction rate — which
+        is a much harder bug than one that fails every time, not a more trustworthy test.
+      </div>
+    </section>
+
+    <section data-anchor="wctf-gray">
+      <h2>Partial failure and the gray-failure blind spot</h2>
+      <p data-anchor="wctf-p7">Conventional monitoring and most integration tests are built around a binary picture
+      of health: a node is up, or it's down. Reality is messier. A <em class="term-def">gray failure</em> is a
+      partial failure with <em>differential observability</em> — the monitoring system sees the node as healthy
+      while the application actually using it experiences it as failed or badly degraded.<sup>3</sup> The health
+      check pings fine. The disk still answers reads. And requests time out anyway, because the one queue that
+      matters is silently stuck.</p>
+      <p data-anchor="wctf-p8">By construction, a test — or a monitor — built around the failure modes someone
+      thought to check for will not see the failure modes nobody thought to check for. And as systems grow more
+      components and more cross-component interactions, gray failures don't get rarer; the research is blunt about
+      this — they get <em>more</em> common, because there are more rare-event interactions to compound.<sup>3</sup></p>
+      <div class="callout key" data-anchor="wctf-callout-gray">
+        <span class="tag">Key idea</span>
+        Partial failure isn't an edge case you can special-case away. It's the normal condition of a system large
+        enough to have parts that fail independently of each other.
+      </div>
+    </section>
+
+    <section data-anchor="wctf-kin">
+      <h2>Chaos, fuzzing, integration tests, model checking — kin, not substitutes</h2>
+      <p data-anchor="wctf-p9">None of this is a knock on the tools distributed-systems engineers already reach for.
+      Jepsen-style fault injection against real database clusters is how the field learned, empirically, that
+      widely used systems violated their own advertised guarantees — one well-known run found a Redis configuration
+      losing 56% of acknowledged writes under a particular partition, and some MongoDB configurations treating
+      network errors as successful acknowledgments.<sup>4</sup> That's real, valuable evidence. But it's evidence
+      of a different shape than what deterministic simulation gives you — and it's worth being precise about how
+      each technique earns its keep, because DST doesn't replace any of them.</p>
+
+      <table class="grid" data-anchor="wctf-table-compare">
+        <tr><th>Technique</th><th>What it actually does</th><th>Runs your real code?</th><th>Reproducible on demand?</th></tr>
+        <tr><td>Unit tests</td><td>Isolates one function or module, mocks its neighbors</td><td>Only partly — mocks stand in for real collaborators</td><td>Yes</td></tr>
+        <tr><td>Integration tests</td><td>Wires a handful of real components together through a few hand-picked scenarios</td><td>Mostly</td><td>Yes, but only for the scenarios someone thought to write</td></tr>
+        <tr><td>Chaos engineering / Jepsen</td><td>Injects real faults — partitions, crashes, clock jumps — into a real or real-like running cluster</td><td>Yes</td><td>No — the exact trace of a given run can't be walked back to</td></tr>
+        <tr><td>Fuzzing</td><td>Randomizes inputs to hunt for crashes and invariant violations</td><td>Yes, for the fuzzed component</td><td>Usually — the triggering input is the reproducer</td></tr>
+        <tr><td>Model checking (e.g. TLA+)</td><td>Exhaustively or systematically explores the state space of a <em>model</em> of the design</td><td>No — checks a model, not the shipped implementation</td><td>Yes, perfectly</td></tr>
+        <tr><td>Deterministic simulation</td><td>Runs real, unmodified system code against a simulated network, disk, clock and RNG, injecting faults on purpose</td><td>Yes</td><td>Yes — replay the seed</td></tr>
+      </table>
+      <p class="hint" data-anchor="wctf-table-hint">The last column is the whole story. Everything above deterministic
+      simulation in this table trades away either "runs your real code" or "reproducible on demand." DST is the row
+      that keeps both — which is precisely what the rest of this book is about building.</p>
+    </section>
+
+    <section data-anchor="wctf-reflect">
+      <div class="reflect" data-anchor="wctf-reflect-box">
+        <h4>But why does "more testing" not just fix this?</h4>
+        <p>Because more testing, done the conventional way, means more samples from a combinatorial space so large
+        that you'll never sample a meaningful fraction of it — and every sample you do take, you throw away the
+        moment the test finishes. You didn't map the space. You didn't even keep the one point you happened to
+        visit. The fix isn't "test harder." It's: stop leaving the ordering, the faults, and the timing to chance —
+        put a single number, a <em>seed</em>, in charge of all of them, so that whichever hostile timeline you
+        stumble into, you can walk straight back to it.</p>
+      </div>
+
+      <figure class="diagram-fig" data-anchor="wctf-fig-replay">
+        <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="wctf-d2-title">
+          <title id="wctf-d2-title">A production incident is seen once and cannot be reproduced; a simulated run with the same seed reaches the identical failure and can be replayed at will</title>
+          <text x="16" y="20">Production incident</text>
+          <rect x="16"  y="30" width="140" height="32" class="stroke fill-soft"/>
+          <rect x="196" y="30" width="160" height="32" class="stroke fill-soft"/>
+          <rect x="396" y="30" width="148" height="32" class="stroke-soft dash"/>
+          <text x="26"  y="51" class="big">3:07am page</text>
+          <text x="206" y="51" class="big">symptom in the logs</text>
+          <text x="406" y="51" class="big dim">can't reproduce</text>
+          <path d="M156 46 L196 46" class="stroke"/>
+          <path d="M188 42 L196 46 L188 50" class="stroke"/>
+          <path d="M356 46 L396 46" class="stroke-soft dash"/>
+
+          <path d="M16 96 L544 96" class="stroke-soft"/>
+
+          <text x="16" y="120" class="red">Simulated run</text>
+          <rect x="16"  y="130" width="140" height="32" class="stroke-red"/>
+          <rect x="196" y="130" width="160" height="32" class="stroke-red"/>
+          <rect x="396" y="130" width="148" height="32" class="stroke-red"/>
+          <text x="26"  y="151" class="big red mono">seed 0x9f2a</text>
+          <text x="206" y="151" class="big red">simulated execution</text>
+          <text x="406" y="151" class="big red">same failure</text>
+          <path d="M156 146 L196 146" class="stroke-red"/>
+          <path d="M188 142 L196 146 L188 150" class="stroke-red"/>
+          <path d="M356 146 L396 146" class="stroke-red"/>
+          <path d="M388 142 L396 146 L388 150" class="stroke-red"/>
+
+          <path d="M470 130 C470 108, 90 108, 86 130" class="stroke-red dash"/>
+          <path d="M92 124 L86 130 L94 134" class="stroke-red"/>
+          <text x="220" y="112" class="red">replay &#8635; — same seed, same failure, on demand</text>
+        </svg>
+        <figcaption><b>One seed, one hostile timeline, one exact replay.</b> The production incident is a rumor by
+        the time you've paged someone; the simulated run is evidence, because you can rerun it.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="wctf-challenges">
+      <div class="challenges">
+        <span class="tag">Try this</span>
+        <ol>
+          <li data-anchor="wctf-ch1">A test flakes once in 400 CI runs, and a teammate proposes a "retry until
+          green" step. In one sentence, why does that make the underlying bug harder to find, not easier?</li>
+          <li data-anchor="wctf-ch2">A monitoring dashboard shows every node green during an outage a customer just
+          reported. Name the failure mode this is, and explain why a synthetic health check missed it.</li>
+          <li data-anchor="wctf-ch3">You're handed a Jepsen report showing a database lost acknowledged writes under
+          a network partition. What can you deterministically reproduce from that report, and what can't you — and
+          why does that gap matter?</li>
+        </ol>
+      </div>
+
+      <p class="sources" data-anchor="wctf-sources">
+        Sources: <sup>1</sup> Musuvathi et al., <em>Finding and Reproducing Heisenbugs in Concurrent Programs</em>
+        (OSDI 2008). <sup>2</sup> Wikipedia, <em>Flaky test</em>.
+        <sup>3</sup> Huang et al., <em>Gray Failure: The Achilles' Heel of Cloud-Scale Systems</em> (HotOS 2017).
+        <sup>4</sup> Kingsbury &amp; Alvaro, <em>The Verification of a Distributed System</em> (ACM Queue).
+        See also Zhou et al., <em>FoundationDB: A Distributed Key Value Store</em> (SIGMOD 2021) and Antithesis,
+        <em>Deterministic simulation testing</em>.
+      </p>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="../index.html">&lsaquo; Prev</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="02-the-determinism-contract.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+</body>
+</html>
