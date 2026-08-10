@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scripting tmux — tmux: Productive Terminal Workspaces</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="tmux-productive-terminal-workspaces">
+
+<header class="book-topbar">
+  <span class="brand">tmux: Productive Terminal Workspaces</span>
+  <nav>
+    <a rel="home" href="../index.html">Contents</a>
+    <a href="../cheatsheet.html">Cheatsheet</a>
+  </nav>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <section class="chapter-open" data-anchor="c13-open">
+      <span class="chapter-part">Part V &mdash; Automation and Extensions</span>
+      <div class="chapter-num" aria-hidden="true">13</div>
+      <span class="chapter-kicker">The last two chapters scripted tmux without naming what they were doing. This chapter names it.</span>
+      <h1 data-anchor="c13-h1">Scripting tmux</h1>
+      <p data-anchor="c13-lede"><code>new-session -d</code>, <code>split-window</code>,
+      <code>send-keys ... C-m</code> &mdash; chapters ten and twelve already used all three from a shell
+      script, because there was never a separate scripting API to introduce. That's the actual point worth
+      stating plainly: every tmux command is available identically from a script, from <code>prefix :</code>,
+      and from a key binding. This chapter fills in the rest of that toolkit &mdash; reading a pane's output
+      back into a script, running conditional logic, and signaling between a driving script and a command
+      running inside tmux &mdash; the pieces chapters ten and twelve didn't need yet.</p>
+    </section>
+
+    <h2 data-anchor="c13-h-problem">The problem: a script that can only write, not read</h2>
+
+    <p data-anchor="c13-p1">Every script so far has been one-directional: type a command into a pane, never
+    check what happened. That's fine for starting a long-lived watcher, but it falls apart the moment a
+    script needs to know something back &mdash; did the build that just ran actually succeed, what's the
+    current pane's live directory, is a background command finished yet. Those all have answers tmux already
+    knows; the gap is a way for a script to ask.</p>
+
+    <h2 data-anchor="c13-h-target">Targets: naming exactly which pane</h2>
+
+    <p data-anchor="c13-p2">Every command that acts on a specific place takes <code>-t
+    session:window.pane</code> &mdash; chapter ten's scripts already used <code>dev:code.2</code> without
+    dwelling on it. The session part matches by exact name first, then by name-prefix, then as an
+    <code>fnmatch(3)</code> pattern; prefixing it with <code>=</code> forces an exact match only, which
+    matters once you have both a <code>work</code> session and a <code>work-2</code> session and don't want
+    a loosely-matched script accidentally landing in the wrong one.</p>
+
+    <h2 data-anchor="c13-h-read">Reading a pane back: capture-pane and display-message</h2>
+
+    <p data-anchor="c13-p3"><code>capture-pane -p</code> prints a pane's contents to stdout instead of into
+    a paste buffer &mdash; the piece that turns "type into a pane" into "pipe a pane's output into
+    <code>grep</code>." By default it only grabs the currently visible screen; <code>-S</code> and
+    <code>-E</code> set the starting and ending lines to reach into scrollback (<code>-S -100</code> for the
+    last hundred lines, <code>-S -</code> for the entire history), and <code>-J</code> joins wrapped lines
+    back into one, useful when a long single line of output got soft-wrapped by the pane's width.</p>
+
+    <pre data-anchor="c13-cmds-capture"><code><span class="cm"># does the visible screen mention an error?</span>
+tmux capture-pane -p -t mysession:0 | grep -i error
+
+<span class="cm"># the last 100 lines of scrollback, wrapped lines rejoined</span>
+tmux capture-pane -p -J -S -100 -E - -t mysession:0</code></pre>
+
+    <p data-anchor="c13-p4"><code>display-message -p 'format'</code> is the equivalent move for a single
+    live value rather than a pane's full text &mdash; it prints a format string (the same <code>#{...}</code>
+    language from chapter nine's status line) to stdout, expanded, so a script can capture it into a
+    variable:</p>
+
+    <pre data-anchor="c13-cmds-display"><code>current_pane=$(tmux display-message -p '#{pane_id}')
+echo "$current_pane"</code></pre>
+
+    <h2 data-anchor="c13-h-conditional">Conditional and background execution</h2>
+
+    <p data-anchor="c13-p5"><code>if-shell shell-command command [else-command]</code> runs
+    <code>shell-command</code> through <code>/bin/sh</code> and executes <code>command</code> on success,
+    <code>else-command</code> otherwise &mdash; the mechanism for a config file that needs to branch on
+    something the shell can test, like which OS it's running on. <code>run-shell shell-command</code> fires
+    a background shell command with no pane or window created for it; without <code>-b</code>
+    (backgrounded) and if the command produces output, that output briefly appears in copy mode in the
+    target pane once it finishes.</p>
+
+    <pre data-anchor="c13-cmds-ifshell"><code><span class="cm"># in tmux.conf: OS-specific clipboard setup</span>
+if-shell "uname | grep -q Darwin" "set -g default-command 'reattach-to-user-namespace -l $SHELL'"
+
+<span class="cm"># fire a background notification script from a binding</span>
+run-shell "~/.tmux/scripts/notify.sh"</code></pre>
+
+    <div class="callout warning" data-anchor="c13-warning-block">
+      <span class="callout-label">Both of these can stall tmux</span>
+      <p><code>if-shell</code> and <code>run-shell</code> both block tmux's command queue until the shell
+      command finishes, unless <code>run-shell</code> is explicitly backgrounded with <code>-b</code>. A
+      slow check placed directly in <code>tmux.conf</code> &mdash; a network call, a slow disk stat &mdash;
+      visibly stalls every subsequent line of config from loading, or stalls whatever key binding triggered
+      it. Keep shell-outs in configuration fast, or background them.</p>
+    </div>
+
+    <h2 data-anchor="c13-h-waitfor">Signaling between a script and a pane: wait-for</h2>
+
+    <p data-anchor="c13-p6"><code>wait-for channel</code>, called plainly, blocks the calling client until
+    another process runs <code>wait-for -S channel</code> against that same channel name &mdash; a simple
+    rendezvous primitive for the case where a driving script needs to know a command <em>inside</em> a pane
+    has actually finished, not just that it was launched:</p>
+
+    <pre data-anchor="c13-cmds-waitfor"><code><span class="cm"># inside the pane, appended after the real work finishes:</span>
+tmux wait-for -S build-done
+
+<span class="cm"># in the driving script, blocks until the pane signals:</span>
+tmux wait-for build-done
+echo "build finished"</code></pre>
+
+    <figure class="diagram-fig" data-anchor="c13-fig-waitfor">
+      <svg class="diagram" viewBox="0 0 560 130" role="img" aria-labelledby="c13figt1">
+        <title id="c13figt1">A driving script sends a command into a pane, then blocks on wait-for until the pane's own command signals the same channel when it finishes</title>
+
+        <rect x="16" y="16" width="200" height="98" class="stroke fill-bg"/>
+        <text x="28" y="36" class="dim">driving script</text>
+        <text x="28" y="58" class="mono">send-keys ... build</text>
+        <text x="28" y="78" class="mono red">wait-for build-done</text>
+        <text x="28" y="98" class="dim">(blocks here)</text>
+
+        <path d="M216 58 L340 58" class="stroke"/>
+        <path d="M332 54 L340 58 L332 62" class="stroke"/>
+
+        <rect x="340" y="16" width="204" height="98" class="stroke fill-soft"/>
+        <text x="352" y="36" class="dim">pane</text>
+        <text x="352" y="58" class="mono">runs the build...</text>
+        <text x="352" y="80" class="mono red">wait-for -S build-done</text>
+
+        <path d="M340 90 L216 90" class="stroke-red dash"/>
+        <path d="M224 86 L216 90 L224 94" class="stroke-red"/>
+        <text x="230" y="82" class="red">signal</text>
+      </svg>
+      <figcaption><b>A rendezvous, not a poll.</b> The driving script blocks cheaply on
+      <code>wait-for</code> instead of repeatedly checking <code>capture-pane</code> in a loop for output
+      that means "done."</figcaption>
+    </figure>
+
+    <h2 data-anchor="c13-h-workflow">A realistic workflow: a checked build script</h2>
+
+    <p data-anchor="c13-p7">Putting several of these together: open a session with panes each running a
+    different long-lived command (the chapter ten/twelve shape), then use <code>capture-pane</code> to check
+    one pane's recent output before deciding what to do next &mdash; a smoke test that confirms a server
+    actually came up before running anything against it, without a human ever watching the pane directly.</p>
+
+    <pre data-anchor="c13-cmds-full"><code>#!/usr/bin/env bash
+set -euo pipefail
+SESSION=checked
+
+tmux new-session -d -s "$SESSION" -n main
+tmux split-window -h -t "$SESSION":main
+tmux split-window -v -t "$SESSION":main.1
+tmux select-layout -t "$SESSION":main tiled
+
+tmux send-keys -t "$SESSION":main.0 'tail -f /var/log/syslog' C-m
+tmux send-keys -t "$SESSION":main.1 'htop' C-m
+tmux send-keys -t "$SESSION":main.2 'npm run dev' C-m
+
+sleep 3
+if tmux capture-pane -p -t "$SESSION":main.2 | grep -qi 'ready'; then
+  echo "dev server is up"
+else
+  echo "dev server did not report ready in time"
+fi
+
+tmux attach -t "$SESSION"</code></pre>
+
+    <div class="callout exercise" data-anchor="c13-exercise">
+      <span class="callout-label">Try it</span>
+      <ol>
+        <li>Adapt the script above to a project you have, swapping <code>npm run dev</code> for a real
+        long-lived command and the <code>grep</code> pattern for text that command actually prints on
+        success.</li>
+        <li>Run it, and confirm the "is up" check reports correctly both when the command starts cleanly
+        and (comment out the real command to test) when it doesn't.</li>
+        <li>Add a <code>wait-for</code> pair: append <code>; tmux wait-for -S done</code> to one pane's
+        <code>send-keys</code> command, then add a bare <code>tmux wait-for done</code> to the script right
+        before the final <code>attach</code>, and confirm the script now blocks until that pane's command
+        actually finishes.</li>
+      </ol>
+    </div>
+
+    <div class="callout mistake" data-anchor="c13-mistake">
+      <span class="callout-label">Common mistake</span>
+      <p><strong>Reading a pane's output before the command has had time to produce any.</strong>
+      <code>send-keys</code> returns as soon as the keystrokes are delivered, not when the program they
+      started has produced output &mdash; a <code>capture-pane</code> or <code>wait-for</code> placed
+      immediately after a <code>send-keys</code> call for a slow-starting program will see an empty or
+      half-started pane. A short <code>sleep</code>, a <code>wait-for</code> signal from inside the pane
+      itself, or a loop polling <code>capture-pane</code> for expected text are all more reliable than
+      assuming the command has already produced its output by the next line of the script.</p>
+    </div>
+
+    <p data-anchor="c13-p8">Scripting drives tmux from the outside. Plugins extend it from the inside &mdash;
+    and unlike everything in this chapter, a plugin's code runs automatically, on every start, whether or
+    not you remember what it does. That's worth being deliberate about, next.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="12-reproducible-project-workspaces.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="14-plugins-use-them-deliberately.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
