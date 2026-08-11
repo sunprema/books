@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Errors: anyhow at the Edges, thiserror in the Core &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch7-intro">
+      <p class="eyebrow">Chapter 07 &middot; Part III — Rust Craft in the Middle</p>
+      <h1>Errors: <code class="inl">anyhow</code> at the Edges, <code class="inl">thiserror</code> in the Core</h1>
+      <p class="lead" data-anchor="ch7-lead">We are about to enter the half of this program that changes
+      your files, and almost everything in it can fail. So it is worth stopping for one short chapter on
+      how this codebase says &ldquo;no.&rdquo; It uses two error crates &mdash; which sounds like
+      indecision, and is in fact the single most useful convention in the Rust ecosystem.</p>
+    </section>
+    <section data-anchor="ch7-question">
+      <h2>One question decides which crate you want</h2>
+      <p data-anchor="ch7-p1"><em>Does the caller need to do something different depending on which failure
+      happened?</em></p>
+      <p data-anchor="ch7-p2">If yes, the caller must be able to <code class="inl">match</code>, which
+      means the error needs a <em>type</em> with named variants. That is
+      <code class="inl">thiserror</code>: a derive macro that writes the boilerplate for a custom error
+      enum. If no &mdash; if the error is going to be printed, logged, and turned into a non-zero exit code
+      &mdash; then a type is overhead and what you want is a good message with context attached. That is
+      <code class="inl">anyhow</code>.</p>
+      <p data-anchor="ch7-p3">The usual formulation is &ldquo;<code class="inl">thiserror</code> for
+      libraries, <code class="inl">anyhow</code> for applications.&rdquo; This project is both at once
+      &mdash; a library crate and a binary that consumes it &mdash; so it draws the line inside itself,
+      and drawing it is the interesting part.</p>
+
+      <figure class="diagram-fig" data-anchor="ch7-fig-split">
+        <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="ch7-d1-title">
+          <title id="ch7-d1-title">The CLI and engine entry points use anyhow, while the funnel, planner and executor define typed thiserror enums that the layers above match on</title>
+          <text x="16" y="16" class="dim">typed where a decision follows; contextual where a human reads it</text>
+
+          <rect x="16" y="28" width="240" height="26" class="stroke fill-soft"/>
+          <text x="26" y="45" class="big">main.rs &mdash; prints, exits</text>
+          <text x="272" y="45" class="mono">anyhow::Result</text>
+
+          <rect x="16" y="62" width="240" height="26" class="stroke fill-soft"/>
+          <text x="26" y="79" class="big">lib.rs &mdash; engine entry points</text>
+          <text x="272" y="79" class="mono">anyhow::Result + Context</text>
+
+          <path d="M16 100 L544 100" class="stroke-red dash"/>
+          <text x="16" y="114" class="red">below this line, a caller branches on the variant</text>
+
+          <rect x="16" y="122" width="164" height="24" class="stroke-red"/>
+          <text x="26" y="138" class="big red mono">HashError</text>
+          <text x="26" y="160" class="dim">2 variants &mdash; funnel counts</text>
+
+          <rect x="196" y="122" width="164" height="24" class="stroke-red"/>
+          <text x="206" y="138" class="big red mono">PreflightError</text>
+          <text x="206" y="160" class="dim">11 variants &mdash; CLI prints why</text>
+
+          <rect x="376" y="122" width="168" height="24" class="stroke-red"/>
+          <text x="386" y="138" class="big red mono">TxnError</text>
+          <text x="386" y="160" class="dim">6 variants &mdash; rollback + journal</text>
+        </svg>
+        <figcaption><b>Two crates, one line.</b> Above the line an error is a message; below it, an error is
+        a decision.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="ch7-smallest">
+      <h2>The smallest typed error in the program</h2>
+      <p data-anchor="ch7-p4">We met this one in the last chapter. Two variants, and both of them exist
+      because the funnel counts them into different columns:</p>
+      <div class="listing" data-anchor="ch7-hasherror">
+  <p class="srcref"><span class="path">src/index/hasher.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Why a funnel stage could not hash a candidate.</span>
+<span class="mac">#[derive(Debug, thiserror::Error)]</span>
+<span class="kw">pub</span> <span class="kw">enum</span> <span class="ty">HashError</span> {
+    <span class="cm">/// The file changed (or vanished, or stopped being a regular file)</span>
+    <span class="cm">/// since it was scanned. The filesystem is mutable; stale candidates</span>
+    <span class="cm">/// simply drop out of the funnel.</span>
+    <span class="mac">#[error("file changed since scan")]</span>
+    <span class="ty">Stale</span>,
+    <span class="mac">#[error(transparent)]</span>
+    <span class="ty">Io</span>(<span class="mac">#[from]</span> std::io::<span class="ty">Error</span>),
+}</pre>
+</div>
+      <p data-anchor="ch7-p5">Four pieces of machinery in nine lines. Let's name each one.</p>
+
+      <h3><code class="inl">#[derive(thiserror::Error)]</code></h3>
+      <p data-anchor="ch7-p6">Generates the <code class="inl">std::error::Error</code> implementation
+      &mdash; the trait that makes a type a first-class error: printable, chainable, usable with
+      <code class="inl">?</code> and with <code class="inl">anyhow</code>. Written by hand this is twenty
+      lines of <code class="inl">impl Display</code> and <code class="inl">impl Error</code>. Note also
+      that <code class="inl">Debug</code> is still derived normally &mdash;
+      <code class="inl">thiserror</code> does not do that one for you, and the trait requires it.</p>
+
+      <h3><code class="inl">#[error("&hellip;")]</code></h3>
+      <p data-anchor="ch7-p7">The <code class="inl">Display</code> text for that variant. This is the string
+      a user will read, so it is written for a user: <em>&ldquo;file changed since scan&rdquo;</em>, not
+      <em>&ldquo;StaleCandidateError&rdquo;</em>. The format string may interpolate the variant's fields
+      &mdash; <code class="inl">{0}</code> for a tuple field, <code class="inl">{name}</code> for a named
+      one &mdash; which we will see used in a moment.</p>
+
+      <h3><code class="inl">#[from]</code></h3>
+      <p data-anchor="ch7-p8">Generates
+      <code class="inl">impl From&lt;std::io::Error&gt; for HashError</code>. That single line is what makes
+      <code class="inl">let mut file = File::open(path)?;</code> work inside a function returning
+      <code class="inl">Result&lt;_, HashError&gt;</code>. The <code class="inl">?</code> operator is not
+      magic: on the error path it calls <code class="inl">From::from</code> to convert whatever it caught
+      into the function's declared error type. <code class="inl">#[from]</code> supplies that conversion.</p>
+
+      <h3><code class="inl">#[error(transparent)]</code></h3>
+      <p data-anchor="ch7-p9">&ldquo;Do not add a message of my own; forward
+      <code class="inl">Display</code> and <code class="inl">source</code> straight through to the wrapped
+      error.&rdquo; So an underlying <em>&ldquo;Permission denied (os error 13)&rdquo;</em> prints exactly
+      that, rather than <em>&ldquo;hash error: Permission denied (os error 13)&rdquo;</em>. Use it whenever
+      your variant is pure pass-through; use a message when your variant genuinely adds information.</p>
+      <p class="hint" data-anchor="ch7-p10">Both patterns are visible in the same enum here, which makes it
+      a good nine lines to keep bookmarked.</p>
+    </section>
+
+    <section data-anchor="ch7-preflight">
+      <h2>Eleven variants that are really a safety policy</h2>
+      <p data-anchor="ch7-p11">Now the big one. Read this as a list of the reasons this program will refuse
+      to touch your file &mdash; because that is exactly what it is:</p>
+      <div class="listing" data-anchor="ch7-preflighterror">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="mac">#[derive(Debug, thiserror::Error)]</span>
+<span class="kw">pub</span> <span class="kw">enum</span> <span class="ty">PreflightError</span> {
+    <span class="mac">#[error("target is not a regular file")]</span>
+    <span class="ty">TargetNotRegular</span>,
+    <span class="mac">#[error("source is not a regular file")]</span>
+    <span class="ty">SourceNotRegular</span>,
+    <span class="mac">#[error("target changed since scan (size, mtime, or inode differs)")]</span>
+    <span class="ty">TargetChanged</span>,
+    <span class="mac">#[error("target has additional hardlinks; replacing it would break them")]</span>
+    <span class="ty">TargetHardlinked</span>,
+    <span class="mac">#[error("source and target are the same inode")]</span>
+    <span class="ty">SameInode</span>,
+    <span class="mac">#[error("source and target are on different volumes; APFS clones are same-volume only")]</span>
+    <span class="ty">DifferentVolume</span>,
+    <span class="mac">#[error("target volume is not APFS")]</span>
+    <span class="ty">NotApfs</span>,
+    <span class="mac">#[error("target is immutable (uchg/schg flag set)")]</span>
+    <span class="ty">TargetImmutable</span>,
+    <span class="mac">#[error("source is not readable: {0}")]</span>
+    <span class="ty">SourceUnreadable</span>(<span class="ty">String</span>),
+    <span class="mac">#[error("target directory is not writable")]</span>
+    <span class="ty">DirNotWritable</span>,
+    <span class="mac">#[error(transparent)]</span>
+    <span class="ty">Io</span>(<span class="mac">#[from]</span> std::io::<span class="ty">Error</span>),
+}</pre>
+</div>
+      <p data-anchor="ch7-p12">Ten named refusals and one pass-through. Every message is a complete
+      sentence aimed at a person, and several of them explain <em>why</em> rather than only
+      <em>what</em>: &ldquo;replacing it would break them,&rdquo; &ldquo;APFS clones are same-volume
+      only.&rdquo;</p>
+      <p data-anchor="ch7-p13">Here is why that matters. The CLI does not translate these into
+      user-facing copy. It prints them:</p>
+      <div class="listing" data-anchor="ch7-skip-print">
+  <p class="srcref"><span class="path">src/main.rs</span><span class="what">inside run_dry_run, verbatim</span></p>
+  <pre class="rs">            <span class="ty">Err</span>(err) =&gt; {
+                <span class="mac">println!</span>(<span class="str">"  target  {}   SKIP — {err}"</span>, plan.target.display());
+            }</pre>
+</div>
+      <div class="term" data-anchor="ch7-term-skip">
+  <div class="term-bar"><span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span><span class="term-title">filecleaner reclaim --group 4</span></div>
+  <pre><b>$</b> filecleaner reclaim --group 4
+Group 4 — dry run (nothing will be modified)
+  source  /Users/you/Documents/notes.md
+  target  /Users/you/Documents/drafts/notes.md   SKIP — target changed since scan (size, mtime, or inode differs)
+  target  /Users/you/Documents/archive/notes.md   SKIP — target has additional hardlinks; replacing it would break them
+Would reclaim (estimate): 0 B. Content is re-verified byte-for-byte at reclaim time.
+Run with --confirm to apply.</pre>
+</div>
+      <div class="callout key" data-anchor="ch7-callout-onetext">
+        <span class="tag">Key idea</span>
+        The error type and the user-facing text are <strong>the same string, written once</strong>. There is
+        no mapping table in <code class="inl">main.rs</code> from variant to message that could drift out of
+        sync with the enum, and adding a twelfth refusal automatically means the CLI can explain it. That
+        is <code class="inl">Display</code> earning its keep.
+      </div>
+      <p data-anchor="ch7-p14">Note the one variant carrying data:
+      <code class="inl">SourceUnreadable(String)</code>, whose message interpolates it with
+      <code class="inl">{0}</code>. &ldquo;Not readable&rdquo; is not actionable on its own &mdash; the user
+      needs to know whether it was permissions or a vanished file &mdash; so the underlying reason is
+      carried along. Compare that to <code class="inl">DirNotWritable</code>, where there is nothing to add:
+      the check that produced it was a boolean.</p>
+    </section>
+
+    <section data-anchor="ch7-txnerror">
+      <h2>Composing one typed error out of another</h2>
+      <div class="listing" data-anchor="ch7-txnerror">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="mac">#[derive(Debug, thiserror::Error)]</span>
+<span class="kw">pub</span> <span class="kw">enum</span> <span class="ty">TxnError</span> {
+    <span class="mac">#[error("preflight failed: {0}")]</span>
+    <span class="ty">Preflight</span>(<span class="mac">#[from]</span> <span class="ty">PreflightError</span>),
+    <span class="mac">#[error("identity verification failed: {0}")]</span>
+    <span class="ty">Identity</span>(<span class="ty">String</span>),
+    <span class="mac">#[error("temp clone verification failed: {0}")]</span>
+    <span class="ty">TempVerify</span>(<span class="ty">String</span>),
+    <span class="mac">#[error("final validation failed: {0}")]</span>
+    <span class="ty">FinalValidation</span>(<span class="ty">String</span>),
+    <span class="mac">#[error(transparent)]</span>
+    <span class="ty">Io</span>(<span class="mac">#[from]</span> io::<span class="ty">Error</span>),
+    <span class="mac">#[error("database error: {0}")]</span>
+    <span class="ty">Db</span>(<span class="ty">String</span>),
+}</pre>
+</div>
+      <p data-anchor="ch7-p15">The first variant is the interesting one.
+      <code class="inl">Preflight(#[from] PreflightError)</code> means a
+      <code class="inl">PreflightError</code> converts automatically into a
+      <code class="inl">TxnError</code> &mdash; which is precisely why the executor can open with a single
+      line:</p>
+      <pre class="rs" data-anchor="ch7-preflight-call">    planner::preflight(plan, adapter)?;</pre>
+      <p data-anchor="ch7-p16">No <code class="inl">map_err</code>, no
+      <code class="inl">match</code>. And unlike the <code class="inl">Io</code> variant, this one keeps a
+      prefix &mdash; <code class="inl">"preflight failed: {0}"</code> &mdash; because knowing that a
+      transaction died <em>during preflight</em> rather than mid-swap is information the reader wants.
+      Compare with <code class="inl">#[error(transparent)]</code> on the line below: same mechanism,
+      opposite decision, and both are right.</p>
+      <p data-anchor="ch7-p17">Three variants carry a <code class="inl">String</code> rather than a
+      structured cause: <code class="inl">Identity</code>, <code class="inl">TempVerify</code>,
+      <code class="inl">FinalValidation</code>. These are the &ldquo;we checked and it did not match&rdquo;
+      failures, where the interesting detail is a human explanation like <em>&ldquo;source and target
+      resource forks differ&rdquo;</em>, and no caller is going to branch on <em>which</em> mismatch. It is
+      a pragmatic middle ground: typed enough to distinguish the <em>stage</em>, loose enough not to invent
+      a taxonomy nobody will match on.</p>
+      <p data-anchor="ch7-p18"><code class="inl">Db(String)</code> is the same pragmatism from the other
+      direction. The database returns an <code class="inl">anyhow::Error</code>, which cannot be a
+      <code class="inl">source</code> for a <code class="inl">thiserror</code> variant, so it is flattened
+      to its message. That is a real seam between the two crates, and this is how it is paid for.</p>
+    </section>
+
+    <section data-anchor="ch7-anyhow">
+      <h2>Above the line: context, not types</h2>
+      <p data-anchor="ch7-p19">Now the other half. At the engine's edges, failures are for reading, and
+      <code class="inl">anyhow</code>'s job is to make sure that by the time one reaches a human it says
+      <em>which</em> thing failed:</p>
+      <div class="listing" data-anchor="ch7-with-context">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">inside run_scan, verbatim</span></p>
+  <pre class="rs">        <span class="kw">let</span> canonical = root
+            .canonicalize()
+            .with_context(|| <span class="mac">format!</span>(<span class="str">"cannot access scan root {}"</span>, root.display()))?;</pre>
+</div>
+      <p data-anchor="ch7-p20">Without that line the user sees <em>&ldquo;No such file or directory
+      (os error 2)&rdquo;</em> and has no idea which of the four paths they typed was wrong. With it they
+      see the context and the cause, chained. And <code class="inl">with_context</code> takes a closure, so
+      the <code class="inl">format!</code> only runs on the error path &mdash; free when things go well.</p>
+      <p data-anchor="ch7-p21">The same trick works on <code class="inl">Option</code>, and this is my
+      favourite instance of it in the codebase:</p>
+      <div class="listing" data-anchor="ch7-context-option">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">inside list_groups, verbatim</span></p>
+  <pre class="rs">    <span class="kw">let</span> scan_id = <span class="kw">match</span> scan_id {
+        <span class="ty">Some</span>(id) =&gt; id,
+        <span class="ty">None</span> =&gt; db
+            .latest_scan_id()?
+            .context(<span class="str">"no completed scans in the index; run `filecleaner scan` first"</span>)?,
+    };</pre>
+</div>
+      <p data-anchor="ch7-p22">Remember chapter 5, where <code class="inl">latest_scan_id</code>
+      carefully converted &ldquo;no rows&rdquo; into <code class="inl">Ok(None)</code>? This is the payoff.
+      The <code class="inl">None</code> becomes an error whose message tells the user exactly what to do
+      next. A tool that says <em>&ldquo;here is what to type&rdquo;</em> instead of
+      <em>&ldquo;none&rdquo;</em> is a tool people can use without reading the manual.</p>
+      <p data-anchor="ch7-p23">And because <code class="inl">main</code> itself returns
+      <code class="inl">anyhow::Result&lt;()&gt;</code>, no error handling is needed at the top at all
+      &mdash; a <code class="inl">?</code> anywhere in <code class="inl">main</code> prints the message,
+      prints its chain of causes, and exits non-zero:</p>
+      <div class="listing" data-anchor="ch7-main-sig">
+  <p class="srcref"><span class="path">src/main.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;()&gt; {
+    <span class="kw">let</span> cli = <span class="ty">Cli</span>::parse();</pre>
+</div>
+    </section>
+
+    <section data-anchor="ch7-aliases">
+      <h2>Two type aliases that keep signatures honest</h2>
+      <p data-anchor="ch7-p24">One last touch. The engine returns per-target outcomes, and the raw types
+      are a mouthful, so <code class="inl">lib.rs</code> names them:</p>
+      <div class="listing" data-anchor="ch7-aliases">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Per-target outcome of a dry run: the plan plus its preflight verdict.</span>
+<span class="kw">pub</span> <span class="kw">type</span> <span class="ty">DryRunResult</span> = (<span class="ty">TxnPlan</span>, <span class="ty">Result</span>&lt;(), <span class="ty">PreflightError</span>&gt;);
+<span class="cm">/// Per-target outcome of an executed reclaim.</span>
+<span class="kw">pub</span> <span class="kw">type</span> <span class="ty">ReclaimResult</span> = (<span class="ty">TxnPlan</span>, <span class="ty">Result</span>&lt;<span class="ty">TxnReport</span>, <span class="ty">TxnError</span>&gt;);</pre>
+</div>
+      <p data-anchor="ch7-p25">Notice the shape: a <code class="inl">Vec</code> of these, not a
+      <code class="inl">Result&lt;Vec&lt;&hellip;&gt;&gt;</code>. Reclaiming a group of five files is five
+      independent operations, and the third one failing must not discard the results of the first two. So
+      the outcome is &ldquo;here is what happened to each target,&rdquo; and every entry carries both the
+      plan (so the caller can name the file) and its verdict.</p>
+      <p data-anchor="ch7-p26">The <code class="inl">Vec&lt;Result&gt;</code> versus
+      <code class="inl">Result&lt;Vec&gt;</code> choice is one of those small decisions that determines
+      whether a tool feels solid. Here it is what allows the CLI to end a run with
+      <em>&ldquo;Reclaimed (estimate): 1.2 GiB; 1 target(s) failed and were rolled back&rdquo;</em> instead
+      of a single sentence about the first thing that went wrong.</p>
+    </section>
+
+    <section data-anchor="ch7-reflect">
+      <div class="reflect" data-anchor="ch7-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A rule you can apply tomorrow, in your own code. Ask of every failure: <em>does someone branch
+        on this?</em> If a caller counts it, retries it, rolls back because of it, or prints a specific
+        sentence for it &mdash; give it a variant. If it is going to be shown to a human and nothing else
+        &mdash; give it context and move on.</p>
+        <p>In this program the answer split cleanly at the library boundary, and the payoff is concrete:
+        the funnel can count stale files separately from unreadable ones, the CLI can tell you exactly why
+        each target was skipped, and the executor can decide how far to roll back &mdash; all without a
+        single <code>if err.to_string().contains(&hellip;)</code> anywhere in the codebase.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch7-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li><code class="inl">TxnError::Db(String)</code> flattens an <code class="inl">anyhow::Error</code>
+          into text, losing its chain. Change <code class="inl">db.rs</code> to return a typed error and
+          follow the change outward &mdash; is the result better, or just longer?</li>
+          <li><code class="inl">PreflightError::Io</code> is <code class="inl">transparent</code> while
+          <code class="inl">TxnError::Preflight</code> has a prefix. Write out the exact message a user sees
+          when an I/O error happens during preflight inside a transaction, following both attributes.</li>
+          <li>Find a failure in this codebase that is currently a <code class="inl">String</code> and that
+          you think a caller <em>should</em> branch on. Propose the variant, and name the caller.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://docs.rs/thiserror/latest/thiserror/">thiserror crate documentation</a></li>
+          <li><a href="https://docs.rs/anyhow/latest/anyhow/">anyhow crate documentation</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/hasher.rs">file_cleaner &mdash; src/index/hasher.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/planner.rs">file_cleaner &mdash; src/txn/planner.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/executor.rs">file_cleaner &mdash; src/txn/executor.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/lib.rs">file_cleaner &mdash; src/lib.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/main.rs">file_cleaner &mdash; src/main.rs</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-the-candidate-funnel.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-the-apfs-trait-seam.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

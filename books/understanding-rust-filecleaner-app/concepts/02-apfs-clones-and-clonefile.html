@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APFS Clones, and Calling clonefile from Rust &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch2-intro">
+      <p class="eyebrow">Chapter 02 &middot; Part I — Orientation</p>
+      <h1>APFS Clones, and Calling <code class="inl">clonefile</code> from Rust</h1>
+      <p class="lead" data-anchor="ch2-lead">Everything in the previous chapter rested on a claim I
+      have not yet justified: that you can have two independent files that occupy the space of one. That
+      sounds like it should be impossible. A file is its bytes; two files, two sets of bytes. So before
+      we write a line of Rust, let's ask the filesystem what it actually offers &mdash; and then look at
+      the two dozen lines that reach it.</p>
+    </section>
+    <section data-anchor="ch2-four">
+      <h2>Four ways to have the same data twice</h2>
+      <p data-anchor="ch2-p1">Unix has offered three of them for decades, and macOS added a fourth.</p>
+      <p data-anchor="ch2-p2">A <em class="term-def">copy</em> is the obvious one: new inode, new blocks,
+      double the space. Perfectly independent, perfectly expensive. A <em class="term-def">hard link</em>
+      is the opposite trade: two directory entries pointing at <em>the same inode</em>. One set of blocks,
+      no extra space &mdash; but also one file wearing two names. Change it through either name and both
+      &ldquo;files&rdquo; change, because there was only ever one. A <em class="term-def">symlink</em>
+      sidesteps the question: it is a tiny file containing a path, and anything that reads it is really
+      reading the target. Delete the target and the link dangles.</p>
+      <p data-anchor="ch2-p3">The fourth is the <em class="term-def">APFS clone</em>, and it is the one
+      that makes this application possible. A clone is a genuinely new inode &mdash; its own metadata, its
+      own permissions, its own timestamps &mdash; whose file structure initially points at the
+      <em>same physical extents</em> as the original. No bytes are copied. And the moment either file is
+      written to, the filesystem quietly gives that file private storage for the blocks that changed. That
+      last property is <em class="term-def">copy-on-write</em>, and it is what buys back the independence
+      a hard link throws away.</p>
+
+      <figure class="diagram-fig" data-anchor="ch2-fig-cow">
+        <svg class="diagram" viewBox="0 0 560 258" role="img" aria-labelledby="ch2-d1-title">
+          <title id="ch2-d1-title">Before cloning, two files each own four disk blocks. After cloning, both file records point at the same four blocks. After one file is edited, only the changed block is duplicated.</title>
+
+          <text x="16" y="16" class="dim">before &mdash; two files, eight blocks</text>
+          <rect x="16" y="26" width="92" height="24" class="stroke fill-soft"/>
+          <text x="26" y="42" class="big">a.pdf</text>
+          <rect x="128" y="26" width="92" height="24" class="stroke fill-soft"/>
+          <text x="138" y="42" class="big">b.pdf</text>
+          <rect x="16" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="40" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="64" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="88" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="128" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="152" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="176" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="200" y="60" width="20" height="16" class="stroke fill-bg"/>
+          <path d="M62 50 L62 60" class="stroke-soft"/>
+          <path d="M174 50 L174 60" class="stroke-soft"/>
+
+          <text x="248" y="16" class="dim">after clonefile &mdash; four blocks</text>
+          <rect x="248" y="26" width="92" height="24" class="stroke fill-soft"/>
+          <text x="258" y="42" class="big">a.pdf</text>
+          <rect x="360" y="26" width="92" height="24" class="stroke-red"/>
+          <text x="370" y="42" class="big red">b.pdf</text>
+          <rect x="286" y="72" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="310" y="72" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="334" y="72" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="358" y="72" width="20" height="16" class="stroke fill-bg"/>
+          <path d="M294 50 L300 72" class="stroke"/>
+          <path d="M406 50 L370 72" class="stroke-red"/>
+          <text x="392" y="86" class="mono dim">shared</text>
+
+          <path d="M16 108 L544 108" class="stroke-soft dash"/>
+
+          <text x="16" y="128" class="dim">then someone edits b.pdf &mdash; only the changed block is copied</text>
+          <rect x="16" y="140" width="92" height="24" class="stroke fill-soft"/>
+          <text x="26" y="156" class="big">a.pdf</text>
+          <rect x="128" y="140" width="92" height="24" class="stroke-red"/>
+          <text x="138" y="156" class="big red">b.pdf</text>
+
+          <rect x="60" y="190" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="84" y="190" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="108" y="190" width="20" height="16" class="stroke fill-bg"/>
+          <rect x="132" y="190" width="20" height="16" class="fill-red stroke-red"/>
+          <rect x="168" y="190" width="20" height="16" class="stroke-red"/>
+          <text x="60" y="222" class="dim">three blocks still shared</text>
+          <text x="168" y="222" class="red">b's private block</text>
+
+          <path d="M62 164 L70 190" class="stroke"/>
+          <path d="M174 164 L142 190" class="stroke-soft"/>
+          <path d="M178 164 L178 190" class="stroke-red"/>
+
+          <text x="16" y="248" class="dim">a.pdf never changed &mdash; its bytes, its inode and its metadata are untouched throughout</text>
+        </svg>
+        <figcaption><b>Copy-on-write, drawn.</b> The clone is not a reference to the original file; it is
+        a second file whose blocks happen, for now, to be the same blocks. Divergence is per-block and
+        automatic.</figcaption>
+      </figure>
+
+      <table class="grid" data-anchor="ch2-compare">
+        <tr><th></th><th>Copy</th><th>Hard link</th><th>Symlink</th><th>APFS clone</th></tr>
+        <tr><td>Own inode?</td><td>yes</td><td><strong>no</strong> &mdash; shared</td><td>yes (a link file)</td><td><strong>yes</strong></td></tr>
+        <tr><td>Own metadata?</td><td>yes</td><td>no</td><td>its own, trivial</td><td><strong>yes</strong></td></tr>
+        <tr><td>Editing one affects the other?</td><td>no</td><td><strong>yes</strong></td><td>yes (same target)</td><td><strong>no</strong></td></tr>
+        <tr><td>Deleting one affects the other?</td><td>no</td><td>no (link count)</td><td>dangles</td><td>no</td></tr>
+        <tr><td>Extra space at creation</td><td>full size</td><td>none</td><td>a few bytes</td><td><strong>none</strong></td></tr>
+        <tr><td>Works across volumes?</td><td>yes</td><td>no</td><td>yes</td><td><strong>no</strong></td></tr>
+      </table>
+      <p class="hint" data-anchor="ch2-compare-hint">The clone column is the copy column, minus the cost
+      &mdash; with one asterisk in the last row that will shape the rest of the program.</p>
+    </section>
+
+    <section data-anchor="ch2-syscall">
+      <h2>The system call</h2>
+      <p data-anchor="ch2-p4">macOS exposes cloning through <code class="inl">clonefile(2)</code>. Four
+      facts from its manual page matter to us, and each one turns into code later:</p>
+      <ol data-anchor="ch2-facts">
+        <li><strong>It shares extents, not bytes.</strong> The call creates a new inode that shares the
+        source's data extents; nothing is copied up front, and the two diverge lazily as either is
+        written.</li>
+        <li><strong>The destination must not exist.</strong> If it does, the call fails with
+        <code class="inl">EEXIST</code>. There is no &ldquo;overwrite&rdquo; mode.</li>
+        <li><strong>Same filesystem only.</strong> Source and destination on different filesystems is
+        <code class="inl">EXDEV</code>.</li>
+        <li><strong>The clone inherits the <em>source's</em> attributes.</strong> The new file gets its own
+        copy of the source's attributes and extended attributes &mdash; with ownership downgraded if you
+        lack privilege, and setuid/setgid cleared.</li>
+      </ol>
+      <div class="callout warn" data-anchor="ch2-callout-attrs">
+        <span class="tag">Remember fact 4</span>
+        A fresh clone arrives wearing the <em>source's</em> clothes: its permissions, its Finder tags, its
+        resource fork. When we use a clone to replace a different file, that is precisely wrong &mdash;
+        and fixing it is the entire subject of chapter 11.
+      </div>
+      <p data-anchor="ch2-p5">Fact 2 looks like an obstacle. It is the opposite: it is a safety property
+      the transaction engine leans on. Because <code class="inl">clonefile</code> physically cannot land on
+      an existing path, there is no code path anywhere in this program that could clone directly over a
+      user's file, even by mistake. Chapter 10's design &mdash; clone to a hidden temp sibling, then swap
+      by renaming &mdash; is not paranoia layered on top of the syscall; it is the only thing the syscall
+      permits.</p>
+    </section>
+
+    <section data-anchor="ch2-wrapper">
+      <h2>The whole wrapper, comment included</h2>
+      <p data-anchor="ch2-p6">Twenty-six lines, six of them the doc comment. Read it once for shape, then we
+      will take it apart line by line.</p>
+      <div class="listing" data-anchor="ch2-clone-fn">
+  <p class="srcref"><span class="path">src/apfs/clone.rs</span><span class="what">the complete macOS implementation, verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Clone `source` to `destination` via `clonefile(2)`: an APFS</span>
+<span class="cm">/// copy-on-write clone sharing data blocks until either file is written.</span>
+<span class="cm">///</span>
+<span class="cm">/// `destination` must not exist (`clonefile` fails with EEXIST — the</span>
+<span class="cm">/// transaction engine relies on this: it never clones onto a live target,</span>
+<span class="cm">/// only onto a fresh temp path). Symlinks are not followed.</span>
+<span class="mac">#[cfg(target_os = "macos")]</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">clone_file</span>(source: &amp;<span class="ty">Path</span>, destination: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt; {
+    <span class="kw">use</span> std::ffi::<span class="ty">CString</span>;
+    <span class="kw">use</span> std::os::unix::ffi::<span class="ty">OsStrExt</span>;
+
+    <span class="cm">// From &lt;sys/clonefile.h&gt;; not bound by the libc crate.</span>
+    <span class="kw">const</span> <span class="ty">CLONE_NOFOLLOW</span>: u32 = <span class="num">0x0001</span>;
+
+    <span class="kw">let</span> src = <span class="ty">CString</span>::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::<span class="ty">Error</span>::new(io::<span class="ty">ErrorKind</span>::<span class="ty">InvalidInput</span>, <span class="str">"source path contains NUL"</span>))?;
+    <span class="kw">let</span> dst = <span class="ty">CString</span>::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::<span class="ty">Error</span>::new(io::<span class="ty">ErrorKind</span>::<span class="ty">InvalidInput</span>, <span class="str">"destination path contains NUL"</span>))?;
+
+    <span class="kw">let</span> result = <span class="kw">unsafe</span> { libc::clonefile(src.as_ptr(), dst.as_ptr(), <span class="ty">CLONE_NOFOLLOW</span>) };
+    <span class="kw">if</span> result == <span class="num">0</span> {
+        <span class="ty">Ok</span>(())
+    } <span class="kw">else</span> {
+        <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error())
+    }
+}</pre>
+</div>
+      <h3>The signature</h3>
+      <p data-anchor="ch2-p7"><code class="inl">fn clone_file(source: &amp;Path, destination: &amp;Path)
+      -&gt; io::Result&lt;()&gt;</code>. It borrows both paths &mdash; it has no reason to own them &mdash;
+      and returns <code class="inl">io::Result&lt;()&gt;</code>, which is just
+      <code class="inl">Result&lt;(), std::io::Error&gt;</code>. The success value is the unit type: there
+      is nothing to hand back, only the fact that it worked. This is the ordinary Rust idiom for &ldquo;a
+      side effect that can fail,&rdquo; and it means callers can write
+      <code class="inl">adapter.clone_file(a, b)?;</code> and move on.</p>
+
+      <h3>Turning a path into something C can read</h3>
+      <p data-anchor="ch2-p8">C strings are NUL-terminated byte sequences. Rust's
+      <code class="inl">Path</code> is neither NUL-terminated nor guaranteed to be UTF-8 &mdash; on Unix
+      it is an arbitrary byte string. The bridge is two steps:
+      <code class="inl">as_os_str().as_bytes()</code> exposes the raw bytes (that
+      <code class="inl">as_bytes</code> comes from the
+      <code class="inl">std::os::unix::ffi::OsStrExt</code> extension trait, which is why the
+      <code class="inl">use</code> sits inside the function), and
+      <code class="inl">CString::new</code> copies them into a NUL-terminated buffer.</p>
+      <p data-anchor="ch2-p9"><code class="inl">CString::new</code> can fail, for exactly one reason: the
+      bytes already contain an interior NUL, which would silently truncate the path. The code maps that to
+      a clear <code class="inl">InvalidInput</code> error rather than unwrapping. It is a case that will
+      essentially never fire, and handling it costs two lines &mdash; that ratio is what makes a systems
+      program trustworthy.</p>
+
+      <h3>Why the <code class="inl">CString</code>s must be bound to variables</h3>
+      <div class="callout key" data-anchor="ch2-callout-lifetime">
+        <span class="tag">Key idea &mdash; the FFI ownership trap</span>
+        <code class="inl">src.as_ptr()</code> returns a pointer <em>into</em> the buffer that
+        <code class="inl">src</code> owns. If the <code class="inl">CString</code> were a temporary &mdash;
+        say, if the code had written
+        <code class="inl">CString::new(&hellip;)?.as_ptr()</code> inline &mdash; it would be dropped at the
+        end of that statement and the pointer would dangle before <code class="inl">clonefile</code> ever
+        saw it. Binding <code class="inl">src</code> and <code class="inl">dst</code> to locals keeps the
+        buffers alive for the whole call. This is the single most common FFI bug in Rust, and the fix is
+        exactly the boring thing this code does.
+      </div>
+
+      <h3>The flag the libc crate does not have</h3>
+      <p data-anchor="ch2-p10">The <code class="inl">libc</code> crate binds the
+      <code class="inl">clonefile</code> function but not the constants from
+      <code class="inl">&lt;sys/clonefile.h&gt;</code>, so the code declares the one it needs and says so
+      in a comment. <code class="inl">CLONE_NOFOLLOW</code> means: if the source is a symlink, do not
+      follow it. That is the same &ldquo;never resolve a link on our behalf&rdquo; discipline you will see
+      in the walker (<code class="inl">follow_links(false)</code>), in the preflight checks
+      (<code class="inl">symlink_metadata</code>), and in every extended-attribute call
+      (<code class="inl">XATTR_NOFOLLOW</code>). A tool that replaces files must always operate on the
+      thing it named, never on something the thing points to.</p>
+      <p class="hint" data-anchor="ch2-p11">Declaring a C constant yourself is a small, honest piece of
+      unsafety debt: you are asserting that <code class="inl">0x0001</code> is what the header says. When
+      you do this, cite the header in a comment, exactly as this code does &mdash; the comment is the
+      audit trail.</p>
+
+      <h3>The <code class="inl">unsafe</code> block, and what it is claiming</h3>
+      <p data-anchor="ch2-p12">One expression is unsafe:
+      <code class="inl">libc::clonefile(src.as_ptr(), dst.as_ptr(), CLONE_NOFOLLOW)</code>. Calling any
+      foreign function is unsafe in Rust, because the compiler cannot see across the boundary; it cannot
+      know whether the callee will honour the pointers' lifetimes, or write where it should not. Writing
+      <code class="inl">unsafe</code> here is a promise from the programmer to the compiler: <em>I have
+      checked the things you cannot.</em> In this case the checks are the ones we just walked through
+      &mdash; both pointers are valid, NUL-terminated, alive for the duration of the call, and the flag is
+      a value the syscall accepts.</p>
+      <p data-anchor="ch2-p13">Notice how small the block is. Not the whole function, not the error
+      handling &mdash; one expression. That is deliberate style: an <code class="inl">unsafe</code> block
+      is a claim you have to defend, so make it cover as little ground as possible.</p>
+
+      <h3>Errors, the Unix way</h3>
+      <p data-anchor="ch2-p14">C reports failure by returning <code class="inl">-1</code> and setting the
+      thread-local <code class="inl">errno</code>. Rust's
+      <code class="inl">io::Error::last_os_error()</code> reads that <code class="inl">errno</code> and
+      wraps it in a proper <code class="inl">io::Error</code> &mdash; one that will print &ldquo;File
+      exists (os error 17)&rdquo; and whose <code class="inl">raw_os_error()</code> the tests can match on
+      exactly. The pattern <em>&ldquo;zero is success, anything else means go ask
+      <code class="inl">errno</code>&rdquo;</em> recurs in every FFI call in this codebase; once you have
+      read it here you have read it in <code class="inl">volume.rs</code>,
+      <code class="inl">forks.rs</code> and <code class="inl">metadata.rs</code> too.</p>
+    </section>
+
+    <section data-anchor="ch2-cfg">
+      <h2>Compiling on a machine that has no APFS</h2>
+      <p data-anchor="ch2-p15">Both blocks in <code class="inl">clone.rs</code> carry a
+      <code class="inl">#[cfg(&hellip;)]</code> attribute, which decides at compile time whether the item
+      exists at all. The macOS version is the real one; here is its counterpart:</p>
+      <div class="listing" data-anchor="ch2-clone-stub">
+  <p class="srcref"><span class="path">src/apfs/clone.rs</span><span class="what">the non-macOS stub, verbatim</span></p>
+  <pre class="rs"><span class="mac">#[cfg(not(target_os = "macos"))]</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">clone_file</span>(_source: &amp;<span class="ty">Path</span>, _destination: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt; {
+    <span class="ty">Err</span>(io::<span class="ty">Error</span>::new(
+        io::<span class="ty">ErrorKind</span>::<span class="ty">Unsupported</span>,
+        <span class="str">"APFS cloning requires macOS"</span>,
+    ))
+}</pre>
+</div>
+      <p data-anchor="ch2-p16">The payoff is that <code class="inl">cargo check</code>,
+      <code class="inl">cargo clippy</code> and the platform-neutral half of the test suite all run on
+      Linux or in CI, while the parts that genuinely need a Mac are the parts that are honestly marked as
+      needing one. (The integration tests take the other half of the deal: they open with
+      <code class="inl">#![cfg(target_os = "macos")]</code>, so the whole file compiles away elsewhere.)
+      Underscored parameter names are how you tell the compiler &mdash; and the reader &mdash; that
+      ignoring an argument is intended, not forgotten.</p>
+    </section>
+
+    <section data-anchor="ch2-proof">
+      <h2>Proving it is a clone and not a hard link</h2>
+      <p data-anchor="ch2-p17">All of the above is a claim about behaviour. The repository turns it into a
+      test that runs against a real APFS volume &mdash; macOS temp directories are on one &mdash; and the
+      assertions are exactly the distinctions from our comparison table.</p>
+      <div class="listing" data-anchor="ch2-test-clone">
+  <p class="srcref"><span class="path">tests/apfs_integration.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="mac">#[test]</span>
+<span class="kw">fn</span> <span class="fn">clone_shares_content_but_diverges_on_write</span>() {
+    <span class="kw">let</span> dir = tempfile::tempdir().unwrap();
+    <span class="kw">let</span> source = dir.path().join(<span class="str">"source.bin"</span>);
+    <span class="kw">let</span> cloned = dir.path().join(<span class="str">"cloned.bin"</span>);
+    <span class="kw">let</span> data = <span class="mac">vec!</span>[0x5au8; <span class="num">256</span> * <span class="num">1024</span>];
+    fs::write(&amp;source, &amp;data).unwrap();
+
+    clone::clone_file(&amp;source, &amp;cloned).unwrap();
+
+    <span class="cm">// Same content, different inode: a real clone, not a hardlink.</span>
+    <span class="mac">assert_eq!</span>(fs::read(&amp;cloned).unwrap(), data);
+    <span class="kw">let</span> src_meta = fs::metadata(&amp;source).unwrap();
+    <span class="kw">let</span> clone_meta = fs::metadata(&amp;cloned).unwrap();
+    <span class="mac">assert_ne!</span>(src_meta.ino(), clone_meta.ino());
+    <span class="mac">assert_eq!</span>(clone_meta.len(), data.len() <span class="kw">as</span> u64);
+
+    <span class="cm">// Copy-on-write isolation: writing the clone leaves the source alone.</span>
+    fs::write(&amp;cloned, <span class="str">b"diverged"</span>).unwrap();
+    <span class="mac">assert_eq!</span>(fs::read(&amp;source).unwrap(), data);
+}</pre>
+</div>
+      <p data-anchor="ch2-p18">Three assertions, three properties: same bytes,
+      <code class="inl">assert_ne!</code> on the inode numbers (so it is not a hard link), and the source
+      surviving a write to the clone unchanged (so copy-on-write really is isolating them). If you ever
+      need to explain APFS clones to someone, this test is a better explanation than a paragraph.</p>
+      <p data-anchor="ch2-p19">And the <code class="inl">EEXIST</code> behaviour the transaction engine
+      depends on is pinned down too, right down to the destination's contents being untouched:</p>
+      <div class="listing" data-anchor="ch2-test-eexist">
+  <p class="srcref"><span class="path">tests/apfs_integration.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="mac">#[test]</span>
+<span class="kw">fn</span> <span class="fn">clone_refuses_existing_destination</span>() {
+    <span class="kw">let</span> dir = tempfile::tempdir().unwrap();
+    <span class="kw">let</span> source = dir.path().join(<span class="str">"source.bin"</span>);
+    <span class="kw">let</span> dest = dir.path().join(<span class="str">"existing.bin"</span>);
+    fs::write(&amp;source, <span class="str">b"source"</span>).unwrap();
+    fs::write(&amp;dest, <span class="str">b"already here"</span>).unwrap();
+
+    <span class="kw">let</span> err = clone::clone_file(&amp;source, &amp;dest).unwrap_err();
+    <span class="mac">assert_eq!</span>(err.raw_os_error(), <span class="ty">Some</span>(libc::<span class="ty">EEXIST</span>));
+    <span class="mac">assert_eq!</span>(fs::read(&amp;dest).unwrap(), <span class="str">b"already here"</span>);
+}</pre>
+</div>
+    </section>
+
+    <section data-anchor="ch2-volume">
+      <h2>&ldquo;Same volume&rdquo;, in code</h2>
+      <p data-anchor="ch2-p20">Cloning is a same-volume feature, so the program has to answer two
+      questions before it can plan anything: <em>are these two paths on the same filesystem</em>, and
+      <em>is that filesystem APFS at all</em>. Both live in
+      <code class="inl">src/apfs/volume.rs</code>, and the first is almost embarrassingly small &mdash;
+      two paths are on the same filesystem when their <code class="inl">st_dev</code> matches.</p>
+      <div class="listing" data-anchor="ch2-volume-dev">
+  <p class="srcref"><span class="path">src/apfs/volume.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Device id (`st_dev`) of the filesystem holding `path`.</span>
+<span class="cm">/// Never follows a symlink at the final component.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">device_of</span>(path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;u64&gt; {
+    <span class="kw">use</span> std::os::unix::fs::<span class="ty">MetadataExt</span>;
+    <span class="ty">Ok</span>(std::fs::symlink_metadata(path)?.dev())
+}
+
+<span class="cm">/// True when both paths live on the same filesystem. A prerequisite for</span>
+<span class="cm">/// cloning, checked at preflight time — volumes can unmount and remount</span>
+<span class="cm">/// between scan and reclaim.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">same_volume</span>(a: &amp;<span class="ty">Path</span>, b: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;bool&gt; {
+    <span class="ty">Ok</span>(device_of(a)? == device_of(b)?)
+}</pre>
+</div>
+      <p data-anchor="ch2-p21">The second needs the C library again, because Rust's standard library
+      has no notion of &ldquo;what kind of filesystem is this.&rdquo; The answer comes from
+      <code class="inl">statfs</code>, whose <code class="inl">f_fstypename</code> field is a C string we
+      compare against <code class="inl">b"apfs"</code>:</p>
+      <div class="listing" data-anchor="ch2-is-apfs">
+  <p class="srcref"><span class="path">src/apfs/volume.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// True when the filesystem holding `path` is APFS. Cloning is an</span>
+<span class="cm">/// APFS-only feature; HFS+, network mounts, etc. must be rejected.</span>
+<span class="mac">#[cfg(target_os = "macos")]</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">is_apfs</span>(path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;bool&gt; {
+    <span class="kw">use</span> std::ffi::{<span class="ty">CStr</span>, <span class="ty">CString</span>};
+    <span class="kw">use</span> std::os::unix::ffi::<span class="ty">OsStrExt</span>;
+
+    <span class="kw">let</span> c_path = <span class="ty">CString</span>::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::<span class="ty">Error</span>::new(io::<span class="ty">ErrorKind</span>::<span class="ty">InvalidInput</span>, <span class="str">"path contains NUL"</span>))?;
+    <span class="kw">let</span> <span class="kw">mut</span> sfs: libc::statfs = <span class="kw">unsafe</span> { std::mem::zeroed() };
+    <span class="kw">let</span> rc = <span class="kw">unsafe</span> { libc::statfs(c_path.as_ptr(), &amp;<span class="kw">mut</span> sfs) };
+    <span class="kw">if</span> rc != <span class="num">0</span> {
+        <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error());
+    }
+    <span class="kw">let</span> fstype = <span class="kw">unsafe</span> { <span class="ty">CStr</span>::from_ptr(sfs.f_fstypename.as_ptr()) };
+    <span class="ty">Ok</span>(fstype.to_bytes() == <span class="str">b"apfs"</span>)
+}</pre>
+</div>
+      <p data-anchor="ch2-p22">Three <code class="inl">unsafe</code> operations, each a different
+      flavour. <code class="inl">std::mem::zeroed()</code> conjures an all-zero
+      <code class="inl">statfs</code> for the kernel to fill in &mdash; safe here because a C struct of
+      integers and byte arrays has no invalid zero state, which is exactly the kind of reasoning an
+      <code class="inl">unsafe</code> block is a receipt for. The call itself is unsafe like any FFI call.
+      And <code class="inl">CStr::from_ptr</code> is unsafe because it trusts that the bytes it is handed
+      really are NUL-terminated &mdash; which the kernel guarantees for this field.</p>
+      <div class="callout" data-anchor="ch2-callout-when">
+        <span class="tag">A timing decision</span>
+        Both of these are called at <strong>preflight</strong> time, immediately before a replacement
+        &mdash; not at scan time. The doc comment says why: volumes can unmount and remount between runs.
+        Anything the program believes about the filesystem has a shelf life, and this codebase is
+        consistently suspicious about how short it is.
+      </div>
+    </section>
+
+    <section data-anchor="ch2-du">
+      <h2>Why <code class="inl">du</code> will lie to you afterwards</h2>
+      <p data-anchor="ch2-p23">Here is the fact that generates every support question a tool like this will
+      ever receive. After reclaiming, <code class="inl">du</code> and Finder's &ldquo;size&rdquo; column
+      still show each file at its full size. Nothing has shrunk. Did it work?</p>
+      <p data-anchor="ch2-p24">It did. Those tools report a file's <em>logical</em> length &mdash; how many
+      bytes you would read out of it &mdash; and that has not changed, because both files really do still
+      contain all their bytes. What changed is how many <em>physical</em> blocks the volume has committed,
+      and the place that shows up is the volume's free space. The README is blunt about it:</p>
+      <div class="callout warn" data-anchor="ch2-callout-estimates">
+        <span class="tag">README.md</span>
+        Reported savings are <strong>estimates</strong>. APFS free-space accounting, local snapshots
+        (including Time Machine's), sparse files, and pre-existing clones all make the observed free-space
+        change differ from the na&iuml;ve sum. <code class="inl">du</code> will still show each clone at
+        full size; the volume's free space is what improves.
+      </div>
+      <p data-anchor="ch2-p25">This honesty is not just documentation &mdash; it is in the type system, in
+      a small way. Chapter 3 will show you a method called
+      <code class="inl">estimated_reclaimable_bytes</code>, and the word <em>estimated</em> is in the name
+      on purpose.</p>
+    </section>
+
+    <section data-anchor="ch2-reflect">
+      <div class="reflect" data-anchor="ch2-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A primitive, and three constraints that will shape everything after it. The primitive: one
+        syscall that makes a second, fully independent file for free. The constraints: it refuses an
+        existing destination (so we must stage and swap), it refuses a different volume (so grouping must
+        be per-device), and it gives the new file the <em>source's</em> metadata (so a replacement must
+        restore the target's).</p>
+        <p>Every one of those constraints reappears as a line of code in the second half of this book. The
+        program is, in a real sense, the shape this syscall pressed into it.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch2-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Rewrite <code class="inl">clone_file</code> so the two <code class="inl">CString</code>s are
+          built inline inside the <code class="inl">unsafe</code> call. Then explain, precisely, when the
+          buffers are freed relative to the syscall.</li>
+          <li><code class="inl">is_apfs</code> compares the type name to <code class="inl">b"apfs"</code>.
+          The manual page suggests asking <code class="inl">getattrlist</code> for
+          <code class="inl">VOL_CAP_INT_CLONE</code> instead. What does each approach get wrong &mdash; and
+          which failure would you rather have?</li>
+          <li><code class="inl">same_volume</code> exists in <code class="inl">volume.rs</code>, but
+          preflight compares <code class="inl">device_of</code> results itself rather than calling it. Find
+          that code in chapter 9 and decide whether the duplication is a wart or a deliberate choice.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://keith.github.io/xcode-man-pages/clonefile.2.html">CLONEFILE(2) &mdash; macOS manual page</a></li>
+          <li><a href="https://docs.rs/libc/latest/aarch64-apple-darwin/libc/fn.clonefile.html">libc crate &mdash; fn clonefile (aarch64-apple-darwin)</a></li>
+          <li><a href="https://eclecticlight.co/2023/04/28/apfs-hard-links-symlinks-aliases-and-clone-files-a-summary/">The Eclectic Light Company &mdash; APFS hard links, symlinks, aliases and clone files</a></li>
+          <li><a href="https://www.ctrl.blog/entry/distinguish-file-link-clone.html">Ctrl blog &mdash; How to distinguish between files, links, and cloned files</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/apfs/clone.rs">file_cleaner &mdash; src/apfs/clone.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/apfs/volume.rs">file_cleaner &mdash; src/apfs/volume.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/apfs_integration.rs">file_cleaner &mdash; tests/apfs_integration.rs</a></li>
+          <li><a href="https://doc.rust-lang.org/nomicon/ffi.html">The Rustonomicon &mdash; Foreign Function Interface</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-what-filecleaner-does.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-the-domain-in-types.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

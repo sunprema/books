@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crash Recovery, and What We Gained &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch12-intro">
+      <p class="eyebrow">Chapter 12 &middot; Part IV — Replacing a File Safely</p>
+      <h1>Crash Recovery, and What We Gained</h1>
+      <p class="lead" data-anchor="ch12-lead">Chapter 10 handled every way the transaction can
+      <em>fail</em>. This chapter handles the one thing it cannot: not failing, but simply stopping. A
+      power cut. A <code class="inl">kill -9</code>. A kernel panic between two renames. No error is
+      returned, no rollback runs, no line of our code executes at all &mdash; and somewhere on the disk is
+      a directory containing a hidden backup, a hidden temp clone, and possibly no file where the user's
+      file used to be.</p>
+    </section>
+    <section data-anchor="ch12-problem">
+      <h2>What is actually on the disk</h2>
+      <p data-anchor="ch12-p1">Imagine finding that directory with no other information. There is
+      <code class="inl">notes.md</code>, a <code class="inl">.filecleaner.3f9a&hellip;.tmp</code> and a
+      <code class="inl">.filecleaner.3f9a&hellip;.backup</code>. What do you do?</p>
+      <p data-anchor="ch12-p2">You cannot tell. Is the temp file a half-verified clone that must be
+      discarded, or a fully verified one that was about to become the answer? Is the backup the user's
+      current file, or a stale copy of a file that has already been correctly replaced? The bytes are
+      identical either way &mdash; that is the entire premise of the tool. The filesystem alone cannot
+      distinguish &ldquo;before the swap&rdquo; from &ldquo;after the swap.&rdquo;</p>
+      <p data-anchor="ch12-p3">Which is why every step of chapter 10 wrote its intention down first.</p>
+    </section>
+
+    <section data-anchor="ch12-states">
+      <h2>Five states, and what each one licenses</h2>
+      <div class="listing" data-anchor="ch12-txnstate">
+  <p class="srcref"><span class="path">src/txn/journal.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Transaction states, journaled durably *before* the filesystem step each</span>
+<span class="cm">/// one precedes. After a crash, the journal plus what is actually on disk</span>
+<span class="cm">/// determines recovery:</span>
+<span class="cm">///</span>
+<span class="cm">/// - `Prepared`     → nothing user-visible has changed; roll back.</span>
+<span class="cm">/// - `BackupCreated`→ target may have been renamed to the backup; roll back.</span>
+<span class="cm">/// - `Swapped`      → the clone was fully verified; roll forward.</span>
+<span class="cm">/// - terminal states record the outcome.</span>
+<span class="mac">#[derive(Debug, Clone, Copy, PartialEq, Eq)]</span>
+<span class="kw">pub</span> <span class="kw">enum</span> <span class="ty">TxnState</span> {
+    <span class="cm">/// Intent recorded; covers temp-clone creation and verification.</span>
+    <span class="ty">Prepared</span>,
+    <span class="cm">/// Written before `rename(target, backup)`.</span>
+    <span class="ty">BackupCreated</span>,
+    <span class="cm">/// Written before `rename(temp, target)`.</span>
+    <span class="ty">Swapped</span>,
+    <span class="cm">/// Final validation passed and the backup was removed.</span>
+    <span class="ty">Committed</span>,
+    <span class="cm">/// The transaction was undone; the target is untouched.</span>
+    <span class="ty">RolledBack</span>,
+}</pre>
+</div>
+      <p data-anchor="ch12-p4">Look at what each state is <em>defined by</em>. Not &ldquo;we are
+      cloning&rdquo; or &ldquo;we are verifying&rdquo; &mdash; each state names the filesystem operation it
+      precedes. <span class="state">backup-created</span> does not mean the backup exists; it means
+      <em>we are about to create it</em>. That is a subtle and important difference: the journal records
+      intentions, and an intention written before an act is the only thing that survives an interruption
+      of the act.</p>
+      <p data-anchor="ch12-p5">And notice how few states there are. There is no state for &ldquo;temp
+      cloned&rdquo; or &ldquo;metadata restored,&rdquo; even though those are real steps.
+      <span class="state">prepared</span> covers all of them &mdash; because the recovery action is
+      identical for every one of them: nothing the user can see has changed, so delete any debris and roll
+      back. States exist to distinguish <em>different repairs</em>, not to log progress. Adding a state
+      that does not change the repair would be pure cost.</p>
+
+      <figure class="diagram-fig" data-anchor="ch12-fig-states">
+        <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="ch12-d1-title">
+          <title id="ch12-d1-title">The journal state machine: prepared advances to backup-created to swapped to committed, and any of the three non-terminal states may instead move to rolled-back</title>
+
+          <rect x="16" y="40" width="96" height="28" class="stroke fill-soft"/>
+          <text x="26" y="58" class="big mono">prepared</text>
+
+          <rect x="144" y="40" width="116" height="28" class="stroke fill-soft"/>
+          <text x="154" y="58" class="big mono">backup-created</text>
+
+          <rect x="292" y="40" width="90" height="28" class="stroke-red"/>
+          <text x="302" y="58" class="big mono red">swapped</text>
+
+          <rect x="414" y="40" width="100" height="28" class="stroke fill-soft"/>
+          <text x="424" y="58" class="big mono">committed</text>
+
+          <path d="M112 54 L144 54" class="stroke"/>
+          <path d="M138 50 L144 54 L138 58" class="stroke"/>
+          <path d="M260 54 L292 54" class="stroke"/>
+          <path d="M286 50 L292 54 L286 58" class="stroke"/>
+          <path d="M382 54 L414 54" class="stroke"/>
+          <path d="M408 50 L414 54 L408 58" class="stroke"/>
+
+          <rect x="196" y="150" width="110" height="28" class="stroke fill-soft"/>
+          <text x="206" y="168" class="big mono">rolled-back</text>
+
+          <path d="M64 68 L214 150" class="stroke-soft"/>
+          <path d="M206 143 L214 150 L204 151" class="stroke-soft"/>
+          <path d="M202 68 L242 150" class="stroke-soft"/>
+          <path d="M235 143 L242 150 L232 151" class="stroke-soft"/>
+          <path d="M337 68 L280 150" class="stroke-soft"/>
+          <path d="M288 143 L280 150 L290 151" class="stroke-soft"/>
+
+          <text x="16" y="96" class="dim">forward progress is strictly ordered &mdash; no state may be skipped</text>
+          <text x="16" y="112" class="dim">any non-terminal state may roll back</text>
+          <text x="16" y="128" class="red">after `swapped`, a crash is repaired by rolling FORWARD, not back</text>
+
+          <text x="330" y="196" class="dim">terminal states have no outgoing edges</text>
+        </svg>
+        <figcaption><b>Six legal edges, and no others.</b> The machine is small enough to hold in your head,
+        which is the property you want in the code that runs after a crash.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="ch12-machine">
+      <h2>The state machine, enforced twice</h2>
+      <p data-anchor="ch12-p6">The legal transitions are one <code class="inl">matches!</code>:</p>
+      <div class="listing" data-anchor="ch12-can-transition">
+  <p class="srcref"><span class="path">src/txn/journal.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="cm">/// Legal state-machine transitions. Forward progress is strictly</span>
+    <span class="cm">/// ordered; any non-terminal state may roll back; `Swapped` may commit</span>
+    <span class="cm">/// directly (recovery rolls forward from there).</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">can_transition</span>(<span class="kw">self</span>, next: <span class="ty">TxnState</span>) -&gt; bool {
+        <span class="kw">use</span> <span class="ty">TxnState</span>::*;
+        <span class="mac">matches!</span>(
+            (<span class="kw">self</span>, next),
+            (<span class="ty">Prepared</span>, <span class="ty">BackupCreated</span>)
+                | (<span class="ty">BackupCreated</span>, <span class="ty">Swapped</span>)
+                | (<span class="ty">Swapped</span>, <span class="ty">Committed</span>)
+                | (<span class="ty">Prepared</span>, <span class="ty">RolledBack</span>)
+                | (<span class="ty">BackupCreated</span>, <span class="ty">RolledBack</span>)
+                | (<span class="ty">Swapped</span>, <span class="ty">RolledBack</span>)
+        )
+    }</pre>
+</div>
+      <p data-anchor="ch12-p7">Matching on the <em>tuple</em> <code class="inl">(self, next)</code>
+      against a list of allowed pairs is a lovely way to write a transition table: the whole legal graph is
+      six lines, and anything not listed is illegal by construction. Terminal states appear on no left-hand
+      side, so they have no outgoing edges at all.</p>
+      <p data-anchor="ch12-p8">And this is not advisory. The database layer refuses to perform an illegal
+      transition:</p>
+      <div class="listing" data-anchor="ch12-db-guard">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">inside journal_set_state, verbatim</span></p>
+  <pre class="rs">        <span class="kw">let</span> current = <span class="ty">TxnState</span>::parse(&amp;current)
+            .ok_or_else(|| anyhow::<span class="mac">anyhow!</span>(<span class="str">"journal row {id} has unknown state {current:?}"</span>))?;
+        <span class="kw">if</span> !current.can_transition(next) {
+            anyhow::<span class="mac">bail!</span>(
+                <span class="str">"illegal journal transition for row {id}: {} -&gt; {}"</span>,
+                current.as_str(),
+                next.as_str()
+            );
+        }</pre>
+</div>
+      <p data-anchor="ch12-p9">It reads the row's current state, parses it, and rejects the write if the
+      edge is not on the list. So a bug in the executor &mdash; jumping straight from
+      <span class="state">prepared</span> to <span class="state">committed</span>, say &mdash; fails loudly
+      at the moment it is attempted, instead of writing a state that makes the journal's story untrue.
+      The doc comment on that method is explicit about why: <em>an illegal transition is a bug and must fail
+      loudly rather than corrupt the recovery invariants.</em></p>
+      <p data-anchor="ch12-p10">The unit tests for the machine are worth their four lines each. They assert
+      the round trip through the string form, the strict forward order (including that
+      <code class="inl">Prepared</code> cannot reach <code class="inl">Swapped</code>), that every
+      non-terminal state can roll back, and that terminal states can go nowhere at all.</p>
+    </section>
+
+    <section data-anchor="ch12-finding">
+      <h2>Finding the wreckage</h2>
+      <div class="listing" data-anchor="ch12-incomplete">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="cm">/// All journal rows in a non-terminal state — interrupted transactions</span>
+    <span class="cm">/// that recovery must repair.</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">journal_incomplete</span>(&amp;<span class="kw">self</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;<span class="ty">JournalEntry</span>&gt;&gt; {
+        <span class="kw">let</span> <span class="kw">mut</span> stmt = <span class="kw">self</span>.conn.prepare(
+            <span class="str">"SELECT id, group_id, source, target, temp, backup, size, state, error
+             FROM txn_journal
+             WHERE state IN ('prepared', 'backup-created', 'swapped')
+             ORDER BY id"</span>,
+        )?;</pre>
+</div>
+      <p data-anchor="ch12-p11">Three states, one index scan, ordered by id so repairs happen in the
+      order the transactions started. This is the query that <code class="inl">idx_journal_state</code> in
+      chapter 5 exists for, and it is why the journal table has no foreign keys &mdash; these rows must be
+      findable even if the scan that produced them was deleted and the groups rebuilt.</p>
+      <p data-anchor="ch12-p12">Then, for each one:</p>
+      <div class="listing" data-anchor="ch12-recover-all">
+  <p class="srcref"><span class="path">src/txn/recovery.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Repair every interrupted transaction found in the journal. Returns a</span>
+<span class="cm">/// human-readable description of each repair. Safe to run on every launch;</span>
+<span class="cm">/// an empty journal is a no-op.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">recover_all</span>(db: &amp;<span class="kw">mut</span> <span class="ty">Db</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;<span class="ty">String</span>&gt;&gt; {
+    <span class="kw">let</span> <span class="kw">mut</span> actions = <span class="ty">Vec</span>::new();
+    <span class="kw">for</span> entry <span class="kw">in</span> db.journal_incomplete()? {
+        <span class="kw">let</span> action = recover_one(db, &amp;entry)?;
+        actions.push(<span class="mac">format!</span>(
+            <span class="str">"txn #{} ({}): {}"</span>,
+            entry.id,
+            entry.target.display(),
+            action
+        ));
+    }
+    <span class="ty">Ok</span>(actions)
+}</pre>
+</div>
+    </section>
+
+    <section data-anchor="ch12-back">
+      <h2>Rolling back: the two states before the point of no return</h2>
+      <div class="listing" data-anchor="ch12-rollback-arms">
+  <p class="srcref"><span class="path">src/txn/recovery.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">        <span class="ty">TxnState</span>::<span class="ty">Prepared</span> =&gt; {
+            remove_if_exists(&amp;entry.temp)?;
+            db.journal_set_state(
+                entry.id,
+                <span class="ty">TxnState</span>::<span class="ty">RolledBack</span>,
+                <span class="ty">Some</span>(<span class="str">"interrupted before swap; target untouched"</span>),
+            )?;
+            <span class="ty">Ok</span>(<span class="str">"rolled back (target was never touched)"</span>.into())
+        }
+        <span class="ty">TxnState</span>::<span class="ty">BackupCreated</span> =&gt; {
+            <span class="kw">let</span> <span class="kw">mut</span> note = <span class="str">"rolled back"</span>;
+            <span class="kw">if</span> !entry.target.exists() &amp;&amp; entry.backup.exists() {
+                fs::rename(&amp;entry.backup, &amp;entry.target)?;
+                note = <span class="str">"rolled back (target restored from backup)"</span>;
+            }
+            remove_if_exists(&amp;entry.temp)?;
+            db.journal_set_state(
+                entry.id,
+                <span class="ty">TxnState</span>::<span class="ty">RolledBack</span>,
+                <span class="ty">Some</span>(<span class="str">"interrupted during swap; target restored"</span>),
+            )?;
+            <span class="ty">Ok</span>(note.into())
+        }</pre>
+</div>
+      <p data-anchor="ch12-p13"><span class="state">prepared</span> is the easy one. Whatever we were
+      doing &mdash; cloning, restoring metadata, verifying &mdash; none of it touched the user's file. There
+      may be a temp clone; delete it if so. Done.</p>
+      <p data-anchor="ch12-p14"><span class="state">backup-created</span> is the interesting one, because we
+      genuinely do not know whether the crash landed before or after
+      <code class="inl">rename(target, backup)</code>. So the code asks the filesystem the one question
+      that settles it: <em>is the target missing while the backup exists?</em> If yes, the rename happened
+      and we put it back. If no, it did not, and there is nothing to restore. Either way the temp is
+      removed and the row is closed.</p>
+      <div class="callout key" data-anchor="ch12-callout-both">
+        <span class="tag">Key idea</span>
+        Recovery uses <strong>both</strong> sources of truth. The journal says which repair to perform; the
+        filesystem says which parts of it are still needed. Neither alone is enough &mdash; the journal
+        cannot know how far a half-executed rename got, and the filesystem cannot tell a pre-swap backup
+        from a post-swap one.
+      </div>
+      <p data-anchor="ch12-p15">Note the condition is <code class="inl">!target.exists() &amp;&amp;
+      backup.exists()</code>, not just one of them. If both exist, something outside this transaction's
+      story has happened and the safe move is to leave the target alone. Recovery never overwrites a file
+      that is already sitting where it belongs.</p>
+    </section>
+
+    <section data-anchor="ch12-forward">
+      <h2>Rolling forward: the state where undoing would be the mistake</h2>
+      <p data-anchor="ch12-p16">Here is the arm that makes this design interesting, and it is worth
+      reading in full:</p>
+      <div class="listing" data-anchor="ch12-forward-arm">
+  <p class="srcref"><span class="path">src/txn/recovery.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">        <span class="ty">TxnState</span>::<span class="ty">Swapped</span> =&gt; {
+            <span class="cm">// The temp clone passed full verification before `swapped` was</span>
+            <span class="cm">// journaled, so completing the swap is the safe direction.</span>
+            <span class="kw">if</span> !entry.target.exists() &amp;&amp; entry.temp.exists() {
+                fs::rename(&amp;entry.temp, &amp;entry.target)?;
+                <span class="kw">if</span> <span class="kw">let</span> <span class="ty">Some</span>(dir) = entry.target.parent() {
+                    <span class="kw">let</span> _ = fsync_dir(dir);
+                }
+            }
+            <span class="kw">if</span> entry.target.exists() {
+                remove_if_exists(&amp;entry.backup)?;
+                db.journal_set_state(entry.id, <span class="ty">TxnState</span>::<span class="ty">Committed</span>, <span class="ty">None</span>)?;
+                <span class="ty">Ok</span>(<span class="str">"rolled forward (swap completed, backup removed)"</span>.into())
+            } <span class="kw">else</span> <span class="kw">if</span> entry.backup.exists() {
+                <span class="cm">// Clone lost mid-crash; fall back to the original.</span>
+                fs::rename(&amp;entry.backup, &amp;entry.target)?;
+                remove_if_exists(&amp;entry.temp)?;
+                db.journal_set_state(
+                    entry.id,
+                    <span class="ty">TxnState</span>::<span class="ty">RolledBack</span>,
+                    <span class="ty">Some</span>(<span class="str">"clone lost during interruption; target restored from backup"</span>),
+                )?;
+                <span class="ty">Ok</span>(<span class="str">"rolled back (clone was lost; target restored from backup)"</span>.into())
+            } <span class="kw">else</span> {
+                db.journal_set_state(
+                    entry.id,
+                    <span class="ty">TxnState</span>::<span class="ty">RolledBack</span>,
+                    <span class="ty">Some</span>(<span class="str">"neither target, temp, nor backup found; manual attention required"</span>),
+                )?;
+                <span class="ty">Ok</span>(<span class="str">"UNRESOLVED: neither target, temp, nor backup exists"</span>.into())
+            }
+        }</pre>
+</div>
+      <p data-anchor="ch12-p17">Why forward and not back? Because of what
+      <span class="state active">swapped</span> means. Chapter 10 wrote that state only after the temp clone
+      had passed <em>every</em> verification &mdash; type, size, mode against the target's snapshot, bytes
+      against the source, resource fork against the source &mdash; and after the post-rename stat proved the
+      original had not changed during the transaction. That clone is known-good. The original is sitting
+      safely at the backup path. Finishing the rename is a single atomic operation with a known-correct
+      input; rolling back would discard verified work for no gain.</p>
+      <p data-anchor="ch12-p18">Then three cases, in order of preference:</p>
+      <table class="grid" data-anchor="ch12-forward-cases">
+        <tr><th>On disk</th><th>Repair</th><th>Outcome</th></tr>
+        <tr><td>target exists (or the rename completes it)</td><td>remove the backup, mark committed</td><td><span class="state done">committed</span> &mdash; the reclaim succeeded</td></tr>
+        <tr><td>no target, no temp, but a backup</td><td>rename backup back, remove temp</td><td><span class="state">rolled-back</span> &mdash; the user's file is back</td></tr>
+        <tr><td>none of the three</td><td>close the row with a warning</td><td><code class="inl">UNRESOLVED</code> &mdash; say so plainly</td></tr>
+      </table>
+      <p data-anchor="ch12-p19">That middle case &mdash; &ldquo;clone lost mid-crash&rdquo; &mdash; is
+      defensive to the point of paranoia, and it is right to be. If the temp file vanished (a
+      filesystem-level cleanup, a user tidying hidden files, a truly unlucky crash) but the backup is still
+      there, the original is recoverable, and recovering it beats leaving the path empty.</p>
+      <p data-anchor="ch12-p20">And the third case is the honest one. If none of the three paths exist,
+      there is genuinely nothing this program can do. It does not pretend: the journal error says
+      <em>manual attention required</em>, and the line printed to the user starts with
+      <code class="inl">UNRESOLVED</code>. A tool that admits its limits is more trustworthy than one that
+      always claims success.</p>
+    </section>
+
+    <section data-anchor="ch12-when">
+      <h2>When recovery runs, and why that is the whole point</h2>
+      <p data-anchor="ch12-p21">Not on a flag. Not on a <code class="inl">repair</code> subcommand. Before
+      every command, every time:</p>
+      <div class="listing" data-anchor="ch12-recover">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Repair any transactions interrupted by a crash or kill. Run on every</span>
+<span class="cm">/// launch; returns a description of each repair performed.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">recover</span>(db_path: &amp;<span class="ty">Path</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;<span class="ty">String</span>&gt;&gt; {
+    <span class="kw">if</span> !db_path.exists() {
+        <span class="kw">return</span> <span class="ty">Ok</span>(<span class="ty">Vec</span>::new());
+    }
+    <span class="kw">let</span> <span class="kw">mut</span> db = <span class="ty">Db</span>::open(db_path)?;
+    recovery::recover_all(&amp;<span class="kw">mut</span> db)
+}</pre>
+</div>
+      <p data-anchor="ch12-p22">The early return matters: on a machine that has never run a scan there
+      is no database, and opening one would create an empty file for nothing. Otherwise, repair, and hand
+      back a description of what was done &mdash; which <code class="inl">main</code> prints before it does
+      anything else:</p>
+      <div class="term" data-anchor="ch12-term-recovered">
+  <div class="term-bar"><span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span><span class="term-title">filecleaner groups, after a power cut</span></div>
+  <pre><b>$</b> filecleaner groups
+<i>recovered: txn #7 (/Users/you/Downloads/golang.pdf): rolled forward (swap completed, backup removed)</i>
+Scan #1: 2 duplicate groups
+  logical duplicates: 26.2 KiB   est. reclaimable: 26.2 KiB
+…</pre>
+</div>
+      <p data-anchor="ch12-p23">One line, and then the command the user asked for. They never learn
+      that a repair was pending; they just learn that one happened. The user guide's promise is exactly
+      this: if your Mac loses power mid-reclaim, no cleanup is needed from you.</p>
+      <p data-anchor="ch12-p24">There is a second, quieter reason recovery runs first. A leftover
+      <code class="inl">.filecleaner.*</code> temp file is byte-identical to a real file by construction. If
+      a scan ran before recovery cleaned it up, the walker's own-artifact filter from chapter 4 would skip
+      it &mdash; but a stale backup at the target path would confuse the index. Repairing first means every
+      later stage sees a filesystem in a consistent state.</p>
+    </section>
+
+    <section data-anchor="ch12-tests">
+      <h2>Testing a crash you cannot cause</h2>
+      <p data-anchor="ch12-p25">You cannot reliably kill a process between two specific renames in a unit
+      test. So the tests do the next best thing: they <em>construct the wreckage by hand</em> &mdash; write
+      a journal row in a chosen state, arrange the files on disk exactly as a kill at that moment would have
+      left them &mdash; and then run recovery against it. There is one test per state:</p>
+      <table class="grid" data-anchor="ch12-recovery-tests">
+        <tr><th>Test</th><th>Reconstructed state</th><th>Asserted repair</th></tr>
+        <tr><td class="mono">recovery_from_prepared_removes_temp_and_rolls_back</td><td>journal <span class="state">prepared</span>, a temp file exists</td><td>temp gone, target's original content intact, row <span class="state">rolled-back</span></td></tr>
+        <tr><td class="mono">recovery_from_backup_created_restores_target</td><td>journal <span class="state">backup-created</span>, target renamed away</td><td>target restored, temp and backup gone, row <span class="state">rolled-back</span></td></tr>
+        <tr><td class="mono">recovery_from_swapped_rolls_forward</td><td>journal <span class="state">swapped</span>, clone staged, target missing</td><td>target has the clone's content, backup removed, row <span class="state done">committed</span></td></tr>
+        <tr><td class="mono">recovery_from_swapped_with_lost_clone_falls_back_to_backup</td><td>journal <span class="state">swapped</span>, no temp, backup present</td><td>target restored from backup, row <span class="state">rolled-back</span></td></tr>
+        <tr><td class="mono">recovery_is_idempotent_and_ignores_terminal_rows</td><td>a repairable row plus a terminal one</td><td>first run repairs one, second run repairs nothing</td></tr>
+      </table>
+      <p data-anchor="ch12-p26">The idempotence test is the one I would keep closest:</p>
+      <div class="listing" data-anchor="ch12-idempotent">
+  <p class="srcref"><span class="path">tests/txn_integration.rs</span><span class="what">abridged &amp;mdash; setup elided</span></p>
+  <pre class="rs">    <span class="mac">assert_eq!</span>(recover(&amp;f.db_path).unwrap().len(), <span class="num">1</span>);
+    <span class="mac">assert_eq!</span>(recover(&amp;f.db_path).unwrap().len(), <span class="num">0</span>, <span class="str">"nothing left to do"</span>);</pre>
+</div>
+      <p data-anchor="ch12-p27">Because recovery runs on <em>every</em> launch, it must be a no-op the
+      second time. If it were not &mdash; if it kept trying to repair a row it had already closed &mdash;
+      every subsequent command would try to undo a completed reclaim. Two lines, and they pin down the one
+      property that makes &ldquo;run it always&rdquo; a safe policy.</p>
+      <p data-anchor="ch12-p28">Notice too what makes the &ldquo;roll forward&rdquo; test convincing: the
+      reconstructed temp file contains <em>different bytes</em> from the original
+      (<code class="inl">b"clon"</code> versus <code class="inl">b"orig"</code>), so afterwards you can tell
+      from the content alone which way recovery went. Testing a swap between two identical files would
+      prove nothing.</p>
+    </section>
+
+    <section data-anchor="ch12-close">
+      <h2>What we gained &mdash; the whole book, in one page</h2>
+      <p data-anchor="ch12-p29">We began with three copies of a video and a refusal to delete any of them.
+      Twelve chapters later, here is what the program does, end to end, and what each piece cost:</p>
+      <table class="grid" data-anchor="ch12-summary">
+        <tr><th>Step</th><th>What it buys</th><th>Lines</th></tr>
+        <tr><td>Walk and filter (ch. 4)</td><td>Candidates, with an audit trail of every refusal, reading no file contents</td><td class="mono">~260</td></tr>
+        <tr><td>Index (ch. 5)</td><td>Resumability, and a durable claim about the past to check against later</td><td class="mono">~640</td></tr>
+        <tr><td>Funnel (ch. 6)</td><td>200,000 files narrowed to a handful of pairs</td><td class="mono">~270</td></tr>
+        <tr><td>Preflight (ch. 9)</td><td>A dry run that means something, and a cheap &ldquo;probably&rdquo;</td><td class="mono">~150</td></tr>
+        <tr><td>Transaction (ch. 10)</td><td>A replacement with only two possible outcomes</td><td class="mono">~330</td></tr>
+        <tr><td>Metadata (ch. 11)</td><td>A replacement macOS cannot tell from the original</td><td class="mono">~470</td></tr>
+        <tr><td>Recovery (ch. 12)</td><td>Crash safety that needs nothing from the user</td><td class="mono">~110</td></tr>
+      </table>
+      <p data-anchor="ch12-p30">And the Rust that carried it, none of it exotic: ownership decided who owned
+      a path and when a buffer died; <code class="inl">Result</code> and <code class="inl">?</code> carried
+      failures without obscuring the happy path; two error crates split &ldquo;something to decide&rdquo;
+      from &ldquo;something to read&rdquo;; iterators and closures expressed the eligibility policy in nine
+      lines; one trait turned an untestable platform boundary into a fault-injection rig; enums with
+      exhaustive <code class="inl">match</code> made &ldquo;did you handle every state?&rdquo; a compile
+      error; and <code class="inl">unsafe</code> was confined to one module, in blocks one expression wide,
+      each with a comment saying what was being promised.</p>
+
+      <div class="callout warn" data-anchor="ch12-callout-honest">
+        <span class="tag">And the honest caveats</span>
+        This is not a backup tool: after reclaiming, the copies share physical blocks on one volume, and if
+        those blocks die they all die together. The savings are estimates &mdash; snapshots, sparse files
+        and pre-existing clones make the observed free space differ, and <code class="inl">du</code> will
+        keep reporting each file at full size. And a replaced file has a new inode, so sync services will
+        see it as changed and may re-upload it. The README says all three plainly, which is itself part of
+        the design.
+      </div>
+
+      <div class="reflect" data-anchor="ch12-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A working answer to a question that sounds impossible: <em>how do you modify someone's files
+        while they are using the computer, and be certain you can never make things worse?</em></p>
+        <p>The answer turned out not to be cleverness. It was a sequence of ordinary decisions, each one
+        paid for by the last. Narrow aggressively, so the authoritative check is affordable. Check at the
+        last possible instant, not the most convenient one. Stage beside the thing you are replacing, so
+        the commit is a rename. Write down what you are about to do, before you do it. Track how far you
+        got, so undo is a lookup. And after the point of no return, stop trying to undo.</p>
+        <p>Those ideas are not about APFS, or macOS, or even about files. They are what any program looks
+        like when it takes seriously that it might be interrupted, and that the data does not belong to it.
+        The best way to keep reading is to clone the repository, run <code>cargo test</code>, and then break
+        something on purpose &mdash; comment out the post-rename stat check and watch which test fails
+        first. That test will tell you, better than this book can, what that line was for.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch12-challenges">
+        <span class="tag">Final challenges</span>
+        <ol>
+          <li>Add a <code class="inl">TempVerified</code> state between <span class="state">prepared</span>
+          and <span class="state">backup-created</span>. Write the recovery arm for it &mdash; and then
+          argue whether it earns its place.</li>
+          <li>Recovery never re-verifies content: rolling forward from
+          <span class="state">swapped</span> trusts a verification that happened before the crash. Construct
+          the scenario where that trust is misplaced, and say what it would cost to close.</li>
+          <li>The journal keeps committed and rolled-back rows forever. Design a retention policy, and say
+          exactly which recovery guarantee constrains how aggressive it can be.</li>
+          <li>Take the pattern &mdash; journal intent, stage beside, verify, atomic swap, repair on launch
+          &mdash; and apply it to something that is not a file. A configuration record? A database row? What
+          plays the part of <code class="inl">rename</code>?</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/journal.rs">file_cleaner &mdash; src/txn/journal.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/recovery.rs">file_cleaner &mdash; src/txn/recovery.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/db.rs">file_cleaner &mdash; src/index/db.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/lib.rs">file_cleaner &mdash; src/lib.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/txn_integration.rs">file_cleaner &mdash; tests/txn_integration.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/docs/user-guide.md">file_cleaner &mdash; docs/user-guide.md (interruptions and recovery)</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/README.md">file_cleaner &mdash; README.md (what this tool is NOT)</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="11-metadata-fidelity.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Cheatsheet &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

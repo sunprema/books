@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Journaled Transaction &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch10-intro">
+      <p class="eyebrow">Chapter 10 &middot; Part IV — Replacing a File Safely</p>
+      <h1>The Journaled Transaction</h1>
+      <p class="lead" data-anchor="ch10-lead">This is the chapter the other eleven exist for. We have a
+      source, a target we believe is identical, a plan, and a preflight that says &ldquo;probably.&rdquo;
+      Now we have to replace a real file on a real disk, in a way that survives being wrong, being
+      interrupted, and being raced by the user &mdash; and that leaves, in every one of those cases,
+      either the old file or the new one. Never neither. Never something in between.</p>
+    </section>
+    <section data-anchor="ch10-sequence">
+      <h2>The sequence, in one breath</h2>
+      <p data-anchor="ch10-p1">The executor's doc comment is the specification, and it is worth reading
+      before any code:</p>
+      <div class="listing" data-anchor="ch10-doccomment">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">the doc comment on execute(), verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Execute one reclamation transaction:</span>
+<span class="cm">///</span>
+<span class="cm">/// preflight → journal `prepared` → snapshot target metadata → byte-compare</span>
+<span class="cm">/// both forks (final authority) → clone source to temp → restore target</span>
+<span class="cm">/// metadata onto temp → verify temp → journal `backup-created` →</span>
+<span class="cm">/// rename(target, backup) → journal `swapped` → rename(temp, target) →</span>
+<span class="cm">/// fsync dir → final validation → remove backup → journal `committed`.</span>
+<span class="cm">///</span>
+<span class="cm">/// On any failure the filesystem is rolled back to the pre-transaction</span>
+<span class="cm">/// state and the journal records `rolled-back` with the error. The source</span>
+<span class="cm">/// is never opened for writing at any point.</span></pre>
+</div>
+      <figure class="diagram-fig" data-anchor="ch10-fig-seq">
+        <svg class="diagram" viewBox="0 0 560 300" role="img" aria-labelledby="ch10-d1-title">
+          <title id="ch10-d1-title">A timeline of the transaction: the journal state prepared covers snapshot, byte comparison, cloning, metadata restore and verification; backup-created is written before renaming the target away; swapped is written before renaming the clone into place; committed follows final validation and backup removal</title>
+
+          <text x="16" y="14" class="dim">journal state</text>
+          <text x="150" y="14" class="dim">filesystem step</text>
+          <text x="440" y="14" class="dim">if we crash here</text>
+
+          <path d="M96 24 L96 268" class="stroke-soft"/>
+
+          <rect x="16" y="30" width="72" height="18" class="stroke fill-soft"/>
+          <text x="24" y="43" class="mono">prepared</text>
+          <text x="150" y="43" class="big">snapshot target metadata</text>
+          <text x="440" y="43" class="dim">roll back</text>
+
+          <text x="150" y="65" class="big red">byte-compare both forks</text>
+          <text x="440" y="65" class="dim">roll back</text>
+
+          <text x="150" y="87" class="big">clonefile(source &rarr; temp)</text>
+          <text x="440" y="87" class="dim">roll back</text>
+
+          <text x="150" y="109" class="big">restore target metadata onto temp</text>
+          <text x="440" y="109" class="dim">roll back</text>
+
+          <text x="150" y="131" class="big">verify temp: type, size, mode, bytes, fork</text>
+          <text x="440" y="131" class="dim">roll back</text>
+
+          <rect x="16" y="146" width="90" height="18" class="stroke fill-soft"/>
+          <text x="24" y="159" class="mono">backup-created</text>
+          <text x="150" y="159" class="big">rename(target &rarr; backup)</text>
+          <text x="440" y="159" class="dim">roll back</text>
+
+          <text x="150" y="181" class="big red">re-stat backup vs. scan expectations</text>
+          <text x="440" y="181" class="dim">roll back</text>
+
+          <rect x="16" y="196" width="72" height="18" class="stroke-red fill-red"/>
+          <text x="24" y="209" class="mono on-ink">swapped</text>
+          <text x="150" y="209" class="big">rename(temp &rarr; target)</text>
+          <text x="440" y="209" class="red">roll FORWARD</text>
+
+          <text x="150" y="231" class="big">fsync(dir), final validation</text>
+          <text x="440" y="231" class="red">roll forward</text>
+
+          <rect x="16" y="246" width="72" height="18" class="stroke fill-soft"/>
+          <text x="24" y="259" class="mono">committed</text>
+          <text x="150" y="259" class="big">remove backup</text>
+          <text x="440" y="259" class="dim">nothing to do</text>
+
+          <text x="16" y="288" class="dim">each state is durable BEFORE the step on its line &mdash; that is what makes the right column decidable</text>
+        </svg>
+        <figcaption><b>The whole transaction.</b> The two red rows are the checks that make the swap
+        trustworthy; the red state is the point after which undoing would be the destructive
+        act.</figcaption>
+      </figure>
+      <p data-anchor="ch10-p2">Everything in this chapter is an elaboration of that picture. Note in
+      particular that the journal state is always written <em>before</em> the step it names &mdash; we will
+      come back to why that direction is the only one that works.</p>
+    </section>
+
+    <section data-anchor="ch10-outer">
+      <h2>The outer shell: commit or undo</h2>
+      <div class="listing" data-anchor="ch10-execute-head">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">verbatim &amp;mdash; the opening</span></p>
+  <pre class="rs"><span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">execute</span>(
+    db: &amp;<span class="kw">mut</span> <span class="ty">Db</span>,
+    adapter: &amp;<span class="kw">dyn</span> <span class="ty">ApfsAdapter</span>,
+    plan: &amp;<span class="ty">TxnPlan</span>,
+) -&gt; <span class="ty">Result</span>&lt;<span class="ty">TxnReport</span>, <span class="ty">TxnError</span>&gt; {
+    planner::preflight(plan, adapter)?;
+
+    <span class="kw">let</span> journal_id = db
+        .journal_insert(plan)
+        .map_err(|e| <span class="ty">TxnError</span>::<span class="ty">Db</span>(e.to_string()))?;</pre>
+</div>
+      <div class="listing" data-anchor="ch10-execute">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">verbatim &amp;mdash; the two arms that follow</span></p>
+  <pre class="rs">    <span class="kw">match</span> run(db, adapter, plan, journal_id) {
+        <span class="ty">Ok</span>(<span class="kw">mut</span> warnings) =&gt; {
+            <span class="cm">// Past this point the swap is validated: never roll back.</span>
+            <span class="kw">if</span> <span class="kw">let</span> <span class="ty">Err</span>(err) = fs::remove_file(&amp;plan.backup) {
+                warnings.push(<span class="mac">format!</span>(
+                    <span class="str">"backup not removed ({}): {err}; recovery will clean it up"</span>,
+                    plan.backup.display()
+                ));
+            }
+            <span class="kw">if</span> <span class="kw">let</span> <span class="ty">Err</span>(err) = db.journal_set_state(journal_id, <span class="ty">TxnState</span>::<span class="ty">Committed</span>, <span class="ty">None</span>) {
+                warnings.push(<span class="mac">format!</span>(
+                    <span class="str">"journal not marked committed: {err}; recovery will complete it"</span>
+                ));
+            }
+            <span class="ty">Ok</span>(<span class="ty">TxnReport</span> {
+                journal_id,
+                bytes: plan.size,
+                warnings,
+            })
+        }
+        <span class="ty">Err</span>((progress, err)) =&gt; {
+            <span class="kw">let</span> message = <span class="kw">match</span> rollback(plan, progress) {
+                <span class="ty">Ok</span>(()) =&gt; err.to_string(),
+                <span class="ty">Err</span>(rb_err) =&gt; <span class="mac">format!</span>(<span class="str">"{err}; ROLLBACK INCOMPLETE: {rb_err}"</span>),
+            };
+            <span class="kw">let</span> _ = db.journal_set_state(journal_id, <span class="ty">TxnState</span>::<span class="ty">RolledBack</span>, <span class="ty">Some</span>(&amp;message));
+            <span class="ty">Err</span>(err)
+        }
+    }
+}</pre>
+</div>
+      <p data-anchor="ch10-p3">The structure is a fork with a moral. All the dangerous work is in
+      <code class="inl">run</code>, whose error type is not a bare <code class="inl">TxnError</code> but a
+      pair: <code class="inl">(Progress, TxnError)</code>. The second element says what went wrong; the
+      first says <em>how far we got</em>, which is the only thing that determines how to undo it.</p>
+
+      <h3>After success, nothing is allowed to fail hard</h3>
+      <p data-anchor="ch10-p4">Look at the <code class="inl">Ok</code> arm. Two things still have to happen
+      &mdash; delete the backup, mark the journal committed &mdash; and <em>neither is allowed to turn this
+      into a failure</em>. Both are caught and turned into warnings that say who will clean up. The comment
+      states the rule: <em>past this point the swap is validated: never roll back.</em></p>
+      <div class="callout key" data-anchor="ch10-callout-nevermore">
+        <span class="tag">Key idea</span>
+        Once the new file is in place and has passed final validation, the user's data is correct. Undoing
+        it because a <em>bookkeeping</em> step failed would take a correct outcome and destroy it. A leftover
+        hidden backup file is untidy; recovery will remove it on the next run. Losing the reclamation
+        because <code class="inl">unlink</code> returned <code class="inl">EBUSY</code> would be absurd. Know
+        which of your steps are the point and which are the paperwork.
+      </div>
+
+      <h3>A failed rollback is shouted, not swallowed</h3>
+      <p data-anchor="ch10-p5">In the <code class="inl">Err</code> arm, if the rollback <em>itself</em>
+      fails, the journal message becomes
+      <code class="inl">"{err}; ROLLBACK INCOMPLETE: {rb_err}"</code> &mdash; capitals and all. That is the
+      one situation this program cannot fully handle on its own, and it makes sure the record says so in
+      words a human will notice while scanning a log.</p>
+      <p data-anchor="ch10-p6">Notice too <code class="inl">let _ = db.journal_set_state(&hellip;)</code> on
+      the failure path: we are already returning an error, and if even the journal write fails there is
+      nothing further to do about it. The deliberate <code class="inl">let _</code> says &ldquo;ignored, on
+      purpose&rdquo; &mdash; unlike a silently dropped <code class="inl">Result</code>, which the compiler
+      would warn about.</p>
+    </section>
+
+    <section data-anchor="ch10-progress">
+      <h2><code class="inl">Progress</code>: knowing how far you got</h2>
+      <div class="listing" data-anchor="ch10-progress">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// How far the filesystem was mutated, for rollback.</span>
+<span class="mac">#[derive(Debug, Clone, Copy, PartialEq, Eq)]</span>
+<span class="kw">enum</span> <span class="ty">Progress</span> {
+    <span class="ty">Clean</span>,
+    <span class="ty">TempCreated</span>,
+    <span class="ty">BackupRenamed</span>,
+    <span class="ty">TargetSwapped</span>,
+}</pre>
+</div>
+      <p data-anchor="ch10-p7">Four states, one per mutation the transaction can have performed. It is
+      private to the module &mdash; no <code class="inl">pub</code> &mdash; because it is an implementation
+      detail of undoing, not part of anyone's API. And it is <code class="inl">Copy</code>, because it is a
+      one-byte value that gets threaded through every error path:</p>
+      <pre class="rs" data-anchor="ch10-fail-closure">    <span class="kw">let</span> <span class="kw">mut</span> progress = <span class="ty">Progress</span>::<span class="ty">Clean</span>;
+    <span class="kw">let</span> fail = |p: <span class="ty">Progress</span>, e: <span class="ty">TxnError</span>| (p, e);
+    <span class="cm">// …</span>
+        .map_err(|e| fail(progress, e.into()))?;</pre>
+      <p data-anchor="ch10-p8">That tiny <code class="inl">fail</code> closure is just a tidier way of
+      writing <code class="inl">(progress, e.into())</code> at twenty call sites. Because
+      <code class="inl">Progress</code> is <code class="inl">Copy</code>, capturing it costs nothing and
+      the closure sees whatever the variable held when the failure occurred.</p>
+      <p data-anchor="ch10-p9">This is a small but genuinely important design idea: <em>rollback is driven
+      by a recorded fact, not by inspecting the filesystem.</em> An undo routine that asked &ldquo;does the
+      temp file exist? does the backup exist?&rdquo; would be guessing, and would guess wrong the moment
+      another process or an interrupted earlier run left similar debris around. The transaction knows what
+      it did.</p>
+    </section>
+
+    <section data-anchor="ch10-authority">
+      <h2>Step 2: the final authority</h2>
+      <p data-anchor="ch10-p10">Before anything is created, the executor compares the two files &mdash; for
+      real, byte by byte, both forks:</p>
+      <div class="listing" data-anchor="ch10-identity">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">inside run(), verbatim</span></p>
+  <pre class="rs">    <span class="cm">// 2. Identity: the byte comparison is the final authority, run inside</span>
+    <span class="cm">//    the transaction so nothing can change between check and swap</span>
+    <span class="cm">//    without being caught by the rename of that exact inode.</span>
+    <span class="kw">let</span> identical = data_forks_identical(&amp;plan.source, &amp;plan.target)
+        .map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> !identical {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">Identity</span>(<span class="str">"source and target data forks differ"</span>.into()),
+        ));
+    }
+    <span class="kw">let</span> source_fork = adapter
+        .read_resource_fork(&amp;plan.source)
+        .map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">let</span> target_fork = adapter
+        .read_resource_fork(&amp;plan.target)
+        .map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> source_fork != target_fork {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">Identity</span>(<span class="str">"source and target resource forks differ"</span>.into()),
+        ));
+    }</pre>
+</div>
+      <p data-anchor="ch10-p11">Both forks, because on macOS a file is not only its data. Two documents
+      with identical data and different custom icons are different documents, and the funnel's grouping key
+      only compared fork <em>lengths</em>. Here the contents are compared.</p>
+      <p data-anchor="ch10-p12">The comparison itself is worth reading, because it is the kind of routine
+      people get subtly wrong:</p>
+      <div class="listing" data-anchor="ch10-byte-compare">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Streaming byte-for-byte comparison of two data forks.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">data_forks_identical</span>(a: &amp;<span class="ty">Path</span>, b: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;bool&gt; {
+    <span class="kw">let</span> <span class="kw">mut</span> fa = fs::<span class="ty">File</span>::open(a)?;
+    <span class="kw">let</span> <span class="kw">mut</span> fb = fs::<span class="ty">File</span>::open(b)?;
+    <span class="kw">if</span> fa.metadata()?.len() != fb.metadata()?.len() {
+        <span class="kw">return</span> <span class="ty">Ok</span>(<span class="kw">false</span>);
+    }
+    <span class="kw">let</span> <span class="kw">mut</span> buf_a = <span class="mac">vec!</span>[<span class="num">0u8</span>; <span class="num">1024</span> * <span class="num">1024</span>];
+    <span class="kw">let</span> <span class="kw">mut</span> buf_b = <span class="mac">vec!</span>[<span class="num">0u8</span>; <span class="num">1024</span> * <span class="num">1024</span>];
+    <span class="kw">loop</span> {
+        <span class="kw">let</span> n = read_full(&amp;<span class="kw">mut</span> fa, &amp;<span class="kw">mut</span> buf_a)?;
+        <span class="kw">let</span> m = read_full(&amp;<span class="kw">mut</span> fb, &amp;<span class="kw">mut</span> buf_b)?;
+        <span class="kw">if</span> n != m || buf_a[..n] != buf_b[..m] {
+            <span class="kw">return</span> <span class="ty">Ok</span>(<span class="kw">false</span>);
+        }
+        <span class="kw">if</span> n == <span class="num">0</span> {
+            <span class="kw">return</span> <span class="ty">Ok</span>(<span class="kw">true</span>);
+        }
+    }
+}
+
+<span class="cm">/// Read until the buffer is full or EOF.</span>
+<span class="kw">fn</span> <span class="fn">read_full</span>(file: &amp;<span class="kw">mut</span> fs::<span class="ty">File</span>, buf: &amp;<span class="kw">mut</span> [u8]) -&gt; io::<span class="ty">Result</span>&lt;usize&gt; {
+    <span class="kw">let</span> <span class="kw">mut</span> filled = <span class="num">0</span>;
+    <span class="kw">while</span> filled &lt; buf.len() {
+        <span class="kw">let</span> n = file.read(&amp;<span class="kw">mut</span> buf[filled..])?;
+        <span class="kw">if</span> n == <span class="num">0</span> {
+            <span class="kw">break</span>;
+        }
+        filled += n;
+    }
+    <span class="ty">Ok</span>(filled)
+}</pre>
+</div>
+      <p data-anchor="ch10-p13">Three details do the work. <strong>Length first</strong>: cheapest
+      possible disqualifier, and it means the loop never has to reason about one file ending early.
+      <strong>Constant memory</strong>: two 1&nbsp;MiB buffers regardless of file size.
+      <strong><code class="inl">read_full</code></strong>: this is the subtle one. A plain
+      <code class="inl">read</code> may return fewer bytes than asked for at any time, for reasons that have
+      nothing to do with the file's contents &mdash; so comparing two raw <code class="inl">read</code>
+      results could report a difference between two identical files simply because the kernel filled the
+      buffers differently. Looping until full or EOF removes that entirely.</p>
+      <p data-anchor="ch10-p14">Its own unit test builds a 3&nbsp;MiB pattern (so the loop runs several
+      times), then a copy differing only in the <em>last byte</em>, and a copy one byte shorter &mdash;
+      catching both the &ldquo;difference in the final buffer&rdquo; and the &ldquo;length mismatch&rdquo;
+      cases.</p>
+      <p data-anchor="ch10-p15">And notice: the source is opened with
+      <code class="inl">fs::File::open</code> &mdash; read-only. Grep the whole executor for the source path
+      and you find two read opens and nothing else. That is the &ldquo;never written&rdquo; promise from
+      chapter 3, kept.</p>
+    </section>
+
+    <section data-anchor="ch10-verify">
+      <h2>Steps 3&ndash;5: build the replacement and audit it</h2>
+      <p data-anchor="ch10-p16">Only now does anything get created:</p>
+      <div class="listing" data-anchor="ch10-clone-restore">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">inside run(), verbatim</span></p>
+  <pre class="rs">    <span class="cm">// 3. Clone to the hidden temp path in the target's directory.</span>
+    adapter
+        .clone_file(&amp;plan.source, &amp;plan.temp)
+        .map_err(|e| fail(progress, e.into()))?;
+    progress = <span class="ty">Progress</span>::<span class="ty">TempCreated</span>;
+
+    <span class="cm">// 4. Make the clone metadata-identical to the target.</span>
+    <span class="kw">let</span> restore = adapter
+        .restore_metadata(&amp;plan.temp, &amp;snapshot)
+        .map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">let</span> warnings = restore.warnings;</pre>
+</div>
+      <p data-anchor="ch10-p17"><code class="inl">progress</code> is advanced <em>immediately after</em>
+      the operation that made it true &mdash; so if the very next line fails, rollback knows a temp file
+      exists. The metadata restore is chapter 11's subject; for now, note only that it returns
+      <em>warnings</em> rather than failing when it cannot restore ownership or an ACL, and that those
+      warnings ride all the way out to the user in the <code class="inl">TxnReport</code>.</p>
+      <p data-anchor="ch10-p18">Then the clone is put on trial. Four independent checks, and the file is
+      not permitted to replace anything until it passes all of them:</p>
+      <div class="listing" data-anchor="ch10-verify-temp">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">inside run(), verbatim</span></p>
+  <pre class="rs">    <span class="cm">// 5. Verify the temp clone before it can replace anything.</span>
+    <span class="kw">let</span> temp_meta = fs::symlink_metadata(&amp;plan.temp).map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> !temp_meta.is_file() || temp_meta.len() != plan.size {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">TempVerify</span>(<span class="str">"temp clone has wrong type or size"</span>.into()),
+        ));
+    }
+    <span class="kw">if</span> temp_meta.mode() &amp; <span class="num">0o7777</span> != snapshot.mode {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">TempVerify</span>(<span class="str">"temp clone mode does not match target"</span>.into()),
+        ));
+    }
+    <span class="kw">let</span> temp_identical =
+        data_forks_identical(&amp;plan.temp, &amp;plan.source).map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> !temp_identical {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">TempVerify</span>(<span class="str">"temp clone content does not match source"</span>.into()),
+        ));
+    }
+    <span class="kw">let</span> temp_fork = adapter
+        .read_resource_fork(&amp;plan.temp)
+        .map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> temp_fork != source_fork {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">TempVerify</span>(<span class="str">"temp clone resource fork does not match"</span>.into()),
+        ));
+    }</pre>
+</div>
+      <p data-anchor="ch10-p19">Type and size, permission bits against the snapshot we took of the
+      target, contents against the source, resource fork against the source. You could argue every one of
+      these is redundant &mdash; <code class="inl">clonefile</code> just made this file, of course it
+      matches. The counter-argument is the one this whole codebase runs on: the cost is one stat and one
+      read of a file we just wrote (still warm in the page cache), and the thing being protected is a user's
+      data. <span class="rule-chip">verify the thing you built before you let it replace something</span></p>
+      <p class="hint" data-anchor="ch10-p20"><code class="inl">mode &amp; 0o7777</code> masks off the file
+      type bits and keeps the permission bits &mdash; including setuid, setgid and sticky, which live in
+      the fourth octal digit and which a careless <code class="inl">&amp; 0o777</code> would silently
+      drop.</p>
+    </section>
+
+    <section data-anchor="ch10-swap">
+      <h2>Step 6: the swap, and the race it closes</h2>
+      <p data-anchor="ch10-p21">Here is the heart of the whole program:</p>
+      <div class="listing" data-anchor="ch10-swap">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">inside run(), verbatim</span></p>
+  <pre class="rs">    <span class="cm">// 6. Swap, journaling each rename before it happens.</span>
+    db.journal_set_state(journal_id, <span class="ty">TxnState</span>::<span class="ty">BackupCreated</span>, <span class="ty">None</span>)
+        .map_err(|e| fail(progress, <span class="ty">TxnError</span>::<span class="ty">Db</span>(e.to_string())))?;
+    fs::rename(&amp;plan.target, &amp;plan.backup).map_err(|e| fail(progress, e.into()))?;
+    progress = <span class="ty">Progress</span>::<span class="ty">BackupRenamed</span>;
+
+    <span class="cm">// Close the verify-to-swap race: rename preserves the inode, so the</span>
+    <span class="cm">// renamed backup must still match what the scan recorded. A target</span>
+    <span class="cm">// mutated at any point since preflight shows up here (mtime/size) and</span>
+    <span class="cm">// rolls back — the user's edit wins, not the clone.</span>
+    <span class="kw">let</span> backup_meta = fs::symlink_metadata(&amp;plan.backup).map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> backup_meta.ino() != plan.expected.ino
+        || backup_meta.len() != plan.expected.size
+        || backup_meta.mtime() != plan.expected.mtime_sec
+        || backup_meta.mtime_nsec() != plan.expected.mtime_nsec
+    {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">Identity</span>(<span class="str">"target changed during the transaction"</span>.into()),
+        ));
+    }
+
+    db.journal_set_state(journal_id, <span class="ty">TxnState</span>::<span class="ty">Swapped</span>, <span class="ty">None</span>)
+        .map_err(|e| fail(progress, <span class="ty">TxnError</span>::<span class="ty">Db</span>(e.to_string())))?;
+    fs::rename(&amp;plan.temp, &amp;plan.target).map_err(|e| fail(progress, e.into()))?;
+    progress = <span class="ty">Progress</span>::<span class="ty">TargetSwapped</span>;</pre>
+</div>
+      <h3>Journal first, then act</h3>
+      <p data-anchor="ch10-p22">Both renames are preceded by a journal write, and the ordering is the entire
+      recovery story. Suppose we crash between them. The journal says
+      <span class="state active">backup-created</span>, and the recovery pass in chapter 12 knows: the
+      target may or may not have been renamed away, but the clone was definitely not put in its place, so
+      restore the backup if the target is missing. If the journal had been written <em>after</em> the
+      rename, a crash in the gap would leave a filesystem that had moved on and a journal that had not
+      &mdash; and recovery would have to guess.</p>
+      <p data-anchor="ch10-p23">Note also that a journal write failure is a transaction failure. It is not
+      optional bookkeeping; a step whose intent could not be recorded must not happen.</p>
+
+      <h3>The check I would frame and hang on a wall</h3>
+      <p data-anchor="ch10-p24">Between the two renames sits a stat of the <em>backup</em> path, compared
+      against what the scan recorded. Why there, of all places?</p>
+      <p data-anchor="ch10-p25">Consider the window this closes. The byte comparison happened in step 2.
+      Steps 3, 4 and 5 &mdash; cloning a possibly-large file, restoring metadata, verifying &mdash; take
+      real time. During all of it, the user can save the target. Nothing so far would notice: the clone was
+      made from the <em>source</em>, and the verification compared it to the <em>source</em>.</p>
+      <p data-anchor="ch10-p26">The insight is that <code class="inl">rename</code> preserves the inode.
+      After <code class="inl">rename(target, backup)</code>, the backup path names <em>exactly the same
+      file object</em> that the target path named a moment ago &mdash; including any changes made to it
+      since. So re-statting it and comparing against <code class="inl">plan.expected</code> asks: is this
+      still the file we scanned? A save during the window bumps the mtime (and usually the size), and this
+      check catches it. And because the rename has already happened, there is no gap left between the check
+      and the swap in which a further change could sneak in unnoticed &mdash; anything that happens now
+      happens to the backup, which is about to be discarded or restored, not to the file we are replacing.</p>
+      <div class="callout key" data-anchor="ch10-callout-userwins">
+        <span class="tag">Key idea</span>
+        <strong>The user's edit always wins.</strong> Not &ldquo;usually&rdquo;, not &ldquo;unless you were
+        unlucky&rdquo;. Two mechanisms cover two windows &mdash; the byte comparison for everything before
+        step 2, this stat for everything after &mdash; and chapter 8's
+        <code class="inl">MutateEarly</code>/<code class="inl">MutateLate</code> faults exist precisely to
+        prove that each window has its own guard.
+      </div>
+      <p data-anchor="ch10-p27">PLAN.md records this check as a hardening item added in milestone M5, with
+      the reasoning attached: <em>rename preserves the inode so the check is sound</em>. It is a good
+      example of a safety property that was not obvious in the first design and became obvious once
+      somebody asked &ldquo;what happens if the user saves right <em>here</em>?&rdquo;</p>
+    </section>
+
+    <section data-anchor="ch10-final">
+      <h2>Step 7: durability and the last audit</h2>
+      <div class="listing" data-anchor="ch10-final-validation">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">inside run(), verbatim</span></p>
+  <pre class="rs">    <span class="kw">if</span> <span class="kw">let</span> <span class="ty">Some</span>(dir) = plan.target.parent() {
+        <span class="cm">// Durability of the renames; best-effort.</span>
+        <span class="kw">let</span> _ = fsync_dir(dir);
+    }
+
+    <span class="cm">// 7. Final validation before the backup may be deleted.</span>
+    <span class="kw">let</span> final_meta = fs::symlink_metadata(&amp;plan.target).map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> !final_meta.is_file() || final_meta.len() != plan.size {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">FinalValidation</span>(<span class="str">"replaced target has wrong type or size"</span>.into()),
+        ));
+    }
+    <span class="kw">let</span> final_identical =
+        data_forks_identical(&amp;plan.target, &amp;plan.source).map_err(|e| fail(progress, e.into()))?;
+    <span class="kw">if</span> !final_identical {
+        <span class="kw">return</span> <span class="ty">Err</span>(fail(
+            progress,
+            <span class="ty">TxnError</span>::<span class="ty">FinalValidation</span>(<span class="str">"replaced target content does not match source"</span>.into()),
+        ));
+    }
+
+    <span class="ty">Ok</span>(warnings)
+}</pre>
+</div>
+      <p data-anchor="ch10-p28"><code class="inl">fsync_dir</code> is three lines &mdash;
+      <code class="inl">fs::File::open(dir)?.sync_all()</code> &mdash; and it exists because renaming a file
+      changes a <em>directory</em>, and directory changes are cached like any other. Without the fsync, a
+      power cut moments after a successful reclaim could leave the directory entry not yet on stable
+      storage. It is best-effort (<code class="inl">let _ =</code>) because some filesystems refuse to fsync
+      a directory handle, and failing a validated swap over that would be the wrong trade.</p>
+      <p data-anchor="ch10-p29">Then the final validation reads the file at the target path &mdash; the new
+      one &mdash; and compares it to the source all over again. This is the third full comparison in one
+      transaction. If it fails, <code class="inl">Progress::TargetSwapped</code> tells rollback to discard
+      the clone and rename the backup back. Only after this passes does the outer shell delete the backup,
+      which is the moment the operation becomes irreversible.</p>
+    </section>
+
+    <section data-anchor="ch10-rollback">
+      <h2>Undo, one case per mutation</h2>
+      <div class="listing" data-anchor="ch10-rollback">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Undo according to how far the transaction got. The target ends up back</span>
+<span class="cm">/// in place in every case.</span>
+<span class="kw">fn</span> <span class="fn">rollback</span>(plan: &amp;<span class="ty">TxnPlan</span>, progress: <span class="ty">Progress</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt; {
+    <span class="kw">match</span> progress {
+        <span class="ty">Progress</span>::<span class="ty">Clean</span> =&gt; <span class="ty">Ok</span>(()),
+        <span class="ty">Progress</span>::<span class="ty">TempCreated</span> =&gt; remove_if_exists(&amp;plan.temp),
+        <span class="ty">Progress</span>::<span class="ty">BackupRenamed</span> =&gt; {
+            remove_if_exists(&amp;plan.temp)?;
+            <span class="kw">if</span> !plan.target.exists() &amp;&amp; plan.backup.exists() {
+                fs::rename(&amp;plan.backup, &amp;plan.target)?;
+            }
+            <span class="ty">Ok</span>(())
+        }
+        <span class="ty">Progress</span>::<span class="ty">TargetSwapped</span> =&gt; {
+            <span class="cm">// The clone sits at the target path but failed validation:</span>
+            <span class="cm">// discard it and restore the original from backup.</span>
+            <span class="kw">if</span> plan.backup.exists() {
+                remove_if_exists(&amp;plan.target)?;
+                fs::rename(&amp;plan.backup, &amp;plan.target)?;
+            }
+            remove_if_exists(&amp;plan.temp)
+        }
+    }
+}</pre>
+</div>
+      <p data-anchor="ch10-p30">A <code class="inl">match</code> with one arm per state, and the
+      compiler guarantees the arms are exhaustive: add a fifth <code class="inl">Progress</code> variant and
+      this function stops compiling until you say what undoing it means. That is a real safety property
+      &mdash; the kind of thing that is a code-review checklist item in other languages and a compile error
+      here.</p>
+      <p data-anchor="ch10-p31">Two touches of care. The <code class="inl">BackupRenamed</code> arm restores
+      only <em>if</em> the target is missing and the backup is present &mdash; so a rollback that runs when
+      the world is already in the right shape does nothing rather than clobbering. And
+      <code class="inl">remove_if_exists</code> treats <code class="inl">NotFound</code> as success:</p>
+      <div class="listing" data-anchor="ch10-remove-if-exists">
+  <p class="srcref"><span class="path">src/txn/executor.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="kw">fn</span> <span class="fn">remove_if_exists</span>(path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt; {
+    <span class="kw">match</span> fs::remove_file(path) {
+        <span class="ty">Ok</span>(()) =&gt; <span class="ty">Ok</span>(()),
+        <span class="ty">Err</span>(err) <span class="kw">if</span> err.kind() == io::<span class="ty">ErrorKind</span>::<span class="ty">NotFound</span> =&gt; <span class="ty">Ok</span>(()),
+        <span class="ty">Err</span>(err) =&gt; <span class="ty">Err</span>(err),
+    }
+}</pre>
+</div>
+      <p data-anchor="ch10-p32">&ldquo;Make sure this file is gone&rdquo; succeeds when the file was
+      never there. That is what makes rollback &mdash; and, in chapter 12, recovery &mdash;
+      <em class="term-def">idempotent</em>: safe to run twice, or ten times, or after a crash that happened
+      during a previous rollback.</p>
+    </section>
+
+    <section data-anchor="ch10-tests">
+      <h2>What the tests demand</h2>
+      <p data-anchor="ch10-p33">The happy-path integration test asserts more than &ldquo;it worked&rdquo;
+      &mdash; it asserts the <em>shape</em> of having worked:</p>
+      <table class="grid" data-anchor="ch10-happy">
+        <tr><th>Assertion</th><th>What it proves</th></tr>
+        <tr><td>content unchanged</td><td>The replacement is byte-identical.</td></tr>
+        <tr><td><code class="inl">assert_ne!</code> on the target's inode</td><td>It really was replaced &mdash; a no-op would also have passed the content check.</td></tr>
+        <tr><td>mode is still <code class="inl">0o600</code>, mtime is still 1&nbsp;400&nbsp;000&nbsp;000</td><td>The target's metadata survived, not the source's.</td></tr>
+        <tr><td>source inode and bytes unchanged</td><td>The source was never written.</td></tr>
+        <tr><td>no <code class="inl">.filecleaner.*</code> left</td><td>Temp and backup both cleaned up.</td></tr>
+        <tr><td>journal row is <span class="state done">committed</span></td><td>Recovery will not touch it later.</td></tr>
+      </table>
+      <p data-anchor="ch10-p34">And then there is the test that justifies the entire byte-comparison design.
+      It writes a target with the same length as the source but different bytes, and then
+      <em>restores the original mtime</em> so that every cheap check agrees:</p>
+      <div class="listing" data-anchor="ch10-adversarial">
+  <p class="srcref"><span class="path">tests/txn_integration.rs</span><span class="what">the adversarial test, abridged &amp;mdash; fixture setup elided</span></p>
+  <pre class="rs">        <span class="cm">// Adversarial mutation: same size, same restored mtime — only the</span>
+        <span class="cm">// bytes differ. Stat-based preflight passes; the byte comparison</span>
+        <span class="cm">// inside the transaction must catch it.</span>
+        <span class="kw">let</span> <span class="kw">mut</span> tweaked = data.clone();
+        tweaked[<span class="num">100</span>] ^= <span class="num">0xff</span>;
+        fs::write(&amp;target, &amp;tweaked).unwrap();
+        set_mtime(&amp;target, <span class="num">1_400_000_000</span>);
+
+        <span class="kw">let</span> (_, results) = reclaim_group(&amp;f.db_path, group_id).unwrap();
+        <span class="kw">let</span> (_, result) = &amp;results[<span class="num">0</span>];
+        <span class="kw">let</span> err = result.as_ref().expect_err(<span class="str">"mismatch must fail"</span>);
+        <span class="mac">assert!</span>(err.to_string().contains(<span class="str">"identity"</span>), <span class="str">"got: {err}"</span>);
+
+        <span class="mac">assert_eq!</span>(fs::read(&amp;target).unwrap(), tweaked, <span class="str">"target untouched"</span>);
+        no_artifacts_left(&amp;f.root);</pre>
+</div>
+      <p data-anchor="ch10-p35">Size: identical. Modification time: identical. Inode: identical.
+      Preflight passes every one of its ten checks. And the transaction still refuses, because it read both
+      files. PLAN.md names this test for what it is: proof that stat checks alone would have been wrong.</p>
+    </section>
+
+    <section data-anchor="ch10-reflect">
+      <div class="reflect" data-anchor="ch10-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A replacement operation with no bad outcomes. Trace any failure through the code and it lands in
+        one of two places: the original file, untouched, with a <code>rolled-back</code> journal row
+        explaining why &mdash; or the new clone, fully verified, with a <code>committed</code> one. There is
+        no third branch where a file is half-written, or missing, or silently the wrong bytes.</p>
+        <p>The techniques are transferable and none of them are exotic: stage the new thing beside the old
+        one; verify it before it can do harm; record your intent before each irreversible step; make the
+        commit point a rename; track how far you got so undo is a lookup rather than a guess; and after the
+        commit point, refuse to undo. Any one of those alone is worth having. Together they are what lets a
+        program modify your files while you keep working.</p>
+        <p>What we have <em>not</em> handled is the case where the process simply stops &mdash; no error, no
+        rollback, no chance to run any of this code. That is what the journal states have been for all
+        along, and it is the last chapter.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch10-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>The final validation compares the new target against the source. Why not against the snapshot
+          of the old target instead &mdash; and what would that catch that this does not?</li>
+          <li>Trace what happens if <code class="inl">rename(temp, target)</code> fails after
+          <span class="state">swapped</span> is journaled. Which <code class="inl">Progress</code> arm runs,
+          and what does the next recovery pass see?</li>
+          <li>The transaction performs three full byte comparisons of the same content. Design a version
+          with two, say exactly which guarantee you gave up, and decide whether you would ship it.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/executor.rs">file_cleaner &mdash; src/txn/executor.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/journal.rs">file_cleaner &mdash; src/txn/journal.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/txn_integration.rs">file_cleaner &mdash; tests/txn_integration.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/PLAN.md">file_cleaner &mdash; PLAN.md (milestones M4 and M5)</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/CLAUDE.md">file_cleaner &mdash; CLAUDE.md (the reclamation transaction spec)</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/README.md">file_cleaner &mdash; README.md (safety model)</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="09-preflight.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="11-metadata-fidelity.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Preflight: Earning the Right to Touch a File &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch9-intro">
+      <p class="eyebrow">Chapter 09 &middot; Part IV — Replacing a File Safely</p>
+      <h1>Preflight: Earning the Right to Touch a File</h1>
+      <p class="lead" data-anchor="ch9-lead">Everything so far has been reconnaissance. We know which
+      files look identical, we know which of them we are allowed to consider, and we have a syscall that
+      can make a clone. Now we are going to modify somebody's disk &mdash; and before the first byte
+      moves, this chapter's job is to answer one question about each target as cheaply as possible:
+      <em>is it still true?</em></p>
+    </section>
+    <section data-anchor="ch9-plan">
+      <h2>First, write down exactly what we intend to do</h2>
+      <p data-anchor="ch9-p1">The unit of work is one target file, and it gets a plan:</p>
+      <div class="listing" data-anchor="ch9-txnplan">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// A fully specified reclamation: replace `target` with a clone of</span>
+<span class="cm">/// `source`, staged at `temp`, keeping `backup` until final validation.</span>
+<span class="cm">/// Temp and backup live in the target's directory so both renames are</span>
+<span class="cm">/// same-directory and atomic.</span>
+<span class="mac">#[derive(Debug, Clone)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">TxnPlan</span> {
+    <span class="kw">pub</span> group_id: i64,
+    <span class="kw">pub</span> source: <span class="ty">PathBuf</span>,
+    <span class="kw">pub</span> target: <span class="ty">PathBuf</span>,
+    <span class="kw">pub</span> temp: <span class="ty">PathBuf</span>,
+    <span class="kw">pub</span> backup: <span class="ty">PathBuf</span>,
+    <span class="kw">pub</span> size: u64,
+    <span class="kw">pub</span> expected: <span class="ty">ExpectedTarget</span>,
+}
+
+<span class="cm">/// What the scan recorded about the target; preflight re-checks the live</span>
+<span class="cm">/// file against this so a target that changed since scanning is never</span>
+<span class="cm">/// touched.</span>
+<span class="mac">#[derive(Debug, Clone, PartialEq, Eq)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">ExpectedTarget</span> {
+    <span class="kw">pub</span> ino: u64,
+    <span class="kw">pub</span> size: u64,
+    <span class="kw">pub</span> mtime_sec: i64,
+    <span class="kw">pub</span> mtime_nsec: i64,
+}</pre>
+</div>
+      <p data-anchor="ch9-p2">Four paths, a size, and a small record of expectations. That last field
+      is the important one, and it is worth naming what it is: a <em class="term-def">claim about the
+      past</em>. It says &ldquo;when we scanned, this path was inode 42, 1.2&nbsp;MB, last modified at this
+      nanosecond.&rdquo; Every safety check from here to the end of the book is some form of comparing the
+      live filesystem against this struct.</p>
+      <p data-anchor="ch9-p3">Notice that the plan is a plain data structure with no methods and no
+      behaviour. It can be built, printed, cloned, stored in the journal and handed to a test &mdash; which
+      is exactly what happens. Separating <em>what we are going to do</em> from <em>doing it</em> is why
+      the dry run costs almost no extra code.</p>
+    </section>
+
+    <section data-anchor="ch9-makeplan">
+      <h2>Where the temp and backup files go</h2>
+      <div class="listing" data-anchor="ch9-makeplan">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Build the transaction plan for one eligible target of a group.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">make_plan</span>(group: &amp;<span class="ty">DuplicateGroup</span>, target: &amp;<span class="ty">GroupMember</span>) -&gt; <span class="ty">TxnPlan</span> {
+    <span class="kw">let</span> dir = target.path.parent().unwrap_or(<span class="ty">Path</span>::new(<span class="str">"."</span>));
+    <span class="kw">let</span> token = <span class="mac">format!</span>(<span class="str">"{:016x}"</span>, rand::random::&lt;u64&gt;());
+    <span class="ty">TxnPlan</span> {
+        group_id: group.id,
+        source: group.source().path.clone(),
+        target: target.path.clone(),
+        temp: dir.join(<span class="mac">format!</span>(<span class="str">".filecleaner.{token}.tmp"</span>)),
+        backup: dir.join(<span class="mac">format!</span>(<span class="str">".filecleaner.{token}.backup"</span>)),
+        size: group.size,
+        expected: <span class="ty">ExpectedTarget</span> {
+            ino: target.ino,
+            size: group.size,
+            mtime_sec: target.mtime_sec,
+            mtime_nsec: target.mtime_nsec,
+        },
+    }
+}</pre>
+</div>
+      <p data-anchor="ch9-p4">Three decisions live in those four lines of path construction.</p>
+
+      <h3>1. In the target's own directory &mdash; not <code class="inl">/tmp</code></h3>
+      <p data-anchor="ch9-p5">This is not a stylistic preference; it is forced twice over. First,
+      <code class="inl">clonefile</code> fails with <code class="inl">EXDEV</code> across filesystems, so a
+      clone staged in <code class="inl">/tmp</code> could not be made from a source on your data volume.
+      Second &mdash; and this is the one that would bite you even if cloning were unrestricted &mdash;
+      <code class="inl">rename(2)</code> is only atomic <em>within</em> a filesystem. A cross-device
+      &ldquo;move&rdquo; is a copy followed by a delete, with a window in the middle where the file exists
+      twice, half-written, or not at all. The entire crash-safety argument of the next three chapters rests
+      on two renames being indivisible, so both staging paths must be siblings of the target.</p>
+
+      <h3>2. A dotted prefix, so the mess is invisible and recognisable</h3>
+      <p data-anchor="ch9-p6">The names begin with <code class="inl">.filecleaner.</code> &mdash; the same
+      <code class="inl">OWN_ARTIFACT_PREFIX</code> constant the walker filters on in chapter 4. The leading
+      dot hides them from Finder and from an ordinary <code class="inl">ls</code>; the prefix makes them
+      unmistakably ours, so a later scan skips them and a later recovery pass recognises them. The user
+      guide even tells users what they are and asks them not to delete them by hand, because recovery uses
+      them.</p>
+
+      <h3>3. One random token, shared by both names</h3>
+      <p data-anchor="ch9-p7"><code class="inl">format!("{:016x}", rand::random::&lt;u64&gt;())</code>
+      produces sixteen hex digits &mdash; 64 bits of randomness &mdash; and both the temp and the backup
+      path use the same one. Two consequences: two concurrent transactions in the same directory cannot
+      collide, and a human (or a recovery pass) looking at a directory containing
+      <code class="inl">.filecleaner.3f9a&hellip;.tmp</code> and
+      <code class="inl">.filecleaner.3f9a&hellip;.backup</code> can see at a glance that they belong to the
+      same operation.</p>
+      <p class="hint" data-anchor="ch9-p8">A collision would need two transactions to draw the same 64-bit
+      number in the same directory at the same moment. And even if it happened, the failure is safe rather
+      than destructive: <code class="inl">clonefile</code> refuses an existing destination with
+      <code class="inl">EEXIST</code>, and that target simply rolls back.</p>
+
+      <p data-anchor="ch9-p9">There is a unit test for exactly this, and its assertions are the three
+      decisions above:</p>
+      <div class="listing" data-anchor="ch9-plan-test">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">unit test, abridged &amp;mdash; fixture setup elided</span></p>
+  <pre class="rs">        <span class="kw">let</span> plan = make_plan(&amp;group, &amp;group.members[<span class="num">1</span>]);
+
+        <span class="mac">assert_eq!</span>(plan.temp.parent().unwrap(), sub);
+        <span class="mac">assert_eq!</span>(plan.backup.parent().unwrap(), sub);
+        <span class="mac">assert!</span>(
+            plan.temp
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(<span class="str">".filecleaner."</span>)
+        );
+        <span class="mac">assert_ne!</span>(plan.temp, plan.backup);
+        <span class="mac">assert_eq!</span>(plan.source, source);</pre>
+</div>
+      <p data-anchor="ch9-p10">The target in that fixture is in a <em>nested</em> subdirectory while
+      the source is in the parent &mdash; so a naive implementation that staged next to the
+      <em>source</em> would pass a sloppier test and fail this one.</p>
+    </section>
+
+    <section data-anchor="ch9-preflight">
+      <h2>Ten questions, asked in order</h2>
+      <p data-anchor="ch9-p11">Now the check itself. Read the doc comment first, because it tells you both
+      what the function is for and &mdash; unusually &mdash; what it deliberately does <em>not</em> do:</p>
+      <div class="listing" data-anchor="ch9-preflight-1">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">verbatim &amp;mdash; the first half</span></p>
+  <pre class="rs"><span class="cm">/// Cheap safety checks, run immediately before a transaction (and for dry</span>
+<span class="cm">/// runs). Reads only — never mutates the filesystem. Content identity is</span>
+<span class="cm">/// deliberately NOT checked here; the executor byte-compares both forks</span>
+<span class="cm">/// inside the journaled transaction.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">preflight</span>(plan: &amp;<span class="ty">TxnPlan</span>, adapter: &amp;<span class="kw">dyn</span> <span class="ty">ApfsAdapter</span>) -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">PreflightError</span>&gt; {
+    <span class="kw">use</span> std::os::unix::fs::<span class="ty">MetadataExt</span>;
+
+    <span class="kw">let</span> target_meta = std::fs::symlink_metadata(&amp;plan.target).map_err(|err| {
+        <span class="kw">if</span> err.kind() == std::io::<span class="ty">ErrorKind</span>::<span class="ty">NotFound</span> {
+            <span class="ty">PreflightError</span>::<span class="ty">TargetChanged</span>
+        } <span class="kw">else</span> {
+            <span class="ty">PreflightError</span>::<span class="ty">Io</span>(err)
+        }
+    })?;
+    <span class="kw">if</span> !target_meta.is_file() {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">TargetNotRegular</span>);
+    }
+    <span class="kw">if</span> target_meta.ino() != plan.expected.ino
+        || target_meta.len() != plan.expected.size
+        || target_meta.mtime() != plan.expected.mtime_sec
+        || target_meta.mtime_nsec() != plan.expected.mtime_nsec
+    {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">TargetChanged</span>);
+    }
+    <span class="kw">if</span> target_meta.nlink() &gt; <span class="num">1</span> {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">TargetHardlinked</span>);
+    }
+
+    <span class="kw">let</span> source_meta = std::fs::symlink_metadata(&amp;plan.source)?;
+    <span class="kw">if</span> !source_meta.is_file() {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">SourceNotRegular</span>);
+    }
+    <span class="kw">if</span> source_meta.ino() == target_meta.ino() &amp;&amp; source_meta.dev() == target_meta.dev() {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">SameInode</span>);
+    }</pre>
+</div>
+      <h3><code class="inl">symlink_metadata</code>, not <code class="inl">metadata</code></h3>
+      <p data-anchor="ch9-p12">The difference is one word and it is the difference between checking the
+      file you named and checking whatever it points at. <code class="inl">fs::metadata</code> follows
+      symlinks; <code class="inl">fs::symlink_metadata</code> does not. If the target path is a symlink,
+      this returns the <em>link's</em> metadata, <code class="inl">is_file()</code> is false, and preflight
+      refuses with <code class="inl">TargetNotRegular</code>. Use the following variant and a symlink would
+      quietly pass every check &mdash; and we would replace the link with a regular file, destroying the
+      link and leaving its target orphaned. Same rule as
+      <code class="inl">CLONE_NOFOLLOW</code>, <code class="inl">follow_links(false)</code>,
+      <code class="inl">XATTR_NOFOLLOW</code>. The program is relentless about this.</p>
+
+      <h3>&ldquo;Not found&rdquo; is not an I/O error, it is a change</h3>
+      <p data-anchor="ch9-p13">That first <code class="inl">map_err</code> reclassifies
+      <code class="inl">NotFound</code> as <code class="inl">TargetChanged</code> while leaving every other
+      failure an <code class="inl">Io</code>. From the user's point of view a file that was deleted since
+      the scan <em>is</em> a file that changed, and the message they get &mdash; &ldquo;target changed
+      since scan&rdquo; &mdash; leads them to the right action (re-scan) instead of to a puzzling
+      <code class="inl">ENOENT</code>.</p>
+
+      <h3>The three-part identity check</h3>
+      <p data-anchor="ch9-p14">Inode, size, and mtime to the nanosecond, all compared against the plan's
+      <code class="inl">expected</code>. Each catches something the others miss: a <em>different
+      inode</em> means the path now names a different file entirely (an editor that saves by
+      write-and-rename does exactly this); a <em>different size</em> means it was appended to or truncated;
+      a <em>different mtime</em> catches a same-size edit. Together they are cheap and they catch the
+      overwhelming majority of real changes.</p>
+      <div class="callout warn" data-anchor="ch9-callout-notenough">
+        <span class="tag">But not all of them</span>
+        A determined adversary &mdash; or an unlucky program &mdash; can write different bytes of the same
+        length and then restore the original mtime, and every check above passes. The repository has a test
+        that does precisely that. Which is why preflight is explicitly <em>not</em> the authority, and why
+        the doc comment says content identity is checked elsewhere. Cheap checks first, expensive truth
+        last.
+      </div>
+
+      <h3>Hard links, again &mdash; and why the check is repeated</h3>
+      <p data-anchor="ch9-p15">Chapter 3's <code class="inl">eligible_targets</code> already excluded
+      members with <code class="inl">nlink &gt; 1</code>. So why check again? Because that filter ran
+      against <em>the index</em>, which describes the world as it was at scan time. Somebody could have run
+      <code class="inl">ln</code> five minutes ago. The index says what we believed; preflight asks the
+      filesystem. That distinction &mdash; belief versus observation &mdash; is the organising idea of this
+      entire chapter.</p>
+
+      <p data-anchor="ch9-p16">Then the platform half, which is where the adapter from chapter 8 finally
+      gets used:</p>
+      <div class="listing" data-anchor="ch9-preflight-2">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">verbatim &amp;mdash; the second half</span></p>
+  <pre class="rs">    <span class="kw">if</span> adapter.device_of(&amp;plan.source)? != adapter.device_of(&amp;plan.target)? {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">DifferentVolume</span>);
+    }
+    <span class="kw">if</span> !adapter.is_apfs(&amp;plan.target)? {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">NotApfs</span>);
+    }
+
+    <span class="kw">let</span> flags = adapter.bsd_flags(&amp;plan.target)?;
+    <span class="kw">if</span> flags &amp; (<span class="ty">UF_IMMUTABLE</span> | <span class="ty">SF_IMMUTABLE</span>) != <span class="num">0</span> {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">TargetImmutable</span>);
+    }
+
+    std::fs::<span class="ty">File</span>::open(&amp;plan.source)
+        .map_err(|err| <span class="ty">PreflightError</span>::<span class="ty">SourceUnreadable</span>(err.to_string()))?;
+
+    <span class="kw">let</span> dir = plan.target.parent().unwrap_or(<span class="ty">Path</span>::new(<span class="str">"."</span>));
+    <span class="kw">if</span> !dir_writable(dir) {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">DirNotWritable</span>);
+    }
+
+    <span class="ty">Ok</span>(())
+}</pre>
+</div>
+      <table class="grid" data-anchor="ch9-checks">
+        <tr><th>#</th><th>Check</th><th>Why it must be here, now</th></tr>
+        <tr><td>1</td><td>target exists &amp; is a regular file</td><td>Not a symlink, not a directory, not a socket.</td></tr>
+        <tr><td>2</td><td>inode, size, mtime match the scan</td><td>The world may have moved since we looked.</td></tr>
+        <tr><td>3</td><td><code class="inl">nlink == 1</code></td><td>A link created after the scan would be silently broken.</td></tr>
+        <tr><td>4</td><td>source is a regular file</td><td>The source could have been replaced too.</td></tr>
+        <tr><td>5</td><td>not the same inode</td><td>Cloning a file over itself is meaningless and dangerous.</td></tr>
+        <tr><td>6</td><td>same device</td><td><code class="inl">clonefile</code> gives <code class="inl">EXDEV</code>; renames stop being atomic. Volumes remount.</td></tr>
+        <tr><td>7</td><td>volume is APFS</td><td>No cloning on HFS+ or a network share.</td></tr>
+        <tr><td>8</td><td>not immutable</td><td><code class="inl">uchg</code>/<code class="inl">schg</code> means the user or the system locked it.</td></tr>
+        <tr><td>9</td><td>source opens for reading</td><td>Cheaper to discover now than three steps in.</td></tr>
+        <tr><td>10</td><td>directory is writable</td><td>We must be able to create the temp file and rename twice.</td></tr>
+      </table>
+
+      <h3>Two constants and a bitmask</h3>
+      <p data-anchor="ch9-p17">The immutability check reads
+      <code class="inl">flags &amp; (UF_IMMUTABLE | SF_IMMUTABLE) != 0</code> &mdash; the classic C idiom
+      for &ldquo;is either of these bits set,&rdquo; written in Rust with the same operators. The constants
+      are declared in the file, as <code class="inl">clone.rs</code> declared
+      <code class="inl">CLONE_NOFOLLOW</code>:</p>
+      <div class="listing" data-anchor="ch9-flags">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="kw">const</span> <span class="ty">UF_IMMUTABLE</span>: u32 = <span class="num">0x0000_0002</span>;
+<span class="kw">const</span> <span class="ty">SF_IMMUTABLE</span>: u32 = <span class="num">0x0002_0000</span>;</pre>
+</div>
+      <p data-anchor="ch9-p18"><code class="inl">UF_</code> is the user-settable
+      &ldquo;locked&rdquo; flag &mdash; the checkbox in Finder's Get Info panel.
+      <code class="inl">SF_</code> is the system flag, which not even root can clear without dropping the
+      system's security level. Either one means somebody deliberately said &ldquo;do not modify this,&rdquo;
+      and the tool takes that at face value. Note also the digit separators in the literals
+      (<code class="inl">0x0002_0000</code>) &mdash; free readability for a bit pattern.</p>
+
+      <h3>The one check that is a syscall in disguise</h3>
+      <div class="listing" data-anchor="ch9-dir-writable">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// `access(2)` check: can this process create and rename entries in `dir`?</span>
+<span class="cm">/// Read-only, so it is safe during dry runs.</span>
+<span class="kw">fn</span> <span class="fn">dir_writable</span>(dir: &amp;<span class="ty">Path</span>) -&gt; bool {
+    <span class="kw">use</span> std::ffi::<span class="ty">CString</span>;
+    <span class="kw">use</span> std::os::unix::ffi::<span class="ty">OsStrExt</span>;
+
+    <span class="kw">let</span> <span class="ty">Ok</span>(c_dir) = <span class="ty">CString</span>::new(dir.as_os_str().as_bytes()) <span class="kw">else</span> {
+        <span class="kw">return</span> <span class="kw">false</span>;
+    };
+    <span class="kw">unsafe</span> { libc::access(c_dir.as_ptr(), libc::<span class="ty">W_OK</span> | libc::<span class="ty">X_OK</span>) == <span class="num">0</span> }
+}</pre>
+</div>
+      <p data-anchor="ch9-p19">Why <code class="inl">access(2)</code> rather than the more obvious
+      &ldquo;try to create a file and see&rdquo;? Because a dry run must not create anything, ever.
+      <code class="inl">access</code> asks the kernel &ldquo;would I be permitted?&rdquo; without doing it.
+      Both bits are needed: <code class="inl">W_OK</code> to create and remove entries,
+      <code class="inl">X_OK</code> to traverse the directory to reach them.</p>
+      <p data-anchor="ch9-p20">This is also a textbook TOCTOU &mdash; time-of-check-to-time-of-use &mdash;
+      pattern, and it is worth being honest about that. Permissions could change between this check and the
+      rename. The mitigation is not to make the check airtight, which is impossible; it is that the actual
+      operation is <em>also</em> checked, and its failure rolls back cleanly. Preflight exists to give the
+      user a good <em>report</em> during a dry run, not to make the transaction safe. The transaction makes
+      itself safe.</p>
+    </section>
+
+    <section data-anchor="ch9-dryrun">
+      <h2>The dry run is preflight, and nothing else</h2>
+      <p data-anchor="ch9-p21">Here is the entire dry-run path in the engine:</p>
+      <div class="listing" data-anchor="ch9-dryrun">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Plan every eligible target of a group and run read-only preflight on</span>
+<span class="cm">/// each. Mutates nothing — this is the `--dry-run` path.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">dry_run_group</span>(
+    db_path: &amp;<span class="ty">Path</span>,
+    group_id: i64,
+) -&gt; <span class="ty">Result</span>&lt;(<span class="ty">DuplicateGroup</span>, <span class="ty">Vec</span>&lt;<span class="ty">DryRunResult</span>&gt;)&gt; {
+    <span class="kw">let</span> group = get_group(db_path, group_id)?;
+    <span class="kw">let</span> adapter = <span class="ty">RealApfs</span>;
+    <span class="kw">let</span> results = group
+        .eligible_targets()
+        .map(|target| {
+            <span class="kw">let</span> plan = planner::make_plan(&amp;group, target);
+            <span class="kw">let</span> verdict = planner::preflight(&amp;plan, &amp;adapter);
+            (plan, verdict)
+        })
+        .collect();
+    <span class="ty">Ok</span>((group, results))
+}</pre>
+</div>
+      <p data-anchor="ch9-p22">And the real path, for comparison &mdash; the same iteration, with
+      <code class="inl">executor::execute</code> where the verdict was:</p>
+      <div class="listing" data-anchor="ch9-reclaim-group">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Execute the reclamation transaction for every eligible target of a</span>
+<span class="cm">/// group. Each target is an independent journaled transaction; one failure</span>
+<span class="cm">/// rolls back that target only and the rest proceed.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">reclaim_group</span>(
+    db_path: &amp;<span class="ty">Path</span>,
+    group_id: i64,
+) -&gt; <span class="ty">Result</span>&lt;(<span class="ty">DuplicateGroup</span>, <span class="ty">Vec</span>&lt;<span class="ty">ReclaimResult</span>&gt;)&gt; {
+    <span class="kw">let</span> group = get_group(db_path, group_id)?;
+    <span class="kw">let</span> <span class="kw">mut</span> db = <span class="ty">Db</span>::open(db_path)?;
+    <span class="kw">let</span> adapter = <span class="ty">RealApfs</span>;
+    <span class="kw">let</span> <span class="kw">mut</span> results = <span class="ty">Vec</span>::new();
+    <span class="kw">for</span> target <span class="kw">in</span> group.eligible_targets() {
+        <span class="kw">let</span> plan = planner::make_plan(&amp;group, target);
+        <span class="kw">let</span> result = executor::execute(&amp;<span class="kw">mut</span> db, &amp;adapter, &amp;plan);
+        results.push((plan, result));
+    }
+    <span class="ty">Ok</span>((group, results))
+}</pre>
+</div>
+      <div class="callout key" data-anchor="ch9-callout-dryrun">
+        <span class="tag">Key idea</span>
+        The dry run is not a simulation of the real path &mdash; it <em>is</em> the real path's first step,
+        stopped early. Same <code class="inl">eligible_targets</code>, same
+        <code class="inl">make_plan</code>, same <code class="inl">preflight</code>, same adapter. There is
+        no second implementation to drift out of sync, and that is the only reason a dry run's verdict is
+        worth anything.
+      </div>
+      <p data-anchor="ch9-p23">Two smaller things worth noticing in the pair. The dry run never opens the
+      database for writing &mdash; it does not even bind a mutable <code class="inl">Db</code> &mdash; so
+      &ldquo;mutates nothing&rdquo; extends to the index as well as the disk. And the reclaim loop is a
+      plain <code class="inl">for</code> pushing into a <code class="inl">Vec</code>, deliberately: each
+      transaction is independent, failures are per-target, and there is no
+      <code class="inl">?</code> that could abandon the remaining files.</p>
+      <p data-anchor="ch9-p24">One integration test guards the purity claim directly. It runs the dry run
+      against a healthy group, asserts the verdict is <code class="inl">Ok</code>, then asserts that the
+      target's inode is unchanged, that no <code class="inl">.filecleaner.*</code> artifacts exist in the
+      directory, and that the journal contains no incomplete rows &mdash; because a dry run should not have
+      written a journal row at all.</p>
+    </section>
+
+    <section data-anchor="ch9-tests">
+      <h2>The refusals, tested one at a time</h2>
+      <p data-anchor="ch9-p25">Every branch above has a test, and they are pleasingly literal:</p>
+      <div class="listing" data-anchor="ch9-tests">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">two of the unit tests, verbatim</span></p>
+  <pre class="rs">    <span class="mac">#[test]</span>
+    <span class="kw">fn</span> <span class="fn">changed_target_is_rejected</span>() {
+        <span class="kw">let</span> (_dir, plan) = fixture();
+        fs::write(&amp;plan.target, <span class="str">b"identical!"</span>).unwrap(); <span class="cm">// size changed</span>
+        <span class="mac">assert!</span>(<span class="mac">matches!</span>(
+            preflight(&amp;plan, &amp;ok_adapter()),
+            <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">TargetChanged</span>)
+        ));
+    }
+
+    <span class="mac">#[test]</span>
+    <span class="kw">fn</span> <span class="fn">symlink_target_is_rejected</span>() {
+        <span class="kw">let</span> (dir, <span class="kw">mut</span> plan) = fixture();
+        <span class="kw">let</span> link = dir.path().join(<span class="str">"link.bin"</span>);
+        std::os::unix::fs::symlink(&amp;plan.target, &amp;link).unwrap();
+        plan.target = link;
+        <span class="mac">assert!</span>(<span class="mac">matches!</span>(
+            preflight(&amp;plan, &amp;ok_adapter()),
+            <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">TargetNotRegular</span>)
+        ));
+    }</pre>
+</div>
+      <p data-anchor="ch9-p26">And one test earns special mention for its honesty about
+      overlapping defences:</p>
+      <div class="listing" data-anchor="ch9-test-hardlink">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">unit test, verbatim</span></p>
+  <pre class="rs">    <span class="mac">#[test]</span>
+    <span class="kw">fn</span> <span class="fn">hardlink_of_source_is_rejected_as_same_inode</span>() {
+        <span class="kw">let</span> dir = tempfile::tempdir().unwrap();
+        <span class="kw">let</span> source = dir.path().join(<span class="str">"src.bin"</span>);
+        fs::write(&amp;source, <span class="str">b"identical"</span>).unwrap();
+        <span class="kw">let</span> target = dir.path().join(<span class="str">"target.bin"</span>);
+        fs::hard_link(&amp;source, &amp;target).unwrap();
+        <span class="kw">let</span> plan = plan_for(dir.path(), &amp;source, &amp;target);
+        <span class="cm">// nlink == 2 trips first; both rejections protect the same invariant.</span>
+        <span class="mac">assert!</span>(<span class="mac">matches!</span>(
+            preflight(&amp;plan, &amp;ok_adapter()),
+            <span class="ty">Err</span>(<span class="ty">PreflightError</span>::<span class="ty">TargetHardlinked</span> | <span class="ty">PreflightError</span>::<span class="ty">SameInode</span>)
+        ));
+    }</pre>
+</div>
+      <p data-anchor="ch9-p27">The test accepts <em>either</em> variant, and the comment explains why:
+      two independent checks defend the same invariant, and which one fires first is an implementation
+      detail. A test that demanded one specific variant would break the day someone reordered two
+      <code class="inl">if</code> statements &mdash; without anything actually being less safe. Writing the
+      assertion at the granularity of the <em>guarantee</em>, not the code path, is a small skill worth
+      practising.</p>
+    </section>
+
+    <section data-anchor="ch9-reflect">
+      <div class="reflect" data-anchor="ch9-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A cheap, honest &ldquo;probably yes&rdquo; &mdash; and a dry run that means something. Ten
+        stat-and-syscall checks cost microseconds and eliminate every target that is obviously ineligible,
+        so the user gets a report they can trust before they type <code>--confirm</code>, and the expensive
+        machinery of the next chapter only ever runs on plausible work.</p>
+        <p>What we did <em>not</em> gain is certainty. Preflight cannot prove the two files are identical,
+        and it cannot prove nothing will change in the next millisecond &mdash; and the code says so out
+        loud in its doc comment rather than implying otherwise. That candour is the handoff to chapter 10,
+        which closes both gaps in the only way they can be closed: inside the transaction, at the last
+        possible instant.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch9-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Preflight checks the source is readable by <em>opening</em> it and dropping the handle
+          immediately. Why not hold the handle open through the transaction &mdash; what would that buy, and
+          what would it cost?</li>
+          <li>The <code class="inl">expected</code> record has no hash. Adding one would let preflight
+          detect same-size, same-mtime edits. Say what it would cost per target, and why the design puts
+          that check in the executor instead.</li>
+          <li>Find an eleventh check you would add. Now justify it against the criterion the existing ten
+          meet: cheap, read-only, and actionable by the user.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/planner.rs">file_cleaner &mdash; src/txn/planner.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/lib.rs">file_cleaner &mdash; src/lib.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/txn_integration.rs">file_cleaner &mdash; tests/txn_integration.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/fault_injection.rs">file_cleaner &mdash; tests/fault_injection.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/docs/user-guide.md">file_cleaner &mdash; docs/user-guide.md</a></li>
+          <li><a href="https://keith.github.io/xcode-man-pages/clonefile.2.html">CLONEFILE(2) &mdash; macOS manual page</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-the-apfs-trait-seam.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-the-journaled-transaction.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

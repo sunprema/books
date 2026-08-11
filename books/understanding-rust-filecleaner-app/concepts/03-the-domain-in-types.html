@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Domain, Written as Types &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch3-intro">
+      <p class="eyebrow">Chapter 03 &middot; Part II — Finding the Duplicates</p>
+      <h1>The Domain, Written as Types</h1>
+      <p class="lead" data-anchor="ch3-lead">Before a program can do anything interesting it has to
+      decide what words it uses. Not variable names &mdash; <em>words</em>: the handful of nouns that the
+      rest of the code will spend its life passing around. In this application there are five, they all
+      live in <code class="inl">src/model.rs</code>, and the whole file is 124 lines. It is the cheapest
+      chapter in the book and, I would argue, the highest-leverage one.</p>
+    </section>
+    <section data-anchor="ch3-newtype">
+      <h2>Two names for two numbers</h2>
+      <p data-anchor="ch3-p1">The file opens with a pair of one-line types:</p>
+      <div class="listing" data-anchor="ch3-newtypes">
+  <p class="srcref"><span class="path">src/model.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Identifies a mounted volume (`st_dev`). APFS cloning only works when</span>
+<span class="cm">/// source and target share a `VolumeId`, and the check must be repeated at</span>
+<span class="cm">/// preflight time because volumes can unmount and remount between runs.</span>
+<span class="mac">#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">VolumeId</span>(<span class="kw">pub</span> u64);
+
+<span class="cm">/// Stored content identity: SHA-256 of the data fork. Hashes nominate</span>
+<span class="cm">/// duplicate candidates; a byte-for-byte comparison is the final authority</span>
+<span class="cm">/// before any replacement.</span>
+<span class="mac">#[derive(Debug, Clone, PartialEq, Eq, Hash)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">ContentId</span>(<span class="kw">pub</span> [u8; <span class="num">32</span>]);</pre>
+</div>
+      <p data-anchor="ch3-p2">These are <em class="term-def">newtypes</em>: tuple structs that wrap
+      exactly one value and add nothing but a name. <code class="inl">VolumeId(pub u64)</code> is a
+      <code class="inl">u64</code> at runtime &mdash; same size, same speed, no allocation, no indirection
+      &mdash; but a different type at compile time. Hand a function a
+      <code class="inl">VolumeId</code> where it wanted a file size and the program does not compile.</p>
+      <p data-anchor="ch3-p3">Look at the derive lists, because they are a design statement.
+      <code class="inl">VolumeId</code> is <code class="inl">Copy</code>: it is one machine word, so
+      passing it around should be as cheap as passing an integer.
+      <code class="inl">ContentId</code> is <em>not</em> <code class="inl">Copy</code>, because it is 32
+      bytes and the author would rather you noticed when you duplicated one. Both are
+      <code class="inl">Hash</code> and <code class="inl">Eq</code>, which is the license to use them as
+      keys in a <code class="inl">HashMap</code> &mdash; the natural thing to want to do with an
+      identity.</p>
+
+      <div class="callout" data-anchor="ch3-callout-honest">
+        <span class="tag">An honest note about this codebase</span>
+        These two types are declared and documented, and <code class="inl">FileEntry::volume()</code>
+        constructs a <code class="inl">VolumeId</code> &mdash; but nothing else in the program currently
+        uses either one. The index stores a device as a plain <code class="inl">u64</code> and a hash as a
+        plain <code class="inl">[u8; 32]</code>, and grouping compares those primitives directly. So the
+        newtypes here document an intention that the code has not yet been wired to enforce. That is worth
+        seeing plainly, because it is the most common half-life of a good idea in a real codebase: the
+        type exists, the discipline hasn't reached the SQL boundary yet.
+      </div>
+      <p data-anchor="ch3-p4">Why does the discipline stall at that boundary? Because
+      <code class="inl">rusqlite</code> hands you back an <code class="inl">i64</code>, and every row
+      constructor would need one more conversion. That is a small cost, but it is a cost paid on every
+      read, and this is what makes newtype adoption an all-or-nothing decision in practice. We will meet
+      the exact spot in the next chapter but one.</p>
+    </section>
+
+    <section data-anchor="ch3-fileentry">
+      <h2><code class="inl">FileEntry</code>: what one scan observation is</h2>
+      <p data-anchor="ch3-p5">Here is the record the scanner produces, one per eligible file:</p>
+      <div class="listing" data-anchor="ch3-fileentry">
+  <p class="srcref"><span class="path">src/model.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// One eligible regular file recorded during enumeration.</span>
+<span class="mac">#[derive(Debug, Clone, PartialEq, Eq)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">FileEntry</span> {
+    <span class="kw">pub</span> path: <span class="ty">PathBuf</span>,
+    <span class="kw">pub</span> dev: u64,
+    <span class="kw">pub</span> ino: u64,
+    <span class="kw">pub</span> nlink: u64,
+    <span class="kw">pub</span> size: u64,
+    <span class="kw">pub</span> mtime_sec: i64,
+    <span class="kw">pub</span> mtime_nsec: i64,
+    <span class="cm">/// Resource-fork length (`com.apple.ResourceFork` xattr), 0 if absent.</span>
+    <span class="cm">/// Part of the grouping key: files whose forks differ are not</span>
+    <span class="cm">/// macOS-identical even when their data forks match.</span>
+    <span class="kw">pub</span> rsrc_len: u64,
+}</pre>
+</div>
+      <p data-anchor="ch3-p6">Every field here is load-bearing, and it is worth asking of each one
+      &ldquo;what decision does this enable?&rdquo;</p>
+      <table class="grid" data-anchor="ch3-fields">
+        <tr><th>Field</th><th>The decision it enables</th></tr>
+        <tr><td class="mono">path</td><td>The only field the user ever sees. Owned (<code class="inl">PathBuf</code>, not <code class="inl">&amp;Path</code>) because the entry outlives the walk.</td></tr>
+        <tr><td class="mono">dev</td><td>Which volume. Clones are same-volume only, so this is part of every grouping key.</td></tr>
+        <tr><td class="mono">ino</td><td>Which <em>file</em>, as opposed to which name. Two paths with one inode are one file.</td></tr>
+        <tr><td class="mono">nlink</td><td>How many names this file has. More than one and we refuse to touch it.</td></tr>
+        <tr><td class="mono">size</td><td>The first, cheapest duplicate filter &mdash; and part of the &ldquo;has it changed?&rdquo; check.</td></tr>
+        <tr><td class="mono">mtime_sec / mtime_nsec</td><td>Change detection at nanosecond resolution, and the tiebreaker for choosing a source.</td></tr>
+        <tr><td class="mono">rsrc_len</td><td>macOS-specific: the resource fork's size. Two files with identical data forks and different forks are <em>different files</em>.</td></tr>
+      </table>
+      <p data-anchor="ch3-p7">Note what is <em>absent</em>: no hash. A <code class="inl">FileEntry</code>
+      is what the walker could learn without opening the file. Hashes arrive later, in the database, as
+      nullable columns &mdash; and that separation is the funnel's whole economy.</p>
+      <p data-anchor="ch3-p8">Note also the timestamp types: <code class="inl">i64</code>, not
+      <code class="inl">u64</code>. Unix timestamps can be negative, and a file dated before 1970 is
+      unusual but not impossible. Choosing the signed type costs nothing and removes a class of bug.</p>
+    </section>
+
+    <section data-anchor="ch3-group">
+      <h2><code class="inl">DuplicateGroup</code>: a set of files that claim to be the same</h2>
+      <p data-anchor="ch3-p9">Once the funnel has run, files that share a volume, a size, a resource-fork
+      length and a full SHA-256 are collected into a group. One member is marked the source.</p>
+      <div class="listing" data-anchor="ch3-group-types">
+  <p class="srcref"><span class="path">src/model.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// A confirmed duplicate group: files on one volume sharing size, resource</span>
+<span class="cm">/// fork length, and full-content SHA-256. Byte comparison still happens at</span>
+<span class="cm">/// reclaim time; this grouping only nominates candidates.</span>
+<span class="mac">#[derive(Debug, Clone)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">DuplicateGroup</span> {
+    <span class="kw">pub</span> id: i64,
+    <span class="kw">pub</span> dev: u64,
+    <span class="kw">pub</span> size: u64,
+    <span class="kw">pub</span> rsrc_len: u64,
+    <span class="kw">pub</span> sha256: [u8; <span class="num">32</span>],
+    <span class="kw">pub</span> members: <span class="ty">Vec</span>&lt;<span class="ty">GroupMember</span>&gt;,
+}
+
+<span class="mac">#[derive(Debug, Clone)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">GroupMember</span> {
+    <span class="kw">pub</span> file_id: i64,
+    <span class="kw">pub</span> path: <span class="ty">PathBuf</span>,
+    <span class="kw">pub</span> ino: u64,
+    <span class="kw">pub</span> nlink: u64,
+    <span class="kw">pub</span> mtime_sec: i64,
+    <span class="kw">pub</span> mtime_nsec: i64,
+    <span class="kw">pub</span> is_source: bool,
+}</pre>
+</div>
+      <p data-anchor="ch3-p10">Read that doc comment once more &mdash; &ldquo;this grouping only
+      nominates candidates.&rdquo; The type is called <code class="inl">DuplicateGroup</code>, it is keyed
+      by a cryptographic hash, and the author still refuses to let it mean &ldquo;these files are
+      identical.&rdquo; It means &ldquo;these files are worth comparing.&rdquo; Chapter 10 does the
+      comparing.</p>
+
+      <h3>A modelling choice worth arguing with</h3>
+      <p data-anchor="ch3-p11">The source is marked by a <code class="inl">bool</code> on each member
+      rather than, say, storing the source as its own field of the group. That makes an invalid state
+      representable: zero sources, or three. The code closes the gap with an assertion instead of a type:</p>
+      <div class="listing" data-anchor="ch3-source-fn">
+  <p class="srcref"><span class="path">src/model.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">source</span>(&amp;<span class="kw">self</span>) -&gt; &amp;<span class="ty">GroupMember</span> {
+        <span class="kw">self</span>.members
+            .iter()
+            .find(|m| m.is_source)
+            .expect(<span class="str">"every group has a source"</span>)
+    }</pre>
+</div>
+      <p data-anchor="ch3-p12">Is that a flaw? Defensibly not, and it is worth understanding why,
+      because the reasoning shows up constantly in real systems code. The invariant is enforced one layer
+      down: the <code class="inl">groups</code> table has a
+      <code class="inl">source_file_id INTEGER NOT NULL</code> column, and the loader marks exactly the
+      member whose id matches. There is precisely one function that can construct a group, and it cannot
+      construct a sourceless one. The <code class="inl">expect</code> is documentation of that invariant,
+      positioned so that if someone ever builds a group by hand and gets it wrong, the program dies
+      immediately and loudly at the exact spot rather than doing something subtle and destructive later.
+      &ldquo;Crash on a broken invariant&rdquo; is the right behaviour for a tool that is about to
+      replace your files.</p>
+    </section>
+
+    <section data-anchor="ch3-eligible">
+      <h2>The safety policy is three methods long</h2>
+      <p data-anchor="ch3-p13">Here is my favourite passage in the codebase, because it is where a
+      paragraph of policy becomes a line of code:</p>
+      <div class="listing" data-anchor="ch3-eligible">
+  <p class="srcref"><span class="path">src/model.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="cm">/// Targets that can actually be reclaimed: a different inode than the</span>
+    <span class="cm">/// source (hardlinks of the source already share storage) and no other</span>
+    <span class="cm">/// hardlinks (replacing one path of a multi-link inode would silently</span>
+    <span class="cm">/// break the link relationship for paths outside our view).</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">eligible_targets</span>(&amp;<span class="kw">self</span>) -&gt; <span class="kw">impl</span> <span class="ty">Iterator</span>&lt;<span class="ty">Item</span> = &amp;<span class="ty">GroupMember</span>&gt; {
+        <span class="kw">let</span> source_ino = <span class="kw">self</span>.source().ino;
+        <span class="kw">self</span>.members
+            .iter()
+            .filter(<span class="kw">move</span> |m| m.ino != source_ino &amp;&amp; m.nlink == <span class="num">1</span>)
+    }
+
+    <span class="cm">/// Bytes stored beyond one copy: size × (distinct inodes − 1).</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">logical_duplicate_bytes</span>(&amp;<span class="kw">self</span>) -&gt; u64 {
+        <span class="kw">self</span>.size * (<span class="kw">self</span>.distinct_inodes() - <span class="num">1</span>)
+    }
+
+    <span class="cm">/// Estimate only: APFS free-space accounting, snapshots, and prior</span>
+    <span class="cm">/// clones can make the observed change differ.</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">estimated_reclaimable_bytes</span>(&amp;<span class="kw">self</span>) -&gt; u64 {
+        <span class="kw">self</span>.size * <span class="kw">self</span>.eligible_targets().count() <span class="kw">as</span> u64
+    }</pre>
+</div>
+      <h3>The two conditions</h3>
+      <p data-anchor="ch3-p14"><code class="inl">m.ino != source_ino</code> excludes hard links of the
+      source. There is nothing to gain: they are already the same inode, already sharing every block.
+      Replacing one would be work that frees zero bytes and breaks a link the user created on purpose.</p>
+      <p data-anchor="ch3-p15"><code class="inl">m.nlink == 1</code> is the sharper rule. If a file has two
+      names and we replace it, the path we replaced now points at a brand-new inode &mdash; and the other
+      name, which we may never have seen, still points at the old one. We would have silently severed a
+      relationship the user relies on, in a directory we might not even have scanned. The tool refuses.
+      <span class="rule-chip">a file with more than one link is never reclaimed</span></p>
+
+      <figure class="diagram-fig" data-anchor="ch3-fig-eligible">
+        <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="ch3-d1-title">
+          <title id="ch3-d1-title">A duplicate group of five paths: one source, one hard link of the source, one hardlinked file with two names, and two ordinary duplicates which are the only eligible targets</title>
+          <text x="16" y="16" class="dim">one group, five paths, two eligible targets</text>
+
+          <rect x="16" y="30" width="150" height="26" class="stroke-red"/>
+          <text x="26" y="47" class="big red">/a/report.pdf</text>
+          <text x="176" y="47" class="mono">source &mdash; only ever read</text>
+
+          <rect x="16" y="64" width="150" height="26" class="stroke-soft"/>
+          <text x="26" y="81" class="big dim">/a/link-to-report.pdf</text>
+          <text x="176" y="81" class="mono dim">same inode as source &mdash; nothing to gain</text>
+
+          <rect x="16" y="98" width="150" height="26" class="stroke-soft"/>
+          <text x="26" y="115" class="big dim">/b/two-names.pdf</text>
+          <text x="176" y="115" class="mono dim">nlink = 2 &mdash; refused, would break a link</text>
+
+          <rect x="16" y="132" width="150" height="26" class="stroke fill-soft"/>
+          <text x="26" y="149" class="big">/c/copy.pdf</text>
+          <text x="176" y="149" class="mono">eligible target</text>
+
+          <rect x="16" y="166" width="150" height="20" class="stroke fill-soft"/>
+          <text x="26" y="180" class="big">/d/copy2.pdf</text>
+          <text x="176" y="180" class="mono">eligible target</text>
+        </svg>
+        <figcaption><b>Two numbers, one policy.</b> <code>logical_duplicate_bytes</code> counts all four
+        non-source paths' worth of waste; <code>estimated_reclaimable_bytes</code> counts only the two we
+        will actually touch. Reporting both, separately, is how the tool avoids promising what it will not
+        deliver.</figcaption>
+      </figure>
+
+      <h3>A closure that has to own its capture</h3>
+      <p data-anchor="ch3-p16">One Rust detail in <code class="inl">eligible_targets</code> is worth
+      slowing down for, because it is a rite of passage. The closure is written
+      <code class="inl">.filter(move |m| &hellip;)</code>. Without <code class="inl">move</code>, the
+      closure would <em>borrow</em> the local <code class="inl">source_ino</code> &mdash; and the function
+      returns the iterator, which would then outlive the local it borrowed. The compiler rejects it. With
+      <code class="inl">move</code>, the closure takes <code class="inl">source_ino</code> by value (it is a
+      <code class="inl">u64</code>, so this is a copy of eight bytes) and the iterator is free to travel.</p>
+      <p data-anchor="ch3-p17">The return type is worth noticing too:
+      <code class="inl">impl Iterator&lt;Item = &amp;GroupMember&gt;</code>. The caller learns &ldquo;this
+      is some iterator of member references&rdquo; and nothing about the three layers of
+      <code class="inl">Filter&lt;Iter&lt;&hellip;&gt;&gt;</code> underneath, which means the
+      implementation can change without touching a signature. And because the items are references, no
+      member is cloned to iterate the group.</p>
+    </section>
+
+    <section data-anchor="ch3-stats">
+      <h2>Counters that serialize</h2>
+      <p data-anchor="ch3-p18">The last type in the file is a plain bag of counters, and its derive list
+      is the interesting part:</p>
+      <div class="listing" data-anchor="ch3-scanstats">
+  <p class="srcref"><span class="path">src/model.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Counters accumulated during a scan, reported to the user afterwards.</span>
+<span class="mac">#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">ScanStats</span> {
+    <span class="kw">pub</span> eligible: u64,
+    <span class="kw">pub</span> eligible_bytes: u64,
+    <span class="kw">pub</span> directories: u64,
+    <span class="kw">pub</span> symlinks: u64,
+    <span class="kw">pub</span> zero_byte: u64,
+    <span class="kw">pub</span> special: u64,
+    <span class="kw">pub</span> packages_skipped: u64,
+    <span class="kw">pub</span> own_artifacts: u64,
+    <span class="kw">pub</span> hardlinked: u64,
+    <span class="kw">pub</span> errors: u64,
+}</pre>
+</div>
+      <p data-anchor="ch3-p19"><code class="inl">Default</code> is why the walker can begin with
+      <code class="inl">ScanStats::default()</code> and get ten zeroes without writing them out.
+      <code class="inl">serde::Serialize</code> is why <code class="inl">filecleaner scan --json</code> can
+      emit these counters to a GUI without a second, hand-maintained JSON shape. One struct, two audiences:
+      the human-readable printer in <code class="inl">main.rs</code> reads the fields, and serde writes
+      them. When the SwiftUI app wants a new counter, adding a field here is the whole change.</p>
+    </section>
+
+    <section data-anchor="ch3-policy">
+      <h2>Choosing the source: a whole policy in one comparison</h2>
+      <p data-anchor="ch3-p20">Which copy survives as the one whose blocks everyone shares? It matters less
+      than you would think &mdash; after cloning, no copy is more authoritative than any other &mdash; but
+      it must be <em>decided the same way every time</em>, or two runs would disagree about which file to
+      leave alone. <code class="inl">src/policy.rs</code> is 67 lines including its tests, and this is the
+      whole of the logic:</p>
+      <div class="listing" data-anchor="ch3-choose-source">
+  <p class="srcref"><span class="path">src/policy.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Default source selection: oldest modification time wins, ties broken by</span>
+<span class="cm">/// lexicographically smallest path. Deterministic so repeated runs pick the</span>
+<span class="cm">/// same source. The source is only ever read, never written, during a</span>
+<span class="cm">/// reclamation transaction.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">choose_source</span>(members: &amp;[<span class="ty">FileEntry</span>]) -&gt; usize {
+    <span class="mac">assert!</span>(!members.is_empty(), <span class="str">"cannot choose a source from no members"</span>);
+    <span class="kw">let</span> <span class="kw">mut</span> best = <span class="num">0</span>;
+    <span class="kw">for</span> (i, candidate) <span class="kw">in</span> members.iter().enumerate().skip(<span class="num">1</span>) {
+        <span class="kw">let</span> b = &amp;members[best];
+        <span class="kw">let</span> candidate_key = (candidate.mtime_sec, candidate.mtime_nsec, &amp;candidate.path);
+        <span class="kw">let</span> best_key = (b.mtime_sec, b.mtime_nsec, &amp;b.path);
+        <span class="kw">if</span> candidate_key &lt; best_key {
+            best = i;
+        }
+    }
+    best
+}</pre>
+</div>
+      <p data-anchor="ch3-p21">The trick is the tuple. In Rust, tuples compare
+      <em class="term-def">lexicographically</em>: compare the first elements, and only if they are equal
+      move on to the second, then the third. So
+      <code class="inl">(mtime_sec, mtime_nsec, &amp;path)</code> expresses &ldquo;oldest second wins;
+      if the seconds tie, oldest nanosecond; if those tie too, the alphabetically first path&rdquo; in a
+      single <code class="inl">&lt;</code>. Writing that policy as nested
+      <code class="inl">if</code>s would take a dozen lines and hide the intent.</p>
+      <p data-anchor="ch3-p22">Two more details. The function returns an <em>index</em>, not a reference
+      &mdash; which sidesteps the borrow that returning <code class="inl">&amp;FileEntry</code> would
+      create, and lets the caller in <code class="inl">db.rs</code> use it to look up a database row id
+      instead. And <code class="inl">&amp;candidate.path</code> compares a
+      <code class="inl">&amp;PathBuf</code> without cloning anything: the comparison borrows, does its
+      work, and ends.</p>
+      <p data-anchor="ch3-p23">The three unit tests below it read like a specification, which is the point
+      of them:</p>
+      <div class="listing" data-anchor="ch3-policy-test">
+  <p class="srcref"><span class="path">src/policy.rs</span><span class="what">one of three unit tests, verbatim</span></p>
+  <pre class="rs">    <span class="mac">#[test]</span>
+    <span class="kw">fn</span> <span class="fn">nanoseconds_break_second_ties</span>() {
+        <span class="kw">let</span> <span class="kw">mut</span> older = entry(<span class="str">"/z/file.txt"</span>, <span class="num">1000</span>);
+        older.mtime_nsec = <span class="num">100</span>;
+        <span class="kw">let</span> <span class="kw">mut</span> newer = entry(<span class="str">"/a/file.txt"</span>, <span class="num">1000</span>);
+        newer.mtime_nsec = <span class="num">200</span>;
+        <span class="mac">assert_eq!</span>(choose_source(&amp;[newer, older]), <span class="num">1</span>);
+    }</pre>
+</div>
+      <p data-anchor="ch3-p24">Note the adversarial construction: the <em>newer</em> file is also the
+      alphabetically-first one, so a policy that accidentally sorted by path alone would return
+      <code class="inl">0</code> and fail. A test that can only pass for the right reason is worth three
+      that pass for any reason.</p>
+
+      <div class="callout key" data-anchor="ch3-callout-source">
+        <span class="tag">Key idea</span>
+        The doc comment slips in a promise that the whole second half of the book has to keep: <strong>the
+        source is only ever read, never written</strong>. Chapter 10 will show you that the executor opens
+        the source exactly twice, both times for reading, and never names it in a
+        <code class="inl">rename</code> or a <code class="inl">remove_file</code>.
+      </div>
+    </section>
+
+    <section data-anchor="ch3-reflect">
+      <div class="reflect" data-anchor="ch3-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A vocabulary, and &mdash; more importantly &mdash; a place where the safety rules live as code
+        rather than as prose. <code>eligible_targets</code> is the answer to &ldquo;which files may we
+        touch?&rdquo;, and it is nine lines long, in one file, with its reasoning in a doc comment directly
+        above it. When chapter 9's preflight re-checks the same conditions against the live filesystem, it
+        is not duplicating this logic; it is confirming that the world still matches what this decided.</p>
+        <p>We also gained a small, honest lesson: two newtypes that document an intention the code hasn't
+        finished adopting. Real codebases are full of these, and reading one accurately means noticing
+        them rather than assuming every declared type is load-bearing.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch3-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Make <code class="inl">VolumeId</code> load-bearing: change <code class="inl">FileEntry.dev</code>
+          and <code class="inl">DuplicateGroup.dev</code> to <code class="inl">VolumeId</code>. How many
+          call sites change, and how many of them are inside <code class="inl">db.rs</code>?</li>
+          <li><code class="inl">logical_duplicate_bytes</code> multiplies before subtracting. Construct a
+          group where <code class="inl">size * (distinct_inodes() - 1)</code> overflows a
+          <code class="inl">u64</code>, and say whether you consider it a real bug.</li>
+          <li><code class="inl">source()</code> panics on a sourceless group. Rewrite it to return
+          <code class="inl">Option&lt;&amp;GroupMember&gt;</code> and follow the change outward &mdash; what
+          happens to <code class="inl">eligible_targets</code>, which calls it unconditionally?</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/model.rs">file_cleaner &mdash; src/model.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/policy.rs">file_cleaner &mdash; src/policy.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/db.rs">file_cleaner &mdash; src/index/db.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/docs/user-guide.md">file_cleaner &mdash; docs/user-guide.md</a></li>
+          <li><a href="https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html">The Rust Programming Language, ch. 4 &mdash; Understanding Ownership</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-apfs-clones-and-clonefile.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-walking-the-disk.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

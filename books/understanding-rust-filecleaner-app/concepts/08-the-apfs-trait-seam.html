@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Seam for Failure: the ApfsAdapter Trait &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch8-intro">
+      <p class="eyebrow">Chapter 08 &middot; Part III — Rust Craft in the Middle</p>
+      <h1>A Seam for Failure: the <code class="inl">ApfsAdapter</code> Trait</h1>
+      <p class="lead" data-anchor="ch8-lead">Here is a test I would like to write. &ldquo;Start replacing
+      a file; when the clone is half-created, fill up the disk; assert that the user's original file is
+      exactly as it was, that no debris is left behind, and that the journal says <em>rolled
+      back</em>.&rdquo; Now: how do you fill up a disk on demand, in a unit test, reliably, on someone
+      else's laptop? You don't. You arrange for the program to be told the disk is full &mdash; and the
+      arrangement is one trait.</p>
+    </section>
+    <section data-anchor="ch8-boundary">
+      <h2>The comment that defines the architecture</h2>
+      <p data-anchor="ch8-p1"><code class="inl">src/apfs/mod.rs</code> opens with a module doc comment. It
+      is four lines and it is the load-bearing sentence of this codebase:</p>
+      <div class="listing" data-anchor="ch8-modcomment">
+  <p class="srcref"><span class="path">src/apfs/mod.rs</span><span class="what">the module doc comment, verbatim</span></p>
+  <pre class="rs"><span class="cm">//! All Darwin-specific and `unsafe` code lives in this module. Everything</span>
+<span class="cm">//! above it (scanner, index, policy, transactions) stays platform-neutral</span>
+<span class="cm">//! and depends on the [`ApfsAdapter`] trait, so tests can inject failures</span>
+<span class="cm">//! at any step without touching a real filesystem.</span></pre>
+</div>
+      <p data-anchor="ch8-p2">Read the causal chain in it: <em>because</em> the platform code is
+      confined, the layers above can depend on an interface instead of on macOS &mdash; and
+      <em>therefore</em> the tests can substitute a different implementation. Testability is not a bonus
+      here; it is the reason the boundary exists.</p>
+      <p data-anchor="ch8-p3">A trait, in Rust, is a set of method signatures a type can promise to
+      provide. If you come from an object-oriented language, it will look like an interface, and for this
+      purpose it behaves like one. The differences that matter here are two: a trait can be implemented
+      for a type you did not write, and calls through a trait can be resolved either at compile time
+      (<em class="term-def">static dispatch</em>, zero cost) or at run time
+      (<em class="term-def">dynamic dispatch</em>, one pointer indirection). This code uses the latter, and
+      we will see why.</p>
+    </section>
+
+    <section data-anchor="ch8-trait">
+      <h2>Seven methods, chosen carefully</h2>
+      <div class="listing" data-anchor="ch8-trait">
+  <p class="srcref"><span class="path">src/apfs/mod.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// The platform operations a reclamation transaction needs.</span>
+<span class="kw">pub</span> <span class="kw">trait</span> <span class="ty">ApfsAdapter</span>: <span class="ty">Send</span> + <span class="ty">Sync</span> {
+    <span class="cm">/// APFS copy-on-write clone. `destination` must not exist.</span>
+    <span class="kw">fn</span> <span class="fn">clone_file</span>(&amp;<span class="kw">self</span>, source: &amp;<span class="ty">Path</span>, destination: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt;;
+
+    <span class="cm">/// Device id of the filesystem holding `path`.</span>
+    <span class="kw">fn</span> <span class="fn">device_of</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;u64&gt;;
+
+    <span class="cm">/// Whether `path` lives on an APFS filesystem.</span>
+    <span class="kw">fn</span> <span class="fn">is_apfs</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;bool&gt;;
+
+    <span class="cm">/// Capture a target's restorable metadata.</span>
+    <span class="kw">fn</span> <span class="fn">snapshot_metadata</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">MetadataSnapshot</span>&gt;;
+
+    <span class="cm">/// Reapply a snapshot to a fresh clone.</span>
+    <span class="kw">fn</span> <span class="fn">restore_metadata</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>, snap: &amp;<span class="ty">MetadataSnapshot</span>)
+    -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">RestoreOutcome</span>&gt;;
+
+    <span class="cm">/// Full resource-fork contents; empty when absent.</span>
+    <span class="kw">fn</span> <span class="fn">read_resource_fork</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;u8&gt;&gt;;
+
+    <span class="cm">/// BSD flags (`st_flags`) of `path`; 0 on platforms without them.</span>
+    <span class="cm">/// Preflight uses this to reject immutable targets.</span>
+    <span class="kw">fn</span> <span class="fn">bsd_flags</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;u32&gt;;
+}</pre>
+</div>
+      <p data-anchor="ch8-p4">The doc comment is doing precise work: <em>the platform operations a
+      reclamation transaction needs</em>. Not &ldquo;filesystem operations.&rdquo; Not an abstraction over
+      files in general. Seven methods, each one a thing the transaction engine actually calls.</p>
+      <p data-anchor="ch8-p5">That narrowness is the whole trick. A general
+      <code class="inl">FileSystem</code> trait with thirty methods would need a thirty-method test double,
+      and nobody writes those &mdash; so in practice such projects test the happy path against the real
+      disk and hope. Because this trait is seven methods, a complete, hostile, scriptable implementation
+      fits in about eighty lines. Testability is a function of surface area.</p>
+      <p data-anchor="ch8-p6">Notice what is <em>not</em> in the trait, either. The executor opens files,
+      compares bytes, and calls <code class="inl">fs::rename</code> directly through
+      <code class="inl">std</code>. Those operations are portable, so they do not need a seam &mdash; and
+      leaving them out means the fault-injection tests exercise <em>real</em> renames on a
+      <em>real</em> filesystem, with only the platform-specific parts scripted. The double is a scalpel,
+      not a simulator.</p>
+
+      <h3><code class="inl">: Send + Sync</code></h3>
+      <p data-anchor="ch8-p7">The <em class="term-def">supertrait</em> bound says any implementation must
+      be safe to send between threads and to share between them. Nothing in the current engine reclaims in
+      parallel &mdash; but declaring the bound now costs nothing, and it constrains implementations
+      (including test doubles) to be thread-safe from the start. It is also the reason the fault-injection
+      adapter cannot reach for a plain <code class="inl">Cell</code> like the walker did.</p>
+
+      <h3>Everything takes <code class="inl">&amp;self</code></h3>
+      <p data-anchor="ch8-p8">Every method borrows immutably, even the ones that mutate the filesystem.
+      That is honest: the <em>adapter</em> holds no state, so cloning a file changes nothing about the
+      adapter. The consequence lands in the test double, which needs to count calls and therefore has to
+      find mutability elsewhere &mdash; we will get there in a minute.</p>
+    </section>
+
+    <section data-anchor="ch8-real">
+      <h2>The real implementation is a unit struct</h2>
+      <div class="listing" data-anchor="ch8-realapfs">
+  <p class="srcref"><span class="path">src/apfs/mod.rs</span><span class="what">abridged &amp;mdash; five delegating bodies elided</span></p>
+  <pre class="rs"><span class="cm">/// The real implementation used in production.</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">RealApfs</span>;
+
+<span class="kw">impl</span> <span class="ty">ApfsAdapter</span> <span class="kw">for</span> <span class="ty">RealApfs</span> {
+    <span class="kw">fn</span> <span class="fn">clone_file</span>(&amp;<span class="kw">self</span>, source: &amp;<span class="ty">Path</span>, destination: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt; {
+        clone::clone_file(source, destination)
+    }
+
+    <span class="cm">// …device_of, is_apfs, snapshot_metadata, restore_metadata and</span>
+    <span class="cm">//   read_resource_fork delegate to their modules the same way…</span>
+
+    <span class="mac">#[cfg(target_os = "macos")]</span>
+    <span class="kw">fn</span> <span class="fn">bsd_flags</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;u32&gt; {
+        <span class="kw">use</span> std::os::macos::fs::<span class="ty">MetadataExt</span>;
+        <span class="ty">Ok</span>(std::fs::symlink_metadata(path)?.st_flags())
+    }
+
+    <span class="mac">#[cfg(not(target_os = "macos"))]</span>
+    <span class="kw">fn</span> <span class="fn">bsd_flags</span>(&amp;<span class="kw">self</span>, _path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;u32&gt; {
+        <span class="ty">Ok</span>(<span class="num">0</span>)
+    }
+}</pre>
+</div>
+      <p data-anchor="ch8-p9"><code class="inl">pub struct RealApfs;</code> &mdash; no fields, no
+      body, no semicolon-less braces. A <em class="term-def">unit struct</em> occupies zero bytes; it
+      exists purely to have a type that can implement the trait. Constructing one, as
+      <code class="inl">lib.rs</code> does with <code class="inl">let adapter = RealApfs;</code>, compiles
+      to nothing at all.</p>
+      <p data-anchor="ch8-p10">Six of the seven methods are one-line delegations to the free functions in
+      <code class="inl">clone.rs</code>, <code class="inl">volume.rs</code>,
+      <code class="inl">metadata.rs</code> and <code class="inl">forks.rs</code>. The seventh,
+      <code class="inl">bsd_flags</code>, is the one place a <code class="inl">cfg</code> split lives
+      inside the impl rather than in a module: on macOS it reads <code class="inl">st_flags</code> through
+      the <code class="inl">std::os::macos</code> extension trait, and elsewhere it returns
+      <code class="inl">Ok(0)</code>. Zero means &ldquo;no flags set,&rdquo; so preflight's immutability
+      check on a non-Mac simply never fires &mdash; a safe default.</p>
+    </section>
+
+    <section data-anchor="ch8-dyn">
+      <h2>How the engine holds it: <code class="inl">&amp;dyn ApfsAdapter</code></h2>
+      <p data-anchor="ch8-p11">Both the planner and the executor take the adapter the same way:</p>
+      <pre class="rs" data-anchor="ch8-dyn-sigs"><span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">preflight</span>(plan: &amp;<span class="ty">TxnPlan</span>, adapter: &amp;<span class="kw">dyn</span> <span class="ty">ApfsAdapter</span>) -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">PreflightError</span>&gt;
+
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">execute</span>(
+    db: &amp;<span class="kw">mut</span> <span class="ty">Db</span>,
+    adapter: &amp;<span class="kw">dyn</span> <span class="ty">ApfsAdapter</span>,
+    plan: &amp;<span class="ty">TxnPlan</span>,
+) -&gt; <span class="ty">Result</span>&lt;<span class="ty">TxnReport</span>, <span class="ty">TxnError</span>&gt;</pre>
+      <p data-anchor="ch8-p12"><code class="inl">&amp;dyn ApfsAdapter</code> is a
+      <em class="term-def">trait object</em>: a fat pointer carrying the data pointer and a pointer to the
+      method table. The alternative would be a generic,
+      <code class="inl">fn execute&lt;A: ApfsAdapter&gt;(&hellip;, adapter: &amp;A, &hellip;)</code>, which
+      compiles a separate copy of the function per adapter type &mdash; faster calls, more code.</p>
+      <p data-anchor="ch8-p13">Dynamic dispatch is the right call here for a reason that has nothing to do
+      with performance: it means there is exactly <em>one</em> compiled
+      <code class="inl">execute</code> in the binary, and the fault-injection tests exercise the very same
+      machine code that runs against your files. With a generic, the test would exercise
+      <code class="inl">execute::&lt;FaultyAdapter&gt;</code> &mdash; a different instantiation of the same
+      source. In practice monomorphised copies behave identically, but for the single most
+      safety-critical function in the program, &ldquo;the tests run the same code&rdquo; is a property
+      worth one pointer indirection. The call happens a handful of times per file replacement, next to
+      operations measured in milliseconds; the cost is not measurable.</p>
+    </section>
+
+    <section data-anchor="ch8-faulty">
+      <h2>The adapter that fails on cue</h2>
+      <p data-anchor="ch8-p14">Now the payoff. <code class="inl">tests/fault_injection.rs</code> defines an
+      adapter that wraps the real one and misbehaves at exactly one chosen point. The catalogue of
+      misbehaviour is an enum, and its doc comments tell you what each fault is <em>for</em>:</p>
+      <div class="listing" data-anchor="ch8-fault-enum">
+  <p class="srcref"><span class="path">tests/fault_injection.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="mac">#[derive(Clone, Copy, PartialEq)]</span>
+<span class="kw">enum</span> <span class="ty">Fault</span> {
+    <span class="cm">/// `snapshot_metadata` fails with EIO before anything is mutated.</span>
+    <span class="ty">Snapshot</span>,
+    <span class="cm">/// `clonefile` fails with ENOSPC — the disk-full case.</span>
+    <span class="ty">CloneEnospc</span>,
+    <span class="cm">/// `restore_metadata` fails with EPERM — the permission case.</span>
+    <span class="ty">RestorePerm</span>,
+    <span class="cm">/// Reading the temp clone's resource fork (3rd fork read) fails.</span>
+    <span class="ty">TempForkRead</span>,
+    <span class="cm">/// Not a failure: rewrite the target (same size, different bytes)</span>
+    <span class="cm">/// during `snapshot_metadata` — before the in-txn byte compare.</span>
+    <span class="ty">MutateEarly</span>,
+    <span class="cm">/// Rewrite the target during `restore_metadata` — *after* the byte</span>
+    <span class="cm">/// compare, in the verify-to-swap window.</span>
+    <span class="ty">MutateLate</span>,
+}</pre>
+</div>
+      <p data-anchor="ch8-p15">Four of these are failures at four different points in the
+      transaction. The other two are not failures at all &mdash; they are a <em>user</em>, editing the file
+      you are in the middle of replacing, at two different instants. We will come back to those.</p>
+      <p data-anchor="ch8-p16">The adapter itself holds the real implementation, the fault to inject, the
+      target's path, and a counter:</p>
+      <div class="listing" data-anchor="ch8-faulty-struct">
+  <p class="srcref"><span class="path">tests/fault_injection.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="kw">struct</span> <span class="ty">FaultyAdapter</span> {
+    real: <span class="ty">RealApfs</span>,
+    fault: <span class="ty">Fault</span>,
+    target: <span class="ty">PathBuf</span>,
+    fork_calls: <span class="ty">AtomicU32</span>,
+}</pre>
+</div>
+      <p data-anchor="ch8-p17">And each method is a one-line decision: is this my fault? Then fail.
+      Otherwise, do the real thing.</p>
+      <div class="listing" data-anchor="ch8-faulty-clone">
+  <p class="srcref"><span class="path">tests/fault_injection.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">fn</span> <span class="fn">clone_file</span>(&amp;<span class="kw">self</span>, source: &amp;<span class="ty">Path</span>, destination: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt; {
+        <span class="kw">if</span> <span class="kw">self</span>.fault == <span class="ty">Fault</span>::<span class="ty">CloneEnospc</span> {
+            <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::from_raw_os_error(libc::<span class="ty">ENOSPC</span>));
+        }
+        <span class="kw">self</span>.real.clone_file(source, destination)
+    }</pre>
+</div>
+      <p data-anchor="ch8-p18"><code class="inl">io::Error::from_raw_os_error(libc::ENOSPC)</code>
+      constructs the <em>exact</em> error a genuinely full disk produces &mdash; the same
+      <code class="inl">errno</code>, the same <code class="inl">ErrorKind</code>, the same message. The
+      executor cannot tell the difference, which is precisely the point. No disk was filled; no VM was
+      spun up; the test runs in milliseconds.</p>
+
+      <h3>Counting calls when all you have is <code class="inl">&amp;self</code></h3>
+      <p data-anchor="ch8-p19">One fault needs to fire on the <em>third</em> call to a method &mdash; and
+      the method signature gives out only a shared reference. Chapter 4 hit this exact wall in the walker
+      and reached for a <code class="inl">Cell</code>. Here the <code class="inl">Send + Sync</code> bound
+      rules that out, so the answer is its thread-safe cousin:</p>
+      <div class="listing" data-anchor="ch8-faulty-fork">
+  <p class="srcref"><span class="path">tests/fault_injection.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">fn</span> <span class="fn">read_resource_fork</span>(&amp;<span class="kw">self</span>, path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;u8&gt;&gt; {
+        <span class="cm">// Executor call order: source (1), target (2), temp (3).</span>
+        <span class="kw">let</span> call = <span class="kw">self</span>.fork_calls.fetch_add(<span class="num">1</span>, <span class="ty">Ordering</span>::<span class="ty">SeqCst</span>) + <span class="num">1</span>;
+        <span class="kw">if</span> <span class="kw">self</span>.fault == <span class="ty">Fault</span>::<span class="ty">TempForkRead</span> &amp;&amp; call == <span class="num">3</span> {
+            <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::from_raw_os_error(libc::<span class="ty">EIO</span>));
+        }
+        <span class="kw">self</span>.real.read_resource_fork(path)
+    }</pre>
+</div>
+      <p data-anchor="ch8-p20"><code class="inl">AtomicU32::fetch_add</code> increments and returns
+      the previous value, atomically, through a shared reference. The comment above it is the test's real
+      documentation: it encodes knowledge of the executor's call order, so that
+      <code class="inl">call == 3</code> unambiguously means &ldquo;while verifying the temp clone.&rdquo;
+      That is a slightly brittle coupling &mdash; reorder the executor's fork reads and this test targets a
+      different step &mdash; and it is a fair price for reaching a failure point that has no other name.</p>
+      <p class="hint" data-anchor="ch8-p21"><code class="inl">Ordering::SeqCst</code> is the strongest
+      memory ordering and the right default when you are not doing lock-free algorithm design: correct
+      first, and here there is no contention to optimise away.</p>
+    </section>
+
+    <section data-anchor="ch8-assert">
+      <h2>One assertion, six faults</h2>
+      <p data-anchor="ch8-p22">Every fault case ends by calling the same function. This is the safety
+      property of the entire program, written down once:</p>
+      <div class="listing" data-anchor="ch8-assert-fn">
+  <p class="srcref"><span class="path">tests/fault_injection.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Every failed transaction must leave: the expected target content at the</span>
+<span class="cm">/// target path (same inode — never swapped), no artifacts, a terminal</span>
+<span class="cm">/// `rolled-back` journal row, and an untouched source.</span>
+<span class="kw">fn</span> <span class="fn">assert_fully_rolled_back</span>(rig: &amp;<span class="ty">Rig</span>, expected_content: &amp;[u8]) {
+    <span class="mac">assert_eq!</span>(fs::read(&amp;rig.plan.target).unwrap(), expected_content);
+    <span class="mac">assert_eq!</span>(
+        fs::metadata(&amp;rig.plan.target).unwrap().ino(),
+        rig.target_ino,
+        <span class="str">"target inode must be the original — the swap must not have happened"</span>
+    );
+    <span class="mac">assert!</span>(!rig.plan.temp.exists(), <span class="str">"temp not cleaned up"</span>);
+    <span class="mac">assert!</span>(!rig.plan.backup.exists(), <span class="str">"backup not cleaned up"</span>);
+    <span class="mac">assert_eq!</span>(fs::read(&amp;rig.plan.source).unwrap(), rig.original);
+
+    <span class="kw">let</span> entry = rig.db.journal_entry(<span class="num">1</span>).unwrap();
+    <span class="mac">assert_eq!</span>(entry.state, <span class="ty">TxnState</span>::<span class="ty">RolledBack</span>);
+    <span class="mac">assert!</span>(entry.error.is_some(), <span class="str">"rollback must record its cause"</span>);
+    <span class="mac">assert!</span>(rig.db.journal_incomplete().unwrap().is_empty());
+}</pre>
+</div>
+      <p data-anchor="ch8-p23">Seven assertions, and each one closes a different way a &ldquo;safe&rdquo;
+      tool could still ruin your day:</p>
+      <table class="grid" data-anchor="ch8-assert-table">
+        <tr><th>Assertion</th><th>The disaster it rules out</th></tr>
+        <tr><td>content equals expected</td><td>Your file's bytes changed.</td></tr>
+        <tr><td>inode is the original</td><td>The bytes match but the file was silently replaced &mdash; which would break hard links, file descriptors, and sync services.</td></tr>
+        <tr><td>no temp file</td><td>Hidden debris accumulating in your folders.</td></tr>
+        <tr><td>no backup file</td><td>Same, plus confusion for a later recovery pass.</td></tr>
+        <tr><td>source unchanged</td><td>The promise that the source is only ever read.</td></tr>
+        <tr><td>journal is <span class="state">rolled-back</span></td><td>A crash-recovery pass later &ldquo;finishing&rdquo; a transaction that already failed.</td></tr>
+        <tr><td>error recorded, nothing incomplete</td><td>A silent failure &mdash; and a row that recovery would keep trying to repair forever.</td></tr>
+      </table>
+      <p data-anchor="ch8-p24">The inode check is the one I would single out. A less careful test would
+      compare contents and stop &mdash; but the whole hazard of this program is that it swaps one file for
+      another with identical bytes. Only the inode number can tell you whether the swap happened.</p>
+    </section>
+
+    <section data-anchor="ch8-mutate">
+      <h2>The two faults that are really a user</h2>
+      <p data-anchor="ch8-p25">Back to <code class="inl">MutateEarly</code> and
+      <code class="inl">MutateLate</code>. Neither returns an error; each rewrites the target file with
+      different bytes <em>of the same length</em>, and then lets the real operation proceed:</p>
+      <div class="listing" data-anchor="ch8-mutate-fn">
+  <p class="srcref"><span class="path">tests/fault_injection.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">fn</span> <span class="fn">mutate_target</span>(&amp;<span class="kw">self</span>) {
+        <span class="kw">let</span> len = fs::metadata(&amp;<span class="kw">self</span>.target).unwrap().len() <span class="kw">as</span> usize;
+        fs::write(&amp;<span class="kw">self</span>.target, <span class="mac">vec!</span>[0xEEu8; len]).unwrap(); <span class="cm">// same size, new bytes</span>
+    }</pre>
+</div>
+      <p data-anchor="ch8-p26">This is you, saving a file, while the tool is mid-transaction. The two
+      variants place that save on either side of the executor's byte comparison &mdash; and the assertions
+      demand that <em>each window has its own defence</em>:</p>
+      <div class="listing" data-anchor="ch8-mutate-tests">
+  <p class="srcref"><span class="path">tests/fault_injection.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="mac">#[test]</span>
+<span class="kw">fn</span> <span class="fn">target_mutated_before_byte_compare_is_caught_by_it</span>() {
+    <span class="kw">let</span> (rig, err) = run_fault(<span class="ty">Fault</span>::<span class="ty">MutateEarly</span>);
+    <span class="mac">assert!</span>(
+        <span class="mac">matches!</span>(&amp;err, <span class="ty">TxnError</span>::<span class="ty">Identity</span>(msg) <span class="kw">if</span> msg.contains(<span class="str">"data forks differ"</span>)),
+        <span class="str">"got: {err}"</span>
+    );
+    <span class="cm">// The user's mutation survives; nothing was replaced.</span>
+    <span class="kw">let</span> mutated = <span class="mac">vec!</span>[0xEEu8; rig.original.len()];
+    assert_fully_rolled_back(&amp;rig, &amp;mutated);
+}
+
+<span class="mac">#[test]</span>
+<span class="kw">fn</span> <span class="fn">target_mutated_after_byte_compare_is_caught_before_swap</span>() {
+    <span class="kw">let</span> (rig, err) = run_fault(<span class="ty">Fault</span>::<span class="ty">MutateLate</span>);
+    <span class="mac">assert!</span>(
+        <span class="mac">matches!</span>(&amp;err, <span class="ty">TxnError</span>::<span class="ty">Identity</span>(msg) <span class="kw">if</span> msg.contains(<span class="str">"changed during the transaction"</span>)),
+        <span class="str">"got: {err}"</span>
+    );
+    <span class="kw">let</span> mutated = <span class="mac">vec!</span>[0xEEu8; rig.original.len()];
+    assert_fully_rolled_back(&amp;rig, &amp;mutated);
+}</pre>
+</div>
+      <div class="callout key" data-anchor="ch8-callout-userwins">
+        <span class="tag">Key idea</span>
+        Look at what is passed to the assertion: <code class="inl">&amp;mutated</code>, not
+        <code class="inl">&amp;rig.original</code>. The test does not demand that the tool undo the user's
+        edit &mdash; it demands that <strong>the user's edit is what survives</strong>. Two different
+        mechanisms catch the two windows (the byte comparison catches the first, a post-rename stat check
+        catches the second), and both tests end at the same place: your bytes, your inode, nothing touched.
+        Chapter 10 shows both mechanisms in the executor.
+      </div>
+      <p data-anchor="ch8-p27">Also worth noticing:
+      <code class="inl">matches!(&amp;err, TxnError::Identity(msg) if msg.contains(&hellip;))</code>. The
+      test asserts on the error's <em>variant</em> and then on a substring of its detail &mdash; exactly the
+      granularity chapter 7's design provides. The variant is the contract; the message is a hint.</p>
+      <p data-anchor="ch8-p28">One more test in the same file skips the adapter entirely and uses the real
+      filesystem, because the failure it wants is one <code class="inl">std::fs</code> can produce directly:
+      it sets a directory to mode <code class="inl">0o555</code>, runs preflight, restores the mode for
+      cleanup, and asserts <code class="inl">PreflightError::DirNotWritable</code>. Use the seam where you
+      need it; use the real thing where you can.</p>
+    </section>
+
+    <section data-anchor="ch8-fakevolumes">
+      <h2>A second double, with a different job</h2>
+      <p data-anchor="ch8-p29">The planner's own unit tests need something else again: a real filesystem
+      for the stat checks, but <em>scripted answers</em> for the questions about volumes. So they define a
+      second, smaller double &mdash; and its unimplemented methods are the interesting part:</p>
+      <div class="listing" data-anchor="ch8-fakevolumes">
+  <p class="srcref"><span class="path">src/txn/planner.rs</span><span class="what">abridged &amp;mdash; the scripted methods are elided</span></p>
+  <pre class="rs">    <span class="cm">/// Adapter whose volume answers are scripted; everything else is real.</span>
+    <span class="kw">struct</span> <span class="ty">FakeVolumes</span> {
+        source_dev: u64,
+        target_dev: u64,
+        apfs: bool,
+        flags: u32,
+    }
+
+    <span class="kw">impl</span> <span class="ty">ApfsAdapter</span> <span class="kw">for</span> <span class="ty">FakeVolumes</span> {
+        <span class="kw">fn</span> <span class="fn">clone_file</span>(&amp;<span class="kw">self</span>, _s: &amp;<span class="ty">Path</span>, _d: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;()&gt; {
+            <span class="mac">unreachable!</span>(<span class="str">"preflight never clones"</span>)
+        }
+        <span class="cm">// …device_of, is_apfs and bsd_flags return the scripted fields…</span>
+        <span class="kw">fn</span> <span class="fn">snapshot_metadata</span>(&amp;<span class="kw">self</span>, _path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">MetadataSnapshot</span>&gt; {
+            <span class="mac">unreachable!</span>(<span class="str">"preflight never snapshots"</span>)
+        }
+        <span class="kw">fn</span> <span class="fn">read_resource_fork</span>(&amp;<span class="kw">self</span>, _path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;u8&gt;&gt; {
+            <span class="mac">unreachable!</span>(<span class="str">"preflight never reads forks"</span>)
+        }
+    }</pre>
+</div>
+      <p data-anchor="ch8-p30">Those <code class="inl">unreachable!</code> messages are executable
+      documentation. &ldquo;Preflight never clones&rdquo; is a claim about the design &mdash; the dry run
+      must be read-only &mdash; and it is enforced here: if anyone ever adds a clone to the preflight path,
+      these tests panic with a sentence explaining what rule was broken. A comment would have gone stale;
+      this cannot.</p>
+      <p data-anchor="ch8-p31">Two doubles, two shapes, one trait. That is what a well-sized seam buys you:
+      each test writes only the fiction it needs, and everything else stays real.</p>
+    </section>
+
+    <section data-anchor="ch8-reflect">
+      <div class="reflect" data-anchor="ch8-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>The ability to ask &ldquo;what if?&rdquo; about the moments that matter and get an answer in
+        milliseconds. What if the disk fills mid-clone? What if we lack permission to restore ownership?
+        What if the user saves the file <em>after</em> we verified it but <em>before</em> we swap it? Each
+        of those is one line in an enum and one test, and each ends at the same assertion: your file, your
+        inode, no debris, a journal row that says what happened.</p>
+        <p>The design lesson generalises past macOS. Put the code you cannot control behind an interface
+        <em>sized to what you actually call</em> &mdash; not to the platform &mdash; and the failures you
+        could never reproduce become the failures you test on every commit.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch8-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Add a fault that makes <code class="inl">bsd_flags</code> report
+          <code class="inl">UF_IMMUTABLE</code>. Which test file should it live in &mdash; and does the
+          transaction even get far enough to need it?</li>
+          <li><code class="inl">TempForkRead</code> fires on the third call because of a comment about call
+          order. Design a way to name the step directly rather than counting, and weigh it against the
+          simplicity of a counter.</li>
+          <li><code class="inl">fs::rename</code> is <em>not</em> behind the trait. Write the test you would
+          most want if it were &mdash; then decide whether it justifies widening the seam.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/apfs/mod.rs">file_cleaner &mdash; src/apfs/mod.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/fault_injection.rs">file_cleaner &mdash; tests/fault_injection.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/txn/planner.rs">file_cleaner &mdash; src/txn/planner.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/PLAN.md">file_cleaner &mdash; PLAN.md (milestone M5, hardening)</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-errors-anyhow-and-thiserror.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-preflight.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
