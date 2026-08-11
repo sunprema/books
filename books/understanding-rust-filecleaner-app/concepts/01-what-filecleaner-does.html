@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Tool That Deletes Nothing &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch1-intro">
+      <p class="eyebrow">Chapter 01 &middot; Part I — Orientation</p>
+      <h1>A Tool That Deletes Nothing</h1>
+      <p class="lead" data-anchor="ch1-lead">Here is a small,
+      familiar disaster. Somewhere on your Mac there are three copies of the same 240&nbsp;MB video:
+      one in <code class="inl">~/Downloads</code>, one in a project folder, one in a directory called
+      <code class="inl">final-FINAL</code>. You know they are the same. You would like the disk space
+      back. And yet you do not delete any of them, because you cannot remember which one some script,
+      some export, some half-finished edit is pointing at &mdash; and being wrong costs you the file.</p>
+      <p data-anchor="ch1-p1">Every deduplication tool you have ever seen resolves that tension by
+      asking you to accept the risk: pick a survivor, delete the rest, hope. The application we are
+      going to read for the next twelve chapters resolves it a different way. It never deletes
+      anything. All three copies stay exactly where they are, with their own names, their own
+      permissions, their own Finder tags, their own last-modified dates &mdash; and afterwards they
+      occupy the space of one.</p>
+    </section>
+    <section data-anchor="ch1-promise">
+      <h2>The promise, stated precisely</h2>
+      <p data-anchor="ch1-p2">The project is <code class="inl">sunprema/file_cleaner</code>, and its
+      README states the whole idea in two sentences:</p>
+      <div class="callout" data-anchor="ch1-readme">
+        <span class="tag">README.md</span>
+        A duplicate-file space reclaimer for macOS/APFS. It finds files with byte-identical content
+        and &mdash; instead of deleting anything &mdash; replaces each duplicate with an <strong>APFS
+        clone</strong> of a chosen source file. Every file keeps its path, its metadata, and its
+        independence; the data blocks are shared on disk (copy-on-write) until a file is modified.
+      </div>
+      <p data-anchor="ch1-p3">Read that again slowly, because the whole program falls out of it. Three
+      words are doing the work. <em class="term-def">Byte-identical</em> means we will need a way to be
+      certain two files are the same &mdash; not probably, certainly &mdash; without reading every byte
+      of every file on the disk. <em class="term-def">Clone</em> means we will need a specific macOS
+      system call, and we will need to reach it from Rust. <em class="term-def">Independence</em> means
+      the replacement has to be so faithful that nothing downstream &mdash; not Finder, not a backup
+      tool, not a shell script &mdash; can tell a swap happened.</p>
+      <p data-anchor="ch1-p4">That is the book. Chapters 2 through 6 build the machinery for the first
+      word, chapter 2 explains the second, and chapters 9 through 12 earn the third.</p>
+    </section>
+
+    <section data-anchor="ch1-cli">
+      <h2>Meeting the tool as a user first</h2>
+      <p data-anchor="ch1-p5">Before we open a single <code class="inl">.rs</code> file, let's use the
+      thing. There are four commands, and the workflow is deliberately a staircase: nothing on your disk
+      changes until the last step, and the last step needs a flag you have to type on purpose.</p>
+      <div class="listing" data-anchor="ch1-workflow">
+  <p class="srcref"><span class="path">README.md</span><span class="what">the whole workflow</span></p>
+  <pre class="rs">filecleaner scan ~/Downloads ~/Documents   <span class="cm"># index files, find duplicate groups</span>
+filecleaner groups                         <span class="cm"># review groups and estimated savings</span>
+filecleaner reclaim --group 3              <span class="cm"># dry run: show what would happen</span>
+filecleaner reclaim --group 3 --confirm    <span class="cm"># perform the replacement</span></pre>
+</div>
+      <p data-anchor="ch1-p6">A scan prints a census of what it saw and what it decided to ignore.
+      This is the real output shape, from the project's own user guide:</p>
+      <div class="term" data-anchor="ch1-term-scan">
+  <div class="term-bar"><span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span><span class="term-title">filecleaner scan ~/Downloads</span></div>
+  <pre><b>$</b> filecleaner scan ~/Downloads
+Scan #1 complete
+  index:              /Users/you/.filecleaner/index.db
+  eligible files:     38 (12.2 MiB)
+  directories:        2
+  skipped:            1 zero-byte, 0 symlinks, 0 special, 0 packages
+Duplicate detection:
+  fingerprinted:      6   fully hashed: 6
+  duplicate groups:   3</pre>
+</div>
+      <p data-anchor="ch1-p7">Two lines there are worth pinning to the wall, because they are the
+      shape of chapters 4 and 6. <code class="inl">skipped:</code> is the eligibility policy &mdash; the
+      tool refuses to consider several categories of file, each for a reason we will meet. And
+      <code class="inl">fingerprinted: 6   fully hashed: 6</code> is the candidate funnel: out of 38
+      files, only six were interesting enough to hash at all.</p>
+
+      <p data-anchor="ch1-p8">Reviewing a group shows you the decision the tool would make, with the
+      chosen <strong>source</strong> and the <strong>target</strong> that would be replaced:</p>
+      <div class="term" data-anchor="ch1-term-groups">
+  <div class="term-bar"><span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span><span class="term-title">filecleaner groups</span></div>
+  <pre><b>$</b> filecleaner groups
+Scan #1: 3 duplicate groups
+  logical duplicates: 267.8 KiB   est. reclaimable: 267.8 KiB
+
+Group 3  [2 files &times; 241.6 KiB, sha256 860ae0e3]
+  logical duplicates: 241.6 KiB   est. reclaimable: 241.6 KiB
+  source  /Users/you/Downloads/golang copy.pdf
+  target  /Users/you/Downloads/golang.pdf</pre>
+</div>
+      <div class="callout key" data-anchor="ch1-callout-dryrun">
+        <span class="tag">Key idea</span>
+        <code class="inl">reclaim --group 3</code> with no other flag is a <strong>dry run</strong>. The
+        destructive path is spelled <code class="inl">--confirm</code>. That is not politeness; it is
+        encoded in the argument parser, and we will see the exact declaration in a moment.
+      </div>
+    </section>
+
+    <section data-anchor="ch1-crate">
+      <h2>One repository, two crates</h2>
+      <p data-anchor="ch1-p9">Now open <code class="inl">Cargo.toml</code>. It is short, and almost every
+      line of it is a decision we will spend a chapter on.</p>
+      <div class="listing" data-anchor="ch1-cargo">
+  <p class="srcref"><span class="path">Cargo.toml</span><span class="what">verbatim</span></p>
+  <pre class="rs">[package]
+name = "file_cleaner"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "filecleaner"
+path = "src/main.rs"
+
+[lib]
+name = "file_cleaner"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+rand = "0.9"
+rayon = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"</pre>
+</div>
+      <p data-anchor="ch1-p10">The first thing to notice is the <code class="inl">[[bin]]</code>
+      and <code class="inl">[lib]</code> pair. This one package produces two artifacts: a library crate
+      called <code class="inl">file_cleaner</code> and a binary called <code class="inl">filecleaner</code>.
+      The binary is a thin front end; all the actual capability lives in the library, and
+      <code class="inl">src/main.rs</code> has to <code class="inl">use file_cleaner::…</code> like any
+      other consumer would.</p>
+      <p data-anchor="ch1-p11">That split is not decoration. It is what makes the integration tests in
+      <code class="inl">tests/</code> possible &mdash; they link the library, not the binary &mdash; and
+      it is what lets the SwiftUI app in <code class="inl">FileCleanerApp/</code> drive the same engine
+      through the CLI's <code class="inl">--json</code> mode without a second implementation of anything.
+      (The Swift app is outside this book's scope; it is worth knowing only that it exists and that it
+      adds no logic of its own.)</p>
+      <p data-anchor="ch1-p12">The second thing is <code class="inl">edition = "2024"</code>. Editions are
+      Rust's way of making small, opt-in language changes without breaking old code. We will see one
+      concrete consequence in chapter 5, where the database code uses a <em class="term-def">let
+      chain</em> &mdash; <code class="inl">if let Some(x) = … &amp;&amp; condition</code> &mdash; which
+      was stabilized in Rust 1.88 and is available only in this edition.</p>
+
+      <h3>The twelve dependencies, and what each one is for</h3>
+      <table class="grid" data-anchor="ch1-deps">
+        <tr><th>Crate</th><th>Job in this application</th><th>Met in</th></tr>
+        <tr><td class="mono">clap</td><td>Parse the CLI, using <code class="inl">derive</code> so the commands are declared as Rust types</td><td>ch. 1</td></tr>
+        <tr><td class="mono">libc</td><td>Raw bindings to the C library: <code class="inl">clonefile</code>, <code class="inl">statfs</code>, xattrs, <code class="inl">access</code></td><td>ch. 2, 11</td></tr>
+        <tr><td class="mono">walkdir</td><td>Recursive directory traversal with a prunable filter</td><td>ch. 4</td></tr>
+        <tr><td class="mono">rusqlite</td><td>The SQLite index; <code class="inl">bundled</code> compiles SQLite into the binary</td><td>ch. 5</td></tr>
+        <tr><td class="mono">blake3</td><td>The fast partial fingerprint</td><td>ch. 6</td></tr>
+        <tr><td class="mono">sha2</td><td>The stored SHA-256 content identity</td><td>ch. 6</td></tr>
+        <tr><td class="mono">rayon</td><td>Bounded parallelism for the hashing stages</td><td>ch. 6</td></tr>
+        <tr><td class="mono">anyhow</td><td>Contextual, displayable errors at the application edges</td><td>ch. 7</td></tr>
+        <tr><td class="mono">thiserror</td><td>Typed error enums the caller can branch on</td><td>ch. 7</td></tr>
+        <tr><td class="mono">rand</td><td>The random token in each transaction's temp filename</td><td>ch. 9</td></tr>
+        <tr><td class="mono">serde / serde_json</td><td><code class="inl">--json</code> output for GUI front ends</td><td>ch. 1, 3</td></tr>
+        <tr><td class="mono">tempfile <span class="state">dev</span></td><td>Throwaway directories for tests &mdash; not shipped in the binary</td><td>ch. 8</td></tr>
+      </table>
+      <p class="hint" data-anchor="ch1-deps-hint">Twelve crates for a systems tool that talks to a
+      filesystem, a database and a C API is a modest list. Notice what is <em>not</em> there: no async
+      runtime. PLAN.md records the reason in one line &mdash; &ldquo;No Tokio: rayon with a bounded pool
+      fits this batch, disk-bound workload.&rdquo;</p>
+    </section>
+
+    <section data-anchor="ch1-modules">
+      <h2>The module map</h2>
+      <p data-anchor="ch1-p13">The entire public shape of the library is six lines:</p>
+      <div class="listing" data-anchor="ch1-modtree">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">lines 1&amp;ndash;6, verbatim</span></p>
+  <pre class="rs"><span class="kw">pub</span> <span class="kw">mod</span> apfs;
+<span class="kw">pub</span> <span class="kw">mod</span> index;
+<span class="kw">pub</span> <span class="kw">mod</span> model;
+<span class="kw">pub</span> <span class="kw">mod</span> policy;
+<span class="kw">pub</span> <span class="kw">mod</span> scanner;
+<span class="kw">pub</span> <span class="kw">mod</span> txn;</pre>
+</div>
+      <p data-anchor="ch1-p14">Six modules, and they are stacked. Reading them bottom-up is reading
+      the program's trust gradient: the further down you go, the more dangerous the code and the smaller
+      it is.</p>
+
+      <figure class="diagram-fig" data-anchor="ch1-fig-layers">
+        <svg class="diagram" viewBox="0 0 560 246" role="img" aria-labelledby="ch1-d1-title">
+          <title id="ch1-d1-title">The crate as five stacked layers: the CLI on top, then the engine API, then the platform-neutral middle of scanner, index, model and txn, and at the bottom the apfs module which holds all unsafe code</title>
+          <text x="16" y="16" class="dim">every layer below the line is platform-neutral; only the bottom box may say `unsafe`</text>
+
+          <rect x="150" y="28" width="260" height="30" class="stroke fill-soft"/>
+          <text x="164" y="47" class="big">src/main.rs &mdash; the clap CLI</text>
+          <text x="424" y="47" class="mono dim">467 lines</text>
+
+          <path d="M280 58 L280 74" class="stroke"/>
+          <path d="M276 68 L280 74 L284 68" class="stroke"/>
+
+          <rect x="150" y="74" width="260" height="30" class="stroke fill-soft"/>
+          <text x="164" y="93" class="big">src/lib.rs &mdash; the engine API</text>
+          <text x="424" y="93" class="mono dim">138 lines</text>
+
+          <path d="M280 104 L280 120" class="stroke"/>
+          <path d="M276 114 L280 120 L284 114" class="stroke"/>
+
+          <rect x="16" y="120" width="126" height="54" class="stroke fill-bg"/>
+          <text x="26" y="140" class="big">scanner/</text>
+          <text x="26" y="156" class="dim">walk &amp; filter</text>
+
+          <rect x="150" y="120" width="126" height="54" class="stroke fill-bg"/>
+          <text x="160" y="140" class="big">index/</text>
+          <text x="160" y="156" class="dim">sqlite &amp; hashing</text>
+
+          <rect x="284" y="120" width="126" height="54" class="stroke fill-bg"/>
+          <text x="294" y="140" class="big">model/ policy</text>
+          <text x="294" y="156" class="dim">types &amp; rules</text>
+
+          <rect x="418" y="120" width="126" height="54" class="stroke fill-bg"/>
+          <text x="428" y="140" class="big">txn/</text>
+          <text x="428" y="156" class="dim">the transaction</text>
+
+          <path d="M16 188 L544 188" class="stroke-red dash"/>
+          <text x="16" y="202" class="red">the unsafe boundary</text>
+
+          <rect x="16" y="208" width="528" height="32" class="stroke-red fill-red"/>
+          <text x="30" y="228" class="big on-ink">apfs/ &mdash; clone.rs, volume.rs, forks.rs, metadata.rs, mod.rs</text>
+        </svg>
+        <figcaption><b>One place for danger.</b> The module comment at the top of
+        <code class="inl">src/apfs/mod.rs</code> is the load-bearing sentence of the architecture: all
+        Darwin-specific and <code class="inl">unsafe</code> code lives in this module, and everything
+        above it depends on a trait instead of on macOS.</figcaption>
+      </figure>
+
+      <p data-anchor="ch1-p15">That last point is worth stating as a rule, because it explains design
+      decisions we will meet six chapters from now. <span class="rule-chip">every <code>unsafe</code>
+      block in the program is inside <code>src/apfs/</code></span> The scanner does not know it is on a
+      Mac. The transaction engine does not call <code class="inl">clonefile</code>; it calls a method on a
+      trait. That single constraint is what makes chapter 8's fault-injection tests possible, and it is
+      the difference between &ldquo;we tested the happy path&rdquo; and &ldquo;we tested a disk that
+      fills up exactly between the clone and the rename.&rdquo;</p>
+    </section>
+
+    <section data-anchor="ch1-engine">
+      <h2>The engine, in eight functions</h2>
+      <p data-anchor="ch1-p16">Under those module declarations, <code class="inl">lib.rs</code> is almost
+      entirely a set of free functions that the CLI calls in order. Here are two of them, and they show
+      the house style you will see everywhere: take paths, do one thing, return a report.</p>
+      <div class="listing" data-anchor="ch1-runscan">
+  <p class="srcref"><span class="path">src/lib.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Walk `roots`, filter eligible regular files, and persist them into the</span>
+<span class="cm">/// SQLite index at `db_path` as a new scan session.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">run_scan</span>(db_path: &amp;<span class="ty">Path</span>, roots: &amp;[<span class="ty">PathBuf</span>], include_packages: bool) -&gt; <span class="ty">Result</span>&lt;<span class="ty">ScanReport</span>&gt; {
+    <span class="kw">let</span> <span class="kw">mut</span> canonical_roots = <span class="ty">Vec</span>::with_capacity(roots.len());
+    <span class="kw">for</span> root <span class="kw">in</span> roots {
+        <span class="kw">let</span> canonical = root
+            .canonicalize()
+            .with_context(|| <span class="mac">format!</span>(<span class="str">"cannot access scan root {}"</span>, root.display()))?;
+        canonical_roots.push(canonical);
+    }
+
+    <span class="kw">let</span> <span class="kw">mut</span> db = <span class="ty">Db</span>::open(db_path)?;
+    <span class="kw">let</span> scan_id = db.begin_scan(&amp;canonical_roots)?;
+
+    <span class="kw">let</span> outcome = walker::walk_roots(&amp;canonical_roots, include_packages);
+
+    db.insert_files(scan_id, &amp;outcome.files)?;
+    db.finish_scan(scan_id)?;
+
+    <span class="ty">Ok</span>(<span class="ty">ScanReport</span> {
+        scan_id,
+        stats: outcome.stats,
+    })
+}</pre>
+</div>
+      <p data-anchor="ch1-p17">Nine lines of logic and one thing to note early: the roots are
+      <code class="inl">canonicalize()</code>d before anything else happens. Symlinked and relative paths
+      are resolved once, at the door, so every path recorded in the index is absolute and real. When we
+      get to the transaction engine and start comparing a live file against what the scan recorded, that
+      decision quietly pays for itself.</p>
+      <p data-anchor="ch1-p18">The other seven entry points fit on one screen:</p>
+      <table class="grid" data-anchor="ch1-api">
+        <tr><th class="mono">fn</th><th>What it does</th><th>Chapter</th></tr>
+        <tr><td class="mono">run_scan</td><td>Walk the roots, filter, persist a new scan session</td><td>4, 5</td></tr>
+        <tr><td class="mono">run_funnel</td><td>Fingerprint &rarr; full hash &rarr; rebuild groups. Safe to re-run</td><td>6</td></tr>
+        <tr><td class="mono">list_groups</td><td>Groups for a scan, sorted by estimated reclaimable bytes</td><td>3</td></tr>
+        <tr><td class="mono">list_scans</td><td>Every scan session, newest first</td><td>5</td></tr>
+        <tr><td class="mono">get_group</td><td>One group by id</td><td>3</td></tr>
+        <tr><td class="mono">dry_run_group</td><td>Plan + preflight every eligible target. Mutates nothing</td><td>9</td></tr>
+        <tr><td class="mono">reclaim_group</td><td>One journaled transaction per eligible target</td><td>10</td></tr>
+        <tr><td class="mono">recover</td><td>Repair transactions interrupted by a crash or kill</td><td>12</td></tr>
+      </table>
+    </section>
+
+    <section data-anchor="ch1-clap">
+      <h2>The CLI as a data structure</h2>
+      <p data-anchor="ch1-p19">One reason this program is pleasant to read is that its command-line
+      interface is not parsing code at all. With clap's <code class="inl">derive</code> feature, the
+      commands are an <code class="inl">enum</code> and the flags are fields; the parser is generated from
+      the types. Here is the whole surface:</p>
+      <div class="listing" data-anchor="ch1-clap-enum">
+  <p class="srcref"><span class="path">src/main.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="mac">#[derive(Subcommand)]</span>
+<span class="kw">enum</span> <span class="ty">Command</span> {
+    <span class="cm">/// Scan directories, then find duplicate groups among the results.</span>
+    <span class="ty">Scan</span> {
+        <span class="cm">/// Directories to scan.</span>
+        <span class="mac">#[arg(required = true)]</span>
+        paths: <span class="ty">Vec</span>&lt;<span class="ty">PathBuf</span>&gt;,
+
+        <span class="cm">/// Traverse macOS packages (.app bundles, libraries, etc.).</span>
+        <span class="mac">#[arg(long)]</span>
+        include_packages: bool,
+    },
+    <span class="cm">/// List scan sessions in the index.</span>
+    <span class="ty">Scans</span>,
+    <span class="cm">/// List duplicate groups found by the most recent scan.</span>
+    <span class="ty">Groups</span> {
+        <span class="cm">/// Show groups for a specific scan instead of the latest.</span>
+        <span class="mac">#[arg(long)]</span>
+        scan: <span class="ty">Option</span>&lt;i64&gt;,
+    },
+    <span class="cm">/// Replace a group's duplicate targets with APFS clones of the source.</span>
+    <span class="cm">/// Without --confirm this is a dry run and modifies nothing.</span>
+    <span class="ty">Reclaim</span> {
+        <span class="cm">/// The duplicate group to reclaim (see `filecleaner groups`).</span>
+        <span class="mac">#[arg(long)]</span>
+        group: i64,
+
+        <span class="cm">/// Show what would happen without touching anything (default).</span>
+        <span class="mac">#[arg(long, conflicts_with = "confirm")]</span>
+        dry_run: bool,
+
+        <span class="cm">/// Actually perform the replacements.</span>
+        <span class="mac">#[arg(long)]</span>
+        confirm: bool,
+    },
+}</pre>
+</div>
+      <p data-anchor="ch1-p20">Three details reward a second look. The doc comments are not comments
+      to the compiler's eye alone &mdash; clap turns each one into the help text for that command or flag,
+      so <code class="inl">filecleaner reclaim --help</code> prints the sentences you just read.
+      <code class="inl">conflicts_with = "confirm"</code> makes <code class="inl">--dry-run --confirm</code>
+      a parse error rather than a runtime coin flip. And <code class="inl">Option&lt;i64&gt;</code> for
+      <code class="inl">--scan</code> is how &ldquo;the user did not say&rdquo; is represented: not a
+      sentinel like <code class="inl">-1</code>, but the absence the type system already has a word for.</p>
+      <p data-anchor="ch1-p21">The dispatch that follows is exactly as boring as it should be, and it
+      contains the one thing that surprised me most on a first read of this codebase:</p>
+      <div class="listing" data-anchor="ch1-recover-first">
+  <p class="srcref"><span class="path">src/main.rs</span><span class="what">inside main(), verbatim</span></p>
+  <pre class="rs">    <span class="cm">// Repair any transaction a previous run left interrupted, before</span>
+    <span class="cm">// touching anything else.</span>
+    <span class="kw">let</span> recovered = recover(&amp;db_path)?;
+    <span class="kw">if</span> !json {
+        <span class="kw">for</span> action <span class="kw">in</span> &amp;recovered {
+            <span class="mac">println!</span>(<span class="str">"recovered: {action}"</span>);
+        }
+    }</pre>
+</div>
+      <p data-anchor="ch1-p22">Before <code class="inl">scan</code>, before
+      <code class="inl">groups</code>, before anything: repair. Not on a flag, not on a subcommand, not
+      &ldquo;if the user reports a problem.&rdquo; If a previous run was killed halfway through replacing
+      a file, the very next invocation of <em>any</em> command puts things right and tells you what it
+      did. We will build the machinery that makes that safe in chapters 10 and 12; for now, just note
+      that the program was designed on the assumption that it <em>will</em> be interrupted.</p>
+
+      <div class="callout warn" data-anchor="ch1-callout-notbackup">
+        <span class="tag">Say it early</span>
+        This tool is <strong>not a backup tool and does not create redundancy</strong>. After reclaiming,
+        the copies share the same physical blocks on the same volume; if those blocks are lost, every
+        copy is lost together. The README says this in its own section, and it is the honest counterweight
+        to the word &ldquo;clone.&rdquo;
+      </div>
+    </section>
+
+    <section data-anchor="ch1-reflect">
+      <div class="reflect" data-anchor="ch1-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A shape to hang the next eleven chapters on. The program is a pipeline with a
+        conscience: <b>walk</b> the disk cheaply, <b>index</b> what you saw, <b>narrow</b> to real
+        duplicates, then <b>replace</b> one file at a time under a transaction that can be interrupted at
+        any instant. Every module you will read exists to serve one of those four verbs, and the one
+        module that touches macOS directly is quarantined at the bottom so the other five can be tested
+        on any machine.</p>
+        <p>Next chapter we go straight to the bottom of that stack &mdash; to the twenty-nine lines that
+        make the whole idea possible.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch1-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>The binary is named <code class="inl">filecleaner</code> and the library
+          <code class="inl">file_cleaner</code>. Why can't they be spelled identically? (Hint: what
+          characters may appear in a Rust crate path?)</li>
+          <li><code class="inl">run_scan</code> canonicalizes its roots but the walker records
+          <code class="inl">entry.into_path()</code> as it goes. What would break if the roots were left
+          relative and the user changed directory between <code class="inl">scan</code> and
+          <code class="inl">reclaim</code>?</li>
+          <li><code class="inl">--dry-run</code> is declared but the dispatch matches on
+          <code class="inl">confirm</code> alone, binding the other field as
+          <code class="inl">dry_run: _</code>. Is the flag therefore useless? Argue both sides.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/README.md">sunprema/file_cleaner &mdash; README.md</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/Cargo.toml">file_cleaner &mdash; Cargo.toml</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/lib.rs">file_cleaner &mdash; src/lib.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/main.rs">file_cleaner &mdash; src/main.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/docs/user-guide.md">file_cleaner &mdash; docs/user-guide.md</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/PLAN.md">file_cleaner &mdash; PLAN.md</a></li>
+          <li><a href="https://docs.rs/clap/latest/clap/_derive/index.html">clap &mdash; derive reference</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="../index.html">&lsaquo; Cover</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="02-apfs-clones-and-clonefile.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

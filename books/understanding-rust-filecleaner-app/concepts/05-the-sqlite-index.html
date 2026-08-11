@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Index That Remembers &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch5-intro">
+      <p class="eyebrow">Chapter 05 &middot; Part II — Finding the Duplicates</p>
+      <h1>The Index That Remembers</h1>
+      <p class="lead" data-anchor="ch5-lead">The walk is over and we have a
+      <code class="inl">Vec&lt;FileEntry&gt;</code> in memory. We could hash it, group it, show it, and be
+      done &mdash; and the program would be perfectly useless. Real scans take minutes. Users interrupt
+      them. Users look at the results, go and make a cup of tea, and come back tomorrow to actually
+      reclaim something. And when they do, the tool must be able to say &ldquo;the file I recorded and the
+      file on disk right now are not the same file&rdquo; &mdash; which means it needs to remember exactly
+      what it saw.</p>
+    </section>
+    <section data-anchor="ch5-why">
+      <h2>Why a database at all</h2>
+      <p data-anchor="ch5-p1">The specification is direct about this. Use SQLite to persist scan results
+      and support pause/resume, filtering, and a review UI without rescanning &mdash; and, in the same
+      breath: <em>treat the filesystem as mutable; validate every candidate again immediately before
+      reclaiming it.</em> Those two sentences describe the two roles the index plays. It is a cache of
+      expensive work, and it is the record of a claim that will later be checked.</p>
+      <p data-anchor="ch5-p2">SQLite arrives through <code class="inl">rusqlite</code>, with one feature
+      flag that is worth a sentence: <code class="inl">features = ["bundled"]</code> compiles SQLite's own
+      C source into the binary. No system library, no version skew between the Mac you built on and the
+      Mac you shipped to, no &ldquo;works on my machine.&rdquo; For a tool that ships as a single
+      executable, that is exactly the trade you want &mdash; a slightly longer build for a dependency that
+      cannot go missing.</p>
+      <p data-anchor="ch5-p3">The whole persistence layer is one struct with one field:</p>
+      <div class="listing" data-anchor="ch5-db-struct">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// SQLite-backed scan index. WAL mode so the journal (M4) can rely on</span>
+<span class="cm">/// durable state transitions, and so a review UI can read while a scan runs.</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">Db</span> {
+    conn: <span class="ty">Connection</span>,
+}</pre>
+</div>
+    </section>
+
+    <section data-anchor="ch5-schema">
+      <h2>Four tables</h2>
+      <p data-anchor="ch5-p4">The schema lives in a single <code class="inl">const SCHEMA: &amp;str</code>
+      executed on every open with <code class="inl">CREATE TABLE IF NOT EXISTS</code>, so opening a fresh
+      database and opening an existing one are the same code path. Here is the table that does the work:</p>
+      <div class="listing" data-anchor="ch5-files-table">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">from the SCHEMA constant, verbatim</span></p>
+  <pre class="rs">CREATE TABLE IF NOT EXISTS files (
+    id         INTEGER PRIMARY KEY,
+    scan_id    INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    dev        INTEGER NOT NULL,
+    ino        INTEGER NOT NULL,
+    nlink      INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime_sec  INTEGER NOT NULL,
+    mtime_nsec INTEGER NOT NULL,
+    rsrc_len   INTEGER NOT NULL DEFAULT 0,
+    <span class="cm">-- Filled in by the funnel stages.</span>
+    fingerprint BLOB,
+    sha256      BLOB,
+    group_id    INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+    UNIQUE (scan_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_scan_size ON files (scan_id, size);
+CREATE INDEX IF NOT EXISTS idx_files_group ON files (group_id);</pre>
+</div>
+      <p data-anchor="ch5-p5">Line for line this is <code class="inl">FileEntry</code> from chapter 3,
+      plus three columns that are deliberately nullable. <code class="inl">fingerprint</code> and
+      <code class="inl">sha256</code> are <code class="inl">NULL</code> until a funnel stage computes them;
+      <code class="inl">group_id</code> is <code class="inl">NULL</code> until grouping runs. That
+      nullability is not sloppiness &mdash; it <em>is</em> the resumability mechanism. &ldquo;Which files
+      still need hashing?&rdquo; is <code class="inl">WHERE fingerprint IS NULL</code>, and a re-run picks
+      up precisely where the last one stopped.</p>
+      <p data-anchor="ch5-p6"><code class="inl">UNIQUE (scan_id, path)</code> pairs with the
+      <code class="inl">INSERT OR IGNORE</code> we are about to see: inserting the same file twice in one
+      scan is a no-op rather than an error. And the two indexes are exactly the two lookups the funnel
+      makes &mdash; by (scan, size) and by group.</p>
+
+      <h3>The table with no foreign keys, on purpose</h3>
+      <div class="listing" data-anchor="ch5-journal-table">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">from the SCHEMA constant, verbatim</span></p>
+  <pre class="rs"><span class="cm">-- Reclamation transaction journal. No foreign keys: journal rows must</span>
+<span class="cm">-- outlive group rebuilds and scans so recovery always has what it needs.</span>
+CREATE TABLE IF NOT EXISTS txn_journal (
+    id         INTEGER PRIMARY KEY,
+    group_id   INTEGER NOT NULL,
+    source     TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    temp       TEXT NOT NULL,
+    backup     TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    state      TEXT NOT NULL,
+    error      TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_state ON txn_journal (state);</pre>
+</div>
+      <div class="callout key" data-anchor="ch5-callout-nofk">
+        <span class="tag">Key idea</span>
+        Everywhere else this schema uses foreign keys with <code class="inl">ON DELETE CASCADE</code>. The
+        journal deliberately has none, and stores <em>full paths</em> rather than file ids. The reason is
+        in the comment: a crashed transaction has to be repairable even if the scan it came from was
+        deleted, the groups were rebuilt, or the whole <code class="inl">files</code> table was replaced.
+        Recovery must never be able to lose the information it needs to put your file back. Normalisation
+        is a good default; surviving a crash beats it.
+      </div>
+      <p data-anchor="ch5-p7">The <code class="inl">idx_journal_state</code> index exists for one query,
+      run on every single launch of the program: find the rows that are not finished. We will read it in
+      chapter 12.</p>
+    </section>
+
+    <section data-anchor="ch5-open">
+      <h2>Opening the database</h2>
+      <div class="listing" data-anchor="ch5-open-fn">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="kw">impl</span> <span class="ty">Db</span> {
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">open</span>(path: &amp;<span class="ty">Path</span>) -&gt; <span class="ty">Result</span>&lt;<span class="kw">Self</span>&gt; {
+        <span class="kw">if</span> <span class="kw">let</span> <span class="ty">Some</span>(parent) = path.parent()
+            &amp;&amp; !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| <span class="mac">format!</span>(<span class="str">"cannot create {}"</span>, parent.display()))?;
+        }
+        <span class="kw">let</span> conn = <span class="ty">Connection</span>::open(path)
+            .with_context(|| <span class="mac">format!</span>(<span class="str">"cannot open database {}"</span>, path.display()))?;
+        conn.pragma_update(<span class="ty">None</span>, <span class="str">"journal_mode"</span>, <span class="str">"WAL"</span>)?;
+        conn.pragma_update(<span class="ty">None</span>, <span class="str">"synchronous"</span>, <span class="str">"NORMAL"</span>)?;
+        conn.pragma_update(<span class="ty">None</span>, <span class="str">"foreign_keys"</span>, <span class="str">"ON"</span>)?;
+        conn.execute_batch(<span class="ty">SCHEMA</span>)?;
+        migrate(&amp;conn)?;
+        <span class="ty">Ok</span>(<span class="kw">Self</span> { conn })
+    }</pre>
+</div>
+      <h3>A Rust 2024 let chain</h3>
+      <p data-anchor="ch5-p8">That first condition is the edition-2024 feature I promised you in chapter 1.
+      <code class="inl">if let Some(parent) = path.parent() &amp;&amp; !parent.as_os_str().is_empty()</code>
+      binds a pattern <em>and</em> tests a boolean in one condition, with the binding visible to the rest of
+      the chain. Before Rust 1.88 you had to nest:</p>
+      <pre class="rs" data-anchor="ch5-nested"><span class="cm">// The pre-2024 shape of the same logic:</span>
+<span class="kw">if</span> <span class="kw">let</span> <span class="ty">Some</span>(parent) = path.parent() {
+    <span class="kw">if</span> !parent.as_os_str().is_empty() {
+        <span class="cm">// …two levels deep to say one thing…</span>
+    }
+}</pre>
+      <p data-anchor="ch5-p9">The guard itself is a nice bit of defensive care: a path like
+      <code class="inl">"index.db"</code> has a parent, and that parent is the empty string. Calling
+      <code class="inl">create_dir_all("")</code> would fail, so the check refuses to try.</p>
+
+      <h3>Three pragmas, three decisions</h3>
+      <table class="grid" data-anchor="ch5-pragmas">
+        <tr><th class="mono">pragma</th><th>What it buys</th></tr>
+        <tr><td class="mono">journal_mode = WAL</td><td>Write-ahead logging: readers do not block the writer and the writer does not block readers. A GUI can list groups while a scan is still inserting &mdash; and the transaction journal can rely on durable state transitions.</td></tr>
+        <tr><td class="mono">synchronous = NORMAL</td><td>Fewer fsyncs than <code class="inl">FULL</code>. In WAL mode this is the usual recommendation: a crash cannot corrupt the database, though the last commits could be lost. The transaction engine does not rely on SQLite alone for durability &mdash; it also re-derives truth from the filesystem.</td></tr>
+        <tr><td class="mono">foreign_keys = ON</td><td>SQLite defaults to <em>off</em> for backward compatibility. Without this line, every <code class="inl">REFERENCES</code> in the schema would be decoration.</td></tr>
+      </table>
+      <p class="hint" data-anchor="ch5-p10">That last row catches a lot of people. If you have ever written
+      SQLite constraints and watched them not be enforced, this pragma is why.</p>
+
+      <h3>Migrating a table that already exists</h3>
+      <p data-anchor="ch5-p11"><code class="inl">CREATE TABLE IF NOT EXISTS</code> has an obvious hole: if
+      the table <em>does</em> exist with an older shape, the statement does nothing at all &mdash; it will
+      not add your new column. So there is a tiny migration step, and its comment says exactly that:</p>
+      <div class="listing" data-anchor="ch5-migrate">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">abridged &amp;mdash; the group_id branch is elided</span></p>
+  <pre class="rs"><span class="cm">/// Bring a pre-M2 database up to the current schema. `CREATE TABLE IF NOT</span>
+<span class="cm">/// EXISTS` never adds columns to an existing table, so add them here.</span>
+<span class="kw">fn</span> <span class="fn">migrate</span>(conn: &amp;<span class="ty">Connection</span>) -&gt; <span class="ty">Result</span>&lt;()&gt; {
+    <span class="kw">let</span> <span class="kw">mut</span> columns = <span class="ty">Vec</span>::new();
+    <span class="kw">let</span> <span class="kw">mut</span> stmt = conn.prepare(<span class="str">"PRAGMA table_info(files)"</span>)?;
+    <span class="kw">let</span> rows = stmt.query_map([], |row| row.get::&lt;_, <span class="ty">String</span>&gt;(<span class="num">1</span>))?;
+    <span class="kw">for</span> row <span class="kw">in</span> rows {
+        columns.push(row?);
+    }
+    <span class="kw">if</span> !columns.iter().any(|c| c == <span class="str">"rsrc_len"</span>) {
+        conn.execute_batch(<span class="str">"ALTER TABLE files ADD COLUMN rsrc_len INTEGER NOT NULL DEFAULT 0"</span>)?;
+    }
+    <span class="cm">// …the same check-then-ALTER for group_id…</span>
+    <span class="ty">Ok</span>(())
+}</pre>
+</div>
+      <p data-anchor="ch5-p12">It asks SQLite what columns exist
+      (<code class="inl">PRAGMA table_info</code>), and adds the missing ones. No version table, no
+      migration framework &mdash; for a local index owned entirely by one tool, this is proportionate. It
+      is also idempotent, which is the property that actually matters: running it a hundred times is the
+      same as running it once.</p>
+    </section>
+
+    <section data-anchor="ch5-writes">
+      <h2>Writing a scan's worth of files</h2>
+      <p data-anchor="ch5-p13">This is the hot write path &mdash; potentially hundreds of thousands of rows
+      &mdash; and it shows three techniques at once:</p>
+      <div class="listing" data-anchor="ch5-insert-files">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">insert_files</span>(&amp;<span class="kw">mut</span> <span class="kw">self</span>, scan_id: i64, files: &amp;[<span class="ty">FileEntry</span>]) -&gt; <span class="ty">Result</span>&lt;()&gt; {
+        <span class="kw">let</span> tx = <span class="kw">self</span>.conn.transaction()?;
+        {
+            <span class="kw">let</span> <span class="kw">mut</span> stmt = tx.prepare(
+                <span class="str">"INSERT OR IGNORE INTO files
+                     (scan_id, path, dev, ino, nlink, size, mtime_sec, mtime_nsec, rsrc_len)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"</span>,
+            )?;
+            <span class="kw">for</span> file <span class="kw">in</span> files {
+                stmt.execute(<span class="mac">params!</span>[
+                    scan_id,
+                    file.path.to_string_lossy(),
+                    file.dev <span class="kw">as</span> i64,
+                    file.ino <span class="kw">as</span> i64,
+                    file.nlink <span class="kw">as</span> i64,
+                    file.size <span class="kw">as</span> i64,
+                    file.mtime_sec,
+                    file.mtime_nsec,
+                    file.rsrc_len <span class="kw">as</span> i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        <span class="ty">Ok</span>(())
+    }</pre>
+</div>
+      <p data-anchor="ch5-p14"><strong>One transaction for the batch.</strong> Without it, SQLite
+      would commit each <code class="inl">INSERT</code> separately &mdash; a durability round trip per row.
+      Wrapping the loop turns thousands of commits into one and is typically the difference between
+      &ldquo;instant&rdquo; and &ldquo;why is this taking a minute.&rdquo;</p>
+      <p data-anchor="ch5-p15"><strong>One prepared statement, reused.</strong> The SQL is parsed and
+      planned once; the loop only binds new values. Note also that the values are bound as parameters
+      (<code class="inl">?1</code>, <code class="inl">?2</code>&hellip;) rather than formatted into the SQL
+      &mdash; a file named <code class="inl">'); DROP TABLE files;--</code> is a perfectly legal filename,
+      and this is what makes it merely a strange name instead of an incident.</p>
+      <p data-anchor="ch5-p16"><strong>An inner scope, and this is the Rust part.</strong> Why are the
+      <code class="inl">{</code> braces there? Because <code class="inl">stmt</code> borrows
+      <code class="inl">tx</code>, and <code class="inl">tx.commit()</code> <em>consumes</em>
+      <code class="inl">tx</code> by value. You cannot move a value while something still borrows it. The
+      inner block ends the statement's lifetime at its closing brace, and only then is the transaction free
+      to be committed. Without the braces the compiler rejects the function &mdash; and it is right to: a
+      statement outliving its transaction is exactly the kind of thing that makes C APIs crash.</p>
+
+      <h3>The casts, and the newtype road not taken</h3>
+      <p data-anchor="ch5-p17">Look at all those <code class="inl">as i64</code>. SQLite's integer type is
+      signed 64-bit; our sizes and inode numbers are <code class="inl">u64</code>. The conversion is
+      lossless for every realistic value and would wrap for absurd ones, and every read does the reverse:
+      <code class="inl">row.get::&lt;_, i64&gt;(4)? as u64</code>. This is the exact boundary where chapter
+      3's <code class="inl">VolumeId</code> newtype would have to earn its keep &mdash; and the friction you
+      can see here is the honest reason it has not yet.</p>
+    </section>
+
+    <section data-anchor="ch5-reads">
+      <h2>Reading rows without losing errors</h2>
+      <p data-anchor="ch5-p18">Every read in this file follows one shape. Here it is in full:</p>
+      <div class="listing" data-anchor="ch5-files-for-scan">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">files_for_scan</span>(&amp;<span class="kw">self</span>, scan_id: i64) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;<span class="ty">FileEntry</span>&gt;&gt; {
+        <span class="kw">let</span> <span class="kw">mut</span> stmt = <span class="kw">self</span>.conn.prepare(
+            <span class="str">"SELECT path, dev, ino, nlink, size, mtime_sec, mtime_nsec, rsrc_len
+             FROM files WHERE scan_id = ?1 ORDER BY path"</span>,
+        )?;
+        <span class="kw">let</span> rows = stmt.query_map(<span class="mac">params!</span>[scan_id], |row| {
+            <span class="ty">Ok</span>(<span class="ty">FileEntry</span> {
+                path: <span class="ty">PathBuf</span>::from(row.get::&lt;_, <span class="ty">String</span>&gt;(<span class="num">0</span>)?),
+                dev: row.get::&lt;_, i64&gt;(<span class="num">1</span>)? <span class="kw">as</span> u64,
+                ino: row.get::&lt;_, i64&gt;(<span class="num">2</span>)? <span class="kw">as</span> u64,
+                nlink: row.get::&lt;_, i64&gt;(<span class="num">3</span>)? <span class="kw">as</span> u64,
+                size: row.get::&lt;_, i64&gt;(<span class="num">4</span>)? <span class="kw">as</span> u64,
+                mtime_sec: row.get(<span class="num">5</span>)?,
+                mtime_nsec: row.get(<span class="num">6</span>)?,
+                rsrc_len: row.get::&lt;_, i64&gt;(<span class="num">7</span>)? <span class="kw">as</span> u64,
+            })
+        })?;
+        <span class="kw">let</span> <span class="kw">mut</span> files = <span class="ty">Vec</span>::new();
+        <span class="kw">for</span> row <span class="kw">in</span> rows {
+            files.push(row?);
+        }
+        <span class="ty">Ok</span>(files)
+    }</pre>
+</div>
+      <p data-anchor="ch5-p19"><code class="inl">query_map</code> returns an iterator of
+      <code class="inl">Result&lt;FileEntry&gt;</code> &mdash; because each individual row can fail to
+      decode. The loop pushes <code class="inl">row?</code>, so one bad row aborts the whole read with an
+      error rather than being silently dropped. It is tempting to write
+      <code class="inl">.filter_map(Result::ok).collect()</code> and save four lines; that would turn
+      &ldquo;this database is corrupt&rdquo; into &ldquo;this scan found fewer files than you
+      remember,&rdquo; which is a far worse bug to be handed at three in the morning.</p>
+      <p class="hint" data-anchor="ch5-p20">The turbofish, <code class="inl">row.get::&lt;_, i64&gt;(1)</code>,
+      is telling <code class="inl">get</code> which type to decode into when the surrounding expression does
+      not pin it down. Where it does &mdash; <code class="inl">mtime_sec</code> is already
+      <code class="inl">i64</code> &mdash; the annotation is simply omitted. Small, consistent, readable.</p>
+
+      <h3>Turning &ldquo;nothing found&rdquo; into a value</h3>
+      <div class="listing" data-anchor="ch5-latest-scan">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">latest_scan_id</span>(&amp;<span class="kw">self</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Option</span>&lt;i64&gt;&gt; {
+        <span class="kw">let</span> id = <span class="kw">self</span>
+            .conn
+            .query_row(
+                <span class="str">"SELECT id FROM scans WHERE status = 'complete' ORDER BY id DESC LIMIT 1"</span>,
+                [],
+                |row| row.get(<span class="num">0</span>),
+            )
+            .map(<span class="ty">Some</span>)
+            .or_else(|err| <span class="kw">match</span> err {
+                rusqlite::<span class="ty">Error</span>::<span class="ty">QueryReturnedNoRows</span> =&gt; <span class="ty">Ok</span>(<span class="ty">None</span>),
+                other =&gt; <span class="ty">Err</span>(other),
+            })?;
+        <span class="ty">Ok</span>(id)
+    }</pre>
+</div>
+      <p data-anchor="ch5-p21">rusqlite treats &ldquo;no rows&rdquo; as an error, because for most
+      single-row queries it is one. Here it is not: an empty index is a perfectly normal state for a tool
+      you just installed. So the code catches that one variant and converts it to
+      <code class="inl">Ok(None)</code>, while every <em>other</em> error stays an error. The distinction
+      matters &mdash; a blanket <code class="inl">.ok()</code> would swallow a corrupt-database error and
+      report &ldquo;you have no scans&rdquo; instead. Chapter 7 will show what the caller does with that
+      <code class="inl">None</code>: turns it into the sentence <em>&ldquo;no completed scans in the index;
+      run <code>filecleaner scan</code> first.&rdquo;</em></p>
+    </section>
+
+    <section data-anchor="ch5-borrow">
+      <h2>The borrow checker as a concurrency policy</h2>
+      <p data-anchor="ch5-p22">Scan the method signatures in this file and a pattern appears:</p>
+      <table class="grid" data-anchor="ch5-sigs">
+        <tr><th class="mono">&amp;self &mdash; reads</th><th class="mono">&amp;mut self &mdash; writes</th></tr>
+        <tr><td class="mono">file_count, list_scans, latest_scan_id,<br>files_for_scan, fingerprint_candidates,<br>full_hash_candidates, group_by_id,<br>groups_for_scan, journal_incomplete,<br>journal_entry</td>
+            <td class="mono">begin_scan, insert_files, finish_scan,<br>set_fingerprints, set_sha256s,<br>rebuild_groups, journal_insert,<br>journal_set_state</td></tr>
+      </table>
+      <p data-anchor="ch5-p23">Nothing forces this. <code class="inl">Connection</code>'s own methods
+      would let every one of these take <code class="inl">&amp;self</code>. The author chose to mark writes
+      as <code class="inl">&amp;mut</code>, and the compiler then enforces something real for free: while a
+      write is in progress, no read of the same <code class="inl">Db</code> can be in flight, because Rust
+      allows either one mutable borrow or any number of shared ones, never both. A whole class of &ldquo;I
+      iterated a query while another statement modified the table&rdquo; bug is ruled out at compile time,
+      in a language that has no idea what SQL is.</p>
+      <div class="callout" data-anchor="ch5-callout-borrow">
+        <span class="tag">A habit worth stealing</span>
+        Take <code class="inl">&amp;mut self</code> when a method changes the thing it names, even if the
+        types would let you get away with <code class="inl">&amp;self</code>. You are not fighting the
+        borrow checker; you are recruiting it to state an invariant you would otherwise have to remember.
+      </div>
+      <p data-anchor="ch5-p24">You can see the same choice paying off in chapter 6, where the funnel takes
+      <code class="inl">db: &amp;mut Db</code> and therefore <em>cannot</em> be accidentally shared across
+      the rayon threads that do the hashing. The parallel part gets a plain slice; the database part stays
+      resolutely single-threaded. That is not a comment in the code &mdash; it is a type.</p>
+    </section>
+
+    <section data-anchor="ch5-reflect">
+      <div class="reflect" data-anchor="ch5-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>Memory, in both senses. The index lets an expensive scan be interrupted and resumed, lets a
+        review UI read while work is happening, and &mdash; most importantly for the second half of this
+        book &mdash; lets the program hold a <em>claim about the past</em>: this file, on this device, had
+        this size and this modification time at this moment. Every safety check in chapters 9 and 10 is a
+        comparison against a row in this table.</p>
+        <p>We also picked up a small, transferable set of habits: one transaction per batch, one prepared
+        statement per loop, an inner scope so the borrow ends, <code>row?</code> instead of
+        <code>.ok()</code>, and <code>&amp;mut self</code> as a statement of intent. None of them are
+        clever. All of them are why this file is 641 lines and still readable.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch5-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Delete the inner braces around <code class="inl">stmt</code> in
+          <code class="inl">insert_files</code> and read the error. Which of the two &mdash; the borrow or
+          the move &mdash; does the compiler complain about first, and why?</li>
+          <li>The journal table stores <code class="inl">source</code>, <code class="inl">target</code>,
+          <code class="inl">temp</code> and <code class="inl">backup</code> as full paths. Name two failure
+          modes this survives that a <code class="inl">file_id</code> reference would not.</li>
+          <li><code class="inl">synchronous = NORMAL</code> means the last commits can be lost in a power
+          cut. Read chapter 12, then come back and decide whether that endangers a reclaim in progress
+          &mdash; and say precisely which journal state would be at risk.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/db.rs">file_cleaner &mdash; src/index/db.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/CLAUDE.md">file_cleaner &mdash; CLAUDE.md (the design specification)</a></li>
+          <li><a href="https://docs.rs/rusqlite/latest/rusqlite/">rusqlite crate documentation</a></li>
+          <li><a href="https://www.sqlite.org/wal.html">SQLite &mdash; Write-Ahead Logging</a></li>
+          <li><a href="https://blog.rust-lang.org/2025/06/26/Rust-1.88.0">Announcing Rust 1.88.0 &mdash; let chains stabilized in the 2024 edition</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-walking-the-disk.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-the-candidate-funnel.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

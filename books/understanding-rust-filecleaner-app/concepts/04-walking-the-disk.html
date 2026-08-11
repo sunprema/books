@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Walking the Disk &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch4-intro">
+      <p class="eyebrow">Chapter 04 &middot; Part II — Finding the Duplicates</p>
+      <h1>Walking the Disk</h1>
+      <p class="lead" data-anchor="ch4-lead">The scan is where the program meets the real world, and the
+      real world is hostile in dull ways. Directories you cannot read. Symlinks that loop. Bundles that
+      look like folders but behave like documents. Files that vanish between the moment you list them and
+      the moment you stat them. The walker's job is not to be clever &mdash; it is to be
+      <em>unsurprisable</em>, and to come back with a tidy list and an honest census of everything it
+      refused.</p>
+    </section>
+    <section data-anchor="ch4-shape">
+      <h2>The shape of the answer</h2>
+      <p data-anchor="ch4-p1">The whole module returns one struct, and the pairing tells you the design:</p>
+      <div class="listing" data-anchor="ch4-outcome">
+  <p class="srcref"><span class="path">src/scanner/walker.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">WalkOutcome</span> {
+    <span class="kw">pub</span> files: <span class="ty">Vec</span>&lt;<span class="ty">FileEntry</span>&gt;,
+    <span class="kw">pub</span> stats: <span class="ty">ScanStats</span>,
+}</pre>
+</div>
+      <p data-anchor="ch4-p2">What we kept, and what we didn't &mdash; in the same value. A walker
+      that returned only <code class="inl">files</code> would leave the user unable to answer &ldquo;why
+      did it only find 38 things in a folder with 200?&rdquo; The counters are not diagnostics bolted on;
+      they are half the result.</p>
+
+      <h3>Errors are counted, never propagated</h3>
+      <p data-anchor="ch4-p3">Notice what the signature is <em>not</em>. It is not
+      <code class="inl">Result&lt;WalkOutcome&gt;</code>. A permission-denied directory in the middle of
+      <code class="inl">~/Documents</code> must not abort a scan of forty thousand files &mdash; it should
+      increment <code class="inl">stats.errors</code> and be skipped. This is a genuine judgement call, and
+      it is the right one for a tool that runs over other people's home directories: partial results with
+      an accurate count of what was missed beat an error message and nothing.</p>
+    </section>
+
+    <section data-anchor="ch4-traversal">
+      <h2>Setting up the traversal</h2>
+      <p data-anchor="ch4-p4">Here is the top of <code class="inl">walk_roots</code>, and it packs three
+      decisions into ten lines:</p>
+      <div class="listing" data-anchor="ch4-walk-setup">
+  <p class="srcref"><span class="path">src/scanner/walker.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Enumerate eligible regular files under `roots`.</span>
+<span class="cm">///</span>
+<span class="cm">/// Symlinks are never followed. Package directories are skipped unless</span>
+<span class="cm">/// `include_packages` is set — except when a root itself is a package, which</span>
+<span class="cm">/// counts as the user explicitly choosing to traverse it.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">walk_roots</span>(roots: &amp;[<span class="ty">PathBuf</span>], include_packages: bool) -&gt; <span class="ty">WalkOutcome</span> {
+    <span class="kw">let</span> <span class="kw">mut</span> files = <span class="ty">Vec</span>::new();
+    <span class="kw">let</span> <span class="kw">mut</span> stats = <span class="ty">ScanStats</span>::default();
+    <span class="kw">let</span> <span class="kw">mut</span> seen_paths = std::collections::<span class="ty">HashSet</span>::new();
+
+    <span class="kw">for</span> root <span class="kw">in</span> roots {
+        <span class="kw">let</span> packages_skipped = <span class="ty">Cell</span>::new(<span class="num">0u64</span>);
+        <span class="kw">let</span> walk = <span class="ty">WalkDir</span>::new(root)
+            .follow_links(<span class="kw">false</span>)
+            .into_iter()
+            .filter_entry(|entry| {
+                <span class="kw">if</span> !include_packages
+                    &amp;&amp; entry.depth() &gt; <span class="num">0</span>
+                    &amp;&amp; entry.file_type().is_dir()
+                    &amp;&amp; filter::is_package_dir(entry.path())
+                {
+                    packages_skipped.set(packages_skipped.get() + <span class="num">1</span>);
+                    <span class="kw">return</span> <span class="kw">false</span>;
+                }
+                <span class="kw">true</span>
+            });</pre>
+</div>
+      <h3><code class="inl">follow_links(false)</code></h3>
+      <p data-anchor="ch4-p5">The same rule as <code class="inl">CLONE_NOFOLLOW</code> in the last chapter.
+      A tool that replaces files must never be redirected by a link into somewhere the user did not name.
+      It also happens to make infinite loops impossible: a symlink pointing at its own ancestor is just an
+      entry to count and skip.</p>
+
+      <h3><code class="inl">filter_entry</code> prunes; a filter would not</h3>
+      <p data-anchor="ch4-p6">This is the most consequential line in the function.
+      <code class="inl">walkdir</code>'s <code class="inl">filter_entry</code> is not
+      <code class="inl">Iterator::filter</code>. When the closure returns
+      <code class="inl">false</code> for a <em>directory</em>, walkdir does not descend into it at all
+      &mdash; the entire subtree is pruned. Filtering afterwards would visit every file inside a
+      <code class="inl">.photoslibrary</code> containing forty thousand images and then throw them away.</p>
+      <p data-anchor="ch4-p7">Why prune packages at all? Because on macOS a
+      <code class="inl">.app</code> or <code class="inl">.photoslibrary</code> is a directory that the
+      system and its applications treat as a single document. <code class="inl">filter.rs</code> says it
+      plainly:</p>
+      <div class="listing" data-anchor="ch4-pkg-list">
+  <p class="srcref"><span class="path">src/scanner/filter.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Directory extensions that macOS treats as packages (documents that are</span>
+<span class="cm">/// really directories). Skipped by default: replacing files inside a package</span>
+<span class="cm">/// can corrupt it as a unit, so traversal must be an explicit user choice.</span>
+<span class="kw">const</span> <span class="ty">PACKAGE_EXTENSIONS</span>: &amp;[&amp;str] = &amp;[
+    <span class="str">"app"</span>,
+    <span class="str">"appex"</span>,
+    <span class="str">"band"</span>,
+    <span class="str">"bundle"</span>,
+    <span class="str">"docset"</span>,
+    <span class="str">"fcpbundle"</span>,
+    <span class="str">"framework"</span>,
+    <span class="str">"imovielibrary"</span>,
+    <span class="str">"kext"</span>,
+    <span class="str">"lproj"</span>,
+    <span class="str">"mpkg"</span>,
+    <span class="str">"photoslibrary"</span>,
+    <span class="str">"pkg"</span>,
+    <span class="str">"playground"</span>,
+    <span class="str">"plugin"</span>,
+    <span class="str">"prefpane"</span>,
+    <span class="str">"qlgenerator"</span>,
+    <span class="str">"scptd"</span>,
+    <span class="str">"tvlibrary"</span>,
+    <span class="str">"xcodeproj"</span>,
+    <span class="str">"xcworkspace"</span>,
+    <span class="str">"xpc"</span>,
+];</pre>
+</div>
+      <p data-anchor="ch4-p8">And the test for one is an extension lookup, lowercased so
+      <code class="inl">Upper.APP</code> is caught too:</p>
+      <div class="listing" data-anchor="ch4-is-pkg">
+  <p class="srcref"><span class="path">src/scanner/filter.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// True if `path` looks like a macOS package root, judged by extension.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">is_package_dir</span>(path: &amp;<span class="ty">Path</span>) -&gt; bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            <span class="kw">let</span> ext = ext.to_ascii_lowercase();
+            <span class="ty">PACKAGE_EXTENSIONS</span>.contains(&amp;ext.as_str())
+        })
+}</pre>
+</div>
+      <p data-anchor="ch4-p9">That chain is idiomatic Rust worth reading slowly.
+      <code class="inl">path.extension()</code> gives <code class="inl">Option&lt;&amp;OsStr&gt;</code>
+      &mdash; a path may have no extension. <code class="inl">.and_then(|e| e.to_str())</code> keeps it an
+      <code class="inl">Option</code> while attempting UTF-8 conversion, which can also fail. Then
+      <code class="inl">.is_some_and(&hellip;)</code> collapses the whole thing to a
+      <code class="inl">bool</code>: &ldquo;there is a value, <em>and</em> it satisfies this predicate.&rdquo;
+      No <code class="inl">unwrap</code>, no nesting, and every failure mode answers &ldquo;not a
+      package.&rdquo;</p>
+
+      <h3><code class="inl">entry.depth() &gt; 0</code>: consent, encoded</h3>
+      <div class="callout key" data-anchor="ch4-callout-depth">
+        <span class="tag">Key idea</span>
+        The package rule is suspended at depth zero. If you type
+        <code class="inl">filecleaner scan ~/Pictures/Photos&nbsp;Library.photoslibrary</code>, you have
+        named the package yourself &mdash; that <em>is</em> the explicit choice the doc comment asks for,
+        so the walk proceeds. One comparison against zero turns a blanket refusal into a policy about
+        consent, and there is a test for each half of it.
+      </div>
+
+      <h3>Why the counter is a <code class="inl">Cell</code></h3>
+      <p data-anchor="ch4-p10">Here is a puzzle the compiler sets you.
+      <code class="inl">filter_entry</code> requires a closure that implements
+      <code class="inl">Fn</code> &mdash; callable through a shared reference, potentially many times
+      &mdash; not <code class="inl">FnMut</code>. So the obvious
+      <code class="inl">let mut packages_skipped = 0u64;</code> followed by
+      <code class="inl">packages_skipped += 1</code> inside the closure will not compile: incrementing
+      requires mutable access to a captured variable, and an <code class="inl">Fn</code> closure does not
+      get it.</p>
+      <p data-anchor="ch4-p11">The answer is <code class="inl">Cell&lt;u64&gt;</code>, which offers
+      <em class="term-def">interior mutability</em>: you may replace the value through a shared reference,
+      because <code class="inl">Cell</code> guarantees nobody can be holding a reference to the inside. So
+      <code class="inl">packages_skipped.set(packages_skipped.get() + 1)</code> mutates through a
+      <code class="inl">&amp;</code>, the closure stays an <code class="inl">Fn</code>, and after the walk
+      the count is folded back into the stats:</p>
+      <div class="listing" data-anchor="ch4-cell-fold">
+  <p class="srcref"><span class="path">src/scanner/walker.rs</span><span class="what">the end of the per-root loop, verbatim</span></p>
+  <pre class="rs">        stats.packages_skipped += packages_skipped.get();</pre>
+</div>
+      <p class="hint" data-anchor="ch4-p12"><code class="inl">Cell</code> is not a lock and costs
+      nothing at runtime; it is single-threaded interior mutability, which is exactly what a walk on one
+      thread needs. Its multi-threaded cousins &mdash; <code class="inl">Mutex</code>,
+      <code class="inl">AtomicU32</code> &mdash; show up later in the book, in chapter 8, for exactly this
+      same &ldquo;I only have a shared reference and I need to count&rdquo; problem.</p>
+    </section>
+
+    <section data-anchor="ch4-ladder">
+      <h2>The classification ladder</h2>
+      <p data-anchor="ch4-p13">Inside the loop, every entry runs a gauntlet. Each rung either counts the
+      entry as excluded and <code class="inl">continue</code>s, or lets it through. Read it top to bottom
+      and you have read the eligibility policy:</p>
+      <div class="listing" data-anchor="ch4-ladder-code">
+  <p class="srcref"><span class="path">src/scanner/walker.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">        <span class="kw">for</span> result <span class="kw">in</span> walk {
+            <span class="kw">let</span> entry = <span class="kw">match</span> result {
+                <span class="ty">Ok</span>(entry) =&gt; entry,
+                <span class="ty">Err</span>(_) =&gt; {
+                    stats.errors += <span class="num">1</span>;
+                    <span class="kw">continue</span>;
+                }
+            };
+
+            <span class="kw">let</span> file_type = entry.file_type();
+            <span class="kw">if</span> file_type.is_dir() {
+                stats.directories += <span class="num">1</span>;
+                <span class="kw">continue</span>;
+            }
+            <span class="kw">if</span> file_type.is_symlink() {
+                stats.symlinks += <span class="num">1</span>;
+                <span class="kw">continue</span>;
+            }
+            <span class="kw">if</span> !file_type.is_file() {
+                stats.special += <span class="num">1</span>;
+                <span class="kw">continue</span>;
+            }
+
+            <span class="kw">let</span> name = entry.file_name().to_string_lossy();
+            <span class="kw">if</span> filter::is_own_artifact(&amp;name) {
+                stats.own_artifacts += <span class="num">1</span>;
+                <span class="kw">continue</span>;
+            }
+
+            <span class="kw">let</span> meta = <span class="kw">match</span> entry.metadata() {
+                <span class="ty">Ok</span>(meta) =&gt; meta,
+                <span class="ty">Err</span>(_) =&gt; {
+                    stats.errors += <span class="num">1</span>;
+                    <span class="kw">continue</span>;
+                }
+            };
+
+            <span class="kw">if</span> meta.len() == <span class="num">0</span> {
+                stats.zero_byte += <span class="num">1</span>;
+                <span class="kw">continue</span>;
+            }</pre>
+</div>
+      <table class="grid" data-anchor="ch4-rungs">
+        <tr><th>Rung</th><th>Why it is excluded</th></tr>
+        <tr><td>walk error</td><td>Unreadable directory or a race. Counted; the walk continues.</td></tr>
+        <tr><td>directory</td><td>We reclaim files, not folders.</td></tr>
+        <tr><td>symlink</td><td>Never followed, never a candidate &mdash; a link's &ldquo;content&rdquo; is a path.</td></tr>
+        <tr><td>not a regular file</td><td>Sockets, FIFOs, devices. Cloning them is meaningless.</td></tr>
+        <tr><td class="mono">.filecleaner.*</td><td>Our own transaction temp and backup files.</td></tr>
+        <tr><td>metadata error</td><td>The file vanished between listing and stat. Counted, skipped.</td></tr>
+        <tr><td>zero bytes</td><td>Every empty file is &ldquo;identical&rdquo; to every other, and reclaiming one frees nothing.</td></tr>
+      </table>
+
+      <div class="callout warn" data-anchor="ch4-callout-artifacts">
+        <span class="tag">The self-reference trap</span>
+        The <code class="inl">.filecleaner.*</code> rung deserves a moment. During a reclaim, the tool
+        creates a hidden clone next to the target &mdash; a file whose content is, by construction,
+        byte-identical to another file it is about to index. Without this rung, a scan that overlapped a
+        reclaim (or ran after an interrupted one) would happily nominate the tool's own scratch files as
+        duplicates, and the transaction engine would start operating on its own machinery. Two lines in
+        <code class="inl">filter.rs</code> close that off:
+      </div>
+      <div class="listing" data-anchor="ch4-own-artifact">
+  <p class="srcref"><span class="path">src/scanner/filter.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Prefix for temp/backup files created by our own reclamation transactions.</span>
+<span class="cm">/// They must never be scanned as duplicate candidates.</span>
+<span class="kw">pub</span> <span class="kw">const</span> <span class="ty">OWN_ARTIFACT_PREFIX</span>: &amp;str = <span class="str">".filecleaner."</span>;
+
+<span class="cm">/// True if `file_name` is a temp/backup file created by this tool.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">is_own_artifact</span>(file_name: &amp;str) -&gt; bool {
+    file_name.starts_with(<span class="ty">OWN_ARTIFACT_PREFIX</span>)
+}</pre>
+</div>
+      <p data-anchor="ch4-p14">The constant is <code class="inl">pub</code> so the planner can build
+      names from the same string it is filtered by &mdash; one source of truth for what &ldquo;our
+      files&rdquo; look like.</p>
+    </section>
+
+    <section data-anchor="ch4-record">
+      <h2>Recording a survivor</h2>
+      <p data-anchor="ch4-p15">What is left is a real, non-empty, non-linked regular file we can read.
+      Three more things happen before it becomes a <code class="inl">FileEntry</code>:</p>
+      <div class="listing" data-anchor="ch4-record-code">
+  <p class="srcref"><span class="path">src/scanner/walker.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">            <span class="cm">// Overlapping roots may reach the same path twice.</span>
+            <span class="kw">if</span> !seen_paths.insert(entry.path().to_path_buf()) {
+                <span class="kw">continue</span>;
+            }
+
+            <span class="kw">if</span> meta.nlink() &gt; <span class="num">1</span> {
+                stats.hardlinked += <span class="num">1</span>;
+            }
+
+            stats.eligible += <span class="num">1</span>;
+            stats.eligible_bytes += meta.len();
+            <span class="kw">let</span> rsrc_len = forks::resource_fork_len(entry.path());
+            files.push(<span class="ty">FileEntry</span> {
+                path: entry.into_path(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                nlink: meta.nlink(),
+                size: meta.len(),
+                mtime_sec: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+                rsrc_len,
+            });</pre>
+</div>
+      <h3>Deduplicating overlapping roots</h3>
+      <p data-anchor="ch4-p16"><code class="inl">HashSet::insert</code> returns
+      <code class="inl">true</code> if the value was new. So <code class="inl">if !seen_paths.insert(&hellip;)</code>
+      reads as &ldquo;if we had already seen this, skip.&rdquo; It matters because
+      <code class="inl">filecleaner scan ~/Documents ~/Documents/Invoices</code> is a perfectly reasonable
+      thing to type, and without this the same file would be indexed twice and could end up appearing to
+      be a duplicate of itself.</p>
+
+      <h3>Hard links are recorded, not rejected &mdash; yet</h3>
+      <p data-anchor="ch4-p17">A file with <code class="inl">nlink &gt; 1</code> is counted but still
+      indexed. That is deliberate: chapter 3's <code class="inl">eligible_targets</code> needs to
+      <em>see</em> those members in order to report them to the user as
+      &ldquo;(hardlinked &times;2 &mdash; skipped)&rdquo; rather than silently omitting them. Exclusion
+      happens where the decision is made, not where the data is gathered.</p>
+
+      <h3>Unix metadata needs an extension trait</h3>
+      <p data-anchor="ch4-p18"><code class="inl">meta.len()</code> is portable
+      <code class="inl">std</code>. <code class="inl">meta.dev()</code>,
+      <code class="inl">meta.ino()</code>, <code class="inl">meta.nlink()</code> and
+      <code class="inl">meta.mtime_nsec()</code> are not &mdash; they only exist because the file begins
+      with <code class="inl">use std::os::unix::fs::MetadataExt;</code>. This is Rust's
+      <em class="term-def">extension trait</em> pattern: the platform-specific API is a trait that adds
+      methods to a portable type, so the portable type stays portable and the extra power is something you
+      opt into by name. Delete that <code class="inl">use</code> and the file stops compiling with
+      &ldquo;no method named <code class="inl">ino</code>&rdquo; &mdash; which is exactly the reminder you
+      want that you have left portable ground.</p>
+
+      <h3><code class="inl">entry.into_path()</code>: a move, not a copy</h3>
+      <p data-anchor="ch4-p19">Every other field is read through <code class="inl">&amp;meta</code>, but
+      the path is taken with <code class="inl">entry.into_path()</code>, which <em>consumes</em> the
+      <code class="inl">DirEntry</code> and hands over the <code class="inl">PathBuf</code> it owned. No
+      allocation, no copy of the bytes &mdash; the buffer simply changes owner. This is why
+      <code class="inl">into_path()</code> is the last thing the loop does with
+      <code class="inl">entry</code>: after a move, the original is gone, and the compiler enforces that
+      you do not reach for it again.</p>
+      <p class="hint" data-anchor="ch4-p20">Small, but the habit is the point. In a walk over a hundred
+      thousand files, &ldquo;take ownership instead of cloning&rdquo; is a hundred thousand avoided
+      allocations, and it costs one word of API knowledge.</p>
+
+      <h3>One xattr call per file</h3>
+      <p data-anchor="ch4-p21"><code class="inl">forks::resource_fork_len</code> is the walker's only trip
+      into the <code class="inl">apfs</code> module, and it is a cheap one &mdash; a
+      <code class="inl">getxattr</code> asking for a size, not for content:</p>
+      <div class="listing" data-anchor="ch4-rsrc-len">
+  <p class="srcref"><span class="path">src/apfs/forks.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Length of the resource fork at `path`, 0 if absent or unreadable.</span>
+<span class="cm">/// Never follows symlinks.</span>
+<span class="mac">#[cfg(target_os = "macos")]</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">resource_fork_len</span>(path: &amp;<span class="ty">Path</span>) -&gt; u64 {
+    <span class="kw">use</span> std::ffi::<span class="ty">CString</span>;
+    <span class="kw">use</span> std::os::unix::ffi::<span class="ty">OsStrExt</span>;
+
+    <span class="kw">let</span> <span class="ty">Ok</span>(c_path) = <span class="ty">CString</span>::new(path.as_os_str().as_bytes()) <span class="kw">else</span> {
+        <span class="kw">return</span> <span class="num">0</span>;
+    };
+    <span class="kw">let</span> len = <span class="kw">unsafe</span> {
+        libc::getxattr(
+            c_path.as_ptr(),
+            <span class="str">c"com.apple.ResourceFork"</span>.as_ptr(),
+            std::ptr::null_mut(),
+            <span class="num">0</span>,
+            <span class="num">0</span>,
+            libc::<span class="ty">XATTR_NOFOLLOW</span>,
+        )
+    };
+    <span class="kw">if</span> len &lt; <span class="num">0</span> { <span class="num">0</span> } <span class="kw">else</span> { len <span class="kw">as</span> u64 }
+}</pre>
+</div>
+      <p data-anchor="ch4-p22">Three things to collect here. The
+      <code class="inl">let&nbsp;&hellip;&nbsp;else</code> form binds
+      <code class="inl">c_path</code> when the conversion succeeds and otherwise runs a block that must
+      diverge &mdash; here, <code class="inl">return 0</code>. It is the tidiest way to say &ldquo;handle
+      the failure and get out&rdquo; without an <code class="inl">if let</code> pyramid. The
+      <code class="inl">c"com.apple.ResourceFork"</code> literal is a C string literal, NUL-terminated at
+      compile time with no allocation at all. And passing a null buffer with length
+      <code class="inl">0</code> is the standard xattr idiom for &ldquo;don't give me the value, just tell
+      me how big it is.&rdquo;</p>
+      <p data-anchor="ch4-p23">Why record it at all? Because on macOS a file's content can live in two
+      places: the ordinary data fork and a resource fork carried as an extended attribute (old fonts,
+      custom icons, some legacy documents). Two files with identical data and different resource forks are
+      <em>not</em> the same file, and the fork length is a nearly-free way to keep them in separate buckets
+      from the very first stage of the funnel.</p>
+    </section>
+
+    <section data-anchor="ch4-tests">
+      <h2>One test that pins the whole policy</h2>
+      <p data-anchor="ch4-p24">The walker's unit test builds a small tree containing one of everything the
+      ladder rejects, then asserts on every counter at once:</p>
+      <div class="listing" data-anchor="ch4-test-walk">
+  <p class="srcref"><span class="path">src/scanner/walker.rs</span><span class="what">unit test, abridged &amp;mdash; the file-name assertions are elided</span></p>
+  <pre class="rs">    <span class="mac">#[test]</span>
+    <span class="kw">fn</span> <span class="fn">walks_and_filters</span>() {
+        <span class="kw">let</span> dir = tempfile::tempdir().unwrap();
+        <span class="kw">let</span> root = dir.path();
+
+        write(&amp;root.join(<span class="str">"a.txt"</span>), <span class="str">b"hello world"</span>);
+        write(&amp;root.join(<span class="str">"sub/b.txt"</span>), <span class="str">b"hello world"</span>);
+        write(&amp;root.join(<span class="str">"empty.txt"</span>), <span class="str">b""</span>);
+        write(&amp;root.join(<span class="str">"Fake.app/Contents/inside.txt"</span>), <span class="str">b"packaged"</span>);
+        write(&amp;root.join(<span class="str">".filecleaner.x.tmp"</span>), <span class="str">b"leftover"</span>);
+        symlink(root.join(<span class="str">"a.txt"</span>), root.join(<span class="str">"link.txt"</span>)).unwrap();
+        fs::hard_link(root.join(<span class="str">"a.txt"</span>), root.join(<span class="str">"hard.txt"</span>)).unwrap();
+
+        <span class="kw">let</span> outcome = walk_roots(&amp;[root.to_path_buf()], <span class="kw">false</span>);
+
+        <span class="cm">// …assertions that a.txt, b.txt and hard.txt are the three survivors…</span>
+
+        <span class="mac">assert_eq!</span>(outcome.stats.eligible, <span class="num">3</span>);
+        <span class="mac">assert_eq!</span>(outcome.stats.zero_byte, <span class="num">1</span>);
+        <span class="mac">assert_eq!</span>(outcome.stats.symlinks, <span class="num">1</span>);
+        <span class="mac">assert_eq!</span>(outcome.stats.packages_skipped, <span class="num">1</span>);
+        <span class="mac">assert_eq!</span>(outcome.stats.own_artifacts, <span class="num">1</span>);
+        <span class="cm">// a.txt and hard.txt share an inode; both count as hardlinked.</span>
+        <span class="mac">assert_eq!</span>(outcome.stats.hardlinked, <span class="num">2</span>);
+    }</pre>
+</div>
+      <p data-anchor="ch4-p25">Seven files in, three out, and every excluded file accounted for by
+      name in a counter. The last assertion is the subtle one: <code class="inl">a.txt</code> and
+      <code class="inl">hard.txt</code> are one inode with two names, so <em>both</em> paths carry
+      <code class="inl">nlink == 2</code> and both are counted. That number is a count of paths, not of
+      files &mdash; and the comment says so, which is the only reason the reader is not left guessing.</p>
+      <p data-anchor="ch4-p26">Two more tests take the consent rule apart from both ends: a package passed
+      explicitly as a root is traversed and reports <code class="inl">packages_skipped: 0</code>, and
+      <code class="inl">include_packages: true</code> traverses a nested one. A fourth confirms the
+      overlapping-roots dedupe. Four tests, and the entire policy in this chapter is nailed down.</p>
+    </section>
+
+    <section data-anchor="ch4-reflect">
+      <div class="reflect" data-anchor="ch4-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A list of candidates, and an audit trail for everything we refused. The walker reads no file
+        contents at all &mdash; not one byte &mdash; and yet it has already thrown away symlinks, packages,
+        empties, specials and our own leftovers. Everything that survives is a real file we can open, on a
+        known device, with a known size and a known modification time.</p>
+        <p>That last sentence is the setup for the next two chapters. Size and mtime are what the index
+        stores, and they are what lets the funnel decide which of these files is even worth <em>opening</em>.
+        Out of 38 files in the earlier example, six.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch4-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Replace the <code class="inl">Cell&lt;u64&gt;</code> with a plain
+          <code class="inl">mut</code> counter and read the compiler's error carefully. What exactly does it
+          say about <code class="inl">Fn</code> versus <code class="inl">FnMut</code>?</li>
+          <li><code class="inl">seen_paths</code> holds a <code class="inl">PathBuf</code> per eligible
+          file for the whole walk. Estimate the memory cost for a million-file scan, and propose a cheaper
+          key that preserves the property being defended.</li>
+          <li>The ladder counts a vanished file as <code class="inl">stats.errors</code>. Should &ldquo;the
+          file disappeared while we were looking at it&rdquo; be its own counter? Argue it as a user-facing
+          decision, not a code one.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/scanner/walker.rs">file_cleaner &mdash; src/scanner/walker.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/scanner/filter.rs">file_cleaner &mdash; src/scanner/filter.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/apfs/forks.rs">file_cleaner &mdash; src/apfs/forks.rs</a></li>
+          <li><a href="https://docs.rs/walkdir/latest/walkdir/">walkdir crate documentation</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/docs/user-guide.md">file_cleaner &mdash; docs/user-guide.md</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-the-domain-in-types.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-the-sqlite-index.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

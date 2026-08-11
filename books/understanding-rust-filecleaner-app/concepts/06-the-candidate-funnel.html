@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Candidate Funnel &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch6-intro">
+      <p class="eyebrow">Chapter 06 &middot; Part II — Finding the Duplicates</p>
+      <h1>The Candidate Funnel</h1>
+      <p class="lead" data-anchor="ch6-lead">Here is the problem in one sentence: you have 200,000 files
+      totalling 400&nbsp;GB, and you need to know which of them have identical contents. The na&iuml;ve
+      answer &mdash; hash everything, compare the hashes &mdash; is correct, obvious, and reads 400&nbsp;GB
+      off the disk. On a laptop that is tens of minutes of grinding for an answer that, nine times out of
+      ten, is &ldquo;there were eleven duplicates.&rdquo; The funnel is how this program gets the same
+      answer while opening almost nothing.</p>
+    </section>
+    <section data-anchor="ch6-argument">
+      <h2>The argument, before the code</h2>
+      <p data-anchor="ch6-p1">The insight is that duplicate detection is a series of ever-more-expensive
+      questions, and each one only has to be asked of whatever survived the last. Two files with different
+      sizes cannot possibly be identical &mdash; and their sizes are already in the database, so that
+      question costs no disk reads at all. Two files with the same size probably still differ, and looking
+      at a few kilobytes from each will usually prove it. Only the files that survive both deserve to be
+      read in full.</p>
+
+      <figure class="diagram-fig" data-anchor="ch6-fig-funnel">
+        <svg class="diagram" viewBox="0 0 560 216" role="img" aria-labelledby="ch6-d1-title">
+          <title id="ch6-d1-title">A four-stage funnel: size buckets read no files, the partial fingerprint reads up to 192 KiB per file, the full SHA-256 reads whole files, and the byte comparison inside the transaction reads two whole files</title>
+
+          <rect x="16" y="26" width="330" height="30" class="stroke fill-soft"/>
+          <text x="28" y="45" class="big">1 &nbsp;(dev, size, rsrc_len) buckets &mdash; pure SQL</text>
+          <text x="356" y="45" class="mono">0 bytes read</text>
+
+          <rect x="60" y="66" width="242" height="30" class="stroke fill-soft"/>
+          <text x="72" y="85" class="big">2 &nbsp;BLAKE3 of first/middle/last 64 KiB</text>
+          <text x="356" y="85" class="mono">&le; 192 KiB / file</text>
+
+          <rect x="104" y="106" width="154" height="30" class="stroke fill-soft"/>
+          <text x="116" y="125" class="big">3 &nbsp;streaming SHA-256</text>
+          <text x="356" y="125" class="mono">whole file</text>
+
+          <rect x="132" y="146" width="98" height="30" class="stroke-red fill-red"/>
+          <text x="144" y="165" class="big on-ink">4 &nbsp;byte compare</text>
+          <text x="356" y="165" class="mono red">both files, at reclaim time</text>
+
+          <path d="M181 56 L181 66" class="stroke-soft"/>
+          <path d="M181 96 L181 106" class="stroke-soft"/>
+          <path d="M181 136 L181 146" class="stroke-red"/>
+
+          <text x="16" y="200" class="dim">stages 1&ndash;3 nominate candidates and live in the index</text>
+          <text x="16" y="212" class="red">stage 4 is the only authority, and it runs inside the transaction (ch. 10)</text>
+        </svg>
+        <figcaption><b>Each stage pays for the next.</b> The funnel is not about being fast for its own
+        sake &mdash; it is about making the final, expensive, <em>authoritative</em> comparison affordable
+        by only ever running it on a handful of pairs.</figcaption>
+      </figure>
+    </section>
+
+    <section data-anchor="ch6-stage1">
+      <h2>Stage 1: the cheapest question is a SQL query</h2>
+      <p data-anchor="ch6-p2">The first stage does not open a single file. It asks the index which files
+      even <em>could</em> have a partner:</p>
+      <div class="listing" data-anchor="ch6-fp-candidates">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="cm">/// Files that still need a partial fingerprint: members of a</span>
+    <span class="cm">/// (volume, size, resource-fork length) bucket containing at least two</span>
+    <span class="cm">/// distinct inodes. Everything else can never be a duplicate candidate.</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">fingerprint_candidates</span>(&amp;<span class="kw">self</span>, scan_id: i64) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;<span class="ty">HashCandidate</span>&gt;&gt; {
+        <span class="kw">self</span>.candidates(
+            scan_id,
+            <span class="str">"SELECT f.id, f.path, f.size, f.mtime_sec, f.mtime_nsec
+             FROM files f
+             JOIN (SELECT dev, size, rsrc_len
+                   FROM files WHERE scan_id = ?1
+                   GROUP BY dev, size, rsrc_len
+                   HAVING COUNT(DISTINCT ino) &gt;= 2) b
+               ON f.dev = b.dev AND f.size = b.size AND f.rsrc_len = b.rsrc_len
+             WHERE f.scan_id = ?1 AND f.fingerprint IS NULL"</span>,
+        )
+    }</pre>
+</div>
+      <p data-anchor="ch6-p3">Every clause is a decision from an earlier chapter, cashed in:</p>
+      <ul data-anchor="ch6-clauses">
+        <li><code class="inl">GROUP BY dev</code> &mdash; because clones are same-volume only (chapter 2). A
+        duplicate on an external drive can never be reclaimed against one on the internal disk, so it is
+        not even a candidate.</li>
+        <li><code class="inl">size</code> &mdash; the obvious one. Different lengths, different files.</li>
+        <li><code class="inl">rsrc_len</code> &mdash; because on macOS identical data forks with different
+        resource forks are different files (chapter 4). Putting it in the bucket key means such files never
+        meet.</li>
+        <li><code class="inl">HAVING COUNT(DISTINCT ino) &gt;= 2</code> &mdash; the sharp one. Not
+        <code class="inl">COUNT(*)</code>: <em>distinct inodes</em>. Ten hard links to one file are ten rows
+        and one inode, and there is nothing to reclaim among them. This single word is how the hardlink
+        rule from chapter 3 reaches all the way down into stage one.</li>
+        <li><code class="inl">AND f.fingerprint IS NULL</code> &mdash; the resumability clause. Already
+        fingerprinted? Not a candidate for fingerprinting.</li>
+      </ul>
+      <p data-anchor="ch6-p4">The second stage's query is the same shape with the fingerprint added to the
+      bucket key and <code class="inl">f.sha256 IS NULL</code> as the filter. Both funnel through one
+      private helper, <code class="inl">candidates</code>, which is where the row-decoding loop lives
+      &mdash; two public methods, one implementation, no duplicated decode.</p>
+    </section>
+
+    <section data-anchor="ch6-stage2">
+      <h2>Stage 2: a fingerprint is three peeks</h2>
+      <p data-anchor="ch6-p5">Now we open files, but only barely.</p>
+      <div class="listing" data-anchor="ch6-fingerprint">
+  <p class="srcref"><span class="path">src/index/fingerprint.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Bytes hashed per sampled range.</span>
+<span class="kw">pub</span> <span class="kw">const</span> <span class="ty">RANGE_LEN</span>: u64 = <span class="num">64</span> * <span class="num">1024</span>;
+
+<span class="cm">/// Cheap partial fingerprint: BLAKE3 over the first, middle, and last</span>
+<span class="cm">/// 64 KiB. Splits most same-sized files without reading full contents.</span>
+<span class="cm">/// Files small enough that the ranges would overlap are hashed whole.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">compute</span>(
+    path: &amp;<span class="ty">Path</span>,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+) -&gt; <span class="ty">Result</span>&lt;[u8; <span class="num">32</span>], <span class="ty">HashError</span>&gt; {
+    verify_unchanged(path, size, mtime_sec, mtime_nsec)?;
+
+    <span class="kw">let</span> <span class="kw">mut</span> file = <span class="ty">File</span>::open(path)?;
+    <span class="kw">let</span> <span class="kw">mut</span> hasher = blake3::<span class="ty">Hasher</span>::new();
+
+    <span class="kw">if</span> size &lt;= <span class="num">3</span> * <span class="ty">RANGE_LEN</span> {
+        <span class="kw">let</span> <span class="kw">mut</span> buf = <span class="ty">Vec</span>::with_capacity(size <span class="kw">as</span> usize);
+        file.read_to_end(&amp;<span class="kw">mut</span> buf)?;
+        hasher.update(&amp;buf);
+    } <span class="kw">else</span> {
+        <span class="kw">let</span> offsets = [<span class="num">0</span>, size / <span class="num">2</span> - <span class="ty">RANGE_LEN</span> / <span class="num">2</span>, size - <span class="ty">RANGE_LEN</span>];
+        <span class="kw">let</span> <span class="kw">mut</span> buf = <span class="mac">vec!</span>[<span class="num">0u8</span>; <span class="ty">RANGE_LEN</span> <span class="kw">as</span> usize];
+        <span class="kw">for</span> offset <span class="kw">in</span> offsets {
+            file.seek(<span class="ty">SeekFrom</span>::<span class="ty">Start</span>(offset))?;
+            file.read_exact(&amp;<span class="kw">mut</span> buf)?;
+            hasher.update(&amp;buf);
+        }
+    }
+    <span class="ty">Ok</span>(*hasher.finalize().as_bytes())
+}</pre>
+</div>
+      <p data-anchor="ch6-p6">Read a 4&nbsp;GB video with this and you touch 192&nbsp;KiB &mdash;
+      about 0.005% of it. Three seeks and three reads, regardless of size.</p>
+      <p data-anchor="ch6-p7"><strong>Why first, middle <em>and</em> last?</strong> Because file formats
+      cluster their differences. Two exports of the same video share a container header; two versions of a
+      document share a preamble; two disk images differ deep inside. Sampling only the head would call
+      thousands of distinct files identical and push them all to the expensive stage. Three points from
+      opposite ends of the file catch the overwhelming majority of near-misses cheaply.</p>
+      <p data-anchor="ch6-p8"><strong>Why the small-file branch?</strong> Look at the offsets for a
+      100&nbsp;KiB file: <code class="inl">0</code>, <code class="inl">18</code>&nbsp;KiB,
+      <code class="inl">36</code>&nbsp;KiB &mdash; three overlapping 64&nbsp;KiB windows that between them
+      run off the end of the file, so <code class="inl">read_exact</code> would fail. Below
+      3&nbsp;&times;&nbsp;<code class="inl">RANGE_LEN</code> (192&nbsp;KiB) the file is simply hashed whole,
+      which is both correct and, at that size, cheaper than seeking around.</p>
+      <p data-anchor="ch6-p9"><strong>Why BLAKE3 here and SHA-256 later?</strong> This stage is a filter,
+      not a record. Nothing is stored under this hash forever; it exists to split a bucket, so raw speed is
+      the only thing that matters and BLAKE3 is very fast. The next stage produces the value the database
+      keeps, and there a widely-recognised cryptographic standard is the better citizen. Two hashes with
+      two jobs.</p>
+      <p data-anchor="ch6-p10"><code class="inl">read_exact</code> rather than
+      <code class="inl">read</code> is a small correctness point worth noticing: a plain
+      <code class="inl">read</code> is allowed to return fewer bytes than you asked for, and hashing a
+      partially-filled buffer would produce a fingerprint that depends on how the kernel felt that
+      morning. <code class="inl">read_exact</code> loops until the buffer is full or the file ends.</p>
+    </section>
+
+    <section data-anchor="ch6-stale">
+      <h2>The check that runs before every read</h2>
+      <p data-anchor="ch6-p11">Both hashing functions open with the same line:
+      <code class="inl">verify_unchanged(path, size, mtime_sec, mtime_nsec)?;</code>. It is fifteen lines
+      and it is the spine of this program's honesty.</p>
+      <div class="listing" data-anchor="ch6-verify-unchanged">
+  <p class="srcref"><span class="path">src/index/hasher.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Confirm `path` is still the regular file the scan recorded: same size,</span>
+<span class="cm">/// same mtime. Called before any read so we never hash — and later never</span>
+<span class="cm">/// reclaim — a file that moved on.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">verify_unchanged</span>(
+    path: &amp;<span class="ty">Path</span>,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+) -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">HashError</span>&gt; {
+    <span class="kw">use</span> std::os::unix::fs::<span class="ty">MetadataExt</span>;
+
+    <span class="kw">let</span> meta = std::fs::symlink_metadata(path).map_err(|_| <span class="ty">HashError</span>::<span class="ty">Stale</span>)?;
+    <span class="kw">if</span> !meta.is_file()
+        || meta.len() != size
+        || meta.mtime() != mtime_sec
+        || meta.mtime_nsec() != mtime_nsec
+    {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">HashError</span>::<span class="ty">Stale</span>);
+    }
+    <span class="ty">Ok</span>(())
+}</pre>
+</div>
+      <p data-anchor="ch6-p12">The scan happened at some point in the past. Between then and now, the
+      user may have edited the file, replaced it, deleted it, or swapped it for a directory. So before
+      trusting anything the index says about a file, the code re-stats it and compares against what was
+      recorded &mdash; size, modification time <em>to the nanosecond</em>, and still-a-regular-file.</p>
+      <p data-anchor="ch6-p13">Notice the error handling on the very first line:
+      <code class="inl">.map_err(|_| HashError::Stale)</code>. If the stat fails at all &mdash; the file is
+      gone, the directory became unreadable &mdash; the answer is not &ldquo;an I/O error occurred,&rdquo;
+      it is &ldquo;this candidate is stale.&rdquo; That is the right framing, because the caller's response
+      is identical in both cases: drop it and move on.</p>
+      <div class="callout key" data-anchor="ch6-callout-stale">
+        <span class="tag">Key idea</span>
+        <code class="inl">Stale</code> is a <em>value</em>, not a failure. The funnel counts it separately
+        from I/O errors and keeps going. A tool that aborted a 200,000-file scan because one file was saved
+        mid-run would be unusable &mdash; and a tool that hashed the new contents and stored them under the
+        old identity would be dangerous.
+      </div>
+    </section>
+
+    <section data-anchor="ch6-stage3">
+      <h2>Stage 3: the stored identity</h2>
+      <div class="listing" data-anchor="ch6-full-sha">
+  <p class="srcref"><span class="path">src/index/hasher.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Stream the whole data fork and return its SHA-256 — the stored content</span>
+<span class="cm">/// identity. (Byte comparison, not this hash, is the final authority before</span>
+<span class="cm">/// a destructive replacement.)</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">full_sha256</span>(
+    path: &amp;<span class="ty">Path</span>,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+) -&gt; <span class="ty">Result</span>&lt;[u8; <span class="num">32</span>], <span class="ty">HashError</span>&gt; {
+    verify_unchanged(path, size, mtime_sec, mtime_nsec)?;
+
+    <span class="kw">let</span> <span class="kw">mut</span> file = <span class="ty">File</span>::open(path)?;
+    <span class="kw">let</span> <span class="kw">mut</span> hasher = <span class="ty">Sha256</span>::new();
+    <span class="kw">let</span> <span class="kw">mut</span> buf = <span class="mac">vec!</span>[<span class="num">0u8</span>; <span class="num">1024</span> * <span class="num">1024</span>];
+    <span class="kw">loop</span> {
+        <span class="kw">let</span> n = file.read(&amp;<span class="kw">mut</span> buf)?;
+        <span class="kw">if</span> n == <span class="num">0</span> {
+            <span class="kw">break</span>;
+        }
+        hasher.update(&amp;buf[..n]);
+    }
+    <span class="ty">Ok</span>(hasher.finalize().into())
+}</pre>
+</div>
+      <p data-anchor="ch6-p14">A 1&nbsp;MiB buffer, reused for the whole file, with
+      <code class="inl">hasher.update(&amp;buf[..n])</code> feeding only the bytes actually read. Memory use
+      is constant whether the file is 2&nbsp;MB or 200&nbsp;GB &mdash; the streaming shape that everything
+      touching large files should have. And unlike the fingerprint, here a short read is fine and expected:
+      the loop simply hashes what it got and asks again, stopping at
+      <code class="inl">n == 0</code> (end of file).</p>
+      <p data-anchor="ch6-p15">The unit test is a nice touch of paranoia &mdash; it hashes
+      <code class="inl">b"abc"</code> and compares against the published SHA-256 test vector, byte by byte.
+      That is not testing SHA-256 (the <code class="inl">sha2</code> crate can do that); it is testing that
+      <em>this</em> code feeds it correctly.</p>
+
+      <div class="callout warn" data-anchor="ch6-callout-authority">
+        <span class="tag">Read the doc comment again</span>
+        &ldquo;Byte comparison, not this hash, is the final authority before a destructive replacement.&rdquo;
+        The program computes a cryptographic hash of the entire file &mdash; and then <em>still refuses to
+        act on it</em>. Chapter 10 re-reads both files in full and compares them byte for byte inside the
+        transaction. Why? Two reasons, and the second is the real one. A hash collision is
+        astronomically unlikely; but a <em>stale</em> hash is not. The SHA-256 in the database was true at
+        scan time, and the file may have changed since. The byte comparison happens milliseconds before the
+        swap, in the same transaction &mdash; and that closeness in time, more than the strength of the
+        hash, is what makes it authoritative.
+      </div>
+    </section>
+
+    <section data-anchor="ch6-driver">
+      <h2>The driver: one function, four lines of meaning</h2>
+      <div class="listing" data-anchor="ch6-funnel-run">
+  <p class="srcref"><span class="path">src/index/funnel.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Run the duplicate-detection funnel over a scan: partial fingerprints for</span>
+<span class="cm">/// size-bucket survivors, full SHA-256 for fingerprint survivors, then</span>
+<span class="cm">/// rebuild the confirmed duplicate groups.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">run</span>(db: &amp;<span class="kw">mut</span> <span class="ty">Db</span>, scan_id: i64) -&gt; <span class="ty">Result</span>&lt;<span class="ty">FunnelReport</span>&gt; {
+    <span class="kw">let</span> <span class="kw">mut</span> report = <span class="ty">FunnelReport</span>::default();
+
+    <span class="kw">let</span> candidates = db.fingerprint_candidates(scan_id)?;
+    <span class="kw">let</span> fingerprints = hash_stage(&amp;candidates, &amp;<span class="kw">mut</span> report, |c| {
+        fingerprint::compute(&amp;c.path, c.size, c.mtime_sec, c.mtime_nsec)
+    });
+    report.fingerprinted = fingerprints.len() <span class="kw">as</span> u64;
+    db.set_fingerprints(&amp;fingerprints)?;
+
+    <span class="kw">let</span> candidates = db.full_hash_candidates(scan_id)?;
+    <span class="kw">let</span> hashes = hash_stage(&amp;candidates, &amp;<span class="kw">mut</span> report, |c| {
+        hasher::full_sha256(&amp;c.path, c.size, c.mtime_sec, c.mtime_nsec)
+    });
+    report.fully_hashed = hashes.len() <span class="kw">as</span> u64;
+    db.set_sha256s(&amp;hashes)?;
+
+    report.groups = db.rebuild_groups(scan_id)?;
+    <span class="ty">Ok</span>(report)
+}</pre>
+</div>
+      <p data-anchor="ch6-p16">Ask the database what needs doing, do it, write the results back. Twice.
+      Then rebuild the groups. The two stages are visibly the same shape because they <em>are</em> the same
+      shape &mdash; which is what makes the shared helper below possible.</p>
+      <p data-anchor="ch6-p17">And because every result is persisted before the next stage begins, the
+      whole function is restartable. Kill it during the SHA-256 stage and re-run: stage one finds no
+      candidates (every fingerprint is already stored), stage two picks up the files whose
+      <code class="inl">sha256</code> is still <code class="inl">NULL</code>. The
+      <code class="inl">FunnelReport</code> says as much in its own doc comment &mdash; a re-run over an
+      unchanged index reports zeros, because there was nothing left to do.</p>
+    </section>
+
+    <section data-anchor="ch6-parallel">
+      <h2>Parallelism in five lines, without a single lock</h2>
+      <div class="listing" data-anchor="ch6-hash-stage">
+  <p class="srcref"><span class="path">src/index/funnel.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="kw">fn</span> <span class="fn">hash_stage</span>(
+    candidates: &amp;[<span class="ty">HashCandidate</span>],
+    report: &amp;<span class="kw">mut</span> <span class="ty">FunnelReport</span>,
+    hash: <span class="kw">impl</span> <span class="ty">Fn</span>(&amp;<span class="ty">HashCandidate</span>) -&gt; <span class="ty">Result</span>&lt;[u8; <span class="num">32</span>], <span class="ty">HashError</span>&gt; + <span class="ty">Sync</span>,
+) -&gt; <span class="ty">Vec</span>&lt;(i64, [u8; <span class="num">32</span>])&gt; {
+    <span class="kw">let</span> results: <span class="ty">Vec</span>&lt;(i64, <span class="ty">Result</span>&lt;[u8; <span class="num">32</span>], <span class="ty">HashError</span>&gt;)&gt; = candidates
+        .par_iter()
+        .map(|c| (c.id, hash(c)))
+        .collect();
+
+    <span class="kw">let</span> <span class="kw">mut</span> ok = <span class="ty">Vec</span>::with_capacity(results.len());
+    <span class="kw">for</span> (id, result) <span class="kw">in</span> results {
+        <span class="kw">match</span> result {
+            <span class="ty">Ok</span>(digest) =&gt; ok.push((id, digest)),
+            <span class="ty">Err</span>(<span class="ty">HashError</span>::<span class="ty">Stale</span>) =&gt; report.stale += <span class="num">1</span>,
+            <span class="ty">Err</span>(<span class="ty">HashError</span>::<span class="ty">Io</span>(_)) =&gt; report.errors += <span class="num">1</span>,
+        }
+    }
+    ok
+}</pre>
+</div>
+      <h3>The parameter that makes one function serve two stages</h3>
+      <p data-anchor="ch6-p18"><code class="inl">hash: impl Fn(&amp;HashCandidate) -&gt; Result&lt;[u8; 32],
+      HashError&gt; + Sync</code>. In English: &ldquo;any callable that turns a candidate into a 32-byte
+      digest or a hash error, and that is safe to call from several threads at once.&rdquo; The
+      <code class="inl">impl Trait</code> position means the compiler generates a specialised copy for each
+      call site &mdash; no dynamic dispatch, no allocation &mdash; and the two closures in
+      <code class="inl">run</code> slot straight in.</p>
+      <p data-anchor="ch6-p19">The <code class="inl">+ Sync</code> is not decoration. It is what
+      <code class="inl">par_iter()</code> demands, and demanding it is how Rust knows this parallelism is
+      sound. Try to pass a closure capturing something thread-unsafe and this line is where it fails to
+      compile.</p>
+
+      <h3><code class="inl">par_iter()</code>: change one word, get every core</h3>
+      <p data-anchor="ch6-p20">Rayon's parallel iterators are drop-in replacements for the standard ones:
+      <code class="inl">.iter()</code> becomes <code class="inl">.par_iter()</code>, and the work is
+      distributed across a thread pool sized to the machine. That is the entire change. The
+      <code class="inl">.map(&hellip;).collect()</code> after it is ordinary iterator code.</p>
+      <p data-anchor="ch6-p21">This is I/O-bound work, and the bound is the point &mdash; a pool of a few
+      threads keeps the disk busy while one thread waits on a read, without spawning 200,000 tasks that
+      would thrash it. PLAN.md's design note is one line: <em>&ldquo;No Tokio: rayon with a bounded pool
+      fits this batch, disk-bound workload.&rdquo;</em> An async runtime would have brought a scheduler, a
+      colour to every function signature, and no benefit for work that is a fixed batch of blocking reads.</p>
+
+      <h3>Collect first, then count</h3>
+      <div class="callout key" data-anchor="ch6-callout-nolock">
+        <span class="tag">Key idea</span>
+        The obvious way to write this is to increment <code class="inl">report.stale</code> from inside the
+        parallel <code class="inl">map</code> &mdash; and that needs a <code class="inl">Mutex</code>, or an
+        atomic, and it makes the ordering of results non-deterministic. This code sidesteps the whole
+        problem: the parallel phase produces a <code class="inl">Vec</code> of
+        <code class="inl">(id, Result)</code> and touches nothing shared; the sequential phase walks that
+        <code class="inl">Vec</code> and does the counting. No locks, no atomics, no contention &mdash; and
+        the counters are exact.
+      </div>
+      <p data-anchor="ch6-p22">The <code class="inl">match</code> in that second phase is where the two
+      variants of <code class="inl">HashError</code> finally earn their existence. A stale file and an
+      unreadable file are both &ldquo;no digest,&rdquo; but the user needs to be told different things
+      &mdash; and the CLI prints them separately:
+      <code class="inl">dropped: 2 changed since scan, 1 unreadable</code>. That is the payoff for a typed
+      error enum, and it is the subject of the next chapter.</p>
+    </section>
+
+    <section data-anchor="ch6-grouping">
+      <h2>Grouping: from hashes to reviewable groups</h2>
+      <p data-anchor="ch6-p23">The last call in the funnel rebuilds the groups from scratch. Its core is
+      one more <code class="inl">GROUP BY</code>, now with the full hash in the key:</p>
+      <div class="listing" data-anchor="ch6-group-key">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">inside rebuild_groups, verbatim</span></p>
+  <pre class="rs">                "SELECT dev, size, rsrc_len, sha256
+                 FROM files
+                 WHERE scan_id = ?1 AND sha256 IS NOT NULL
+                 GROUP BY dev, size, rsrc_len, sha256
+                 HAVING COUNT(DISTINCT ino) &gt;= 2",</pre>
+</div>
+      <p data-anchor="ch6-p24">For each surviving key it loads the members, calls
+      <code class="inl">policy::choose_source</code> from chapter 3, and writes one
+      <code class="inl">groups</code> row plus a <code class="inl">group_id</code> on every member. One
+      ordering detail is worth stealing:</p>
+      <div class="listing" data-anchor="ch6-clear-first">
+  <p class="srcref"><span class="path">src/index/db.rs</span><span class="what">inside rebuild_groups, verbatim</span></p>
+  <pre class="rs">        <span class="cm">// Clear membership before deleting groups so the files → groups</span>
+        <span class="cm">// foreign key never dangles.</span>
+        tx.execute(
+            <span class="str">"UPDATE files SET group_id = NULL WHERE scan_id = ?1"</span>,
+            <span class="mac">params!</span>[scan_id],
+        )?;
+        tx.execute(<span class="str">"DELETE FROM groups WHERE scan_id = ?1"</span>, <span class="mac">params!</span>[scan_id])?;</pre>
+</div>
+      <p data-anchor="ch6-p25">Detach the children, then delete the parents &mdash; and do both
+      inside one transaction, so no other reader ever sees the half-way state. The comment explains the
+      order so that the next person does not &ldquo;tidy&rdquo; it into a constraint violation.</p>
+    </section>
+
+    <section data-anchor="ch6-tests">
+      <h2>What the tests insist on</h2>
+      <p data-anchor="ch6-p26">The funnel's integration tests are worth listing, because together they are
+      a specification of everything above:</p>
+      <table class="grid" data-anchor="ch6-testlist">
+        <tr><th>Test</th><th>The claim it defends</th></tr>
+        <tr><td>Identical large files share a fingerprint</td><td>Sampling is deterministic and position-based.</td></tr>
+        <tr><td>A one-byte middle difference changes it</td><td>Same size, same head, same tail &mdash; and still split, cheaply.</td></tr>
+        <tr><td>Small files are hashed whole</td><td>The &le;192 KiB branch is correct, not just non-crashing.</td></tr>
+        <tr><td>A stale candidate is rejected</td><td><code class="inl">verify_unchanged</code> fires before any read.</td></tr>
+        <tr><td>Hardlinks collapse to one entity</td><td><code class="inl">COUNT(DISTINCT ino)</code> does what the comment says.</td></tr>
+        <tr><td>Resource-fork differences split groups</td><td><code class="inl">rsrc_len</code> in the bucket key is load-bearing.</td></tr>
+        <tr><td>A re-run rehashes nothing</td><td>The <code class="inl">IS NULL</code> clauses really do make it resumable.</td></tr>
+      </table>
+      <p data-anchor="ch6-p27">The second row is the one I would put on the wall. Two 400&nbsp;KiB files,
+      identical except for one flipped byte in the middle, same size, same mtime. A head-only fingerprint
+      would call them candidates and send both to a full hash. This one does not &mdash; and the test
+      exists specifically to keep it that way.</p>
+    </section>
+
+    <section data-anchor="ch6-reflect">
+      <div class="reflect" data-anchor="ch6-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>Enormously less I/O, and &mdash; less obviously &mdash; permission to be paranoid later. Because
+        the funnel narrows 200,000 files down to a handful of genuine candidate pairs, the program can
+        afford to re-read <em>both files in full</em> immediately before touching anything. If detection
+        had to be the authority, we would be forced to trust a hash computed minutes or days ago. Because
+        detection is only a nomination, we get to check the answer at the last possible instant.</p>
+        <p>That is a design lesson well beyond this program: making the cheap path cheap is often how you
+        buy the right to make the critical path expensive.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch6-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Compute the total bytes read by the fingerprint stage for 10,000 files of 1&nbsp;GB each that
+          all share a size, and compare it to the full-hash stage. Then decide how much of that ratio
+          survives if the files are all 100&nbsp;KiB instead.</li>
+          <li><code class="inl">hash_stage</code> collects every result before counting. What is the peak
+          memory cost for a million candidates &mdash; and would you accept a lock to avoid it?</li>
+          <li>The fingerprint's middle offset is <code class="inl">size / 2 - RANGE_LEN / 2</code>. Construct
+          two files of equal size that this fingerprint cannot distinguish, then say why the funnel is still
+          correct.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/funnel.rs">file_cleaner &mdash; src/index/funnel.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/fingerprint.rs">file_cleaner &mdash; src/index/fingerprint.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/hasher.rs">file_cleaner &mdash; src/index/hasher.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/index/db.rs">file_cleaner &mdash; src/index/db.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/funnel_integration.rs">file_cleaner &mdash; tests/funnel_integration.rs</a></li>
+          <li><a href="https://docs.rs/rayon/latest/rayon/">rayon crate documentation &mdash; parallel iterators</a></li>
+          <li><a href="https://github.com/BLAKE3-team/BLAKE3">BLAKE3 &mdash; official implementation and specification</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-the-sqlite-index.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-errors-anyhow-and-thiserror.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
