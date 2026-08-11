@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>API Design and API Management &middot; IBM webMethods</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="ibm-webmethods">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; Building Integrations</span> &middot; Chapter 9</p>
+    <p class="chapter-no" aria-hidden="true">09</p>
+    <h1 data-anchor="ch9-h1">API design and API <span class="accent">management</span></h1>
+
+    <p class="lede" data-anchor="ch9-lede">The fastest way to publish an API is to expose the flow service directly. Do that and your internal service signature becomes a public contract, changeable only by consensus with everyone who called it. The gateway exists so that the API and the implementation can move independently.</p>
+
+    <h2 data-anchor="ch9-h2-consumer">Design for the consumer, not the backend</h2>
+
+    <p data-anchor="ch9-p1">Meridian's ERP models an order as a header IDoc plus line segments with a plant code, a distribution channel and a division. None of that is meaningful to the customer's procurement system. If those fields appear in the public API, you have published SAP's data model under your own brand, and every future ERP change becomes a customer-facing migration.</p>
+
+    <p data-anchor="ch9-p2">The API should be modelled on what the consumer is trying to do: submit an order, ask about its status, cancel it. Three resources, verbs that match HTTP semantics, and a payload that is Meridian's canonical order &mdash; not the ERP's.</p>
+
+    <div class="table-wrap" data-anchor="ch9-table-rest">
+      <table>
+        <caption>Meridian Orders API</caption>
+        <thead><tr><th>Operation</th><th>Method + path</th><th>Success</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Submit an order</td><td><code>POST /v1/orders</code></td><td><code>201</code> + <code>Location</code></td><td>Idempotent on <code>customerPoNumber</code></td></tr>
+          <tr><td>Read status</td><td><code>GET /v1/orders/{id}</code></td><td><code>200</code></td><td>Cacheable, no side effects</td></tr>
+          <tr><td>Cancel</td><td><code>POST /v1/orders/{id}/cancellation</code></td><td><code>202</code></td><td>Asynchronous; the ERP decides</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout key" data-anchor="ch9-key-status">
+      <span class="callout-title">Status codes are part of the contract</span>
+      <p><code>400</code> means the caller must change something before retrying. <code>409</code> means a conflicting state &mdash; a duplicate PO number with different contents. <code>422</code> means well-formed but rejected by a business rule. <code>503</code> plus <code>Retry-After</code> means come back later, and is the honest answer when the ERP is in its batch window. A blanket <code>500</code> teaches every client to retry things that will never succeed.</p>
+    </div>
+
+    <h2 data-anchor="ch9-h2-gateway">What the gateway does that your service should not</h2>
+
+    <p data-anchor="ch9-p3">API Gateway provides a <span class="term">policy framework</span> that programs API behaviour and implements management functions without writing code. That sentence is a division of labour: anything that is true of <em>every</em> API belongs in a policy, and anything specific to orders belongs in the flow service.</p>
+
+    <figure class="diagram-fig" data-anchor="ch9-fig-policy">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="c9d1">
+        <title id="c9d1">A request passes through identify, authorize, threat protection and rate limiting policies at the gateway before reaching the integration service</title>
+
+        <rect x="16" y="52" width="366" height="66" class="stroke fill-soft"/>
+        <text x="26" y="42">API Gateway policies</text>
+
+        <rect x="30"  y="66" width="76" height="38" class="stroke fill-bg"/>
+        <text x="38"  y="84" class="big">identify</text>
+        <text x="38"  y="97" class="dim">key, JWT</text>
+
+        <rect x="118" y="66" width="76" height="38" class="stroke fill-bg"/>
+        <text x="126" y="84" class="big">authorize</text>
+        <text x="126" y="97" class="dim">scopes</text>
+
+        <rect x="206" y="66" width="76" height="38" class="stroke fill-bg"/>
+        <text x="214" y="84" class="big">threat</text>
+        <text x="214" y="97" class="dim">size, depth</text>
+
+        <rect x="294" y="66" width="76" height="38" class="stroke-red"/>
+        <text x="302" y="84" class="big red">throttle</text>
+        <text x="302" y="97" class="red">token bucket</text>
+
+        <rect x="424" y="66" width="120" height="38" class="stroke-thick fill-bg"/>
+        <text x="434" y="90" class="big">submitOrder</text>
+
+        <path d="M382 85 L424 85" class="stroke"/>
+        <path d="M416 81 L424 85 L416 89" class="stroke"/>
+        <path d="M16 85 L30 85" class="stroke"/>
+
+        <text x="424" y="130" class="dim">business rules only</text>
+        <text x="16" y="145" class="dim">nothing reaches the service until every policy has passed</text>
+      </svg>
+      <figcaption><b>Cross-cutting concerns move left.</b> The service never sees an unauthenticated request, an oversized payload, or a caller over quota &mdash; so it never contains code for any of them.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch9-h2-auth">Authentication and authorization</h2>
+
+    <p data-anchor="ch9-p4">Three tiers, and most estates need all three. <span class="term">API keys</span> identify an application &mdash; cheap, revocable, and not a security boundary on their own. <span class="term">OAuth 2.0</span> with scoped access tokens is the default for anything a third party calls; the scope, not the key, is what authorizes the operation. <span class="term">Mutual TLS</span> is for partners with an existing certificate relationship, which is exactly the B2B population of chapter 11.</p>
+
+    <p data-anchor="ch9-p5">The design question that matters more than the mechanism: does the token identify the <em>application</em> or the <em>user</em>? Meridian's procurement integration is application-to-application, so a client-credentials token identifying the customer's system is right, and the customer's own user identity is carried in the payload as data. Conflating the two produces an audit trail that cannot answer either question.</p>
+
+    <h2 data-anchor="ch9-h2-rate">Rate limiting, quotas, and the arithmetic of nodes</h2>
+
+    <p data-anchor="ch9-p6">Rate limiting in API Gateway is the <span class="term">Traffic Optimization</span> policy: it limits the number of API invocations during a specified time interval, implemented with a <span class="term">token bucket</span> algorithm. Token bucket matters because it permits bursts up to the bucket size while holding the long-run average &mdash; which is what you want for a procurement system that submits fifty orders at 09:00 and nothing until noon.</p>
+
+    <div class="callout warn" data-anchor="ch9-nodes">
+      <span class="callout-title">The limit multiplies by your node count</span>
+      <p>If a limit is enforced per gateway node and you run four nodes behind a load balancer, a "100 per minute" policy admits up to 400 per minute. Confirm whether your limits are counted locally or in shared state before you quote a number to a customer &mdash; and before you rely on one to protect a downstream system.</p>
+    </div>
+
+    <h2 data-anchor="ch9-h2-versioning">Versioning and lifecycle</h2>
+
+    <p data-anchor="ch9-p7">Version in the path (<code>/v1/</code>) because it is visible in every log, cache key and support ticket. Then run versions in parallel: a new major version goes live while the old one keeps serving, consumers migrate individually, and the old version is retired only when its traffic is zero and you have said so three times. Deprecation needs a date, a header on every response, and a named human at each consumer &mdash; announcements to a mailing list do not migrate anyone.</p>
+
+    <p class="pullquote" data-anchor="ch9-pq">The gateway's real product is not security or throttling. It is the ability to change the implementation without asking permission.</p>
+
+    <div class="callout warn" data-anchor="ch9-fail">
+      <span class="callout-title">Failure scenario</span>
+      <p>Meridian exposes <code>submitOrder</code> straight through, so the API's payload is the ERP's IDoc structure. Two years later the ERP is upgraded and <code>vbeln</code> becomes 12 characters. Every customer integration must change on the same weekend, because there is no translation layer to absorb it. The mapping that would have prevented this is about forty lines and should have been written on day one &mdash; the gateway alone would not have saved them, because the schema, not the endpoint, was the leak.</p>
+    </div>
+
+    <div class="review" data-anchor="ch9-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>Could you replace your backend system tomorrow without changing the API contract? If not, where does it leak?</li>
+        <li>Which of your gateway policies are per-node, and what is the effective limit at your current node count?</li>
+        <li>Does each error class map to a distinct status code, or does everything become <code>500</code>?</li>
+        <li>For your oldest API version: how much traffic does it still carry, and who owns each remaining consumer?</li>
+        <li>Do your tokens identify applications or users, and does your audit trail need both?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-connecting-enterprise-systems.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-messaging-event-driven.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
