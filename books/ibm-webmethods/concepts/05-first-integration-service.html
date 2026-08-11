@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Your First Integration Service &middot; IBM webMethods</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="ibm-webmethods">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; Building Integrations</span> &middot; Chapter 5</p>
+    <p class="chapter-no" aria-hidden="true">05</p>
+    <h1 data-anchor="ch5-h1">Your first integration <span class="accent">service</span></h1>
+
+    <p class="lede" data-anchor="ch5-lede">We build <code>submitOrder</code>: an HTTP request in, a validated canonical order, a sales order in the ERP, a response out. It is about forty steps of real work and it is the skeleton every later chapter hangs something on.</p>
+
+    <h2 data-anchor="ch5-h2-lifecycle">What happens before your first step runs</h2>
+
+    <p data-anchor="ch5-p1">Integration Server decodes the client request, identifies the requested service, invokes it, passes data to it in the expected format, and returns the output to the client. Your flow service is the middle of that sentence. Two consequences matter immediately: the transport has already been handled by the time you get control, and whatever you leave in the pipeline at the end is what the caller receives.</p>
+
+    <h2 data-anchor="ch5-h2-signature">Start with the signature</h2>
+
+    <p data-anchor="ch5-p2">Design the interface before the implementation, because the signature is the part you cannot change later without breaking someone. For Meridian's order intake:</p>
+
+    <p class="pre-label">meridian.order.pub:submitOrder &mdash; signature</p>
+    <pre><code><span class="kw">Input</span>
+  order            <span class="ty">CanonicalOrder</span>   <span class="cm"># document reference, not a loose string</span>
+  correlationId    <span class="ty">String</span>          <span class="cm"># accepted from the caller</span>
+
+<span class="kw">Output</span>
+  orderStatus      <span class="ty">String</span>          <span class="cm"># ACCEPTED | REJECTED</span>
+  salesOrderNumber <span class="ty">String</span>          <span class="cm"># ERP key, absent when rejected</span>
+  errors           <span class="ty">String[]</span>        <span class="cm"># populated only on REJECTED</span></code></pre>
+
+    <div class="callout key" data-anchor="ch5-key-sig">
+      <span class="callout-title">Two decisions hidden in six lines</span>
+      <p>The input is a <em>document reference</em>, so validation has something to check against and Designer can generate the mapping. And rejection is a normal output value, not an exception &mdash; a business rejection is a legitimate answer to a well-formed request, and modelling it as a thrown error means the caller sees a 500 for their own typo.</p>
+    </div>
+
+    <h2 data-anchor="ch5-h2-build">The guided build</h2>
+
+    <p data-anchor="ch5-p3">Six moves, in order. The order matters: everything that can reject the request happens before anything that changes the world.</p>
+
+    <p class="pre-label">meridian.order.pub:submitOrder &mdash; flow</p>
+    <pre><code><span class="num">1</span> <span class="kw">MAP</span>     <span class="cm"># establish the correlation id</span>
+     BRANCH on '/correlationId'
+       $null: INVOKE meridian.order.util:buildCorrelationId
+
+<span class="num">2</span> <span class="kw">INVOKE</span>  pub.schema:validate
+     <span class="cm"># object = /order, conformsTo = meridian.order.doc:CanonicalOrder</span>
+     BRANCH on '/isValid'
+       "false": <span class="kw">MAP</span> -&gt; orderStatus = <span class="str">"REJECTED"</span>, errors = /errors
+                <span class="kw">EXIT</span> from '$flow' signal SUCCESS
+
+<span class="num">3</span> <span class="kw">INVOKE</span>  meridian.order.impl:checkDuplicate
+     <span class="cm"># idempotency: has this customerPoNumber been seen?</span>
+     BRANCH on '/isDuplicate'
+       "true":  <span class="kw">MAP</span> -&gt; orderStatus = <span class="str">"ACCEPTED"</span>,
+                       salesOrderNumber = /existingSalesOrder
+                <span class="kw">EXIT</span> from '$flow' signal SUCCESS
+
+<span class="num">4</span> <span class="kw">INVOKE</span>  meridian.order.impl:validateOrder    <span class="cm"># business rules</span>
+     BRANCH on '/ruleFailures'
+       $default: <span class="cm">(non-empty) reject as in step 2</span>
+
+<span class="num">5</span> <span class="kw">SEQUENCE</span> (exit on: FAILURE)                 <span class="cm"># the side effect</span>
+     <span class="kw">INVOKE</span> meridian.erp.adapter:createSalesOrder
+     <span class="kw">INVOKE</span> meridian.order.impl:recordIdempotencyKey
+
+<span class="num">6</span> <span class="kw">MAP</span>     <span class="cm"># shape the reply AND drop everything else</span>
+     orderStatus      = <span class="str">"ACCEPTED"</span>
+     salesOrderNumber = /erpResponse/vbeln
+     <span class="cm"># drop: order, erpResponse, isValid, isDuplicate, ruleFailures</span></code></pre>
+
+    <figure class="diagram-fig" data-anchor="ch5-fig-flow">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="c5d1">
+        <title id="c5d1">Validation, duplicate check and business rules all reject before the ERP call, which is the first step that changes anything</title>
+
+        <rect x="16"  y="52" width="86" height="40" class="stroke fill-soft"/>
+        <rect x="130" y="52" width="86" height="40" class="stroke fill-soft"/>
+        <rect x="244" y="52" width="86" height="40" class="stroke fill-soft"/>
+        <rect x="358" y="52" width="86" height="40" class="stroke-red"/>
+        <rect x="472" y="52" width="72" height="40" class="stroke fill-soft"/>
+        <text x="24"  y="70" class="big">validate</text>
+        <text x="138" y="70" class="big">dedupe</text>
+        <text x="252" y="70" class="big">rules</text>
+        <text x="366" y="70" class="big red">create in</text>
+        <text x="366" y="84" class="big red">ERP</text>
+        <text x="480" y="76" class="big">reply</text>
+
+        <path d="M102 72 L130 72" class="stroke"/><path d="M122 68 L130 72 L122 76" class="stroke"/>
+        <path d="M216 72 L244 72" class="stroke"/><path d="M236 68 L244 72 L236 76" class="stroke"/>
+        <path d="M330 72 L358 72" class="stroke"/><path d="M350 68 L358 72 L350 76" class="stroke"/>
+        <path d="M444 72 L472 72" class="stroke"/><path d="M464 68 L472 72 L464 76" class="stroke"/>
+
+        <path d="M59 92 L59 122 L508 122 L508 92" class="stroke-soft dash"/>
+        <path d="M173 92 L173 122" class="stroke-soft dash"/>
+        <path d="M287 92 L287 122" class="stroke-soft dash"/>
+        <text x="200" y="140" class="dim">early exits &mdash; nothing has changed yet</text>
+
+        <text x="358" y="42" class="red">the only irreversible step</text>
+      </svg>
+      <figcaption><b>Push the side effect right.</b> Everything left of the accent box can reject the request with no cleanup. Once you cross it, failure needs compensation instead &mdash; which is chapter 12's subject.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch5-h2-map">Mapping is where the bugs live</h2>
+
+    <p data-anchor="ch5-p4"><code>MAP</code> looks like the boring step. It is where most defects originate, for one reason: the pipeline is permissive. Map a field name with a typo and nothing errors &mdash; the target is simply absent, the downstream system receives a null, and the order goes through with no delivery date. Three habits prevent almost all of it:</p>
+
+    <ul data-anchor="ch5-list-map">
+      <li><b>Validate against a document type</b> rather than trusting the shape. <code>pub.schema:validate</code> against <code>CanonicalOrder</code> turns a silent null into a loud rejection.</li>
+      <li><b>Drop as you go.</b> Every <code>MAP</code> that finishes a phase should drop the inputs that phase consumed. The pipeline at the reply step should contain the reply and nothing else.</li>
+      <li><b>Never map a field you have not seen a real example of.</b> The ERP's <code>vbeln</code> is a sales order number; it is also ten characters, zero-padded, and your <code>String</code> will happily carry <code>"0000123456"</code> into a system that expected <code>123456</code>.</li>
+    </ul>
+
+    <h2 data-anchor="ch5-h2-test">Testing it before it exists anywhere else</h2>
+
+    <p data-anchor="ch5-p5">Run the service in Designer with a sample pipeline. Then run it three more times: once with a required field missing, once with the same <code>customerPoNumber</code> twice, and once with the ERP adapter pointed at a host that refuses connections. Those three are the tests that matter, and all three should produce a defined answer rather than a stack trace reaching the caller.</p>
+
+    <div class="callout warn" data-anchor="ch5-fail">
+      <span class="callout-title">Failure scenario</span>
+      <p>Step 5 succeeds in the ERP, then <code>recordIdempotencyKey</code> fails because the database connection pool is exhausted. The <code>SEQUENCE</code> exits on failure and the caller sees an error &mdash; so the customer's system retries, the duplicate check finds no key, and a second sales order is created. The lesson is uncomfortable and worth sitting with: the idempotency record must be written in the <em>same</em> transaction as the side effect, or the side effect must be made naturally idempotent by passing the customer PO number to the ERP as its own external reference. Chapter 8 chooses the second.</p>
+    </div>
+
+    <div class="review" data-anchor="ch5-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>Is every rejecting check ahead of every side effect in your flow?</li>
+        <li>What is in the pipeline at your final <code>MAP</code>, and would you be happy to see all of it in a log?</li>
+        <li>Is a business rejection modelled as an output value or as a thrown error &mdash; and which does the caller's client library do something sensible with?</li>
+        <li>If the step after your side effect fails, what does a retry from the caller do?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-dev-environment.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-flow-service-patterns.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

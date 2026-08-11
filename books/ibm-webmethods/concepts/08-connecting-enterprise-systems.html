@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Connecting Enterprise Systems &middot; IBM webMethods</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="ibm-webmethods">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; Building Integrations</span> &middot; Chapter 8</p>
+    <p class="chapter-no" aria-hidden="true">08</p>
+    <h1 data-anchor="ch8-h1">Connecting enterprise <span class="accent">systems</span></h1>
+
+    <p class="lede" data-anchor="ch8-lede">Adapters are where an integration meets physics: connection pools, transaction semantics, timeouts, and a downstream system that has opinions about how hard you may push it. Get the pool arithmetic wrong and no amount of flow-service elegance saves you.</p>
+
+    <h2 data-anchor="ch8-h2-shape">The shape of every adapter</h2>
+
+    <p data-anchor="ch8-p1">Whatever the target, the model is the same. You configure a <span class="term">connection</span>; then you define <span class="term">adapter services</span> over it for the outbound direction and <span class="term">adapter notifications</span> for the inbound one. The order is not negotiable: an adapter connection must be configured before any adapter service or notification can be configured against it.</p>
+
+    <p data-anchor="ch8-p2">The connection is also where the operational behaviour lives. For the JDBC adapter, connections carry the parameters Integration Server uses to manage database connections &mdash; pool size, timeouts, and the transaction type &mdash; so the connection is a capacity decision, not a piece of plumbing you fill in once.</p>
+
+    <h2 data-anchor="ch8-h2-tx">Transaction types: pick deliberately</h2>
+
+    <p data-anchor="ch8-p3">The JDBC adapter offers three, and the choice constrains what you can build on top of it.</p>
+
+    <div class="table-wrap" data-anchor="ch8-table-tx">
+      <table>
+        <caption>JDBC adapter transaction types</caption>
+        <thead><tr><th>Type</th><th>Behaviour</th><th>Required for</th><th>Cost</th></tr></thead>
+        <tbody>
+          <tr><td><code>NO_TRANSACTION</code></td><td>The connection auto-commits each operation</td><td>Reads; single idempotent writes</td><td>No multi-statement atomicity</td></tr>
+          <tr><td><code>LOCAL_TRANSACTION</code></td><td>Local transactions on one resource</td><td><code>BatchInsertSQL</code> / <code>BatchUpdateSQL</code>; exactly-once notifications with delete-stored-records</td><td>Held locks for the transaction's life</td></tr>
+          <tr><td><code>XA_TRANSACTION</code></td><td>Distributed XA transactions across resources</td><td>Genuine two-phase commit across systems</td><td>Latency, lock duration, recovery complexity</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout key" data-anchor="ch8-key-tx">
+      <span class="callout-title">Two documented requirements that bite silently</span>
+      <p>If you use <code>BatchInsertSQL</code> or <code>BatchUpdateSQL</code> adapter services, the connection <em>must</em> be <code>LOCAL_TRANSACTION</code>. And a basic notification using the exactly-once and delete-stored-records options must also be on a <code>LOCAL_TRANSACTION</code> connection. Both are easy to get wrong because the connection is configured in one place and the requirement appears in another.</p>
+    </div>
+
+    <p data-anchor="ch8-p4">The architect's view on XA: reach for it last. It buys atomicity across two resources at the cost of holding locks in both while a network round trip completes, and its recovery path is the one nobody has rehearsed. Most integration flows are better served by making the operation idempotent and compensating on failure &mdash; which is what chapter 12 builds, and what Meridian uses.</p>
+
+    <h2 data-anchor="ch8-h2-pool">Pool arithmetic</h2>
+
+    <p data-anchor="ch8-p5">Here is the calculation that actually determines your throughput. A pool of <span class="term">C</span> connections, each held for <span class="term">t</span> seconds per call, supports at most <span class="term">C&nbsp;/&nbsp;t</span> calls per second. Meridian's ERP answers in 300&ndash;900&nbsp;ms and tolerates roughly 20 concurrent connections. At the pessimistic 900&nbsp;ms that is 20&nbsp;/&nbsp;0.9 &asymp; 22 calls per second &mdash; against a peak of 8 orders/second. Comfortable, until someone adds a second ERP call per order and halves it.</p>
+
+    <figure class="diagram-fig" data-anchor="ch8-fig-pool">
+      <svg class="diagram" viewBox="0 0 560 175" role="img" aria-labelledby="c8d1">
+        <title id="c8d1">Requests queue for a fixed pool of connections; when arrival rate exceeds pool capacity the queue grows without bound</title>
+
+        <text x="16" y="20">Arrivals</text>
+        <path d="M16 44 L120 44" class="stroke"/>
+        <path d="M112 40 L120 44 L112 48" class="stroke"/>
+        <text x="16" y="66" class="mono">8 / s</text>
+
+        <rect x="130" y="26" width="90" height="36" class="stroke fill-soft"/>
+        <text x="140" y="48" class="big">queue</text>
+
+        <rect x="250" y="16" width="140" height="120" class="stroke-thick fill-bg"/>
+        <text x="260" y="36" class="big">pool: 20 conns</text>
+        <path d="M260 48 L380 48" class="stroke-soft"/>
+        <text x="260" y="70" class="mono">hold t = 0.9 s</text>
+        <text x="260" y="94" class="big">capacity</text>
+        <text x="260" y="112" class="mono red">20 / 0.9 = 22 / s</text>
+
+        <path d="M220 44 L250 44" class="stroke"/>
+        <path d="M242 40 L250 44 L242 48" class="stroke"/>
+
+        <rect x="420" y="26" width="124" height="36" class="stroke fill-soft"/>
+        <text x="430" y="48" class="big">ERP</text>
+        <path d="M390 44 L420 44" class="stroke"/>
+        <path d="M412 40 L420 44 L412 48" class="stroke"/>
+
+        <path d="M16 160 L544 160" class="stroke-red"/>
+        <text x="16" y="154" class="red">add a second ERP call per order and capacity halves to 11 / s</text>
+      </svg>
+      <figcaption><b>Pool size times call duration is your ceiling.</b> Raising the pool above what the downstream system allows does not raise the ceiling &mdash; it just moves the rejection from your queue to their connection limit.</figcaption>
+    </figure>
+
+    <p data-anchor="ch8-p6">Which gives the rule: <b>size the pool to the downstream system's limit, never above it.</b> A pool of 100 against an ERP that accepts 20 does not give you five times the throughput; it gives you eighty connection errors and a support call from the ERP team. When you need more capacity, the lever is <em>t</em> &mdash; fewer calls per order, or a bulk interface &mdash; not <em>C</em>.</p>
+
+    <h2 data-anchor="ch8-h2-erp">ERP, CRM and SaaS</h2>
+
+    <p data-anchor="ch8-p7">The SAP adapter is a useful contrast to JDBC: it fully manages all connections, connection pools and sessions itself. That means your tuning surface is the adapter's own configuration rather than an Integration Server pool, and it means you should resist the temptation to wrap it in your own pooling &mdash; two pools in series produce a system whose capacity nobody can calculate.</p>
+
+    <p data-anchor="ch8-p8">SaaS targets bring a different constraint: a published rate limit you cannot raise. Meridian's CRM allows 100 calls per minute. There is no adapter setting that changes this, so it must be absorbed architecturally &mdash; the CRM is not called from the order flow at all, but subscribes to order events and batches its updates. Chapter 10 builds that; the point here is that the limit is a design input, discovered at design time, not a runtime surprise.</p>
+
+    <h2 data-anchor="ch8-h2-resilience">Timeouts, throttling, and not making it worse</h2>
+
+    <ul data-anchor="ch8-list-resilience">
+      <li><b>Every call gets a timeout, and it is shorter than the caller's.</b> If the customer's client gives up at 30&nbsp;s and your ERP call has no timeout, you hold a connection for work whose result nobody will read.</li>
+      <li><b>Budget the whole request.</b> Three sequential calls at 10&nbsp;s each cannot live inside a 20&nbsp;s SLA. Add the timeouts up before you commit to a number.</li>
+      <li><b>Fail fast when the pool is exhausted.</b> A short pool-wait timeout converts a slow collapse into an immediate, visible rejection you can alert on.</li>
+      <li><b>Add a circuit breaker for the downstream you cannot trust.</b> After <em>n</em> consecutive failures, stop calling for a cooling period and reject immediately. This is the difference between one system being down and every thread in your runtime being parked on it.</li>
+    </ul>
+
+    <p class="pullquote" data-anchor="ch8-pq">Retrying into an overloaded system is not resilience. It is the mechanism by which a brief outage becomes a long one.</p>
+
+    <div class="callout warn" data-anchor="ch8-fail">
+      <span class="callout-title">Failure scenario</span>
+      <p>The ERP slows from 900&nbsp;ms to 6&nbsp;s under its own batch window. Connection hold time rises sevenfold, so pool capacity falls from 22/s to about 3/s. Orders queue, the queue exceeds the caller's 30&nbsp;s timeout, customers retry, and the arrival rate doubles. Nothing has failed &mdash; every component is doing exactly what it was configured to do. The fix is a pool-wait timeout of two seconds and a circuit breaker: shed load early, tell the caller honestly, and let the ERP finish its batch.</p>
+    </div>
+
+    <div class="review" data-anchor="ch8-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>For each adapter connection: what is the pool size, what is the downstream system's own limit, and who confirmed the second number?</li>
+        <li>How many downstream calls does your busiest flow make, and what is the sum of their timeouts against your SLA?</li>
+        <li>Is any connection using <code>XA_TRANSACTION</code>, and has its recovery path ever been tested?</li>
+        <li>Which downstream system would take your runtime down with it today, and what would a circuit breaker there cost to add?</li>
+        <li>Which SaaS rate limits are design inputs in your architecture, and which are still undiscovered?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-transformation-canonical-models.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-api-design-management.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
