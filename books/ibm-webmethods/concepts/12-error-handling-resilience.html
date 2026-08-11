@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Error Handling, Recovery, and Resilience &middot; IBM webMethods</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="ibm-webmethods">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Reliability and Operations</span> &middot; Chapter 12</p>
+    <p class="chapter-no" aria-hidden="true">12</p>
+    <h1 data-anchor="ch12-h1">Error handling, recovery, and <span class="accent">resilience</span></h1>
+
+    <p class="lede" data-anchor="ch12-lede">Almost every bad retry policy comes from one omission: nobody classified the failure first. Retrying a validation error is pure waste; not retrying a connection reset is a lost order. The classification is the design.</p>
+
+    <h2 data-anchor="ch12-h2-taxonomy">Three kinds of failure</h2>
+
+    <div class="table-wrap" data-anchor="ch12-table-taxonomy">
+      <table>
+        <caption>The error taxonomy that drives everything else</caption>
+        <thead><tr><th>Class</th><th>Examples</th><th>Retry?</th><th>Goes to</th></tr></thead>
+        <tbody>
+          <tr><td><b>Technical &mdash; transient</b></td><td>Timeout, connection reset, pool exhausted, HTTP 503</td><td>Yes, bounded, with backoff</td><td>Automatic recovery</td></tr>
+          <tr><td><b>Technical &mdash; permanent</b></td><td>Unknown host, TLS handshake failure, 401, malformed XML</td><td>No</td><td>On-call; it needs a fix</td></tr>
+          <tr><td><b>Business</b></td><td>Unknown SKU, credit limit exceeded, invalid delivery date</td><td>Never</td><td>The requester, as a rejection</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="ch12-p1">Business failures are not errors in the operational sense at all: the system worked perfectly and the answer is no. Model them as output values (chapter 5), route them to the requester, and keep them out of the error log &mdash; an error log full of credit-limit rejections is an error log nobody reads.</p>
+
+    <div class="callout key" data-anchor="ch12-key-classify">
+      <span class="callout-title">Classify once, at the boundary</span>
+      <p>Write one <code>classifyFailure</code> service that turns the raw error from <code>pub.flow:getLastError</code> into a class. Every catch block calls it, and every retry decision reads its output. Scattering the judgement across forty catch blocks guarantees forty different opinions about whether a socket timeout is retryable.</p>
+    </div>
+
+    <h2 data-anchor="ch12-h2-retry">Retry, properly</h2>
+
+    <p data-anchor="ch12-p2">Flow's built-in retry primitive is <code>REPEAT</code>, which executes its children one or more times and can be set to repeat on SUCCESS or on FAILURE. Repeat-on-FAILURE with a count and an interval is your retry loop. Four properties separate a retry that helps from one that causes the outage:</p>
+
+    <ul data-anchor="ch12-list-retry">
+      <li><b>Bounded.</b> Three attempts, not "until it works". Unbounded retry against a struggling system is how a five-minute blip becomes an hour.</li>
+      <li><b>Backed off.</b> Exponential: 1&nbsp;s, 2&nbsp;s, 4&nbsp;s. Immediate retries arrive while the downstream is still failing and cost you three times the load at the worst moment.</li>
+      <li><b>Jittered.</b> Add randomness. A thousand orders that all failed at the same instant will all retry at the same instant, and the synchronized second wave is often larger than the first.</li>
+      <li><b>Conditional.</b> Only on the transient class. This is the whole point of the taxonomy.</li>
+    </ul>
+
+    <figure class="diagram-fig" data-anchor="ch12-fig-retry">
+      <svg class="diagram" viewBox="0 0 560 175" role="img" aria-labelledby="c12d1">
+        <title id="c12d1">Retries without jitter arrive in synchronized waves; with jitter they spread across the interval</title>
+
+        <text x="16" y="20">Without jitter</text>
+        <path d="M16 46 L544 46" class="stroke-soft"/>
+        <path d="M60 34 L60 58 M60 34 L60 58" class="stroke-red"/>
+        <path d="M180 34 L180 58" class="stroke-red"/>
+        <path d="M420 34 L420 58" class="stroke-red"/>
+        <text x="52" y="74" class="red">all 1000</text>
+        <text x="172" y="74" class="red">all 1000</text>
+        <text x="412" y="74" class="red">all 1000</text>
+
+        <text x="16" y="112">With jitter</text>
+        <path d="M16 138 L544 138" class="stroke-soft"/>
+        <path d="M46 130 L46 146 M64 130 L64 146 M78 130 L78 146 M96 130 L96 146" class="stroke"/>
+        <path d="M150 130 L150 146 M172 130 L172 146 M196 130 L196 146 M214 130 L214 146" class="stroke"/>
+        <path d="M380 130 L380 146 M404 130 L404 146 M436 130 L436 146 M462 130 L462 146" class="stroke"/>
+        <text x="16" y="164" class="dim">same total load, spread &mdash; the downstream can drain</text>
+      </svg>
+      <figcaption><b>Jitter is not a nicety.</b> Synchronized retry waves are self-inflicted denial of service, and they hit exactly when the downstream system is least able to absorb them.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch12-h2-idempotency">Idempotency is what makes retry safe</h2>
+
+    <p data-anchor="ch12-p3">Retry is only correct if repeating the operation is harmless. Three ways to get there, in order of preference. <b>Natural idempotency</b>: pass the customer's PO number to the ERP as its own external reference, so a second create with the same reference returns the existing sales order rather than making another. <b>A dedupe store</b>: record the key before the side effect, check it on entry. <b>Conditional update</b>: write only if the current state matches what you expect.</p>
+
+    <p data-anchor="ch12-p4">Chapter 5 left a bug open &mdash; the ERP call succeeded and the idempotency record failed, so the retry duplicated the order. Natural idempotency dissolves it: with the PO number as the ERP's external reference, the retry's create is a no-op that returns the same sales order number, and the failed bookkeeping write no longer matters.</p>
+
+    <h2 data-anchor="ch12-h2-compensation">Compensation and saga thinking</h2>
+
+    <p data-anchor="ch12-p5">Once a flow crosses two systems, atomicity is gone unless you pay for XA &mdash; and chapter 8 argued against that. The alternative is a <span class="term">saga</span>: a sequence of local transactions, each with a defined compensating action, run in reverse on failure.</p>
+
+    <p class="pre-label">Meridian's order saga</p>
+    <pre><code><span class="kw">forward</span>                        <span class="kw">compensate</span>
+1  reserve stock              &rarr;  release reservation
+2  create ERP sales order     &rarr;  cancel sales order
+3  publish OrderAccepted      &rarr;  publish OrderCancelled  <span class="cm"># never "unpublish"</span>
+
+<span class="cm"># fail at 3 -&gt; run 2's compensation, then 1's, in that order</span></code></pre>
+
+    <p data-anchor="ch12-p6">Two rules keep sagas honest. Compensations must themselves be idempotent, because the compensation can fail and be retried too. And you cannot compensate an event by deleting it &mdash; the fact was published and subscribers acted on it. You compensate a published fact with another published fact.</p>
+
+    <p class="pullquote" data-anchor="ch12-pq">You cannot un-send a message. Design the reversal as a new event, or do not publish until the thing is true.</p>
+
+    <h2 data-anchor="ch12-h2-poison">Poison messages and dead letters</h2>
+
+    <p data-anchor="ch12-p7">A message that fails deterministically will fail forever, and while it does, it blocks everything behind it on an ordered destination. Count attempts on the message itself, and after the limit move it to a dead-letter destination with the error, the attempt count and the correlation ID attached. Then &mdash; the part teams forget &mdash; alert on the dead-letter queue's depth. A dead-letter queue nobody watches is a data-loss mechanism with extra steps.</p>
+
+    <h2 data-anchor="ch12-h2-logging">What the platform records for you</h2>
+
+    <p data-anchor="ch12-p8">If error logging is enabled, Integration Server always writes an error log entry when a service error occurs, and error logs contain stack trace information for all errors, including exceptions thrown by services. Separately, service audit logging can <span class="term">store the input pipeline</span> &mdash; and that is what makes a later resubmit of the service possible at all. That single setting is the difference between "we lost 40 orders" and "we replayed 40 orders"; chapter 13 covers what it costs.</p>
+
+    <div class="callout warn" data-anchor="ch12-fail">
+      <span class="callout-title">Failure scenario</span>
+      <p>A malformed order from a new customer integration throws on every attempt. The retry is unbounded, so the trigger reprocesses it every two seconds, forever. Each attempt writes a stack trace; over a weekend the error log fills the disk, Integration Server stops writing logs, and the genuine incident on Monday morning has no diagnostics at all. One bad message took out observability for everything else &mdash; which is why the bound, the dead-letter destination and the disk alarm are all the same control.</p>
+    </div>
+
+    <div class="review" data-anchor="ch12-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>Does one service classify failures, or does every catch block have its own opinion?</li>
+        <li>Are your retries bounded, backed off, jittered, and conditional on the transient class? Which of the four is missing?</li>
+        <li>For each retried operation: what makes it idempotent &mdash; nature, a dedupe store, or hope?</li>
+        <li>Write out your longest flow's compensations. Is each one idempotent, and is the event compensated by another event?</li>
+        <li>What is currently in your dead-letter destinations, and when did someone last look?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="11-file-and-b2b.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="13-observability-troubleshooting.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
