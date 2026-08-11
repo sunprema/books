@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metadata Fidelity &mdash; Understanding Rust - FileCleaner App</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-rust-filecleaner-app">
+<header class="topbar">
+  <span class="brand"><span class="pick">filecleaner&gt;</span> Understanding Rust &mdash; FileCleaner App</span>
+  <span class="spacer"></span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</header>
+
+<div class="book-viewport">
+  <article class="book-leaf">
+    <section data-anchor="ch11-intro">
+      <p class="eyebrow">Chapter 11 &middot; Part IV — Replacing a File Safely</p>
+      <h1>Metadata Fidelity</h1>
+      <p class="lead" data-anchor="ch11-lead">Recall fact four from chapter 2: a clone arrives with its
+      own copy of the <em>source's</em> attributes and extended attributes. That is a sensible default for
+      &ldquo;make me a copy of this file.&rdquo; It is exactly wrong for &ldquo;make me a replacement for
+      <em>that other</em> file.&rdquo; The clone we hand the user has the source's permissions, the
+      source's Finder tags, the source's icon &mdash; and the user is expecting their own file. This
+      chapter is the 466 lines that fix that.</p>
+    </section>
+    <section data-anchor="ch11-goal">
+      <h2>The goal, stated by the module itself</h2>
+      <div class="listing" data-anchor="ch11-modcomment">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">the module doc comment, verbatim</span></p>
+  <pre class="rs"><span class="cm">//! Snapshot and restore of the target-specific metadata that must survive a</span>
+<span class="cm">//! replacement: permissions, ownership, timestamps, BSD flags, extended</span>
+<span class="cm">//! attributes (which carry Finder info, tags, and the resource fork), and</span>
+<span class="cm">//! ACLs. The clone starts with the *source's* metadata; restoring the</span>
+<span class="cm">//! snapshot makes it indistinguishable from the target it replaces.</span></pre>
+</div>
+      <p data-anchor="ch11-p1"><em>Indistinguishable</em> is a demanding word, and it is the right
+      bar. If the replacement has a different modification date, every backup tool on the machine thinks
+      the file changed. If it loses a Finder tag, the user's carefully colour-coded folder is quietly
+      wrong. If it loses an ACL, someone may gain or lose access. A space-saving tool that costs you your
+      metadata has not saved you anything.</p>
+    </section>
+
+    <section data-anchor="ch11-snapshot">
+      <h2>What gets captured</h2>
+      <div class="listing" data-anchor="ch11-snapshot-struct">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Everything we capture from a target before replacing it.</span>
+<span class="mac">#[derive(Debug, Clone, PartialEq, Eq)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">MetadataSnapshot</span> {
+    <span class="cm">/// Permission bits including setuid/setgid/sticky (`st_mode &amp; 0o7777`).</span>
+    <span class="kw">pub</span> mode: u32,
+    <span class="kw">pub</span> uid: u32,
+    <span class="kw">pub</span> gid: u32,
+    <span class="cm">/// BSD flags (`st_flags`): UF_HIDDEN, UF_IMMUTABLE, …</span>
+    <span class="kw">pub</span> flags: u32,
+    <span class="kw">pub</span> atime: (i64, i64),
+    <span class="kw">pub</span> mtime: (i64, i64),
+    <span class="cm">/// Birth time; restored via `setattrlist` where possible.</span>
+    <span class="kw">pub</span> crtime: <span class="ty">Option</span>&lt;(i64, i64)&gt;,
+    <span class="cm">/// All extended attributes, sorted by name. Includes</span>
+    <span class="cm">/// `com.apple.FinderInfo` and `com.apple.ResourceFork`.</span>
+    <span class="kw">pub</span> xattrs: <span class="ty">Vec</span>&lt;(<span class="ty">String</span>, <span class="ty">Vec</span>&lt;u8&gt;)&gt;,
+    <span class="cm">/// ACL in text form, `None` when the file has no ACL.</span>
+    <span class="kw">pub</span> acl_text: <span class="ty">Option</span>&lt;<span class="ty">String</span>&gt;,
+}</pre>
+</div>
+      <p data-anchor="ch11-p2">Two type choices tell you about macOS. <code class="inl">crtime</code>
+      is an <code class="inl">Option</code>, because the <em class="term-def">birth time</em> &mdash; the
+      date a file was created, which macOS tracks and most Unixes do not &mdash; is not always available;
+      <code class="inl">None</code> means &ldquo;there was nothing to restore,&rdquo; which is different
+      from &ldquo;we failed.&rdquo; And <code class="inl">xattrs</code> is a
+      <code class="inl">Vec&lt;(String, Vec&lt;u8&gt;)&gt;</code>: names are text, values are arbitrary
+      bytes. A Finder tag is a binary property list; a resource fork can be megabytes. Neither is a
+      <code class="inl">String</code>, and pretending otherwise would corrupt them.</p>
+      <p data-anchor="ch11-p3">The snapshot is taken with one <code class="inl">stat</code>, one xattr
+      enumeration and one ACL read, and its <code class="inl">PartialEq</code> derive means a test can
+      snapshot two files and assert the metadata round-tripped exactly.</p>
+
+      <h3>Timestamps as pairs</h3>
+      <p data-anchor="ch11-p4"><code class="inl">(i64, i64)</code> is seconds and nanoseconds &mdash; the
+      shape of a <code class="inl">timespec</code>, which is what the syscalls want. It is a small
+      concession to the C boundary, and it is honest: nanosecond precision is exactly what
+      <code class="inl">verify_unchanged</code> and the executor's race check compare on, so throwing it
+      away here would defeat them.</p>
+    </section>
+
+    <section data-anchor="ch11-outcome">
+      <h2>Restore that is allowed to partially fail</h2>
+      <div class="listing" data-anchor="ch11-outcome-struct">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// What a restore actually accomplished. Ownership and ACL restoration can</span>
+<span class="cm">/// legitimately fail without privileges; the caller decides whether partial</span>
+<span class="cm">/// fidelity is acceptable before committing the swap.</span>
+<span class="mac">#[derive(Debug, Default, Clone, PartialEq, Eq)]</span>
+<span class="kw">pub</span> <span class="kw">struct</span> <span class="ty">RestoreOutcome</span> {
+    <span class="kw">pub</span> ownership_restored: bool,
+    <span class="kw">pub</span> crtime_restored: bool,
+    <span class="kw">pub</span> warnings: <span class="ty">Vec</span>&lt;<span class="ty">String</span>&gt;,
+}</pre>
+</div>
+      <p data-anchor="ch11-p5">This little struct encodes a real-world truth. Restoring
+      <code class="inl">uid</code>/<code class="inl">gid</code> requires privileges an ordinary user does
+      not have, and a file owned by someone else is a perfectly normal thing to find in a scan. If that
+      made the whole transaction fail, the tool would be useless in exactly the directories people most
+      want to clean.</p>
+      <p data-anchor="ch11-p6">So the module splits its failures in two. Mode, xattrs and timestamps are
+      <strong>hard</strong> &mdash; if they cannot be restored, return <code class="inl">Err</code> and the
+      transaction rolls back. Ownership, ACL and birth time are <strong>soft</strong> &mdash; record a
+      warning and carry on. Those warnings travel out through
+      <code class="inl">TxnReport.warnings</code> and the CLI prints them:</p>
+      <div class="listing" data-anchor="ch11-warn-print">
+  <p class="srcref"><span class="path">src/main.rs</span><span class="what">inside run_reclaim, verbatim</span></p>
+  <pre class="rs">                <span class="kw">for</span> warning <span class="kw">in</span> &amp;report.warnings {
+                    <span class="mac">println!</span>(<span class="str">"      warning: {warning}"</span>);
+                }</pre>
+</div>
+      <p data-anchor="ch11-p7">The doc comment's phrasing is careful:
+      <em>the caller decides whether partial fidelity is acceptable</em>. Today the caller accepts it and
+      reports it. A future GUI could offer to stop. The <em>policy</em> is not baked into the
+      <em>mechanism</em>, which is why the mechanism returns a struct instead of a bool.</p>
+    </section>
+
+    <section data-anchor="ch11-order">
+      <h2>The order is the design</h2>
+      <p data-anchor="ch11-p8">Here is the top of <code class="inl">restore</code>. Read the doc comment
+      first &mdash; it is four lines and it is the entire chapter:</p>
+      <div class="listing" data-anchor="ch11-restore-top">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="cm">/// Reapply a snapshot to `path` (the fresh clone). Hard failures on</span>
+    <span class="cm">/// mode/xattrs/times return `Err`; ownership, ACL, and birth-time</span>
+    <span class="cm">/// restoration degrade to warnings because they can require privileges</span>
+    <span class="cm">/// the process legitimately lacks.</span>
+    <span class="cm">///</span>
+    <span class="cm">/// Order matters: xattrs and ACL first, then ownership (chown clears</span>
+    <span class="cm">/// setuid bits), then mode, then times (earlier steps touch them), and</span>
+    <span class="cm">/// BSD flags last — an immutable flag would block every other step.</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">restore</span>(path: &amp;<span class="ty">Path</span>, snap: &amp;<span class="ty">MetadataSnapshot</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">RestoreOutcome</span>&gt; {
+        <span class="kw">let</span> <span class="kw">mut</span> outcome = <span class="ty">RestoreOutcome</span>::default();
+
+        <span class="cm">// Xattrs: remove strays inherited from the source, then write the</span>
+        <span class="cm">// target's set.</span>
+        <span class="kw">let</span> wanted: std::collections::<span class="ty">HashSet</span>&lt;&amp;str&gt; =
+            snap.xattrs.iter().map(|(n, _)| n.as_str()).collect();
+        <span class="kw">for</span> existing <span class="kw">in</span> list_xattrs(path)? {
+            <span class="kw">if</span> !wanted.contains(existing.as_str()) {
+                remove_xattr(path, &amp;existing)?;
+            }
+        }
+        <span class="kw">for</span> (name, value) <span class="kw">in</span> &amp;snap.xattrs {
+            set_xattr(path, name, value)?;
+        }</pre>
+</div>
+      <figure class="diagram-fig" data-anchor="ch11-fig-order">
+        <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="ch11-d1-title">
+          <title id="ch11-d1-title">Five restore steps in a fixed order: extended attributes and ACL, then ownership, then mode, then timestamps, then BSD flags — each ordered because a later step would otherwise undo or block it</title>
+          <text x="16" y="16" class="dim">each arrow is a reason, not a preference</text>
+
+          <rect x="16" y="26" width="120" height="26" class="stroke fill-soft"/>
+          <text x="26" y="43" class="big">1 xattrs + ACL</text>
+          <text x="150" y="43" class="mono dim">strays removed first, then the target's set written</text>
+
+          <rect x="16" y="60" width="120" height="26" class="stroke fill-soft"/>
+          <text x="26" y="77" class="big">2 ownership</text>
+          <text x="150" y="77" class="mono dim">chown clears setuid/setgid &mdash; so it must precede mode</text>
+
+          <rect x="16" y="94" width="120" height="26" class="stroke fill-soft"/>
+          <text x="26" y="111" class="big">3 mode</text>
+          <text x="150" y="111" class="mono dim">restores the bits chown just cleared</text>
+
+          <rect x="16" y="128" width="120" height="26" class="stroke fill-soft"/>
+          <text x="26" y="145" class="big">4 times</text>
+          <text x="150" y="145" class="mono dim">every step above touches mtime &mdash; so this goes after them</text>
+
+          <rect x="16" y="162" width="120" height="14" class="stroke-red"/>
+          <text x="26" y="173" class="big red">5 BSD flags</text>
+          <text x="150" y="173" class="mono red">an immutable flag would block steps 1&ndash;4</text>
+
+          <path d="M76 52 L76 60" class="stroke"/>
+          <path d="M76 86 L76 94" class="stroke"/>
+          <path d="M76 120 L76 128" class="stroke"/>
+          <path d="M76 154 L76 162" class="stroke-red"/>
+        </svg>
+        <figcaption><b>Four dependencies, one order.</b> Any other sequence loses something: setuid bits, a
+        modification time, or the ability to write at all.</figcaption>
+      </figure>
+
+      <h3>Removing the strays</h3>
+      <p data-anchor="ch11-p9">The first thing restore does is <em>delete</em>. Because the clone inherited
+      the source's extended attributes, it may be carrying attributes the target never had &mdash; the
+      source's Finder tag, the source's Spotlight comment, the source's resource fork. Copying the target's
+      xattrs on top would leave those extras in place, and the replacement would be a file with a stranger's
+      tags on it.</p>
+      <p data-anchor="ch11-p10">So the code builds a <code class="inl">HashSet</code> of the names the
+      target had, lists what the clone currently has, and removes anything not wanted &mdash; then writes
+      the target's set. The <code class="inl">HashSet&lt;&amp;str&gt;</code> borrows the names out of the
+      snapshot rather than cloning them, which is a nice small instance of &ldquo;a set of references is
+      still a set.&rdquo;</p>
+      <p data-anchor="ch11-p11">The integration test for this is pointed: the stand-in file is given an
+      xattr called <code class="inl">user.stray-from-source</code> that the target does not have, and the
+      test asserts it is gone afterwards. The name is the documentation.</p>
+
+      <h3>chown before chmod</h3>
+      <p data-anchor="ch11-p12">This is a classic Unix trap.
+      <code class="inl">chown</code> clears the setuid and setgid bits &mdash; deliberately, because
+      transferring a setuid binary to a new owner would otherwise be a privilege-escalation gift. So if you
+      restore the mode first and the ownership second, you silently lose those bits. Restore ownership
+      first, mode second, and the bits land last and survive. The code does exactly that, and it also
+      avoids the syscall entirely when it can:</p>
+      <div class="listing" data-anchor="ch11-chown">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">        <span class="kw">let</span> meta = std::fs::symlink_metadata(path)?;
+        <span class="kw">if</span> meta.uid() == snap.uid &amp;&amp; meta.gid() == snap.gid {
+            outcome.ownership_restored = <span class="kw">true</span>;
+        } <span class="kw">else</span> {
+            <span class="kw">let</span> c_path = cpath(path)?;
+            <span class="kw">let</span> rc = <span class="kw">unsafe</span> { libc::lchown(c_path.as_ptr(), snap.uid, snap.gid) };
+            <span class="kw">if</span> rc == <span class="num">0</span> {
+                outcome.ownership_restored = <span class="kw">true</span>;
+            } <span class="kw">else</span> {
+                <span class="kw">let</span> err = io::<span class="ty">Error</span>::last_os_error();
+                outcome.warnings.push(<span class="mac">format!</span>(
+                    <span class="str">"ownership not restored to {}:{}: {err}"</span>,
+                    snap.uid, snap.gid
+                ));
+            }
+        }</pre>
+</div>
+      <p data-anchor="ch11-p13">If the clone already has the right owner &mdash; the overwhelmingly
+      common case, since both files usually belong to the user running the tool &mdash; nothing is called
+      at all and <code class="inl">ownership_restored</code> is simply true. Only when they differ does it
+      attempt <code class="inl">lchown</code> (the <code class="inl">l</code> is &ldquo;do not follow
+      symlinks,&rdquo; the same discipline as everywhere else), and a failure there becomes a warning
+      naming the uid and gid it wanted.</p>
+
+      <h3>Then mode, times, and flags</h3>
+      <div class="listing" data-anchor="ch11-restore-mid">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim &amp;mdash; restore(), steps 3 and 4a</span></p>
+  <pre class="rs">        <span class="kw">let</span> c_path = cpath(path)?;
+        <span class="kw">let</span> rc = <span class="kw">unsafe</span> { libc::chmod(c_path.as_ptr(), snap.mode <span class="kw">as</span> libc::mode_t) };
+        <span class="kw">if</span> rc != <span class="num">0</span> {
+            <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error());
+        }
+
+        <span class="kw">match</span> set_crtime(path, snap.crtime) {
+            <span class="ty">Ok</span>(restored) =&gt; outcome.crtime_restored = restored,
+            <span class="ty">Err</span>(err) =&gt; outcome
+                .warnings
+                .push(<span class="mac">format!</span>(<span class="str">"birth time not restored: {err}"</span>)),
+        }</pre>
+</div>
+      <div class="listing" data-anchor="ch11-restore-tail">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim &amp;mdash; restore(), steps 4b and 5</span></p>
+  <pre class="rs">        <span class="kw">let</span> times = [
+            libc::timespec {
+                tv_sec: snap.atime.<span class="num">0</span>,
+                tv_nsec: snap.atime.<span class="num">1</span>,
+            },
+            libc::timespec {
+                tv_sec: snap.mtime.<span class="num">0</span>,
+                tv_nsec: snap.mtime.<span class="num">1</span>,
+            },
+        ];
+        <span class="kw">let</span> rc = <span class="kw">unsafe</span> {
+            libc::utimensat(
+                libc::<span class="ty">AT_FDCWD</span>,
+                c_path.as_ptr(),
+                times.as_ptr(),
+                libc::<span class="ty">AT_SYMLINK_NOFOLLOW</span>,
+            )
+        };
+        <span class="kw">if</span> rc != <span class="num">0</span> {
+            <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error());
+        }
+
+        <span class="kw">if</span> snap.flags != <span class="num">0</span> {
+            <span class="cm">// chflags follows symlinks, but restore only ever runs on the</span>
+            <span class="cm">// temp clone we just created, which is a regular file.</span>
+            <span class="kw">let</span> rc = <span class="kw">unsafe</span> { libc::chflags(c_path.as_ptr(), snap.flags) };
+            <span class="kw">if</span> rc != <span class="num">0</span> {
+                <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error());
+            }
+        }
+
+        <span class="ty">Ok</span>(outcome)
+    }</pre>
+</div>
+      <p data-anchor="ch11-p14"><code class="inl">chmod</code> is hard-fail: a replacement with the
+      wrong permissions is not acceptable, and chapter 10's temp verification double-checks the mode
+      afterwards for exactly this reason.</p>
+      <p data-anchor="ch11-p15"><code class="inl">utimensat</code> takes a two-element array &mdash; access
+      time then modification time &mdash; and <code class="inl">AT_FDCWD</code> means &ldquo;interpret the
+      path relative to the current directory,&rdquo; which for an absolute path is a formality. It comes
+      after everything else because every preceding operation touches the modification time; setting it
+      first would be immediately undone.</p>
+      <p data-anchor="ch11-p16"><code class="inl">chflags</code> is last and conditional. If the target had
+      BSD flags &mdash; hidden, locked &mdash; they go on now, because setting an immutable flag any earlier
+      would lock the file against every step that follows. The comment addresses the one wart:
+      <code class="inl">chflags</code> has no <code class="inl">l</code> variant, so it follows symlinks
+      &mdash; and the code explains why that cannot bite here, since restore only ever runs on a temp clone
+      it just created itself. That is the right way to handle an unavoidable sharp edge: not by ignoring
+      it, but by writing down why it is blunt in this context.</p>
+    </section>
+
+    <section data-anchor="ch11-xattr">
+      <h2>The ask-then-read pattern, with a retry</h2>
+      <p data-anchor="ch11-p17">Reading a list of extended attributes is the canonical example of a C API
+      that hands you a buffer-sizing problem. You ask how big, allocate, then ask again for real:</p>
+      <div class="listing" data-anchor="ch11-listxattr">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn</span> <span class="fn">list_xattrs</span>(path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;<span class="ty">String</span>&gt;&gt; {
+        <span class="kw">let</span> c_path = cpath(path)?;
+        <span class="kw">loop</span> {
+            <span class="kw">let</span> size = <span class="kw">unsafe</span> {
+                libc::listxattr(
+                    c_path.as_ptr(),
+                    std::ptr::null_mut(),
+                    <span class="num">0</span>,
+                    libc::<span class="ty">XATTR_NOFOLLOW</span>,
+                )
+            };
+            <span class="kw">if</span> size &lt; <span class="num">0</span> {
+                <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error());
+            }
+            <span class="kw">if</span> size == <span class="num">0</span> {
+                <span class="kw">return</span> <span class="ty">Ok</span>(<span class="ty">Vec</span>::new());
+            }
+            <span class="cm">// …the second call, into a buffer of that size…</span></pre>
+</div>
+      <div class="listing" data-anchor="ch11-listxattr">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim &amp;mdash; the read, the ERANGE retry, and the parse</span></p>
+  <pre class="rs">            <span class="kw">let</span> <span class="kw">mut</span> buf = <span class="mac">vec!</span>[<span class="num">0u8</span>; size <span class="kw">as</span> usize];
+            <span class="kw">let</span> read = <span class="kw">unsafe</span> {
+                libc::listxattr(
+                    c_path.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::<span class="ty">XATTR_NOFOLLOW</span>,
+                )
+            };
+            <span class="kw">if</span> read &lt; <span class="num">0</span> {
+                <span class="kw">let</span> err = io::<span class="ty">Error</span>::last_os_error();
+                <span class="cm">// The list grew between the two calls; retry.</span>
+                <span class="kw">if</span> err.raw_os_error() == <span class="ty">Some</span>(libc::<span class="ty">ERANGE</span>) {
+                    <span class="kw">continue</span>;
+                }
+                <span class="kw">return</span> <span class="ty">Err</span>(err);
+            }
+            buf.truncate(read <span class="kw">as</span> usize);
+            <span class="kw">return</span> <span class="ty">Ok</span>(buf
+                .split(|&amp;b| b == <span class="num">0</span>)
+                .filter(|name| !name.is_empty())
+                .map(|name| <span class="ty">String</span>::from_utf8_lossy(name).into_owned())
+                .collect());
+        }
+    }</pre>
+</div>
+      <p data-anchor="ch11-p18">The <code class="inl">loop</code> is the part most people leave out.
+      Between the sizing call and the reading call, another process can add an attribute &mdash; and the
+      kernel then returns <code class="inl">ERANGE</code> because the buffer no longer fits. The obvious
+      code treats that as an error; this code treats it as &ldquo;the world moved, ask again.&rdquo; The
+      same pattern, with the same retry, appears in <code class="inl">get_xattr</code> just below it.</p>
+      <p data-anchor="ch11-p19">The parsing tail is a nice piece of iterator work.
+      <code class="inl">listxattr</code> returns names packed as NUL-separated bytes, so:
+      <code class="inl">split</code> on zero bytes, <code class="inl">filter</code> out the empty slice left
+      by the trailing separator, and <code class="inl">map</code> each to an owned
+      <code class="inl">String</code> with <code class="inl">from_utf8_lossy</code> &mdash; lossy, because
+      an attribute name that is not valid UTF-8 should not crash a scan.</p>
+      <p data-anchor="ch11-p20"><code class="inl">buf.as_mut_ptr().cast()</code> is worth a glance too:
+      <code class="inl">.cast()</code> converts <code class="inl">*mut u8</code> to the
+      <code class="inl">*mut c_void</code> the signature wants. It is <code class="inl">as</code>-casting
+      for pointers, but restricted to pointer-to-pointer conversions &mdash; a small, sharp tool instead of
+      a blunt one.</p>
+    </section>
+
+    <section data-anchor="ch11-acl">
+      <h2>Binding a C API the <code class="inl">libc</code> crate does not have</h2>
+      <p data-anchor="ch11-p21">Darwin's ACL functions are not in the <code class="inl">libc</code> crate.
+      Rather than adding a dependency, the module declares the six functions it needs:</p>
+      <div class="listing" data-anchor="ch11-acl-extern">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="cm">// The libc crate does not bind Darwin's ACL API; declare what we use.</span>
+    <span class="kw">type</span> <span class="ty">AclT</span> = *<span class="kw">mut</span> libc::c_void;
+    <span class="kw">const</span> <span class="ty">ACL_TYPE_EXTENDED</span>: libc::c_uint = <span class="num">0x100</span>;
+
+    <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="str">"C"</span> {
+        <span class="kw">fn</span> <span class="fn">acl_get_link_np</span>(path: *<span class="kw">const</span> libc::c_char, acl_type: libc::c_uint) -&gt; <span class="ty">AclT</span>;
+        <span class="kw">fn</span> <span class="fn">acl_set_link_np</span>(
+            path: *<span class="kw">const</span> libc::c_char,
+            acl_type: libc::c_uint,
+            acl: <span class="ty">AclT</span>,
+        ) -&gt; libc::c_int;
+        <span class="kw">fn</span> <span class="fn">acl_to_text</span>(acl: <span class="ty">AclT</span>, len_p: *<span class="kw">mut</span> libc::ssize_t) -&gt; *<span class="kw">mut</span> libc::c_char;
+        <span class="kw">fn</span> <span class="fn">acl_from_text</span>(text: *<span class="kw">const</span> libc::c_char) -&gt; <span class="ty">AclT</span>;
+        <span class="kw">fn</span> <span class="fn">acl_init</span>(count: libc::c_int) -&gt; <span class="ty">AclT</span>;
+        <span class="kw">fn</span> <span class="fn">acl_free</span>(obj: *<span class="kw">mut</span> libc::c_void) -&gt; libc::c_int;
+    }</pre>
+</div>
+      <p data-anchor="ch11-p22">An <code class="inl">extern "C"</code> block is a promise: &ldquo;these
+      functions exist in some library I will be linked against, with these signatures.&rdquo; The compiler
+      cannot check it. Get a type wrong &mdash; say <code class="inl">c_int</code> where the real API takes
+      a <code class="inl">c_uint</code> &mdash; and you get undefined behaviour, not an error. That is why
+      the whole block sits inside the <code class="inl">apfs</code> module and why every declaration mirrors
+      the system header exactly. In the Rust 2024 edition the block itself is written
+      <code class="inl">unsafe extern "C"</code>, making the promise explicit at the declaration site.</p>
+      <p data-anchor="ch11-p23">The ACL is handled as <em>text</em>: read it with
+      <code class="inl">acl_get_link_np</code>, convert to a string with
+      <code class="inl">acl_to_text</code>, and later parse it back with
+      <code class="inl">acl_from_text</code>. That is a pragmatic choice &mdash; the textual form is stable
+      and human-readable, and it avoids modelling ACL entries in Rust at all.</p>
+      <p data-anchor="ch11-p24">Two subtleties in the reading code are worth naming. The first is an error
+      code that means something surprising:</p>
+      <div class="listing" data-anchor="ch11-acl-enoent">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">inside get_acl_text, verbatim</span></p>
+  <pre class="rs">        <span class="kw">let</span> acl = <span class="kw">unsafe</span> { acl_get_link_np(c_path.as_ptr(), <span class="ty">ACL_TYPE_EXTENDED</span>) };
+        <span class="kw">if</span> acl.is_null() {
+            <span class="kw">let</span> err = io::<span class="ty">Error</span>::last_os_error();
+            <span class="cm">// ENOENT here means "no ACL", not "no file".</span>
+            <span class="kw">return</span> <span class="kw">match</span> err.raw_os_error() {
+                <span class="ty">Some</span>(libc::<span class="ty">ENOENT</span>) =&gt; <span class="ty">Ok</span>(<span class="ty">None</span>),
+                _ =&gt; <span class="ty">Err</span>(err),
+            };
+        }</pre>
+</div>
+      <p data-anchor="ch11-p25">A file with no ACL reports <code class="inl">ENOENT</code> &mdash;
+      &ldquo;no such file or directory&rdquo; &mdash; which is exactly the sort of thing you only learn by
+      being burned. Mapping it to <code class="inl">Ok(None)</code>, with a comment, is the difference
+      between working code and a mystery bug.</p>
+      <p data-anchor="ch11-p26">The second is memory management. These C functions allocate, and Rust will
+      not free their memory for you, so every path calls <code class="inl">acl_free</code> &mdash;
+      including the text buffer returned by <code class="inl">acl_to_text</code>, which is a separate
+      allocation from the ACL itself. The code computes a
+      <code class="inl">result</code> value first and frees afterwards, so that the cleanup runs on both the
+      success and failure paths. That is the manual equivalent of a destructor, and forgetting it is how
+      long-running processes leak.</p>
+      <p data-anchor="ch11-p27">Restoring has one more wrinkle, and it is the same idea as removing stray
+      xattrs:</p>
+      <div class="listing" data-anchor="ch11-acl-empty">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">inside set_acl_text, verbatim</span></p>
+  <pre class="rs">            <span class="cm">// No ACL on the target: install an empty one so nothing</span>
+            <span class="cm">// inherited from the source survives.</span>
+            <span class="ty">None</span> =&gt; {
+                <span class="kw">let</span> acl = <span class="kw">unsafe</span> { acl_init(<span class="num">0</span>) };
+                <span class="kw">if</span> acl.is_null() {
+                    <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error());
+                }
+                acl
+            }</pre>
+</div>
+      <p data-anchor="ch11-p28">&ldquo;The target had no ACL&rdquo; cannot be implemented as &ldquo;do
+      nothing,&rdquo; because the clone may have inherited one from the source or from the directory. It
+      has to be implemented as &ldquo;install an empty ACL.&rdquo; Absence has to be applied, not skipped
+      &mdash; a rule worth remembering any time you are restoring state.</p>
+    </section>
+
+    <section data-anchor="ch11-crtime">
+      <h2>Birth time, via <code class="inl">setattrlist</code></h2>
+      <p data-anchor="ch11-p29">There is no portable way to set a file's creation date. macOS offers
+      <code class="inl">setattrlist</code>, which takes a bitmap describing which attributes you are
+      setting and a buffer holding their values &mdash; and which is also not in the
+      <code class="inl">libc</code> crate. So the module declares the struct and the function:</p>
+      <div class="listing" data-anchor="ch11-attrlist">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="mac">#[repr(C)]</span>
+    <span class="kw">struct</span> <span class="ty">AttrList</span> {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+
+    <span class="kw">const</span> <span class="ty">ATTR_BIT_MAP_COUNT</span>: u16 = <span class="num">5</span>;
+    <span class="kw">const</span> <span class="ty">ATTR_CMN_CRTIME</span>: u32 = <span class="num">0x0000_0200</span>;
+    <span class="kw">const</span> <span class="ty">FSOPT_NOFOLLOW</span>: u32 = <span class="num">0x1</span>;</pre>
+</div>
+      <p data-anchor="ch11-p30"><code class="inl">#[repr(C)]</code> is mandatory here and it is the
+      whole reason this works. By default, Rust reserves the right to reorder struct fields for packing; a
+      C API reading this memory expects the fields in declaration order with C's padding rules.
+      <code class="inl">#[repr(C)]</code> pins that layout. Leave it off and you have a struct that compiles
+      fine and hands the kernel garbage.</p>
+      <div class="listing" data-anchor="ch11-set-crtime">
+  <p class="srcref"><span class="path">src/apfs/metadata.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs">    <span class="cm">/// Restore the birth time. Returns Ok(false) when the snapshot has no</span>
+    <span class="cm">/// birth time to restore.</span>
+    <span class="kw">fn</span> <span class="fn">set_crtime</span>(path: &amp;<span class="ty">Path</span>, crtime: <span class="ty">Option</span>&lt;(i64, i64)&gt;) -&gt; io::<span class="ty">Result</span>&lt;bool&gt; {
+        <span class="kw">let</span> <span class="ty">Some</span>((sec, nsec)) = crtime <span class="kw">else</span> {
+            <span class="kw">return</span> <span class="ty">Ok</span>(<span class="kw">false</span>);
+        };
+        <span class="kw">let</span> c_path = cpath(path)?;
+        <span class="kw">let</span> attrs = <span class="ty">AttrList</span> {
+            bitmapcount: <span class="ty">ATTR_BIT_MAP_COUNT</span>,
+            reserved: <span class="num">0</span>,
+            commonattr: <span class="ty">ATTR_CMN_CRTIME</span>,
+            volattr: <span class="num">0</span>,
+            dirattr: <span class="num">0</span>,
+            fileattr: <span class="num">0</span>,
+            forkattr: <span class="num">0</span>,
+        };
+        <span class="kw">let</span> <span class="kw">mut</span> when = libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec,
+        };
+        <span class="kw">let</span> rc = <span class="kw">unsafe</span> {
+            setattrlist(
+                c_path.as_ptr(),
+                (&amp;raw <span class="kw">const</span> attrs).cast(),
+                (&amp;raw <span class="kw">mut</span> when).cast(),
+                std::mem::size_of::&lt;libc::timespec&gt;(),
+                <span class="ty">FSOPT_NOFOLLOW</span>,
+            )
+        };
+        <span class="kw">if</span> rc != <span class="num">0</span> {
+            <span class="kw">return</span> <span class="ty">Err</span>(io::<span class="ty">Error</span>::last_os_error());
+        }
+        <span class="ty">Ok</span>(<span class="kw">true</span>)
+    }</pre>
+</div>
+      <p data-anchor="ch11-p31">The return type says something precise:
+      <code class="inl">Ok(false)</code> means &ldquo;there was nothing to restore,&rdquo;
+      <code class="inl">Ok(true)</code> means &ldquo;restored,&rdquo; and
+      <code class="inl">Err</code> means &ldquo;tried and failed&rdquo; &mdash; which the caller turns into
+      a warning. Three outcomes, no ambiguity.</p>
+      <p data-anchor="ch11-p32">And <code class="inl">(&amp;raw const attrs).cast()</code> is modern Rust
+      worth adopting. The raw-borrow operators <code class="inl">&amp;raw const</code> and
+      <code class="inl">&amp;raw mut</code> create a raw pointer <em>without</em> first creating a
+      reference. The older spelling, <code class="inl">&amp;attrs as *const _</code>, briefly materialises a
+      <code class="inl">&amp;</code> &mdash; which carries aliasing guarantees that can be violated in FFI
+      contexts. Same machine code, fewer footguns, and it reads as what it is: give me the address.</p>
+    </section>
+
+    <section data-anchor="ch11-forks">
+      <h2>The resource fork, once more</h2>
+      <p data-anchor="ch11-p33">Chapter 4 read the fork's <em>length</em> at scan time. The transaction
+      needs its <em>contents</em>, and <code class="inl">forks.rs</code> gets them by reusing the xattr
+      reader:</p>
+      <div class="listing" data-anchor="ch11-read-fork">
+  <p class="srcref"><span class="path">src/apfs/forks.rs</span><span class="what">verbatim</span></p>
+  <pre class="rs"><span class="cm">/// Full resource-fork contents; empty when the file has none.</span>
+<span class="mac">#[cfg(target_os = "macos")]</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">read_resource_fork</span>(path: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;<span class="ty">Vec</span>&lt;u8&gt;&gt; {
+    <span class="kw">match</span> <span class="kw">crate</span>::apfs::metadata::darwin_get_xattr(path, <span class="ty">RESOURCE_FORK_XATTR</span>) {
+        <span class="ty">Ok</span>(data) =&gt; <span class="ty">Ok</span>(data),
+        <span class="ty">Err</span>(err) <span class="kw">if</span> err.raw_os_error() == <span class="ty">Some</span>(libc::<span class="ty">ENOATTR</span>) =&gt; <span class="ty">Ok</span>(<span class="ty">Vec</span>::new()),
+        <span class="ty">Err</span>(err) =&gt; <span class="ty">Err</span>(err),
+    }
+}
+
+<span class="cm">/// Byte-for-byte resource-fork comparison. Files identical "in the macOS</span>
+<span class="cm">/// sense" must match here as well as in their data forks.</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">resource_forks_equal</span>(a: &amp;<span class="ty">Path</span>, b: &amp;<span class="ty">Path</span>) -&gt; io::<span class="ty">Result</span>&lt;bool&gt; {
+    <span class="ty">Ok</span>(read_resource_fork(a)? == read_resource_fork(b)?)
+}</pre>
+</div>
+      <p data-anchor="ch11-p34">The same shape as the ACL's <code class="inl">ENOENT</code>: a specific
+      error code &mdash; <code class="inl">ENOATTR</code>, &ldquo;attribute not found&rdquo; &mdash; is not
+      a failure but a value, the empty fork. The <code class="inl">match</code> guard
+      <code class="inl">Err(err) if &hellip;</code> is exactly the right tool: match on one error and let
+      every other one through untouched.</p>
+      <p data-anchor="ch11-p35">Because a fork is just an xattr, the restore path gets it for free &mdash;
+      it is one of the entries in <code class="inl">snap.xattrs</code>. The dedicated reader exists for the
+      <em>comparison</em> in chapter 10's identity check, where a fork must be compared byte for byte
+      independently of the data fork.</p>
+    </section>
+
+    <section data-anchor="ch11-test">
+      <h2>The round trip, tested</h2>
+      <p data-anchor="ch11-p36">The integration test builds a target with distinctive metadata, snapshots
+      it, and restores onto a stand-in that has been deliberately made wrong in every dimension:</p>
+      <div class="listing" data-anchor="ch11-roundtrip-test">
+  <p class="srcref"><span class="path">tests/apfs_integration.rs</span><span class="what">abridged &amp;mdash; the assertions after the restore are elided</span></p>
+  <pre class="rs">    <span class="cm">// Give the target distinctive metadata.</span>
+    fs::set_permissions(&amp;target, fs::<span class="ty">Permissions</span>::from_mode(<span class="num">0o640</span>)).unwrap();
+    set_xattr(&amp;target, <span class="str">"com.apple.metadata:_kMDItemUserTags"</span>, <span class="str">b"bplist-tags"</span>);
+    set_xattr(&amp;target, <span class="str">"user.custom"</span>, <span class="str">b"target-specific"</span>);
+    forks_set(&amp;target, <span class="str">b"target resource fork"</span>);
+    <span class="kw">let</span> mtime = <span class="ty">SystemTime</span>::<span class="ty">UNIX_EPOCH</span> + <span class="ty">Duration</span>::from_secs(<span class="num">1_234_567_890</span>);
+    <span class="cm">// …set the target's mtime…</span>
+
+    <span class="kw">let</span> snap = metadata::snapshot(&amp;target).unwrap();
+    <span class="mac">assert_eq!</span>(snap.mode, <span class="num">0o640</span>);
+    <span class="mac">assert_eq!</span>(snap.xattrs.len(), <span class="num">3</span>);
+    <span class="mac">assert!</span>(snap.acl_text.is_none());
+
+    <span class="cm">// A stand-in for the fresh clone: different mode, a stray xattr the</span>
+    <span class="cm">// target does not have, no fork, wrong times.</span>
+    <span class="kw">let</span> temp = dir.path().join(<span class="str">"stand-in.doc"</span>);
+    fs::write(&amp;temp, <span class="str">b"target content"</span>).unwrap();
+    fs::set_permissions(&amp;temp, fs::<span class="ty">Permissions</span>::from_mode(<span class="num">0o755</span>)).unwrap();
+    set_xattr(&amp;temp, <span class="str">"user.stray-from-source"</span>, <span class="str">b"should vanish"</span>);</pre>
+</div>
+      <p data-anchor="ch11-p37">A Finder tag, a custom xattr, a resource fork, a specific mode, a
+      specific mtime &mdash; and a stand-in carrying a stray attribute whose name announces what it is
+      testing. The assertions that follow check that all three of the target's attributes arrived, the
+      mode is <code class="inl">0o640</code> again, the mtime is what it was, and
+      <code class="inl">user.stray-from-source</code> is gone.</p>
+      <p data-anchor="ch11-p38">That last one is the assertion the whole module exists for. Anyone can copy
+      metadata onto a file. Removing what should not be there is the part people forget.</p>
+    </section>
+
+    <section data-anchor="ch11-reflect">
+      <div class="reflect" data-anchor="ch11-reflect-box">
+        <h4>So what did we actually gain?</h4>
+        <p>A replacement your Mac cannot tell from the original. Same permissions, same owner where we are
+        allowed, same access, modification and creation times, same Finder tags and comments, same resource
+        fork, same ACL, same BSD flags &mdash; and, crucially, <em>nothing extra</em> inherited from the
+        source. Only the inode number and the physical blocks are different, and those are the two things
+        the user was never looking at.</p>
+        <p>The transferable lessons are about restoring state generally: absence is a value that must be
+        applied, not skipped; ordering is a dependency graph, not a preference; ask-then-read needs a retry;
+        and a partial success is worth reporting rather than either hiding or fataling on. This module is
+        466 lines and roughly a third of them are comments explaining why a line is where it is. On code
+        this sharp, that ratio is correct.</p>
+      </div>
+
+      <div class="challenges" data-anchor="ch11-challenges">
+        <span class="tag">Challenges</span>
+        <ol>
+          <li>Swap the chmod and chown steps and write the test that catches it. Which bits does it have to
+          check, and what permissions does the test need to run?</li>
+          <li><code class="inl">acl_text</code> stores the ACL as a string produced by
+          <code class="inl">acl_to_text</code>. What breaks if a future macOS changes that textual format
+          between the snapshot and the restore &mdash; and does the transaction still fail safe?</li>
+          <li>The snapshot captures <code class="inl">atime</code> and restores it. Given that reading a
+          file updates its access time, argue whether restoring it is worth the syscall.</li>
+        </ol>
+      </div>
+    </section>
+    <section class="sources" data-anchor="sources">
+      <strong>Sources for this chapter</strong>
+      <ol>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/apfs/metadata.rs">file_cleaner &mdash; src/apfs/metadata.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/apfs/forks.rs">file_cleaner &mdash; src/apfs/forks.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/tests/apfs_integration.rs">file_cleaner &mdash; tests/apfs_integration.rs</a></li>
+          <li><a href="https://github.com/sunprema/file_cleaner/blob/main/src/main.rs">file_cleaner &mdash; src/main.rs</a></li>
+          <li><a href="https://keith.github.io/xcode-man-pages/clonefile.2.html">CLONEFILE(2) &mdash; macOS manual page (what a clone inherits)</a></li>
+          <li><a href="https://doc.rust-lang.org/nomicon/ffi.html">The Rustonomicon &mdash; Foreign Function Interface</a></li>
+      </ol>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="10-the-journaled-transaction.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="12-crash-recovery.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
