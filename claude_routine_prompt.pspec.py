@@ -155,6 +155,30 @@ operation be re-read as an absent mechanism and substituted around; (6) PushAler
 conditions dereferenced inputs that are None on a gated run. A degradation branch
 that does by hand what a strict tool did invisibly needs a LARGER tool list than
 the happy path, not the tail of it.
+v2.0.6 — from the run of 2026-08-11 (issue #148, shipped as draft PR #149). That
+run succeeded, but only because a human happened to be watching. (1) The issue
+named a source repository that was private at dispatch. NOTHING in the spec said
+what to do when an issue's own subject matter is unreachable, so the run chose a
+defensible-looking degradation — write the book generically and disclose it — and
+was 45 minutes from shipping a book about a generic deduplicator when the real
+codebase had a journaled transaction, crash recovery and a fault-injection trait
+seam. The human made the repo public and the run was restarted. Reachability of
+the issue's OWN references is now a declared gate before the issue is claimed,
+and an unreachable reference is an alerting condition, because a routine that is
+meant to run unattended cannot depend on someone reading over its shoulder.
+(2) execution_mode had no entry for the mechanism that actually worked: a headless
+`claude -p` in the checkout DOES load a mid-run-installed plugin and invokes the
+real skills, which strictly beats hand-following SKILL.md. (3) Registration is not
+decided once — the skills became invocable LATER in the same session, so a single
+early re-check permanently understated the available mode. (4) "Nothing commits
+until a page fully verifies" was false for the single-pass path: write-book left
+all 12 concepts 'requested' while 7 finished pages sat on disk, so the declared
+resume rule would have rebuilt every one of them. Staged builds are now the
+default above a size threshold, resume trusts the filesystem over the manifest,
+and long builds checkpoint. (5) Environment facts that cost a cycle each: root
+cannot use --permission-mode bypassPermissions; a setsid/nohup child's real pid is
+a GRANDchild, so $! supervises a wrapper that exits immediately and reports a
+false completion; gh subcommands that go through GraphQL 403 where REST succeeds.
 """
 
 from pydantic import BaseModel, Field
@@ -195,10 +219,17 @@ class Workspace(BaseModel):
 
 class PluginStatus(BaseModel):
     usable: bool
-    execution_mode: Enum["skill_command", "on_disk_skill_files", "none"]
+    execution_mode: Enum["skill_command", "headless_subprocess",
+                         "on_disk_skill_files", "none"]
     plugin_root: str
     installed_now: bool
     registration_failed: bool
+
+class SourceAccess(BaseModel):
+    checked: bool
+    all_reachable: bool
+    unreachable_refs: str = Field(max_length=500)
+    proceed_degraded: bool
 
 class IssueRef(BaseModel):
     found: bool
@@ -232,11 +263,12 @@ class Alert(BaseModel):
     suppressed_reason: str
 
 class RunReport(BaseModel):
-    outcome: Enum["published_draft", "published_with_errors", "no_work",
-                  "already_in_progress", "workspace_failed", "plugin_failed",
-                  "generation_failed", "uncertain"]
+    outcome: Enum["published_draft", "published_degraded", "published_with_errors",
+                  "no_work", "already_in_progress", "sources_unreachable",
+                  "workspace_failed", "plugin_failed", "generation_failed",
+                  "uncertain"]
     stopped_at: Enum["resolve_workspace", "verify_plugin", "select_issue",
-                     "mark_started", "generate_book", "complete"]
+                     "check_sources", "mark_started", "generate_book", "complete"]
     validator_errors: int = Field(ge=0)
     summary: str = Field(max_length=500)
     operator_action: str = Field(max_length=300)
@@ -288,6 +320,29 @@ class VerifyPlugin(Task):
          "the NEXT session — confirmed 2026-08-01", "must"),
         ("If unavailable, try exactly one install (bookbank@kit), then re-check",
          "one bounded repair attempt; unattended runs must not loop on setup"),
+        ("Prefer, in this order: skill_command; headless_subprocess; "
+         "on_disk_skill_files. If the skills are not invocable in this session but "
+         "the plugin IS unpacked on disk, FIRST try headless_subprocess — one "
+         "`claude -p` run started from books_dir, which resolves plugins at ITS "
+         "start and so invokes the real skills. Confirm by asking that subprocess "
+         "to list its book-related skills before relying on it",
+         "v2.0.6(2): a fresh subprocess is a new session, which is exactly the "
+         "condition a mid-run install satisfies. Running the real skill beats "
+         "hand-following its SKILL.md, so the weaker mode must not be reached for "
+         "first merely because it was written down first", "must"),
+        ("Re-check invocability at each later task boundary, not only here, and "
+         "upgrade execution_mode if a stronger mode has become available. "
+         "registration_failed stays true for the run once it has been true",
+         "v2.0.6(3): the 2026-08-11 run found the skills invocable LATER in the "
+         "same session; a single early verdict understated the mode for the whole "
+         "run and would have forced hand-execution needlessly"),
+        ("Running as root, `--permission-mode bypassPermissions` is REFUSED. Use "
+         "acceptEdits plus an explicit --allowedTools list. A subprocess started "
+         "via setsid/nohup reports a WRAPPER pid: supervise the grandchild found "
+         "with `pgrep -af \"[c]laude -p\"`, never $!",
+         "v2.0.6(5): both cost a cycle; the pid error is worse than it looks — the "
+         "wrapper exits at once and the run reads that as the build having "
+         "finished in seconds", "must"),
         ("If the skills are not invocable but the plugin IS unpacked on disk, set "
          "execution_mode='on_disk_skill_files' and proceed: read the plugin's own "
          "SKILL.md files and follow their procedures literally, using the plugin's "
@@ -317,7 +372,8 @@ class VerifyPlugin(Task):
          "invocable, even when on_disk_skill_files rescues the run",
          "that flag is the run's only signal that the dispatch config needs a "
          "one-time fix"),
-        ("usable = execution_mode in ['skill_command', 'on_disk_skill_files']",
+        ("usable = execution_mode in ['skill_command', 'headless_subprocess', "
+         "'on_disk_skill_files']",
          "one boolean carries the go/no-go so every later step gates on it", "must"),
     ]
     on_uncertain = {"usable": False, "execution_mode": "none", "plugin_root": "",
@@ -366,6 +422,54 @@ class SelectIssue(Task):
                   "stale_branch": ""}
 
 
+class CheckReferencedSources(Task):
+    """Establish whether the material the issue asks the book to be ABOUT can
+    actually be read, before the issue is claimed."""
+    issue_number: int
+    returns: SourceAccess
+
+    tools = [
+        Tool("gh", ops=["issue view", "api"]),
+        Tool("bash", ops=["git clone", "git ls-remote"]),
+        Tool("web-fetch", ops=["get"]),
+    ]
+    constraints = UNATTENDED + [
+        ("Extract every repository, URL and attachment named anywhere in the issue "
+         "body — Topic, Seed concepts, Notes, Reference material alike — and prove "
+         "each one readable by command: clone the repo, fetch the URL. A reference "
+         "the run cannot read is unreachable no matter how confidently the issue "
+         "describes it",
+         "v2.0.6(1): the request named a private repo, and the only signal was a "
+         "404 that arrived 40 minutes into a build already writing a different "
+         "book", "must"),
+        ("Never substitute general knowledge for an unreachable reference "
+         "silently. Comment on the issue naming exactly what could not be read and "
+         "what the book will lack without it, BEFORE generation",
+         "the requester is the one person who can fix access, and they can only do "
+         "it if they are told; the 2026-08-11 run was rescued only because a human "
+         "happened to be reading the transcript", "must"),
+        ("proceed_degraded is true only when the topic still stands up without the "
+         "unreachable material — a book ABOUT a specific codebase does not. When it "
+         "is false, this is a clean stop: do NOT claim the issue, and leave it in "
+         "the queue for a run made after access is granted",
+         "a generic book shipped under a specific title is worse than no book: it "
+         "reads as authoritative, and nothing about it looks wrong", "must"),
+        ("On a resumed or re-dispatched run, re-check reachability from scratch "
+         "rather than trusting a previous verdict",
+         "v2.0.6(1): access was granted BETWEEN two runs of the same issue, and a "
+         "cached 'private' would have degraded the retry for no reason", "must"),
+        ("Record every unreachable reference in unreachable_refs even when "
+         "proceeding; it must reach the PR body, the run report and the operator",
+         "a degradation nobody is told about is indistinguishable from a clean run"),
+    ]
+    on_uncertain = {"checked": False, "all_reachable": False,
+                    "unreachable_refs": "reachability could not be established",
+                    "proceed_degraded": False}
+    on_failure = {"checked": False, "all_reachable": False,
+                  "unreachable_refs": "reachability check failed",
+                  "proceed_degraded": False}
+
+
 class MarkStarted(Task):
     """Label the issue in-progress and comment, BEFORE any generation work and
     ONLY once the run has proven it can generate."""
@@ -395,6 +499,7 @@ class GenerateBook(Task):
     plugin_root: str
     books_dir: str
     stale_branch: str
+    unreachable_refs: str
     returns: BookBuild
 
     tools = [
@@ -494,8 +599,47 @@ class GenerateBook(Task):
         ("If gh pr create is not callable unattended, push anyway and use the "
          "GitHub compare URL as the deliverable link",
          "the branch is the work; the PR is just its front door"),
-        ("Nothing commits until a page fully verifies",
-         "this is what makes any restart safe to resume"),
+        ("A `gh` op that fails with a GraphQL 403 while REST succeeds is an "
+         "environment fact, not an absent mechanism: reach the same declared op "
+         "through `gh api repos/{owner}/{repo}/...` or the harness's GitHub tools, "
+         "and record the substitution. This is the one place where the dispatch "
+         "wrapper's system prompt and this spec disagree — the wrapper may state "
+         "there is no gh at all",
+         "v2.0.6(5): `gh issue view --json` is GraphQL-backed and 403s here while "
+         "the same read over REST returns fine; treating that as a missing tool "
+         "would abort a run that has every capability it needs", "must"),
+        ("Above ~6 concepts, build in stages (stage-book-build) rather than one "
+         "single-pass write-book run: scaffold once, then one scoped run per "
+         "concept page",
+         "v2.0.6(4): the per-page path is what flips each concept to 'ready' as it "
+         "lands, and that manifest write is the entire basis of the resume rule "
+         "below. A single-pass run is not resumable no matter what the spec says "
+         "about it", "must"),
+        ("Commit each verified page as it lands, and checkpoint a long build even "
+         "mid-book. Never hold a completed page as untracked work waiting for the "
+         "book to finish",
+         "v2.0.6(4): the container is ephemeral and reclaimed without warning; the "
+         "2026-08-11 run was holding 45 minutes of finished pages in an untracked "
+         "directory when it checkpointed them out of self-preservation", "must"),
+        ("On resume, the FILESYSTEM is authoritative over book.json: a concepts/"
+         "NN-*.html that exists and is well-formed is done, whatever status the "
+         "manifest reports. Rebuild only what is genuinely absent",
+         "v2.0.6(4): a single-pass run leaves every concept 'requested' while "
+         "finished pages sit on disk, so a manifest-driven resume rebuilds the "
+         "entire book and silently discards verified work", "must"),
+        ("Before relaunching any builder on resume, check for a live one "
+         "(`pgrep -af \"[c]laude -p\"`) and stand down if found",
+         "v2.0.6(5): a self-scheduled fallback nearly started a second builder "
+         "against the same book folder while the first was still writing it", "must"),
+        ("Stream a delegated build's output to a log (--output-format stream-json) "
+         "rather than buffering it",
+         "a 45-minute build whose output only appears at exit gives supervision "
+         "nothing to act on, and loses the whole transcript if it is killed"),
+        ("When unreachable_refs is non-empty, say so in the PR body AND in the "
+         "book's own summary — name what could not be read and that the affected "
+         "content is general rather than drawn from the source",
+         "a reader cannot tell a researched chapter from an improvised one; the "
+         "book itself has to carry the caveat", "must"),
     ]
     undo = ("Delete the pushed claude/book-* branch if no PR or compare URL was "
             "produced")
@@ -546,6 +690,7 @@ class PushAlert(Task):
     workspace: Workspace | None
     plugin: PluginStatus | None
     issue: IssueRef | None
+    sources: SourceAccess | None
     build: BookBuild | None
     art: ImageRequests | None
     notify: IssueNote | None
@@ -578,6 +723,7 @@ class PushAlert(Task):
          "OR notify.commented is False; "
          "OR art.status == 'errored_noted'; "
          "OR build.cover_rendered is False OR build.visual_qa_ran is False; "
+         "OR sources.all_reachable is False; "
          "OR (plugin.registration_failed AND outcome in ['published_draft', "
          "'published_with_errors'])",
          "these are the states where a human's attention changes the outcome. "
@@ -606,18 +752,22 @@ class BookbankRun(Task):
     plugin    = VerifyPlugin() if workspace.resolved else None
     issue     = SelectIssue(freeform_context=freeform_context,
                             repo_slug=workspace.repo_slug) if plugin.usable else None
-    mark      = MarkStarted(issue_number=issue.number) if issue.proceed else None
+    sources   = CheckReferencedSources(
+                            issue_number=issue.number) if issue.proceed else None
+    mark      = MarkStarted(issue_number=issue.number) if (
+                            sources.all_reachable or sources.proceed_degraded) else None
     build     = GenerateBook(issue_number=issue.number,
                              execution_mode=plugin.execution_mode,
                              plugin_root=plugin.plugin_root,
                              books_dir=workspace.books_dir,
-                             stale_branch=issue.stale_branch) if mark.marked else None
+                             stale_branch=issue.stale_branch,
+                             unreachable_refs=sources.unreachable_refs) if mark.marked else None
     art       = OpenImageRequests(book_id=build.book_id,
                                   branch=build.branch) if build.built else None
     notify    = NotifyIssue(issue_number=issue.number,
                             pr_url=build.pr_url) if build.built else None
     alert     = PushAlert(workspace=workspace, plugin=plugin, issue=issue,
-                          build=build, art=art, notify=notify)
+                          sources=sources, build=build, art=art, notify=notify)
 
     constraints = UNATTENDED + [
         ("Every step after ResolveWorkspace is gated on the step before it "
@@ -626,14 +776,23 @@ class BookbankRun(Task):
         ("Do not proceed past SelectIssue when found is false, or when "
          "already_in_progress is true without redo_requested",
          "an empty queue and a claimed issue are both clean stops", "must"),
+        ("Do not proceed past CheckReferencedSources when the issue's own subject "
+         "matter is unreachable and the topic does not stand without it. The issue "
+         "is NOT claimed on that path — it stays in the queue for a run made after "
+         "access is granted",
+         "v2.0.6(1): claiming an issue this run cannot actually research parks it "
+         "behind an in-progress label while producing nothing worth merging", "must"),
         ("Reduce to RunReport by this mapping, in order — first match wins: "
          "NOT workspace.resolved -> ('workspace_failed', 'resolve_workspace'); "
          "NOT plugin.usable -> ('plugin_failed', 'verify_plugin'); "
          "NOT issue.found -> ('no_work', 'select_issue'); "
          "issue.already_in_progress AND NOT issue.redo_requested -> "
          "('already_in_progress', 'select_issue'); "
+         "NOT (sources.all_reachable OR sources.proceed_degraded) -> "
+         "('sources_unreachable', 'check_sources'); "
          "NOT build.built -> ('generation_failed', 'generate_book'); "
          "build.validator_errors > 0 -> ('published_with_errors', 'complete'); "
+         "NOT sources.all_reachable -> ('published_degraded', 'complete'); "
          "otherwise -> ('published_draft', 'complete'). "
          "Always copy build.validator_errors into RunReport.validator_errors (0 "
          "when no build ran)",
@@ -646,9 +805,13 @@ class BookbankRun(Task):
         ("Populate operator_action whenever the run needed a human to change "
          "configuration — name the file or setting, not just the symptom",
          "the value of a blocked run is a fix the human can apply once"),
-        ("If killed mid-build, resumption is safe: nothing commits until a page "
-         "verifies, so re-check book.json and relaunch the next unbuilt page",
-         "restart resilience is a property of the commit discipline"),
+        ("If killed mid-build, resumption is safe because each verified page was "
+         "committed as it landed. On resume, read the FILESYSTEM to decide what "
+         "remains — book.json's per-concept status is trustworthy only on the "
+         "staged path — then relaunch the next genuinely absent page",
+         "v2.0.6(4): the old wording asserted a commit discipline the single-pass "
+         "path does not have, and pointed resume at a manifest that path never "
+         "updates; both halves had to be corrected together"),
         ("WHEN GenerateBook is delegated to a separate executor sharing this "
          "checkout, the orchestrator performs no git operations in books_dir "
          "while it runs, and treats the executor's untracked in-progress files "
@@ -665,4 +828,4 @@ class BookbankRun(Task):
                                "completed step's undo has been run in reverse.",
                     "operator_action": "Inspect the run transcript before re-dispatching."}
     on_failure = "abort"
-    meta = {"version": "2.0.5", "dispatch": "manual|webhook", "repo": "sunprema/books"}
+    meta = {"version": "2.0.6", "dispatch": "manual|webhook", "repo": "sunprema/books"}
