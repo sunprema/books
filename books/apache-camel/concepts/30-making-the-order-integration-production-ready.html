@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Making the Order Integration Production-Ready &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VII &mdash; Capstone Project</span> &middot; Chapter 30</p>
+    <p class="chapter-no">30</p>
+    <h1 data-anchor="prod-h1">Making the Order Integration Production-Ready</h1>
+
+    <p class="lede" data-anchor="prod-lede">Chapter 29 ended with a working route and a short, honest list of what it
+    doesn't yet handle: a malformed CSV row, a customer or inventory API that's down or slow, and a file that gets
+    picked up twice. None of those are bugs &mdash; they're what "happy path first, harden second" leaves open on
+    purpose. This chapter closes all three, then adds the two things a route needs before anyone should trust it
+    unattended: tests that prove the hardening actually works, and enough observability to see it working (or
+    failing) without reading the code again at 3 a.m.</p>
+
+    <h2 data-anchor="prod-h2-shape">Four layers, wrapped around the same six stages</h2>
+    <p data-anchor="prod-p-shape1">Nothing from Chapter 29 gets rewritten. Production-readiness isn't a seventh
+    pipeline stage &mdash; it's four concerns that wrap around the existing intake-to-publish pipeline: a duplicate
+    check, a failure policy, a test suite that proves both, and a way to watch it all happen.</p>
+
+    <figure class="diagram-fig" data-anchor="prod-fig-layers">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="prodD1t">
+        <title id="prodD1t">The Chapter 29 pipeline, unchanged, wrapped in four hardening layers: idempotency around the intake seam, an error and dead-letter policy around every stage, a test suite proving both, and observability watching the whole thing</title>
+
+        <rect x="30" y="18" width="500" height="46" class="stroke fill-soft"/>
+        <text x="42" y="46" class="big">Pipeline (Ch. 29): intake &rarr; parse &rarr; validate &rarr; enrich &times;2 &rarr; route &rarr; publish</text>
+
+        <rect x="30" y="76" width="240" height="34" class="stroke fill-red"/>
+        <text x="42" y="98" class="big on-ink">1&#8201;&middot;&#8201;Idempotent consumer</text>
+
+        <rect x="290" y="76" width="240" height="34" class="stroke fill-red"/>
+        <text x="302" y="98" class="big on-ink">2&#8201;&middot;&#8201;Error &amp; dead-letter policy</text>
+
+        <rect x="30" y="122" width="240" height="34" class="stroke fill-ink"/>
+        <text x="42" y="144" class="big on-ink">3&#8201;&middot;&#8201;Route tests</text>
+
+        <rect x="290" y="122" width="240" height="34" class="stroke fill-ink"/>
+        <text x="302" y="144" class="big on-ink">4&#8201;&middot;&#8201;Metrics, MDC, tracing, health</text>
+
+        <path d="M150 64 L150 74" class="stroke-soft dash"/>
+        <path d="M410 64 L410 74" class="stroke-soft dash"/>
+        <text x="30" y="176" class="dim">Same six stages as Chapter 29 &mdash; nothing here replaces them, everything here wraps them.</text>
+      </svg>
+      <figcaption>Four hardening layers over an unchanged pipeline. The first two change what the route does on
+      failure or repetition; the last two prove it and let you watch it.</figcaption>
+    </figure>
+
+    <h2 data-anchor="prod-h2-idempotent">Layer 1: making reprocessing safe</h2>
+    <p data-anchor="prod-p-idem1">Chapter 29's third open edge case was blunt: nothing in the route checks whether
+    an <code>orderId</code> has already been published, so a file re-picked-up after a partial failure &mdash; the
+    SFTP connection dropping halfway through the last run, say &mdash; republishes every order in it, duplicates
+    included. Chapter 16 already gave you the fix in general form: the Idempotent Consumer pattern, filtering
+    duplicates at the receiving end by checking each message's key against a repository of keys already seen. What's
+    left is deciding exactly where that check goes and what backs it.</p>
+
+    <p data-anchor="prod-p-idem2">The key can't exist any earlier than it does. A raw CSV row-map has no
+    <code>orderId</code> until <code>OrderMapper.fromCsvRow</code> has run and produced a real <code>Order</code>
+    &mdash; so the idempotent check belongs right on the <code>direct:toCanonicalOrder</code> seam, immediately after
+    the mapper bean and before anything downstream does real work on the order.</p>
+
+    <div class="pre-label">The idempotent consumer, keyed on orderId, right after the mapper produces one</div>
+    <pre><code><span class="at">@Bean</span>
+<span class="ty">JdbcMessageIdRepository</span> orderIdRepository(<span class="ty">DataSource</span> dataSource) {
+    <span class="kw">return</span> <span class="kw">new</span> <span class="ty">JdbcMessageIdRepository</span>(dataSource, <span class="str">"orderIntegration"</span>);
+}
+
+<span class="kw">from</span>(<span class="str">"direct:toCanonicalOrder"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"toCanonicalOrder"</span>)
+    .<span class="fn">bean</span>(<span class="ty">OrderMapper</span>.<span class="kw">class</span>, <span class="str">"fromCsvRow"</span>)
+    .<span class="fn">idempotentConsumer</span>(<span class="fn">simple</span>(<span class="str">"${body.orderId}"</span>), orderIdRepository)
+        .<span class="fn">skipDuplicate</span>(<span class="kw">false</span>)
+        .<span class="fn">choice</span>()
+            .<span class="fn">when</span>(<span class="fn">exchangeProperty</span>(<span class="ty">Exchange</span>.DUPLICATE_MESSAGE).<span class="fn">isEqualTo</span>(<span class="kw">true</span>))
+                .<span class="fn">log</span>(<span class="ty">LoggingLevel</span>.WARN, <span class="str">"Duplicate order ${body.orderId} — already processed"</span>)
+                .<span class="kw">to</span>(<span class="str">"direct:duplicateOrders"</span>)
+            .<span class="fn">otherwise</span>()
+                .<span class="kw">to</span>(<span class="str">"direct:validateOrder"</span>)
+        .<span class="fn">end</span>()
+    .<span class="fn">end</span>();</code></pre>
+
+    <p data-anchor="prod-p-idem3">Two choices in that snippet are deliberate, not defaults. <code>skipDuplicate(false)</code>
+    means a caught duplicate doesn't just vanish &mdash; it's routed to <code>direct:duplicateOrders</code> where
+    someone can actually see it happened, the same shift from silent-drop to visible-branch Chapter 16 introduced.
+    And the repository is <code>JdbcMessageIdRepository</code>, not <code>MemoryIdempotentRepository</code>: this
+    route's whole reason for adding idempotency is to survive the kind of restart that would also wipe an in-memory
+    map clean, so the history of seen order IDs has to live somewhere a fresh process can still see it &mdash; a
+    <code>CAMEL_MESSAGEPROCESSED</code> table keyed on <code>(processorName, messageId)</code>, in this case. A
+    Kafka-backed <code>KafkaIdempotentRepository</code> is the equivalent choice if this integration already leans
+    on Kafka more than a relational database.</p>
+
+    <div class="callout warn" data-anchor="prod-callout-removeonfailure">
+      <span class="callout-title">A dead-lettered order keeps its key &mdash; on purpose, with a consequence</span>
+      <p><code>removeOnFailure</code> defaults to <code>true</code>: when an order's exchange ends in a genuine,
+      unhandled failure &mdash; a bad row rejected by <code>validate()</code>, say &mdash; its key comes back out of
+      the repository, so a corrected resend for the same <code>orderId</code> isn't blocked. But that removal only
+      fires on a truly <em>failed</em> exchange. An order that exhausts its redeliveries and lands on a dead letter
+      via <code>handled(true)</code> is, internally, <em>failure-handled</em> rather than failed &mdash; so its key
+      stays. That's correct: the idempotency check already did its job once. But it means a human replaying that
+      dead-lettered order later has to go around the idempotent consumer (or clear that one key first) &mdash;
+      sending it back through <code>direct:toCanonicalOrder</code> the normal way will have it silently treated as
+      a duplicate of the failure that dead-lettered it.</p>
+    </div>
+
+    <h2 data-anchor="prod-h2-errors">Layer 2: an error and dead-letter policy for both remaining edge cases</h2>
+    <p data-anchor="prod-p-err1">Chapter 29 left two failure points genuinely undecided: a <code>validate()</code>
+    rejection, and a slow or failing call to either the customer or inventory API. They're not the same kind of
+    failure, and Chapter 23's own distinction &mdash; business exceptions versus technical ones &mdash; is exactly
+    the tool for telling them apart.</p>
+
+    <p data-anchor="prod-p-err2">A <code>PredicateValidationException</code> is a business rejection: the row is
+    what it is, and retrying it produces the identical rejection every time, so it gets <code>handled(true)</code>
+    with no redelivery at all, and a route to a rejected-orders destination for a human to look at. An
+    <code>HttpOperationFailedException</code> or <code>ConnectException</code> from either <code>enrich()</code>
+    call is different &mdash; plausibly transient, worth a few retries with backoff before giving up.</p>
+
+    <div class="pre-label">Two onException clauses, plus a route-wide Dead Letter Channel as the catch-all</div>
+    <pre><code><span class="kw">onException</span>(<span class="ty">PredicateValidationException</span>.<span class="kw">class</span>)
+    .<span class="fn">routeId</span>(<span class="str">"validationFailurePolicy"</span>)
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="fn">useOriginalMessage</span>()
+    .<span class="fn">log</span>(<span class="ty">LoggingLevel</span>.WARN, <span class="str">"Rejecting order (validation failed): ${exception.message}"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:rejectedOrders"</span>);
+
+<span class="kw">onException</span>(<span class="ty">ConnectException</span>.<span class="kw">class</span>, <span class="ty">HttpOperationFailedException</span>.<span class="kw">class</span>)
+    .<span class="fn">maximumRedeliveries</span>(<span class="num">5</span>)
+    .<span class="fn">redeliveryDelay</span>(<span class="num">2000</span>)
+    .<span class="fn">backOffMultiplier</span>(<span class="num">2</span>)
+    .<span class="fn">useExponentialBackOff</span>()
+    .<span class="fn">useCollisionAvoidance</span>()
+    .<span class="fn">maximumRedeliveryDelay</span>(<span class="num">30000</span>)
+    .<span class="fn">retriesExhaustedLogLevel</span>(<span class="ty">LoggingLevel</span>.ERROR)
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="fn">useOriginalMessage</span>()
+    .<span class="kw">to</span>(<span class="str">"direct:orderDeadLetter"</span>);
+
+<span class="fn">errorHandler</span>(<span class="fn">deadLetterChannel</span>(<span class="str">"direct:orderDeadLetter"</span>)
+    .<span class="fn">useOriginalMessage</span>()
+    .<span class="fn">maximumRedeliveries</span>(<span class="num">2</span>)
+    .<span class="fn">redeliveryDelay</span>(<span class="num">1000</span>));</code></pre>
+
+    <p data-anchor="prod-p-err3">The technical clause earns every one of its options. <code>useExponentialBackOff()</code>
+    with a <code>maximumRedeliveryDelay</code> cap keeps a struggling customer or inventory API from being hit with
+    the same retry cadence forever, without letting the delay grow to something absurd either.
+    <code>useCollisionAvoidance()</code> adds jitter, which matters most exactly when it's needed most: if the
+    inventory API has an outage and a hundred in-flight orders all fail their <code>enrich()</code> call within
+    the same second, jitter is what keeps their hundred retries from landing back on that API in one synchronized
+    burst the moment it starts to recover. And the route-wide <code>deadLetterChannel(...)</code> at the bottom
+    isn't decorative &mdash; it's what turns "an exception neither <code>onException</code> clause claims" into
+    "still lands on a durable destination" instead of "propagates back to the SFTP consumer thread and potentially
+    aborts whatever's left of the file."</p>
+
+    <p data-anchor="prod-p-err4"><code>useOriginalMessage()</code> is doing real work in both clauses, not just the
+    route-wide one. By the time an exchange fails deep in enrichment, its body has already been reshaped away from
+    the CSV row the partner actually sent &mdash; without it, whoever opens the dead-letter destination to debug a
+    failure sees a half-enriched intermediate shape instead of the order as it originally arrived.</p>
+
+    <div class="pre-label">The dead-letter destination itself: durable, inspectable, counted</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orderDeadLetter"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"orderDeadLetter"</span>)
+    .<span class="fn">marshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.Jackson)
+    .<span class="kw">to</span>(<span class="str">"micrometer:counter:orders.deadlettered"</span>)
+    .<span class="kw">to</span>(<span class="str">"kafka:order.integration.dlq?brokers={{kafka.brokers}}"</span>);</code></pre>
+
+    <div class="callout key" data-anchor="prod-callout-noreplay">
+      <span class="callout-title">A dead-letter topic is a queue to inspect, not a trash can to auto-empty</span>
+      <p>Recall the redelivery chapter's warning: blind, automatic replay of an entire dead-letter destination
+      re-poisons it &mdash; a payload-shape problem or a code defect fails identically the second time. This
+      integration's DLQ topic exists so a human (or an automated process, once the fix is verified) can replay a
+      <em>specific</em> order once its root cause is actually understood, not so the whole topic gets fed back in
+      on a timer.</p>
+    </div>
+
+    <h2 data-anchor="prod-h2-tests">Layer 3: proving both layers actually work</h2>
+    <p data-anchor="prod-p-tests1">Chapter 25's toolkit was built for exactly this: a duplicate check and a
+    retry-then-dead-letter policy are both things a test should prove, not just trust. Two tests, each reusing a
+    tool from that chapter.</p>
+
+    <div class="pre-label">Proving the idempotent consumer: a real duplicate, without a real database</div>
+    <pre><code><span class="kw">class</span> <span class="ty">OrderIdempotencyTest</span> <span class="kw">extends</span> <span class="ty">CamelTestSupport</span> {
+
+    <span class="at">@Override</span>
+    <span class="ty">RouteBuilder</span> createRouteBuilder() { <span class="kw">return</span> <span class="kw">new</span> <span class="ty">OrderIntegrationRoute</span>(); }
+
+    <span class="at">@Override</span>
+    <span class="kw">boolean</span> isUseAdviceWith() { <span class="kw">return</span> <span class="kw">true</span>; }
+
+    <span class="at">@Test</span>
+    <span class="kw">void</span> secondCopyOfSameOrderIdIsFiltered() <span class="kw">throws</span> <span class="ty">Exception</span> {
+        context.<span class="fn">getRouteDefinition</span>(<span class="str">"toCanonicalOrder"</span>).<span class="fn">adviceWith</span>(context, <span class="kw">new</span> <span class="ty">AdviceWithRouteBuilder</span>() {
+            <span class="at">@Override</span>
+            <span class="kw">void</span> configure() {
+                <span class="fn">weaveByType</span>(<span class="ty">IdempotentConsumerDefinition</span>.<span class="kw">class</span>)
+                    .<span class="fn">selectFirst</span>()
+                    .<span class="fn">replace</span>()
+                    .<span class="fn">idempotentConsumer</span>(<span class="fn">simple</span>(<span class="str">"${body.orderId}"</span>), <span class="ty">MemoryIdempotentRepository</span>.<span class="fn">memoryIdempotentRepository</span>(<span class="num">1000</span>))
+                        .<span class="fn">skipDuplicate</span>(<span class="kw">false</span>)
+                        .<span class="kw">to</span>(<span class="str">"mock:afterIdempotent"</span>);
+            }
+        });
+        context.<span class="fn">start</span>();
+
+        <span class="ty">MockEndpoint</span> afterIdempotent = <span class="fn">getMockEndpoint</span>(<span class="str">"mock:afterIdempotent"</span>);
+        afterIdempotent.<span class="fn">expectedMessageCount</span>(<span class="num">2</span>);
+
+        <span class="ty">Order</span> order = <span class="kw">new</span> <span class="ty">Order</span>(<span class="str">"ORD-42"</span>, <span class="str">"SKU-1"</span>, <span class="num">3</span>);
+        template.<span class="fn">sendBody</span>(<span class="str">"direct:toCanonicalOrder"</span>, order);
+        template.<span class="fn">sendBody</span>(<span class="str">"direct:toCanonicalOrder"</span>, order);
+
+        afterIdempotent.<span class="fn">assertIsSatisfied</span>();
+        <span class="ty">Exchange</span> second = afterIdempotent.<span class="fn">getExchanges</span>().<span class="fn">get</span>(<span class="num">1</span>);
+        <span class="fn">assertTrue</span>(second.<span class="fn">getProperty</span>(<span class="ty">Exchange</span>.DUPLICATE_MESSAGE, <span class="ty">Boolean</span>.<span class="kw">class</span>));
+    }
+}</code></pre>
+
+    <p data-anchor="prod-p-tests2"><code>weaveByType(IdempotentConsumerDefinition.class)</code> swaps out the
+    durable <code>JdbcMessageIdRepository</code> for an in-memory one, for this test only &mdash; a unit test has
+    no business standing up a real database, and doesn't need one to prove the filtering logic. Both sends still
+    reach the mock because <code>skipDuplicate(false)</code> lets the duplicate through; the assertion checks
+    <em>which one</em> got flagged, not just how many arrived.</p>
+
+    <div class="pre-label">Proving retry-then-dead-letter, without waiting through real backoff</div>
+    <pre><code><span class="at">@Test</span>
+<span class="kw">void</span> enrichmentFailureRetriesThenDeadLetters() <span class="kw">throws</span> <span class="ty">Exception</span> {
+    context.<span class="fn">getRouteDefinition</span>(<span class="str">"enrichOrder"</span>).<span class="fn">adviceWith</span>(context, <span class="kw">new</span> <span class="ty">AdviceWithRouteBuilder</span>() {
+        <span class="at">@Override</span>
+        <span class="kw">void</span> configure() {
+            <span class="fn">weaveByType</span>(<span class="ty">OnExceptionDefinition</span>.<span class="kw">class</span>)
+                .<span class="fn">selectFirst</span>()
+                .<span class="fn">replace</span>()
+                .<span class="kw">onException</span>(<span class="ty">ConnectException</span>.<span class="kw">class</span>)
+                    .<span class="fn">maximumRedeliveries</span>(<span class="num">3</span>)
+                    .<span class="fn">redeliveryDelay</span>(<span class="num">0</span>)
+                    .<span class="fn">handled</span>(<span class="kw">true</span>)
+                    .<span class="kw">to</span>(<span class="str">"mock:orderDeadLetter"</span>);
+            <span class="fn">weaveByToUri</span>(<span class="str">"http://customer-api*"</span>).<span class="fn">replace</span>().<span class="kw">to</span>(<span class="str">"mock:customerApi"</span>);
+        }
+    });
+    context.<span class="fn">start</span>();
+
+    <span class="ty">MockEndpoint</span> customerApi = <span class="fn">getMockEndpoint</span>(<span class="str">"mock:customerApi"</span>);
+    customerApi.<span class="fn">whenExchangeReceived</span>(<span class="num">0</span>, e -&gt; { <span class="kw">throw</span> <span class="kw">new</span> <span class="ty">ConnectException</span>(<span class="str">"down"</span>); });
+    customerApi.<span class="fn">whenExchangeReceived</span>(<span class="num">1</span>, e -&gt; { <span class="kw">throw</span> <span class="kw">new</span> <span class="ty">ConnectException</span>(<span class="str">"down"</span>); });
+
+    <span class="ty">MockEndpoint</span> deadLetter = <span class="fn">getMockEndpoint</span>(<span class="str">"mock:orderDeadLetter"</span>);
+    deadLetter.<span class="fn">expectedMessageCount</span>(<span class="num">1</span>);
+
+    template.<span class="fn">sendBody</span>(<span class="str">"direct:enrichOrder"</span>, <span class="kw">new</span> <span class="ty">Order</span>(<span class="str">"ORD-43"</span>, <span class="str">"SKU-2"</span>, <span class="num">1</span>));
+
+    deadLetter.<span class="fn">assertIsSatisfied</span>();
+}</code></pre>
+
+    <p data-anchor="prod-p-tests3"><code>redeliveryDelay(0)</code> on the test-only policy is what keeps this a
+    fast unit test instead of a slow one: what's actually under test is that three redeliveries happen and the
+    fourth attempt gives up, not how many real seconds a production backoff schedule would take. Real 2-second,
+    4-second, 8-second delays belong in production, not in a build that runs on every commit.</p>
+
+    <h2 data-anchor="prod-h2-observability">Layer 4: seeing it happen in production</h2>
+    <p data-anchor="prod-p-obs1">Tests prove the hardening works once, under your control. Observability is what
+    proves it's still working at 2 a.m., without anyone re-reading the route. Four pieces, each aimed at a
+    different question an operator actually asks.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>What each observability piece answers</caption>
+        <thead>
+          <tr><th>Question</th><th>Answered by</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Which stage is failing, and how often?</td><td>Per-stage <code>routeId</code>s + <code>MicrometerRoutePolicyFactory</code></td></tr>
+          <tr><td>How many orders actually shipped today, vs. needed a human?</td><td>Inline <code>micrometer:counter</code> business metrics</td></tr>
+          <tr><td>Every log line for this one order &mdash; where are they?</td><td><code>camel-mdc</code> (<code>orderId</code>) + <code>breadcrumbId</code></td></tr>
+          <tr><td>Should this pod stop receiving new files right now?</td><td>A readiness <code>HealthCheck</code> on the customer/inventory APIs</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="prod-p-obs2">The first piece is cheap and easy to miss: every code sample so far has given its
+    <code>from(...)</code> block an explicit <code>.routeId(...)</code>, and that's not incidental style. Chapter
+    29's version left most stages unnamed, so Camel auto-assigned generic ids &mdash; <code>route2</code>,
+    <code>route3</code>. <code>MicrometerRoutePolicyFactory</code> still produces a full set of per-route counters
+    (<code>camel.exchanges.total</code>, <code>.succeeded</code>, <code>.failed</code>, <code>.failures.handled</code>,
+    <code>.external.redeliveries</code>) and a <code>camel.route.policy</code> duration timer either way &mdash;
+    but a dashboard built on <code>route4</code> tells an operator nothing a dashboard built on
+    <code>enrichOrder</code> doesn't tell them more clearly.</p>
+
+    <div class="pre-label">Registering the metrics factory once; every named route gets counters and a timer</div>
+    <pre><code><span class="at">@Bean</span>
+<span class="ty">MicrometerRoutePolicyFactory</span> micrometerRoutePolicyFactory() {
+    <span class="kw">return</span> <span class="kw">new</span> <span class="ty">MicrometerRoutePolicyFactory</span>();
+}</code></pre>
+
+    <p data-anchor="prod-p-obs3">Those automatic counters measure exchanges through a technical stage, which isn't
+    quite the same thing as orders a business stakeholder cares about. A second, inline metric closes that gap
+    &mdash; the dead-letter route above already pushes <code>orders.deadlettered</code>; the publish route gets the
+    same treatment for the success side.</p>
+
+    <div class="pre-label">A business-level counter, not just a technical exchange count</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:publishFulfillment"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"publishFulfillment"</span>)
+    .<span class="fn">marshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.Jackson)
+    .<span class="fn">setHeader</span>(<span class="ty">KafkaConstants</span>.KEY, <span class="fn">simple</span>(<span class="str">"${body[orderId]}"</span>))
+    .<span class="kw">to</span>(<span class="str">"micrometer:counter:orders.fulfilled"</span>)
+    .<span class="kw">to</span>(<span class="str">"kafka:order.fulfillment.events?brokers={{kafka.brokers}}"</span>);</code></pre>
+
+    <p data-anchor="prod-p-obs4">The third piece ties every log line for one order together. <code>breadcrumbId</code>
+    is already there for free &mdash; Camel stamps it on every exchange from the moment the SFTP consumer picks up
+    the file &mdash; but it can't carry an <code>orderId</code> that doesn't exist until the mapper has run.
+    <code>camel-mdc</code> fills that gap from <code>toCanonicalOrder</code> onward: the same seam where the
+    idempotent consumer's key becomes available is also where <code>orderId</code> becomes worth promoting into
+    every subsequent log line.</p>
+
+    <div class="pre-label">Promoting orderId into MDC, declaratively</div>
+    <pre><code>camel.mdc.enabled=<span class="kw">true</span>
+camel.mdc.customHeaders=orderId,tenantId</code></pre>
+
+    <p data-anchor="prod-p-obs5">The fourth piece is the one easiest to get backwards: whether a customer-API or
+    inventory-API outage should count as this integration's own <em>liveness</em> failure or just its
+    <em>readiness</em>. It's readiness. Restarting this route's own pod does nothing to fix an outage in a system
+    it doesn't own &mdash; all a liveness failure would accomplish is adding container churn on top of an already
+    degraded dependency. A readiness failure, on the other hand, is exactly the right lever: it tells the
+    orchestrator to stop sending this pod new order files until the dependency recovers on its own.</p>
+
+    <div class="pre-label">Readiness, not liveness &mdash; a downstream outage shouldn't restart a healthy pod</div>
+    <pre><code><span class="kw">public</span> <span class="kw">class</span> <span class="ty">DownstreamOrderApisHealthCheck</span> <span class="kw">extends</span> <span class="ty">AbstractHealthCheck</span> {
+    <span class="kw">public</span> <span class="ty">DownstreamOrderApisHealthCheck</span>() { <span class="kw">super</span>(<span class="str">"custom"</span>, <span class="str">"order-integration-apis"</span>); }
+
+    <span class="at">@Override</span>
+    <span class="kw">protected</span> <span class="kw">void</span> doCall(<span class="ty">HealthCheckResultBuilder</span> builder, <span class="ty">Map</span>&lt;<span class="ty">String</span>, <span class="ty">Object</span>&gt; options) {
+        <span class="kw">if</span> (customerApiClient.isReachable() &amp;&amp; inventoryApiClient.isReachable()) {
+            builder.<span class="fn">up</span>();
+        } <span class="kw">else</span> {
+            builder.<span class="fn">down</span>().<span class="fn">message</span>(<span class="str">"customer-api or inventory-api unreachable"</span>);
+        }
+    }
+
+    <span class="at">@Override</span>
+    <span class="kw">public</span> <span class="kw">boolean</span> isLiveness() { <span class="kw">return</span> <span class="kw">false</span>; }
+}</code></pre>
+
+    <div class="pullquote" data-anchor="prod-pullquote">The route from Chapter 29 already did the interesting work.
+    Everything in this chapter is the unglamorous other half of shipping it: deciding, on purpose, what happens
+    when a message repeats, when a call fails, and how anyone finds out either one occurred &mdash; instead of
+    discovering the answer the first time it happens in production.</div>
+
+    <h2 data-anchor="prod-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="prod-p-reflection">Four layers, none of them new patterns &mdash; the Idempotent Consumer from
+    Chapter 16, exception policy and Dead Letter Channel from Chapters 23 and 24, <code>AdviceWith</code> and
+    <code>MockEndpoint</code> from Chapter 25, and <code>camel-mdc</code>, Micrometer, and health checks from
+    Chapter 26, each one aimed at a specific edge case Chapter 29 left open on purpose. What's different is that
+    none of them were optional add-ons bolted onto a finished route &mdash; the idempotent consumer had to go
+    exactly on the seam where <code>orderId</code> first exists, the error policy had to distinguish a business
+    rejection from a technical one instead of treating every exception the same, and the tests had to prove both
+    without a real database or a real API. That's the actual difference between an integration that works and one
+    that's production-ready: not more code, but every decision a real system forces made on purpose, before
+    production forces it on you instead.</p>
+
+    <div class="review" data-anchor="prod-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>The idempotent consumer in Layer 1 sits on the <code>direct:toCanonicalOrder</code> seam, after the
+        mapper bean. Suppose a defect in <code>OrderMapper.fromCsvRow</code> itself throws an exception before it
+        returns an <code>Order</code>. Does the idempotent consumer protect against that row being reprocessed if
+        the file is picked up again? Why or why not?</li>
+        <li>The technical <code>onException</code> clause in Layer 2 uses <code>handled(true)</code> before routing
+        to <code>direct:orderDeadLetter</code>. Trace through what happens to that same order's key in the
+        idempotent repository once redeliveries are exhausted and the exchange reaches the dead letter &mdash; and
+        what a human replaying it later needs to do differently because of that.</li>
+        <li>Layer 4 gives the customer/inventory health check <code>isLiveness()</code> returning <code>false</code>.
+        Describe a plausible failure in this integration that <em>should</em> be a liveness failure instead
+        &mdash; one where restarting the pod is actually the right response &mdash; and explain what makes it
+        different from a downstream API outage.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="29-building-an-order-processing-integration.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="31-designing-maintainable-camel-applications.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

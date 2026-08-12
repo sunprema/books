@@ -1240,6 +1240,27 @@
       "title": "Packaging Executable Archives :: Spring Boot Maven Plugin",
       "kind": "official-docs",
       "accessed": "2026-08-12"
+    },
+    {
+      "id": "src-camel-sql-jdbc-idempotent-repo",
+      "url": "https://github.com/apache/camel/blob/main/components/camel-sql/src/main/java/org/apache/camel/processor/idempotent/jdbc/JdbcMessageIdRepository.java",
+      "title": "JdbcMessageIdRepository (camel-sql source — CAMEL_MESSAGEPROCESSED table shape)",
+      "kind": "official-docs",
+      "accessed": "2026-08-12"
+    },
+    {
+      "id": "src-camel-kafka-idempotent-repo",
+      "url": "https://www.javadoc.io/static/org.apache.camel/camel-kafka/4.0.0-M2/allclasses-index.html",
+      "title": "KafkaIdempotentRepository (camel-kafka API — topic-backed IdempotentRepository)",
+      "kind": "official-docs",
+      "accessed": "2026-08-12"
+    },
+    {
+      "id": "src-nickmck-camel-idempotent-once",
+      "url": "https://nickmck.net/2023/09/26/camel-once/",
+      "title": "Idempotent message processing with Camel (removeOnFailure vs. ExchangeHelper.isFailureHandled)",
+      "kind": "blog",
+      "accessed": "2026-08-12"
     }
   ],
   "structure": {
@@ -5162,7 +5183,175 @@
         "src-eip-hohpe-woolf"
       ]
     },
-    "making-the-order-integration-production-ready": {},
+    "making-the-order-integration-production-ready": {
+      "researched": "2026-08-12",
+      "claims": [
+        {
+          "text": "The idempotency key for this integration can only be checked once an Order actually has an orderId — which the CSV row doesn't have until OrderMapper.fromCsvRow has run. Placing idempotentConsumer() any earlier (e.g. in the SFTP intake route or right after unmarshal()) has nothing stable to key on; it has to sit on the direct:toCanonicalOrder → direct:validateOrder seam, after the mapper bean and before validation spends any further work on the order.",
+          "sources": [
+            "src-camel-idempotent-eip"
+          ]
+        },
+        {
+          "text": "MemoryIdempotentRepository is the wrong choice for this route in production: the SFTP consumer, the order-processing routes, or a Spring Boot/Quarkus pod can all restart, and this integration's whole reason for adding idempotency is to survive a partially-processed file being re-picked-up after exactly that kind of restart. A durable, shareable repository — JdbcMessageIdRepository (org.apache.camel.processor.idempotent.jdbc, shipped in camel-sql) backed by a CAMEL_MESSAGEPROCESSED table keyed on (processorName, messageId), or KafkaIdempotentRepository (org.apache.camel.processor.idempotent.kafka, camel-kafka) backed by a compacted topic — is what makes the seen-orderIds history outlive any one process.",
+          "sources": [
+            "src-camel-idempotent-eip",
+            "src-camel-sql-jdbc-idempotent-repo",
+            "src-camel-kafka-idempotent-repo",
+            "src-cwiki-idempotent-consumer"
+          ]
+        },
+        {
+          "text": "skipDuplicate(false) paired with a branch on the Exchange.DUPLICATE_MESSAGE property turns a silently-dropped duplicate order into a visible one — the same shape Chapter 16 introduced generically, now aimed specifically at an order a partner's SFTP export re-sent. Left at its default (skipDuplicate(true)), a duplicate order simply vanishes from the route with nothing to show for it, which is the wrong failure mode for a business event someone may later ask \"what happened to order X\" about.",
+          "sources": [
+            "src-camel-idempotent-eip",
+            "src-cwiki-idempotent-consumer"
+          ]
+        },
+        {
+          "text": "removeOnFailure's default (true) removes an order's key from the repository when its exchange ends in an unhandled failure — exactly right for a row that fails validate(): the key comes back out, so once the partner resends a corrected row for the same orderId, the idempotent consumer doesn't block it. But removeOnFailure only fires on a genuinely failed exchange; internally IdempotentOnCompletion checks ExchangeHelper.isFailureHandled(exchange), and an exchange that reached a dead-letter destination via handled(true) is, by definition, failure-handled rather than failed. That means an order dead-lettered after exhausting redeliveries keeps its key in the repository — which is also correct (its idempotency check already passed once; it shouldn't be treated as never-seen), but it has a direct operational consequence: manually replaying that dead-lettered order later must go around the idempotent consumer (or clear that specific key first), because sending it back through direct:toCanonicalOrder normally will have it silently swallowed as a 'duplicate' of the failure that dead-lettered it.",
+          "sources": [
+            "src-nickmck-camel-idempotent-once",
+            "src-camel-idempotent-eip",
+            "src-camel-dead-letter"
+          ]
+        },
+        {
+          "text": "The two failure points this route already had to answer for (Chapter 29's edge cases) split naturally into a business exception and a set of technical ones: PredicateValidationException from validate() is a business rejection — the row is what it is, retrying produces the identical rejection every time — so it gets handled(true) with no redelivery and a route to a rejected-orders destination. HttpOperationFailedException / ConnectException from either enrich() call against the customer or inventory API is a technical failure, plausibly transient, so it gets redelivery with backoff before falling back to a dead letter.",
+          "sources": [
+            "src-camel-exception-clause",
+            "src-camel-redelivery-policy-javadoc",
+            "src-camel-dead-letter"
+          ]
+        },
+        {
+          "text": "A route-wide errorHandler(deadLetterChannel(...)) set as this integration's baseline catches anything not claimed by the two specific onException clauses — a NullPointerException in a bean, a runtime error nobody wrote a policy for — so 'unhandled' still means 'lands on a durable, inspectable destination', not 'silently propagates back to the SFTP consumer thread and potentially aborts file processing.' useOriginalMessage() on that dead letter channel matters here specifically: by the time an exchange fails deep in enrichment or routing, its body has already been reshaped away from the row the partner actually sent, and useOriginalMessage() is what lets a human debugging the dead-letter queue see the order as it originally arrived rather than a partially-enriched intermediate shape.",
+          "sources": [
+            "src-camel-dead-letter",
+            "src-camel-error-handler"
+          ]
+        },
+        {
+          "text": "Testing this route's hardening reuses exactly Chapter 25's tools, aimed at the three new behaviors: AdviceWith swapping the durable JdbcMessageIdRepository for a MemoryIdempotentRepository (a test must not depend on a real database) to prove a duplicate orderId is filtered; a MockEndpoint on the rejected-orders destination to prove a bad row never reaches enrichment; and AdviceWith's weaveByType(OnExceptionDefinition.class) with a zero-delay redelivery policy plus whenExchangeReceived(n, ...) scripting a mocked enrichment endpoint to fail a fixed number of times, proving both that retries happen and that exhaustion lands the order on the dead letter mock — all without a test that sleeps through real backoff or calls a real customer/inventory API.",
+          "sources": [
+            "src-camel-advice-with",
+            "src-camel-mock-component",
+            "src-camel-notify-builder"
+          ]
+        },
+        {
+          "text": "MicrometerRoutePolicyFactory's per-route counters (camel.exchanges.total/succeeded/failed/failures.handled/external.redeliveries) are only as useful as the route ids they're tagged with — Chapter 29's direct: stages beyond orderIntake never called .routeId(...), so Camel auto-assigned generic ids (route2, route3, ...). Giving every stage an explicit, meaningful routeId (parseOrders, toCanonicalOrder, validateOrder, enrichOrder, routeOrder, publishFulfillment) is what turns the automatic metrics into a dashboard that reads 'enrichOrder is where the failures are' instead of 'route4 is failing.'",
+          "sources": [
+            "src-camel-micrometer-adoc"
+          ]
+        },
+        {
+          "text": "camel-mdc promoting orderId into MDC only makes sense from direct:toCanonicalOrder onward — the same seam where the idempotent consumer's key becomes available — while breadcrumbId (set automatically from the SFTP consumer's own message id) is what ties log lines together for the stages before an orderId exists yet (file pickup, CSV unmarshalling). Together the two give every log line in the integration a traceable id, whichever side of the CSV-to-Order boundary it's on.",
+          "sources": [
+            "src-camel-mdc-component-adoc",
+            "src-camel-mdc-manual"
+          ]
+        },
+        {
+          "text": "A readiness-only custom HealthCheck (isLiveness() returning false) against the customer and inventory APIs lets Kubernetes stop routing new order files' enrichment traffic to a pod during a downstream outage without restarting a process that is otherwise perfectly healthy — restarting it would not fix an outage in a system this integration doesn't own, and would only add container-churn on top of an already-degraded dependency.",
+          "sources": [
+            "src-camel-health-check-manual"
+          ]
+        },
+        {
+          "text": "Inline micrometer:counter endpoints at the publish and dead-letter destinations (orders.fulfilled, orders.deadlettered) give an operational dashboard a business-level signal — orders actually shipped, orders that needed a human — that the automatic per-route camel.exchanges.* counters don't: those count exchanges through a technical stage, not domain outcomes a business stakeholder would recognize on a dashboard.",
+          "sources": [
+            "src-camel-micrometer-adoc"
+          ]
+        }
+      ],
+      "snippets": [
+        {
+          "lang": "java",
+          "code": "@Bean\nJdbcMessageIdRepository orderIdRepository(DataSource dataSource) {\n    return new JdbcMessageIdRepository(dataSource, \"orderIntegration\");\n}\n\nfrom(\"direct:toCanonicalOrder\")\n    .routeId(\"toCanonicalOrder\")\n    .bean(OrderMapper.class, \"fromCsvRow\")\n    .idempotentConsumer(simple(\"${body.orderId}\"), orderIdRepository)\n        .skipDuplicate(false)\n        .choice()\n            .when(exchangeProperty(Exchange.DUPLICATE_MESSAGE).isEqualTo(true))\n                .log(LoggingLevel.WARN, \"Duplicate order ${body.orderId} \\u2014 already processed\")\n                .to(\"direct:duplicateOrders\")\n            .otherwise()\n                .to(\"direct:validateOrder\")\n        .end()\n    .end();",
+          "note": "The idempotent check sits right after the mapper bean, the earliest point orderId exists; skipDuplicate(false) routes a caught duplicate to its own destination instead of dropping it silently.",
+          "sources": [
+            "src-camel-idempotent-eip",
+            "src-camel-sql-jdbc-idempotent-repo"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "onException(PredicateValidationException.class)\n    .routeId(\"validationFailurePolicy\")\n    .handled(true)\n    .useOriginalMessage()\n    .log(LoggingLevel.WARN, \"Rejecting order (validation failed): ${exception.message}\")\n    .to(\"direct:rejectedOrders\");\n\nonException(ConnectException.class, HttpOperationFailedException.class)\n    .maximumRedeliveries(5)\n    .redeliveryDelay(2000)\n    .backOffMultiplier(2)\n    .useExponentialBackOff()\n    .useCollisionAvoidance()\n    .maximumRedeliveryDelay(30000)\n    .retriesExhaustedLogLevel(LoggingLevel.ERROR)\n    .handled(true)\n    .useOriginalMessage()\n    .to(\"direct:orderDeadLetter\");\n\nerrorHandler(deadLetterChannel(\"direct:orderDeadLetter\")\n    .useOriginalMessage()\n    .maximumRedeliveries(2)\n    .redeliveryDelay(1000));",
+          "note": "Two onException clauses splitting business (no retry) from technical (redelivery + backoff + jitter) failures, plus a route-wide Dead Letter Channel as the catch-all for anything neither clause claims.",
+          "sources": [
+            "src-camel-exception-clause",
+            "src-camel-redelivery-policy-javadoc",
+            "src-camel-dead-letter"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:orderDeadLetter\")\n    .routeId(\"orderDeadLetter\")\n    .marshal().json(JsonLibrary.Jackson)\n    .to(\"micrometer:counter:orders.deadlettered\")\n    .to(\"kafka:order.integration.dlq?brokers={{kafka.brokers}}\");",
+          "note": "A durable, inspectable DLQ topic (not a log line) so an exhausted order can be diagnosed and, once the root cause is fixed, deliberately replayed — never auto-replayed wholesale.",
+          "sources": [
+            "src-camel-dead-letter",
+            "src-activemq-dlq-handling",
+            "src-camel-micrometer-adoc"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "class OrderIdempotencyTest extends CamelTestSupport {\n\n    @Override\n    protected RouteBuilder createRouteBuilder() { return new OrderIntegrationRoute(); }\n\n    @Override\n    public boolean isUseAdviceWith() { return true; }\n\n    @Test\n    void secondCopyOfSameOrderIdIsFiltered() throws Exception {\n        context.getRouteDefinition(\"toCanonicalOrder\").adviceWith(context, new AdviceWithRouteBuilder() {\n            @Override\n            public void configure() {\n                weaveByType(IdempotentConsumerDefinition.class)\n                    .selectFirst()\n                    .replace()\n                    .idempotentConsumer(simple(\"${body.orderId}\"), MemoryIdempotentRepository.memoryIdempotentRepository(1000))\n                        .skipDuplicate(false)\n                        .to(\"mock:afterIdempotent\");\n            }\n        });\n        context.start();\n\n        MockEndpoint afterIdempotent = getMockEndpoint(\"mock:afterIdempotent\");\n        afterIdempotent.expectedMessageCount(2);\n\n        Order order = new Order(\"ORD-42\", \"SKU-1\", 3);\n        template.sendBody(\"direct:toCanonicalOrder\", order);\n        template.sendBody(\"direct:toCanonicalOrder\", order);\n\n        afterIdempotent.assertIsSatisfied();\n        Exchange second = afterIdempotent.getExchanges().get(1);\n        assertTrue(second.getProperty(Exchange.DUPLICATE_MESSAGE, Boolean.class));\n    }\n}",
+          "note": "AdviceWith swaps the durable JdbcMessageIdRepository for an in-memory one for the test only; both sends reach the mock (skipDuplicate(false)) so the test can assert the second one is flagged rather than just counting messages.",
+          "sources": [
+            "src-camel-advice-with",
+            "src-camel-mock-component",
+            "src-camel-idempotent-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "@Test\nvoid enrichmentFailureRetriesThenDeadLetters() throws Exception {\n    context.getRouteDefinition(\"enrichOrder\").adviceWith(context, new AdviceWithRouteBuilder() {\n        @Override\n        public void configure() {\n            weaveByType(OnExceptionDefinition.class)\n                .selectFirst()\n                .replace()\n                .onException(ConnectException.class)\n                    .maximumRedeliveries(3)\n                    .redeliveryDelay(0)\n                    .handled(true)\n                    .to(\"mock:orderDeadLetter\");\n            weaveByToUri(\"http://customer-api*\").replace().to(\"mock:customerApi\");\n        }\n    });\n    context.start();\n\n    MockEndpoint customerApi = getMockEndpoint(\"mock:customerApi\");\n    customerApi.whenExchangeReceived(0, e -> { throw new ConnectException(\"down\"); });\n    customerApi.whenExchangeReceived(1, e -> { throw new ConnectException(\"down\"); });\n\n    MockEndpoint deadLetter = getMockEndpoint(\"mock:orderDeadLetter\");\n    deadLetter.expectedMessageCount(1);\n\n    template.sendBody(\"direct:enrichOrder\", new Order(\"ORD-43\", \"SKU-2\", 1));\n\n    deadLetter.assertIsSatisfied();\n}",
+          "note": "Zero-delay redelivery policy proves the retry-then-dead-letter behavior without waiting through real backoff timings; weaveByToUri swaps the real customer API endpoint for a mock scripted to fail twice.",
+          "sources": [
+            "src-camel-advice-with",
+            "src-camel-mock-component"
+          ]
+        },
+        {
+          "lang": "properties",
+          "code": "camel.mdc.enabled=true\ncamel.mdc.customHeaders=orderId,tenantId",
+          "note": "Promotes the orderId header into SLF4J MDC from direct:toCanonicalOrder onward, so every log line for an order's journey can be grepped by orderId in addition to Camel's own breadcrumbId.",
+          "sources": [
+            "src-camel-mdc-component-adoc"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "public class DownstreamOrderApisHealthCheck extends AbstractHealthCheck {\n    public DownstreamOrderApisHealthCheck() { super(\"custom\", \"order-integration-apis\"); }\n\n    @Override\n    protected void doCall(HealthCheckResultBuilder builder, Map<String, Object> options) {\n        if (customerApiClient.isReachable() && inventoryApiClient.isReachable()) {\n            builder.up();\n        } else {\n            builder.down().message(\"customer-api or inventory-api unreachable\");\n        }\n    }\n\n    @Override\n    public boolean isLiveness() { return false; }\n}",
+          "note": "Readiness-only: an outage in either enrichment dependency should stop new order files being routed to this pod, not restart a healthy process.",
+          "sources": [
+            "src-camel-health-check-manual"
+          ]
+        }
+      ],
+      "pitfalls": [
+        "Placing idempotentConsumer() before OrderMapper.fromCsvRow has run: orderId doesn't exist yet on a raw CSV row-map, so the key expression evaluates against nothing stable.",
+        "Shipping MemoryIdempotentRepository to production for this route: a restart of the SFTP consumer or the whole application loses every previously-seen orderId, so a file re-picked-up after a crash duplicates every order it contains.",
+        "Assuming removeOnFailure's default keeps a dead-lettered order's key removed the same way a plain validation failure does — a handled(true) dead letter is failure-handled, not failed, so the key stays; a manual replay of that dead-lettered order must bypass the idempotent consumer or it will be silently treated as an already-seen duplicate.",
+        "Giving the technical-exception onException clause no maximumRedeliveryDelay alongside useExponentialBackOff() — a burst of enrichment failures can compute delays that grow unboundedly without a cap.",
+        "Leaving every direct: stage without an explicit routeId: MicrometerRoutePolicyFactory still produces per-route counters, but they're tagged route2, route3, ... instead of validateOrder, enrichOrder — technically complete metrics that are practically useless on a dashboard.",
+        "Testing the redelivery-then-dead-letter behavior by actually waiting through real redeliveryDelay/backOffMultiplier timings instead of swapping in a zero-delay policy for the test — slow and flaky under CI load for no extra confidence.",
+        "Treating a customer-API or inventory-API outage as a liveness failure instead of a readiness failure — restarting this integration's own pod does nothing to fix a downstream system it doesn't control."
+      ],
+      "furtherReading": [
+        "src-camel-idempotent-eip",
+        "src-camel-dead-letter",
+        "src-camel-exception-clause",
+        "src-camel-advice-with",
+        "src-camel-mock-component",
+        "src-camel-micrometer-adoc",
+        "src-camel-mdc-component-adoc",
+        "src-camel-health-check-manual",
+        "src-nickmck-camel-idempotent-once"
+      ]
+    },
     "designing-maintainable-camel-applications": {}
   },
   "volatile": [
