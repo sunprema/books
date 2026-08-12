@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Multicast and Recipient Lists &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part IV &mdash; Core Integration Patterns</span> &middot; Chapter 14</p>
+    <p class="chapter-no">14</p>
+    <h1 data-anchor="mrl-h1">Multicast and Recipient Lists</h1>
+
+    <p class="lede" data-anchor="mrl-lede">Chapter 12's <code>toD()</code> answered "which one destination should
+    this exchange go to, computed at runtime?" Chapter 13's <code>split()</code> answered "how do I turn one exchange
+    into many, so each part gets its own trip through the route?" Neither one answers a question that comes up just
+    as often: the same, whole exchange &mdash; not a part of it &mdash; genuinely needs to reach <em>more than one
+    place</em>. An order confirmation needs to hit an audit log, a notification service, and an analytics pipeline,
+    all three, every time. A multi-warehouse order needs to notify whichever warehouses actually stock its line
+    items &mdash; a list that's a different length for every order. That's what this chapter covers:
+    <span class="term">Multicast</span>, for a fixed set of destinations declared right in the route, and
+    <span class="term">Recipient List</span>, for a destination set computed per message. They turn out to be close
+    enough under the hood that the difference is really just one question &mdash; are the destinations known when
+    you write the route, or only when a message arrives? &mdash; and everything else follows from the answer.</p>
+
+    <h2 data-anchor="mrl-h2-multicast">multicast(): a fixed fan-out, declared in the route</h2>
+    <p data-anchor="mrl-p-multicast1"><code>multicast()</code> sends a copy of the incoming exchange to every
+    destination chained inside its block. Each destination gets its own independent copy &mdash; same body, same
+    headers, same properties &mdash; so nothing one branch does to its copy leaks into another's. The destinations
+    themselves are just <code>.to()</code> calls, written in the route's source, identical for every message that
+    passes through:</p>
+
+    <div class="pre-label">Every order confirmation goes to all three, every time</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orderConfirmed"</span>)
+    .<span class="fn">multicast</span>()
+        .<span class="kw">to</span>(<span class="str">"jms:queue:audit.orders"</span>)
+        .<span class="kw">to</span>(<span class="str">"bean:notificationService?method=orderConfirmed"</span>)
+        .<span class="kw">to</span>(<span class="str">"kafka:analytics.order-events"</span>)
+    .<span class="fn">end</span>();</code></pre>
+
+    <p data-anchor="mrl-p-multicast2">Read that route and you've seen every destination &mdash; there's nothing to
+    look up at runtime, nothing hiding behind a header value. That's <code>multicast()</code>'s whole appeal: use it
+    when the fan-out list is a property of the <em>integration</em>, not of any particular message.</p>
+
+    <figure class="diagram-fig" data-anchor="mrl-fig-multicast">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="mrlD1t">
+        <title id="mrlD1t">One order-confirmed exchange enters multicast(); a copy is sent to each of three fixed destinations declared in the route: an audit queue, a notification bean, and an analytics topic</title>
+
+        <rect x="16" y="76" width="120" height="40" class="stroke fill-soft"/>
+        <text x="26" y="100" class="big">1 exchange</text>
+        <text x="26" y="114" class="dim">order confirmed</text>
+
+        <path d="M136 96 L192 96" class="stroke"/>
+        <path d="M184 92 L192 96 L184 100" class="stroke"/>
+        <rect x="192" y="70" width="82" height="52" class="stroke fill-red"/>
+        <text x="202" y="101" class="mono on-ink">multicast()</text>
+
+        <path d="M274 82 L330 82 L330 24 L380 24" class="stroke-soft dash"/>
+        <path d="M274 96 L380 96" class="stroke-soft dash"/>
+        <path d="M274 110 L330 110 L330 168 L380 168" class="stroke-soft dash"/>
+
+        <rect x="380" y="8" width="164" height="32" class="stroke fill-none"/>
+        <text x="392" y="29" class="mono">audit.orders</text>
+        <rect x="380" y="80" width="164" height="32" class="stroke fill-none"/>
+        <text x="392" y="101" class="mono">notificationService</text>
+        <rect x="380" y="152" width="164" height="32" class="stroke fill-none"/>
+        <text x="392" y="173" class="mono">analytics.order-events</text>
+
+        <text x="16" y="150" class="dim">same three destinations,</text>
+        <text x="16" y="164" class="dim">written in the route, every message</text>
+      </svg>
+      <figcaption>multicast() copies the exchange once per declared destination; the set of destinations never changes between messages.</figcaption>
+    </figure>
+
+    <div class="callout warn" data-anchor="mrl-callout-default-agg">
+      <span class="callout-title">No AggregationStrategy means only the last reply survives</span>
+      <p>Leave <code>multicast()</code> exactly as written above and ask, same as Chapter 13 asked about
+      <code>split()</code>: what does the exchange look like after <code>.end()</code>? Camel's answer, with no
+      strategy supplied, is the same quiet drop &mdash; the outgoing exchange becomes whatever the <em>last</em>
+      destination's reply turned into, and every earlier destination's result (and any exception it raised) is
+      simply gone. It's not a coincidence that this reads like Chapter 13's warning: Camel's own documentation
+      describes multicast as the baseline processor that both <code>split()</code> and <code>recipientList()</code>
+      are built on &mdash; same engine, same default, same trap.</p>
+    </div>
+
+    <h2 data-anchor="mrl-h2-parallel">Running the fan-out in parallel, and what happens when one branch fails</h2>
+    <p data-anchor="mrl-p-parallel1">If you want the fan-out's three destinations combined into one result instead
+    of discarded down to one, give <code>multicast()</code> an <code>AggregationStrategy</code> &mdash; the exact
+    same <code>aggregate(Exchange oldExchange, Exchange newExchange)</code> interface from Chapter 13, called once
+    per destination, <code>oldExchange</code> <code>null</code> on the first call. Add <code>.parallelProcessing()</code>
+    to run the destinations concurrently instead of one after another, and <code>.timeout(ms)</code> to bound how
+    long the whole fan-out is allowed to take:</p>
+
+    <div class="pre-label">Same three destinations, run concurrently and folded into one result</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orderConfirmed"</span>)
+    .<span class="fn">multicast</span>(<span class="kw">new</span> OrderFanOutAggregationStrategy())
+        .<span class="fn">parallelProcessing</span>()
+        .<span class="fn">stopOnException</span>()
+        .<span class="fn">timeout</span>(<span class="num">3000</span>)
+        .<span class="kw">to</span>(<span class="str">"jms:queue:audit.orders"</span>)
+        .<span class="kw">to</span>(<span class="str">"bean:notificationService?method=orderConfirmed"</span>)
+        .<span class="kw">to</span>(<span class="str">"kafka:analytics.order-events"</span>)
+    .<span class="fn">end</span>()
+    .<span class="kw">to</span>(<span class="str">"direct:orderFanOutComplete"</span>);</code></pre>
+
+    <p data-anchor="mrl-p-parallel2"><code>.parallelProcessing()</code> changes how the three destinations run, not
+    whether the route waits for them &mdash; the calling thread still blocks at the <code>multicast()</code> block
+    until all three finish, same as <code>split()</code>'s parallel mode in the last chapter. And with a custom
+    strategy in play, <code>aggregate()</code> may now be invoked from more than one thread at once; Camel
+    synchronizes those calls for you by default, so it's safe even if your strategy isn't written to be
+    thread-safe on its own.</p>
+
+    <div class="callout warn" data-anchor="mrl-callout-stoponexception">
+      <span class="callout-title">stopOnException isn't the default &mdash; a failing branch doesn't stop its siblings</span>
+      <p>Left unset, Camel keeps sending to every remaining destination even after one of them throws: the
+      exception is recorded on <em>that destination's own exchange</em>, and if you've supplied an
+      <code>AggregationStrategy</code>, it's up to that strategy's <code>aggregate()</code> method to notice
+      <code>newExchange.getException()</code> and decide what to do about it. Nothing forces you to check &mdash;
+      an aggregation strategy that only ever reads a successful body will swallow a failed branch just as quietly
+      as the missing-strategy trap above does. <code>stopOnException()</code> is the other option: it aborts the
+      whole fan-out the instant any one destination throws, and sends that exception straight to the route's error
+      handler instead. Neither is "more correct" &mdash; a partial audit-log failure probably shouldn't block order
+      confirmation; a partial payment fan-out probably should stop everything. Choose deliberately, per route.</p>
+    </div>
+
+    <h2 data-anchor="mrl-h2-recipientlist">recipientList(): the same fan-out, with a computed destination list</h2>
+    <p data-anchor="mrl-p-recipientlist1">Now the case <code>multicast()</code> can't handle: an order that needs to
+    notify whichever warehouses actually stock its line items &mdash; one warehouse for a small order, four for a
+    large one, a list whose length and contents are decided per message, not per route. <code>recipientList()</code>
+    is <code>multicast()</code> with one thing changed: instead of a chain of literal <code>.to()</code> calls, you
+    give it an expression, evaluated once per exchange, whose result becomes the destination list.</p>
+
+    <div class="pre-label">Which warehouses, computed per order</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orderConfirmed"</span>)
+    .<span class="fn">recipientList</span>(<span class="fn">header</span>(<span class="str">"WarehouseTargets"</span>))
+        .<span class="fn">ignoreInvalidEndpoints</span>()
+    .<span class="fn">end</span>();
+
+<span class="cm">// A bean upstream sets a per-order, comma-delimited header, e.g.:</span>
+<span class="cm">// exchange.getMessage().setHeader("WarehouseTargets",</span>
+<span class="cm">//     "jms:queue:warehouse.west,jms:queue:warehouse.east");</span></code></pre>
+
+    <p data-anchor="mrl-p-recipientlist2">If the expression's result is a <code>String</code>, Camel splits it into
+    individual endpoint URIs on a delimiter &mdash; a comma by default, trimming whitespace around each one &mdash;
+    and re-configurable for values that legitimately contain commas: <code>recipientList(header("WarehouseTargets"),
+    ";")</code>. If the expression already evaluates to a <code>List</code> or other <code>Collection</code> of
+    URIs &mdash; built by a bean instead of assembled as delimited text &mdash; Camel uses it directly, no
+    string-splitting step at all. <code>ignoreInvalidEndpoints()</code> is the option multicast never needed: skip a
+    computed URI that doesn't resolve to a real endpoint, instead of failing the whole exchange over one bad entry
+    in a list nobody wrote by hand.</p>
+
+    <figure class="diagram-fig" data-anchor="mrl-fig-recipientlist">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="mrlD2t">
+        <title id="mrlD2t">Two different order exchanges enter recipientList(); each evaluates its own WarehouseTargets header into a different-length list of destinations, computed per message rather than fixed in the route</title>
+
+        <rect x="16" y="24" width="150" height="34" class="stroke fill-soft"/>
+        <text x="26" y="46" class="mono">order A &middot; 1 warehouse</text>
+        <rect x="16" y="132" width="150" height="34" class="stroke fill-soft"/>
+        <text x="26" y="154" class="mono">order B &middot; 3 warehouses</text>
+
+        <path d="M166 41 L230 41 L230 92 L268 92" class="stroke-soft dash"/>
+        <path d="M166 149 L230 149 L230 96 L268 96" class="stroke-soft dash"/>
+
+        <rect x="268" y="70" width="104" height="44" class="stroke fill-red"/>
+        <text x="278" y="97" class="mono on-ink">recipientList()</text>
+
+        <path d="M372 78 L420 40" class="stroke-soft dash"/>
+        <path d="M372 92 L420 92" class="stroke-soft dash"/>
+        <path d="M372 92 L420 122" class="stroke-soft dash"/>
+        <path d="M372 92 L420 158" class="stroke-soft dash"/>
+
+        <rect x="420" y="26" width="124" height="28" class="stroke fill-none"/>
+        <text x="430" y="45" class="mono">warehouse.west</text>
+        <rect x="420" y="78" width="124" height="28" class="stroke fill-none"/>
+        <text x="430" y="97" class="mono">warehouse.east</text>
+        <rect x="420" y="108" width="124" height="28" class="stroke fill-none"/>
+        <text x="430" y="127" class="mono">warehouse.south</text>
+        <rect x="420" y="144" width="124" height="28" class="stroke fill-none"/>
+        <text x="430" y="163" class="mono">warehouse.north</text>
+
+        <text x="16" y="112" class="dim">same expression, different list length per exchange</text>
+      </svg>
+      <figcaption>recipientList() evaluates its expression fresh for every exchange &mdash; the destination list is a property of the message, not the route.</figcaption>
+    </figure>
+
+    <p data-anchor="mrl-p-recipientlist3">Everything else about <code>recipientList()</code> is the option set you
+    already know from <code>multicast()</code>: <code>parallelProcessing()</code>, <code>stopOnException()</code>, an
+    <code>AggregationStrategy</code>, <code>.timeout()</code> &mdash; because underneath, it's the same fan-out
+    engine, aimed at a list it computed instead of a list you wrote.</p>
+
+    <div class="callout key" data-anchor="mrl-callout-cachesize">
+      <span class="callout-title">cacheSize: bound the producers a computed list can create</span>
+      <p><code>multicast()</code>'s handful of literal <code>.to()</code> calls reuse the same few producers for
+      the life of the route &mdash; nothing to bound. A recipient list can compute a genuinely different set of URIs
+      on every message; left unbounded, Camel's <code>ProducerCache</code> would keep every distinct endpoint it has
+      ever seen warm indefinitely. Set <code>cacheSize</code> deliberately once the possible destination space is
+      large or unbounded &mdash; per-customer queues, for instance &mdash; the same high-cardinality caution
+      Chapter 12 raised for <code>toD()</code>'s cache, applied here to a whole computed list instead of one
+      computed destination:</p>
+      <pre><code><span class="kw">from</span>(<span class="str">"direct:orderConfirmed"</span>)
+    .<span class="fn">recipientList</span>(<span class="fn">header</span>(<span class="str">"WarehouseTargets"</span>), <span class="str">";"</span>)
+        .<span class="fn">cacheSize</span>(<span class="num">50</span>)
+    .<span class="fn">end</span>();</code></pre>
+    </div>
+
+    <h2 data-anchor="mrl-h2-compare">One destination, a fixed set, or a computed set &mdash; three related tools</h2>
+    <p data-anchor="mrl-p-compare1">Chapter 12's <code>toD()</code> and this chapter's <code>recipientList()</code>
+    are easy to blur together &mdash; both compute something from an expression at runtime. The difference is
+    cardinality: <code>toD()</code> computes exactly <em>one</em> destination per exchange; <code>recipientList()</code>
+    computes <em>zero, one, or many</em>. Reach for <code>toD()</code> when a message goes to exactly one place that
+    varies by message. Reach for <code>recipientList()</code> when the same message may need to reach several places
+    at once, and which ones varies by message. And reach for plain <code>multicast()</code> when the "which ones"
+    part never varies at all &mdash; when the honest answer is "always these three," writing them as literal
+    <code>.to()</code> calls is more legible than routing a fixed answer through a header nobody ever changes.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Three send-to-more-than-one-computed-thing tools, side by side</caption>
+        <thead>
+          <tr><th>EIP</th><th>Destination count</th><th>Destinations decided</th><th>Covered in</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>toD()</code></td><td>exactly one</td><td>per exchange, from an expression</td><td>Chapter 12</td></tr>
+          <tr><td><code>multicast()</code></td><td>a fixed set</td><td>once, when the route is written</td><td>this chapter</td></tr>
+          <tr><td><code>recipientList()</code></td><td>zero, one, or many</td><td>per exchange, from an expression</td><td>this chapter</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pullquote" data-anchor="mrl-pullquote">multicast(), split(), and recipientList() aren't three
+    unrelated patterns that happen to share a name &mdash; Camel documents multicast as the baseline engine the
+    other two are built on. Same options, same AggregationStrategy contract, same default of quietly keeping only
+    the last result if you never ask for more. What changes between them is only what gets fanned out: a fixed
+    endpoint list, a computed endpoint list, or the parts of one exchange that was split before any of this began.</div>
+
+    <h2 data-anchor="mrl-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="mrl-p-reflection">A way to answer "how many places should this one message reach," cleanly
+    separated from Chapter 13's "how many messages should this become." <code>multicast()</code> covers the fan-out
+    that's a property of the integration &mdash; always these destinations, written where anyone reading the route
+    can see them. <code>recipientList()</code> covers the fan-out that's a property of the message &mdash; a
+    destination list computed fresh per exchange, with <code>ignoreInvalidEndpoints()</code> and <code>cacheSize</code>
+    as the two extra knobs that computed list needs and a fixed one never did. Both default to the same quiet,
+    last-reply-wins trap without an explicit <code>AggregationStrategy</code>, and both leave <code>stopOnException()</code>
+    off by default, so a partial failure keeps going unless you say otherwise. The next chapter turns the direction
+    of these ideas around: instead of sending one message to several places, <span class="term">Message
+    Enrichment</span> pulls data <em>in</em> from a second place to complete the message you already have.</p>
+
+    <div class="review" data-anchor="mrl-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A <code>multicast()</code> block has three <code>.to()</code> destinations and no
+        <code>AggregationStrategy</code>. What does the exchange look like after <code>.end()</code>, and which
+        earlier chapter's default does this match?</li>
+        <li>You need to notify exactly one region-specific queue per order, computed from a header, and separately,
+        notify every warehouse that stocks any line item in that same order, also computed from a header. Which EIP
+        handles which case, and what's the cardinality difference that decides it?</li>
+        <li>A recipient list route sets <code>parallelProcessing()</code> but leaves <code>stopOnException()</code>
+        unset, and one of the four computed destinations throws. What happens to the other three destinations, and
+        where does the failing destination's exception end up?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="13-message-splitting-and-aggregation.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="15-message-enrichment.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

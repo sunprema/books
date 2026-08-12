@@ -185,6 +185,13 @@
       "accessed": "2026-08-12"
     },
     {
+      "id": "src-camel-multicast-eip",
+      "url": "https://camel.apache.org/components/4.18.x/eips/multicast-eip.html",
+      "title": "Multicast EIP",
+      "kind": "official-docs",
+      "accessed": "2026-08-12"
+    },
+    {
       "id": "src-camel-recipientlist-eip",
       "url": "https://camel.apache.org/components/4.18.x/eips/recipientList-eip.html",
       "title": "Recipient List EIP",
@@ -2194,7 +2201,109 @@
         "src-eip-hohpe-woolf"
       ]
     },
-    "multicast-and-recipient-lists": {},
+    "multicast-and-recipient-lists": {
+      "researched": "2026-08-12",
+      "claims": [
+        {
+          "text": "Multicast (Camel's multicast() EIP) sends a copy of one incoming exchange to a fixed set of endpoints declared right in the route — the destinations are the .to() calls chained inside the multicast() block, baked into the route's source and identical for every message that passes through.",
+          "sources": [
+            "src-camel-multicast-eip"
+          ]
+        },
+        {
+          "text": "Recipient List (Camel's recipientList() EIP) sends a copy of one incoming exchange to a set of endpoints computed at runtime from an expression evaluated per exchange (commonly a header). If the expression's result is a String, Camel splits it into individual endpoint URIs on a delimiter (default a comma, re-configurable, e.g. recipientList(header(\"targets\"), \";\")), trimming whitespace around each URI; if the expression already evaluates to a List/Collection of URIs, Camel uses it directly with no string-splitting step.",
+          "sources": [
+            "src-camel-recipientlist-eip"
+          ]
+        },
+        {
+          "text": "Camel's own documentation describes Multicast as the baseline implementation that both the Recipient List and the Splitter EIPs are built on — the same underlying processor, the same core option set (parallelProcessing, stopOnException, aggregationStrategy, timeout, streaming), and the same AggregationStrategy.aggregate(oldExchange, newExchange) contract apply to all three; they differ in what gets multicast (a fixed endpoint list, a runtime-computed endpoint list, or the parts of one already-split body) rather than in the machinery that fans a message out and folds results back.",
+          "sources": [
+            "src-camel-multicast-eip"
+          ]
+        },
+        {
+          "text": "By default multicast() (and recipientList()) processes its destinations sequentially, on the calling thread, in declared/list order. parallelProcessing() switches to running the destinations concurrently on Camel's executor service (a default one, or a custom executorService() you supply) — but the calling thread still blocks at the multicast/recipientList block until every destination has finished, the same \"parallel changes how the parts run, not whether the route waits\" shape as split()'s parallelProcessing().",
+          "sources": [
+            "src-camel-multicast-eip",
+            "src-camel-recipientlist-eip"
+          ]
+        },
+        {
+          "text": "Left with no explicit AggregationStrategy, multicast() and recipientList() both default to keeping only the last destination's reply as the outgoing exchange once the block finishes — every earlier destination's result (and any exception attached to it) is silently discarded, the same UseLatestAggregationStrategy-shaped quiet drop that split() defaults to without a strategy.",
+          "sources": [
+            "src-camel-multicast-eip"
+          ]
+        },
+        {
+          "text": "stopOnException (default false) controls what happens when one destination throws: left at its default, Camel still sends to every remaining destination even after one has failed, records the exception on that destination's own exchange, and (with an AggregationStrategy in place) leaves it to that strategy's aggregate() to inspect newExchange.getException() per branch and decide how to react. Setting stopOnException(true) instead aborts the whole multicast/recipientList the moment any one destination throws, and propagates that exception straight to the route's error handler.",
+          "sources": [
+            "src-camel-multicast-eip"
+          ]
+        },
+        {
+          "text": "Recipient List carries two options multicast has no use for, both consequences of its destinations being computed rather than fixed: ignoreInvalidEndpoints() skips a runtime-computed URI that doesn't resolve to a real endpoint instead of failing the whole exchange, and cacheSize bounds how many distinct dynamically-resolved endpoint producers Camel's ProducerCache keeps warm — important because, unlike multicast's handful of literal .to() calls, a recipient list can compute a different set of destination URIs on every single message.",
+          "sources": [
+            "src-camel-recipientlist-eip"
+          ]
+        },
+        {
+          "text": "Recipient List and Dynamic To (toD(), covered in the Content-Based Routing chapter) solve adjacent but distinct problems: toD() computes exactly one destination per exchange from an expression; recipientList() computes a list of zero, one, or many destinations per exchange from an expression. Reach for toD() when a message goes to exactly one place that varies by message; reach for recipientList() when the same message may need to reach several places at once, and which ones varies by message.",
+          "sources": [
+            "src-camel-tod-eip",
+            "src-camel-recipientlist-eip"
+          ]
+        }
+      ],
+      "snippets": [
+        {
+          "lang": "java",
+          "code": "from(\"direct:orderConfirmed\")\n    .multicast()\n        .to(\"jms:queue:audit.orders\")\n        .to(\"bean:notificationService?method=orderConfirmed\")\n        .to(\"kafka:analytics.order-events\")\n    .end();",
+          "note": "A fixed, always-the-same set of three destinations — every order-confirmed event goes to all three, every time; reading the route shows every destination with nothing left to look up at runtime.",
+          "sources": [
+            "src-camel-multicast-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:orderConfirmed\")\n    .multicast(new OrderFanOutAggregationStrategy())\n        .parallelProcessing()\n        .stopOnException()\n        .timeout(3000)\n        .to(\"jms:queue:audit.orders\")\n        .to(\"bean:notificationService?method=orderConfirmed\")\n        .to(\"kafka:analytics.order-events\")\n    .end()\n    .to(\"direct:orderFanOutComplete\");",
+          "note": "Same three destinations, run concurrently with a bounded total wait, folded into one result by an AggregationStrategy with the identical oldExchange/newExchange shape used by split() and aggregate() in Chapter 13; stopOnException aborts the whole fan-out (instead of silently continuing) the moment any one destination throws.",
+          "sources": [
+            "src-camel-multicast-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:orderConfirmed\")\n    .recipientList(header(\"WarehouseTargets\"))\n        .ignoreInvalidEndpoints()\n    .end();\n\n// A bean upstream sets a per-order, comma-delimited header, e.g.:\n// exchange.getMessage().setHeader(\"WarehouseTargets\",\n//     \"jms:queue:warehouse.west,jms:queue:warehouse.east\");",
+          "note": "The destination list is computed per order (which warehouses stock any of its line items) rather than fixed in the route; ignoreInvalidEndpoints() skips a warehouse queue name that doesn't resolve instead of failing the whole order.",
+          "sources": [
+            "src-camel-recipientlist-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:orderConfirmed\")\n    .recipientList(header(\"WarehouseTargets\"), \";\")\n        .cacheSize(50)\n    .end();",
+          "note": "A re-configured delimiter (for values that may legitimately contain commas) and an explicit cacheSize bounding how many distinct warehouse-queue producers stay warm in the ProducerCache — the same high-cardinality caution toD()'s cacheSize raised in Chapter 12, here applied to a whole computed list instead of one computed destination.",
+          "sources": [
+            "src-camel-recipientlist-eip",
+            "src-camel-tod-eip"
+          ]
+        }
+      ],
+      "pitfalls": [
+        "Writing multicast()/recipientList() with no AggregationStrategy and expecting a combined result downstream — you get the last destination's reply and nothing else, with every earlier destination's result (and any exception it raised) silently gone, the exact failure shape Chapter 13 warned about for split().",
+        "Assuming parallelProcessing() lets the route continue past the multicast/recipientList block before every destination finishes — it changes how the destinations run, not whether the calling thread waits for all of them.",
+        "Reaching for recipientList() when the destination set is actually always the same — that trades multicast()'s \"read the route, see every destination\" clarity for a runtime lookup with nothing to show for it.",
+        "Leaving cacheSize at its default on a recipient list that can compute a very high-cardinality destination set (e.g., a per-customer queue name) — the ProducerCache can thrash, the same caution the Content-Based Routing chapter raised for a high-cardinality toD() expression.",
+        "Assuming stopOnException() is the default — it isn't; left unset, a failing destination doesn't stop its siblings, so a partial failure can go unnoticed unless the AggregationStrategy is written to actually check each branch's exchange.getException()."
+      ],
+      "furtherReading": [
+        "src-camel-multicast-eip",
+        "src-camel-recipientlist-eip",
+        "src-camel-tod-eip",
+        "src-camel-eips"
+      ]
+    },
     "message-enrichment": {},
     "reliable-message-delivery": {},
     "asynchronous-integration-patterns": {},
