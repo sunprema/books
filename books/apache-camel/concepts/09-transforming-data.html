@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Transforming Data &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Working with Messages</span> &middot; Chapter 09</p>
+    <p class="chapter-no">09</p>
+    <h1 data-anchor="xform-h1">Transforming Data</h1>
+
+    <p class="lede" data-anchor="xform-lede">Last chapter opened the Exchange and showed you exactly what's
+    inside it &mdash; body, headers, properties, pattern, exception &mdash; but it didn't change a single one
+    of them. This chapter does. Camel gives you three ways to transform a message, and they aren't
+    interchangeable stylistic choices: they're three different weights of tool, and picking the wrong one is
+    how a two-line change turns into forty lines of Java nobody wants to test. We'll also come back to type
+    conversion from Chapter 08 and finally open the box it was hiding: where those converters actually come
+    from, and how to write your own.</p>
+
+    <h2 data-anchor="xform-h2-three">Three tools, one job, escalating weight</h2>
+    <p data-anchor="xform-p-three1">Every transformation in a Camel route is one of three shapes. A
+    <span class="term">Simple expression</span> is the lightest: a short string evaluated inline by the DSL,
+    no Java class of its own. A <span class="term">bean method</span> is one step heavier: an ordinary Java
+    method, already written, that Camel calls and feeds the message into. A <span class="term">Processor</span>
+    is the heaviest and most capable: a full block of Java with the entire Exchange in hand &mdash; body,
+    headers, properties, exception, all of it. None of the three is "correct." The skill is reaching for the
+    lightest one that actually does the job, and only climbing the stack when the job genuinely needs it.</p>
+
+    <figure class="diagram-fig" data-anchor="xform-fig-tiers">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="xformD1t">
+        <title id="xformD1t">Simple expressions are the lightest transformation tool, bean methods are one step heavier, and Processors are the heaviest but most capable</title>
+
+        <rect x="60" y="16" width="440" height="36" class="stroke fill-red"/>
+        <text x="72" y="39" class="big on-ink">Simple expression &mdash; setBody / setHeader / filter</text>
+
+        <rect x="60" y="66" width="440" height="36" class="stroke fill-soft"/>
+        <text x="72" y="89" class="big">Bean method &mdash; an existing POJO, no Exchange import</text>
+
+        <rect x="60" y="116" width="440" height="36" class="stroke fill-soft"/>
+        <text x="72" y="139" class="big">Processor &mdash; arbitrary Java, full Exchange access</text>
+
+        <text x="512" y="39" class="dim">lightest</text>
+        <text x="512" y="139" class="dim">heaviest</text>
+      </svg>
+      <figcaption>Start at the top. Climb down only when the transformation genuinely needs what the
+      layer below gives you &mdash; a reusable method, or the full Exchange.</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Which tool, and why</caption>
+        <thead>
+          <tr><th>Tool</th><th>Best for</th><th>Unit-testable on its own?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="term">Simple expression</span></td><td>a short inline change to the current body/header</td><td>not really &mdash; it only exists inside a route</td></tr>
+          <tr><td><span class="term">Bean method</span></td><td>reusable logic that doesn't need the Exchange itself</td><td>yes, as a plain Java method</td></tr>
+          <tr><td><span class="term">Processor</span></td><td>logic that needs properties, the exception, or the pattern</td><td>yes, but the test has to build an Exchange</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="xform-h2-setbody">setBody, transform, and setHeader</h2>
+    <p data-anchor="xform-p-setbody1">The lightest tier is a DSL step evaluating an expression and writing the
+    result somewhere specific. <code>setBody(expression)</code> replaces the current message's body.
+    <code>setHeader(name, expression)</code> does the same for one header, leaving the body untouched.
+    <code>filter(predicate)</code>, which you already met in Chapter 03, is the boolean-valued cousin of the
+    same idea: it doesn't replace anything, it decides whether the exchange continues at all.</p>
+
+    <div class="pre-label">Three declarative steps, one route</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="fn">setHeader</span>(<span class="str">"OrderTotal"</span>, <span class="fn">simple</span>(<span class="str">"${body.total}"</span>))
+    .<span class="fn">filter</span>(<span class="fn">simple</span>(<span class="str">"${header.OrderTotal} &gt; 0"</span>))
+    .<span class="fn">setBody</span>(<span class="fn">simple</span>(<span class="str">"Order ${header.OrderId} total ${header.OrderTotal}"</span>))
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.billable"</span>);</code></pre>
+
+    <p data-anchor="xform-p-setbody2">You'll also see <code>transform(expression)</code> in older code and in
+    Camel's own EIP catalog, sitting right next to <code>setBody</code> and looking like it does the same
+    thing &mdash; because it does. Historically the two were documented as operating on different halves of an
+    Exchange that no longer exists in the form the docs describe.</p>
+
+    <div class="callout" data-anchor="xform-callout-transform">
+      <span class="callout-title">transform() vs. setBody() &mdash; a distinction that outlived its Exchange</span>
+      <p>Back when Camel modeled an Exchange as a separate In message and Out message, <code>transform()</code>
+      was documented as always writing to the Out message. Chapter 08 already told you that model is gone:
+      modern Camel has one current message, reached through <code>getMessage()</code>, and both
+      <code>transform()</code> and <code>setBody()</code> replace it the same way. In practice, reach for
+      <code>setBody()</code> &mdash; it's the name people actually search for. <code>transform()</code> exists
+      mainly because it's the DSL keyword named after the Message Translator pattern it implements.</p>
+    </div>
+
+    <p data-anchor="xform-p-convertbodyto">One more declarative step is worth knowing for the narrowest case of
+    all: changing the body's Java <em>type</em> without computing anything new. <code>convertBodyTo(Class)</code>
+    hands the current body straight to the type-converter registry and writes back whatever comes out &mdash;
+    shorter than a <code>.process()</code> lambda that does the exact same <code>getBody(Class)</code> call by
+    hand, and more honest about what it's actually doing.</p>
+
+    <div class="pre-label">The narrow case: only the type changes</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="fn">convertBodyTo</span>(<span class="ty">String</span>.<span class="kw">class</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.text"</span>);</code></pre>
+
+    <h2 data-anchor="xform-h2-simple">The Simple language, precisely</h2>
+    <p data-anchor="xform-p-simple1">Every <code>simple(...)</code> string above is Camel's own expression and
+    predicate language &mdash; the same one that's been quietly doing work since Chapter 05's
+    <code>log("Copying ${header.CamelFileName}")</code>. It mixes plain literal text with
+    <code>${&hellip;}</code> markers freely: anything outside the braces is copied through unchanged, and each
+    <code>${&hellip;}</code> block is evaluated and substituted in place. That's the whole mixing rule.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Simple's built-in functions, the ones you'll reach for constantly</caption>
+        <thead>
+          <tr><th>Expression</th><th>Reads</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>${body}</code></td><td>the current message body</td></tr>
+          <tr><td><code>${header.name}</code></td><td>a header (case-insensitive, Chapter 08)</td></tr>
+          <tr><td><code>${exchangeProperty.name}</code></td><td>an exchange property &mdash; also <code>${exchangeProperty[name]}</code></td></tr>
+          <tr><td><code>${body.getAddress}</code> / <code>${body.address}</code></td><td>a getter on a POJO body &mdash; <code>${body.address.city}</code> chains</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="xform-p-simple2">As a predicate language &mdash; used inside <code>filter()</code>,
+    <code>choice()</code>/<code>when()</code>, and anywhere else a route needs a true/false answer &mdash;
+    Simple adds comparison and string operators: <code>==</code>, <code>&gt;</code>, <code>&lt;</code>,
+    <code>&gt;=</code>, <code>&lt;=</code>, <code>!=</code>, <code>contains</code>, <code>in</code>,
+    <code>is</code>, <code>range</code>, <code>regex</code>, among others. The left side must be a
+    <code>${&hellip;}</code> expression; the right side can be a string literal in single quotes, a constant,
+    <code>null</code>, or another <code>${&hellip;}</code> expression. Camel type-converts the right side to
+    match the left side automatically &mdash; which is why <code>${header.OrderTotal} &gt; 100</code> just
+    works even when a header arriving over JMS or HTTP is a <code>String</code> underneath.</p>
+
+    <div class="callout warn" data-anchor="xform-callout-syntax">
+      <span class="callout-title">Two ways Simple predicates fail silently</span>
+      <p>Simple requires spaces around the operator &mdash; <code>${header.Total}&gt;100</code> doesn't parse
+      the way it looks like it should; write <code>${header.Total} &gt; 100</code>. And an unquoted string on
+      the right side is treated as another expression, not a literal &mdash; write <code>'US'</code>, not
+      <code>US</code>. Neither mistake is a compile error, because Simple is only checked when the route runs,
+      not by <code>javac</code>.</p>
+    </div>
+
+    <p data-anchor="xform-p-simple3">This is also the answer to a question Chapters 03 and 07 left open: the
+    fluent Java builder you saw for Content-Based Router &mdash;
+    <code>header("CamelOrderCountry").isEqualTo("US")</code> &mdash; and an equivalent Simple string,
+    <code>simple("${header.CamelOrderCountry} == 'US'")</code>, are two spellings of the same predicate. The
+    fluent builder is type-checked and refactorable; the Simple string is shorter, and it's the <em>only</em>
+    option in the YAML and XML DSLs, which have no Java method chain to call.</p>
+
+    <h2 data-anchor="xform-h2-bean">Calling out to a bean</h2>
+    <p data-anchor="xform-p-bean1">The middle tier hands a message to an ordinary Java object already sitting
+    in Camel's registry &mdash; a Spring or Quarkus bean, or one registered by hand. <code>.bean("pricingService",
+    "quote")</code> (or the endpoint form, <code>bean:pricingService?method=quote</code>) converts the current
+    body to whatever type the chosen method's parameter declares, invokes it, and replaces the body with
+    whatever the method returns. Nothing about the method itself imports Camel.</p>
+
+    <div class="pre-label">A plain Java method, called from a route</div>
+    <pre><code><span class="kw">public</span> <span class="kw">class</span> <span class="ty">PricingService</span> {
+    <span class="kw">public</span> <span class="ty">Quote</span> <span class="fn">quote</span>(<span class="ty">Order</span> order) {
+        <span class="kw">return</span> <span class="kw">new</span> <span class="ty">Quote</span>(order.<span class="fn">getId</span>(), order.<span class="fn">getTotal</span>() * <span class="num">1.08</span>);
+    }
+}
+
+<span class="cm">// route:</span>
+<span class="kw">from</span>(<span class="str">"jms:queue:orders.validated"</span>)
+    .<span class="fn">bean</span>(<span class="str">"pricingService"</span>, <span class="str">"quote"</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.quoted"</span>);</code></pre>
+
+    <p data-anchor="xform-p-bean2">When you don't name a method explicitly, Camel still has to pick one, and
+    it does so in a fixed order &mdash; worth knowing precisely, because "which method actually ran" is a
+    surprisingly common source of confusion once a bean grows a second overload.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>How Camel picks a bean method, in order</caption>
+        <thead>
+          <tr><th>#</th><th>Rule</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>an explicit method name in the DSL &mdash; <code>.bean("svc", "quote")</code></td></tr>
+          <tr><td>2</td><td>a <code>CamelBeanMethodName</code> header set on the message</td></tr>
+          <tr><td>3</td><td>a method the bean itself marks with Camel's <code>@Handler</code> annotation</td></tr>
+          <tr><td>4</td><td>best-effort matching of the body's type against the bean's public methods</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="xform-p-bean3">Rule 4 works right up until a second overload is added that also happens to
+    accept a compatible type &mdash; at which point which method runs can silently change out from under you.
+    Naming the method explicitly (rule 1) or marking it <code>@Handler</code> (rule 3) removes the ambiguity
+    for good. Overloaded methods can also be disambiguated by qualifying parameter types directly in the URI
+    &mdash; <code>bean:foo?method=bar(String,int)</code> &mdash; and literal parameter values can be supplied
+    the same way for a method that doesn't need the message body at all.</p>
+
+    <div class="callout key" data-anchor="xform-callout-bean-return">
+      <span class="callout-title">A bean method's return value always wins</span>
+      <p>The bean component replaces the current body with whatever the invoked method returns &mdash;
+      including a <code>void</code> method's <code>null</code>. A transformation method that logs something
+      and returns nothing, called where a route still expects to read the body afterward, quietly wipes it
+      out. If a method's job is a side effect, not a transformation, that's what a <code>Processor</code> or a
+      wiretap is for &mdash; not a bean call sitting in the middle of the pipeline.</p>
+    </div>
+
+    <p data-anchor="xform-p-bean4">The practical case for pulling logic into a bean method instead of an inline
+    <code>.process()</code> lambda is exactly this testability: a method with no <code>Exchange</code> in its
+    signature can be called directly from a plain unit test, no route or mock Exchange required, and the same
+    code is what the route calls in production.</p>
+
+    <h2 data-anchor="xform-h2-converter">Type conversion, revisited: writing your own</h2>
+    <p data-anchor="xform-p-converter1">Chapter 08 showed you the consumer side of type conversion:
+    <code>getBody(Class)</code> asks the type-converter registry for a converter and applies it on the spot.
+    What it didn't show you is where those converters come from. At startup, Camel scans the classpath for
+    <code>META-INF/services/org/apache/camel/TypeConverterLoader</code> files &mdash; every Camel component JAR
+    on the classpath contributes one &mdash; and loads whatever converters they register. That's the entire
+    reason a conversion between, say, a <code>String</code> and an <code>InputStream</code> just works with no
+    configuration: camel-core and its components already ship the converters for it.</p>
+
+    <p data-anchor="xform-p-converter2">Writing your own is ordinary Java plus two annotations. Annotate the
+    class <code>@Converter</code>, and annotate each conversion method the same way &mdash; a static method
+    taking the from-type (and, optionally, a second <code>Exchange</code> parameter) and returning the
+    to-type.</p>
+
+    <div class="pre-label">A custom type converter</div>
+    <pre><code><span class="at">@Converter</span>
+<span class="kw">public</span> <span class="kw">class</span> <span class="ty">OrderConverters</span> {
+    <span class="at">@Converter</span>
+    <span class="kw">public</span> <span class="kw">static</span> <span class="ty">Order</span> <span class="fn">fromJson</span>(<span class="ty">String</span> json, <span class="ty">Exchange</span> exchange) {
+        <span class="kw">return</span> <span class="kw">new</span> <span class="ty">ObjectMapper</span>().<span class="fn">readValue</span>(json, <span class="ty">Order</span>.<span class="kw">class</span>);
+    }
+}</code></pre>
+
+    <p data-anchor="xform-p-converter3">Once that class is on the classpath, <code>getBody(Order.class)</code>
+    can turn a JSON-string body into an <code>Order</code> with no route-level code change at all &mdash; the
+    conversion becomes part of the registry, available to every route in the application, not just the one
+    that needed it first. Adding <code>@Converter(generateLoader = true)</code> at the class level, together
+    with Camel's component packaging build plugin, generates the <code>TypeConverterLoader</code> file at
+    build time instead of relying on reflective scanning &mdash; faster startup, and the recommended path for
+    new code. A separate method annotated <code>@FallbackConverter</code> can also be registered to run only
+    after every regular converter has already failed to produce the requested type.</p>
+
+    <div class="pullquote" data-anchor="xform-pullquote">Every transformation in this book is one of three
+    shapes underneath: an expression, a method call, or a block of Java. Knowing all three isn't the skill.
+    Reaching for the lightest one that actually fits &mdash; and only climbing the stack when the job genuinely
+    needs it &mdash; is.</div>
+
+    <h2 data-anchor="xform-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="xform-p-reflection">A vocabulary for every transformation you'll write from here on, and a
+    rule for choosing among them: Simple for a short inline change, a bean for reusable logic that doesn't
+    need the Exchange, a Processor for logic that does. Plus the other half of Chapter 08's type conversion
+    &mdash; not just how to ask for a converted type, but where the converter that answers actually came from,
+    and how to add one of your own. Next chapter puts all of this to work on a specific, very common shape of
+    transformation: whole message formats &mdash; JSON, XML, CSV &mdash; marshalled and unmarshalled at the
+    edge of a route, using exactly the type-converter machinery this chapter just opened up.</p>
+
+    <div class="review" data-anchor="xform-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A colleague writes a five-line <code>.process()</code> lambda that only reads
+        <code>${body.total}</code> and writes it to a header. Which of the three tools from this chapter
+        would you reach for instead, and why?</li>
+        <li>A Simple predicate written as <code>${header.Status}==active</code> never matches, even for
+        exchanges that clearly have <code>Status</code> set to <code>active</code>. Name both mistakes in that
+        one string.</li>
+        <li>A bean has two public methods that could each accept the current body's type, and no method name
+        is given in the DSL. What decides which one runs, and what are the two ways to make that decision
+        explicit instead?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="08-understanding-the-exchange.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="10-working-with-data-formats.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
