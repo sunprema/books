@@ -5025,7 +5025,143 @@
         "src-quarkus-native-image"
       ]
     },
-    "building-an-order-processing-integration": {},
+    "building-an-order-processing-integration": {
+      "researched": "2026-08-12",
+      "claims": [
+        {
+          "text": "This capstone composes six patterns already covered individually in Parts II–V into one route: an SFTP polling consumer (Chapter 18) as intake, csv-dataformat unmarshalling (Chapter 10) to turn each row into a canonical Order, validate() (Chapter 11) as a hard gate before anything downstream trusts the data, two chained enrich() calls (Chapter 15) against a customer API and an inventory API, choice()/when()/otherwise() (Chapter 12) to split domestic from international orders, and a Kafka producer (Chapter 21) to publish a fulfillment event once a branch finishes. No new EIP is introduced in this chapter; the work is wiring, not invention.",
+          "sources": [
+            "src-camel-file-component",
+            "src-camel-sftp-component",
+            "src-camel-csv-dataformat",
+            "src-camel-validate-eip",
+            "src-camel-enrich-eip",
+            "src-camel-choice-eip",
+            "src-camel-kafka-component"
+          ]
+        },
+        {
+          "text": "csv-dataformat's useMaps(true) unmarshal option treats the CSV's first record as a header row and returns each subsequent row as a Map<String,String> keyed by that header, rather than the positional List<String> the format returns by default — which is what lets a route address a column by name (body[\"OrderId\"]) instead of by fragile column index, the first step in turning a raw CSV row into something worth calling canonical.",
+          "sources": [
+            "src-camel-csv-dataformat"
+          ]
+        },
+        {
+          "text": "Chaining two enrich() calls back to back (customer lookup, then inventory lookup) works because each enrich() replaces the exchange with whatever its own AggregationStrategy returns — as long as each strategy folds the resource reply's fields into the running Order and returns the old (order) exchange rather than the new (resource) exchange, the second enrich() sees the first enrichment's result as its own oldExchange, and the two compose in sequence with no extra wiring.",
+          "sources": [
+            "src-camel-enrich-eip",
+            "src-camel-aggregate-eip"
+          ]
+        },
+        {
+          "text": "AggregationStrategy.aggregate(Exchange oldExchange, Exchange newExchange) returns a single combined Exchange; documented guidance is to mutate and return one of the two input exchanges rather than construct a third, and to favor returning oldExchange when possible — for an enrichment strategy this means: take the order already on oldExchange, copy the fields you need off newExchange's body onto it, and return oldExchange so the order (not the raw API reply) is what continues down the route.",
+          "sources": [
+            "src-camel-aggregate-eip",
+            "src-camel-enrich-eip"
+          ]
+        },
+        {
+          "text": "A choice() with no otherwise() silently does nothing for a message that matches no when() — in an order-routing choice keyed on a derived OrderType header, that means an order whose type wasn't set to exactly DOMESTIC or INTERNATIONAL (a typo, a null, a third type nobody planned for) falls through the choice block and is neither routed nor rejected; it simply never reaches a fulfillment event. An otherwise() branch that routes to a dead-letter or manual-review destination is what turns a silent gap into a visible one.",
+          "sources": [
+            "src-camel-choice-eip"
+          ]
+        },
+        {
+          "text": "Keying the fulfillment event's Kafka message on the order id (setHeader(KafkaConstants.KEY, simple(\"${body.orderId}\"))) sends every event for the same order to the same partition, which is what gives a downstream consumer ordering guarantees between events for one order — without a key, Kafka distributes records round-robin (or by a random/sticky partitioner) across partitions and same-order events can be read out of order relative to each other.",
+          "sources": [
+            "src-camel-kafka-component"
+          ]
+        },
+        {
+          "text": "camel-http's throwExceptionOnFailure default (true) means a customer- or inventory-lookup enrich() call that hits a 4xx/5xx response raises an HttpOperationFailedException rather than quietly aggregating an error body into the order — which is why an enrichment failure surfaces as a route exception (handled by Chapter 23's onException, not explored further in this chapter) instead of a corrupted order sailing through to fulfillment.",
+          "sources": [
+            "src-camel-http-component"
+          ]
+        },
+        {
+          "text": "Splitting the integration into direct: hops (direct:validateOrder, direct:enrichOrder, direct:routeOrder, direct:publishFulfillment) rather than one unbroken method chain lets each stage be addressed, tested, and reasoned about on its own — the same direct: composition Chapter 6 introduced for route reuse — and is the seam Chapter 31 will later split into separate, independently testable RouteBuilder classes.",
+          "sources": [
+            "src-camel-java-dsl"
+          ]
+        }
+      ],
+      "snippets": [
+        {
+          "lang": "java",
+          "code": "from(\"sftp://partner.example.com:22/orders/incoming\"\n        + \"?username={{sftp.username}}&privateKeyFile={{sftp.key}}\"\n        + \"&knownHostsFile={{sftp.knownHosts}}&strictHostKeyChecking=yes\"\n        + \"&readLock=changed&readLockCheckInterval=2000&readLockTimeout=20000\"\n        + \"&include=.*\\\\.csv&delay=30000\")\n    .routeId(\"orderIntake\")\n    .log(\"Picked up order file: ${header.CamelFileName}\")\n    .to(\"direct:parseOrders\");",
+          "note": "Order intake as an SFTP polling consumer, reusing Chapter 18's readLock=changed pattern for a partner server that doesn't write atomically",
+          "sources": [
+            "src-camel-sftp-component"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "CsvDataFormat ordersCsv = new CsvDataFormat();\nordersCsv.setUseMaps(true);\n\nfrom(\"direct:parseOrders\")\n    .unmarshal(ordersCsv)\n    .split(body())\n        .to(\"direct:toCanonicalOrder\");\n\nfrom(\"direct:toCanonicalOrder\")\n    .bean(OrderMapper.class, \"fromCsvRow\")\n    .to(\"direct:validateOrder\");",
+          "note": "The same CsvDataFormat().setUseMaps(true) instance from Chapter 10, reused here: one Map<String,String> per row addressed by header name, then a small OrderMapper bean converts each row into the canonical Order used by the rest of the route",
+          "sources": [
+            "src-camel-csv-dataformat"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:validateOrder\")\n    .validate(simple(\"${body.orderId} != null && ${body.sku} != null && ${body.quantity} > 0\"))\n    .to(\"direct:enrichOrder\");",
+          "note": "validate() throws PredicateValidationException on a bad row, which the route's onException policy (Chapter 23) is responsible for catching — this chapter only shows the gate, not the recovery",
+          "sources": [
+            "src-camel-validate-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:enrichOrder\")\n    .enrich(\"http://customer-api/customers/${body.customerId}\", new CustomerEnrichmentStrategy())\n    .enrich(\"http://inventory-api/items/${body.sku}\", new InventoryEnrichmentStrategy())\n    .to(\"direct:routeOrder\");",
+          "note": "Two enrich() calls chained — each strategy merges its resource reply into the order and returns oldExchange, so the second enrich() builds on the first's result",
+          "sources": [
+            "src-camel-enrich-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "public class CustomerEnrichmentStrategy implements AggregationStrategy {\n    @Override\n    public Exchange aggregate(Exchange oldExchange, Exchange newExchange) {\n        Order order = oldExchange.getIn().getBody(Order.class);\n        Customer customer = newExchange.getIn().getBody(Customer.class);\n        order.setCustomerCountry(customer.getCountry());\n        order.setShippingAddress(customer.getAddress());\n        return oldExchange;\n    }\n}",
+          "note": "The documented AggregationStrategy shape: read oldExchange (the order), read newExchange (the resource reply), mutate and return oldExchange rather than constructing a new Exchange",
+          "sources": [
+            "src-camel-aggregate-eip",
+            "src-camel-enrich-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:routeOrder\")\n    .setHeader(\"OrderType\", simple(\"${body.customerCountry} == 'US' ? 'DOMESTIC' : 'INTERNATIONAL'\"))\n    .choice()\n        .when(header(\"OrderType\").isEqualTo(\"DOMESTIC\"))\n            .to(\"direct:domesticFulfillment\")\n        .when(header(\"OrderType\").isEqualTo(\"INTERNATIONAL\"))\n            .to(\"direct:internationalFulfillment\")\n        .otherwise()\n            .to(\"direct:manualReview\")\n    .end();",
+          "note": "OrderType is derived from the customer enrichment, not read off the CSV — the choice() only runs after enrichment has actually populated customerCountry; otherwise() catches anything that doesn't resolve cleanly",
+          "sources": [
+            "src-camel-choice-eip"
+          ]
+        },
+        {
+          "lang": "java",
+          "code": "from(\"direct:domesticFulfillment\")\n    .setHeader(\"FulfillmentCenter\", constant(\"US-EAST\"))\n    .to(\"direct:publishFulfillment\");\n\nfrom(\"direct:internationalFulfillment\")\n    .setHeader(\"FulfillmentCenter\", constant(\"INTL-HUB\"))\n    .to(\"direct:publishFulfillment\");\n\nfrom(\"direct:publishFulfillment\")\n    .marshal().json(JsonLibrary.Jackson)\n    .setHeader(KafkaConstants.KEY, simple(\"${body[orderId]}\"))\n    .to(\"kafka:order.fulfillment.events?brokers={{kafka.brokers}}\");",
+          "note": "Both branches converge on one direct:publishFulfillment endpoint so the marshal-and-publish step is written once; keying by orderId keeps one order's events in partition order",
+          "sources": [
+            "src-camel-kafka-component",
+            "src-camel-json-jackson-dataformat"
+          ]
+        }
+      ],
+      "pitfalls": [
+        "Deriving OrderType before enrichment has run reads a field that isn't populated yet — the choice() must come after the enrich() calls that fill in the data it routes on, not before.",
+        "Forgetting otherwise() on the domestic/international choice() means an order that fails to resolve to exactly one branch is silently dropped, not rejected — there is no exception and no log unless one is added explicitly.",
+        "An enrich() call with no explicit AggregationStrategy discards the original order and replaces the body with the raw resource reply — easy to miss in a quick prototype, catastrophic once a second enrich() call needs the first enrichment's result still present.",
+        "useMaps(true) column names must match the CSV's actual header spelling exactly (case, punctuation); a header that reads 'Order Id' but is addressed as body['OrderId'] fails at read time with no compile-time warning.",
+        "Publishing the fulfillment event before persisting or committing the order (e.g. before an idempotency check, covered next chapter) risks a duplicate event if the same file is reprocessed after a partial failure."
+      ],
+      "furtherReading": [
+        "src-camel-sftp-component",
+        "src-camel-csv-dataformat",
+        "src-camel-enrich-eip",
+        "src-camel-aggregate-eip",
+        "src-camel-choice-eip",
+        "src-camel-kafka-component",
+        "src-eip-hohpe-woolf"
+      ]
+    },
     "making-the-order-integration-production-ready": {},
     "designing-maintainable-camel-applications": {}
   },
