@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Deployment and Route Lifecycle &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VI &mdash; Reliability and Operations</span> &middot; Chapter 28</p>
+    <p class="chapter-no">28</p>
+    <h1 data-anchor="dep-h1">Deployment and Route Lifecycle</h1>
+
+    <p class="lede" data-anchor="dep-lede">Chapter 27 ended on a promise: packaging a Camel application, running it
+    under Spring Boot or Quarkus, and shutting it down without losing whatever message was in flight at the time.
+    This chapter keeps that promise. But it's worth saying up front that "deployment" here isn't a single event.
+    A route isn't just on or off &mdash; it has a lifecycle, with states in between, and every choice in this
+    chapter (which runtime you package against, whether a broken route should take the whole application down,
+    how long shutdown is allowed to take) is really a choice about what that lifecycle looks like in production.</p>
+
+    <h2 data-anchor="dep-h2-packaging">Packaging: where does a route actually run</h2>
+    <p data-anchor="dep-p-packaging1">Every route in this book so far has run inside a test, or from an IDE
+    launcher. A route's code &mdash; the <code>RouteBuilder</code>, the YAML, the XML &mdash; doesn't change
+    depending on where it deploys, but what wraps around it does. Camel supports three runtime targets that share
+    the exact same DSL: plain <span class="term">camel-main</span> (a bare <code>CamelContext</code> booted from a
+    <code>main()</code> method, no framework underneath), Spring Boot, and Quarkus. Which one you choose is a
+    packaging and operations decision, not a routing one.</p>
+
+    <p data-anchor="dep-p-packaging2">The fastest way to try a route before committing to any of the three is
+    <span class="term">Camel JBang</span> &mdash; the <code>camel</code> CLI you first saw in Chapter 4.
+    <code>camel run</code> runs a route file directly, with no Maven project, no POM, no IDE: it resolves and
+    downloads the Camel JARs and whatever components the route needs, and <code>--dev</code> adds live reload on
+    every save. Once a prototype is ready to become a real project, <code>camel export</code> turns those same
+    route files into a full Maven project scaffolded for one of the three runtimes &mdash;
+    <code>--runtime=spring-boot</code>, <code>--runtime=quarkus</code>, or <code>--runtime=main</code>. Nothing
+    about the route changes; only the project around it gets generated.</p>
+
+    <div class="pre-label">From a JBang prototype to a runtime-specific project</div>
+    <pre><code><span class="cm"># iterate on a single file, no project at all</span>
+camel run OrderRoute.java --dev
+
+<span class="cm"># turn it into a Maven project targeting one runtime</span>
+camel export --runtime=quarkus --gav=com.example:order-integration:1.0.0</code></pre>
+
+    <h2 data-anchor="dep-h2-springboot">Running under Spring Boot</h2>
+    <p data-anchor="dep-p-springboot1">Add the <code>camel-spring-boot-starter</code> dependency and two things
+    happen automatically: Camel auto-configures a <code>CamelContext</code> as a Spring bean, and it scans the
+    application context for any <code>RouteBuilder</code> beans and adds their routes to it &mdash; the same
+    auto-detection you've been relying on since Chapter 4's project setup. Packaging is Spring Boot's own
+    concern, not Camel's: the <code>spring-boot-maven-plugin</code>'s <code>repackage</code> goal, bound to
+    Maven's <code>package</code> phase, nests your application's classes plus every runtime dependency inside one
+    self-contained jar with its own launcher, so it runs with a plain <code>java -jar</code>.</p>
+
+    <div class="pre-label">Build once, run anywhere a JVM is available</div>
+    <pre><code>mvn clean package
+java -jar target/order-integration-1.0.0.jar</code></pre>
+
+    <h2 data-anchor="dep-h2-quarkus">Camel Quarkus, briefly</h2>
+    <p data-anchor="dep-p-quarkus1">Camel Quarkus runs the same routing engine on a different foundation, and it
+    gives you three genuinely different ways to run an application. <span class="term">Dev mode</span>
+    (<code>mvn quarkus:dev</code>) live-reloads route and Java changes as you save, the fastest inner loop of the
+    three. <span class="term">JVM mode</span> &mdash; <code>mvn package</code>, then <code>java -jar</code> &mdash;
+    is functionally close to the Spring Boot jar: an ordinary JVM process. <span class="term">Native mode</span>
+    is the one that's actually different: <code>mvn package -Dnative</code> ahead-of-time compiles the whole
+    application &mdash; Camel, your routes, every dependency on the classpath &mdash; into a single
+    platform-specific executable, using GraalVM or its Quarkus-focused downstream distribution, Mandrel.</p>
+
+    <p data-anchor="dep-p-quarkus2">The trade a native build makes is stark. The build itself is slower and far
+    more resource-hungry &mdash; GraalVM has to statically analyze a closed world of every class the application
+    could possibly reach. What you get back is a runtime that starts in milliseconds rather than seconds and sits
+    at tens of megabytes of resident memory rather than hundreds. That's the trade that matters for a
+    serverless-style integration, or any container platform that bills or autoscales on cold-start time and
+    memory footprint &mdash; the two numbers a native build is built to shrink.</p>
+
+    <div class="callout warn" data-anchor="dep-callout-native">
+      <span class="callout-title">A native build that compiles fine can still fail on its first request</span>
+      <p>GraalVM's closed-world analysis has to see every code path statically; anything that only exists through
+      reflection &mdash; some Camel components, some third-party libraries &mdash; needs explicit registration, or
+      a Quarkus extension that already handles it, before native-image can include it. Skip that step and the
+      binary builds without complaint, then throws the moment execution reaches the unregistered path in
+      production. Test the native build itself before trusting it, not just the JVM-mode jar it was built from.</p>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Four ways to run the same route code</caption>
+        <thead>
+          <tr><th>Target</th><th>Build</th><th>Run</th><th>Best for</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Camel Main</td><td>plain Maven jar</td><td><code>java -jar</code></td><td>a small standalone integration, no framework needed</td></tr>
+          <tr><td>Spring Boot</td><td><code>mvn package</code> (repackaged fat jar)</td><td><code>java -jar</code></td><td>teams already standardized on Spring</td></tr>
+          <tr><td>Quarkus (JVM)</td><td><code>mvn package</code></td><td><code>java -jar</code></td><td>Quarkus's dev-mode workflow, ordinary JVM ops</td></tr>
+          <tr><td>Quarkus (native)</td><td><code>mvn package -Dnative</code> (GraalVM/Mandrel)</td><td>the compiled executable directly</td><td>fast cold-start, low-memory, serverless-style deployment</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="dep-h2-lifecycle">The route lifecycle: more states than "on"</h2>
+    <p data-anchor="dep-p-lifecycle1">A <code>CamelContext</code> moves through a defined sequence of operations:
+    <code>build</code>, <code>init</code>, <code>start</code>, <code>stop</code>, and eventually
+    <code>shutdown</code>, with <code>suspend</code> and <code>resume</code> as a second pair alongside
+    <code>start</code>/<code>stop</code>. The two pairs aren't interchangeable. <code>stop</code> performs a full
+    graceful shutdown &mdash; the subject of the rest of this chapter &mdash; and releases resources.
+    <code>suspend</code> only pauses consumers, keeping the <code>CamelContext</code> itself, and every route's
+    registered state, <em>warm</em>. <code>resume</code> is correspondingly cheaper than starting from a cold
+    stop, because there's less to rebuild.</p>
+
+    <p data-anchor="dep-p-lifecycle2">Individual routes carry this same distinction, independent of the whole
+    context. Recall <code>autoStartup="{{key}}"</code> from Chapter 27: a route with <code>autoStartup=false</code>
+    isn't skipped, it's registered like any other route, just never started automatically. It can be started
+    later, by route ID, through Camel's <span class="term">RouteController</span> &mdash; the same component
+    responsible for starting every route automatically at boot, and the subject of the next section.</p>
+
+    <figure class="diagram-fig" data-anchor="dep-fig-lifecycle">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="depD1t">
+        <title id="depD1t">A route moves from stopped to started to suspended; resume returns it to started without a cold start, while stop performs a full graceful shutdown back to stopped</title>
+        <rect x="16" y="60" width="110" height="36" class="stroke fill-soft"/>
+        <rect x="225" y="60" width="110" height="36" class="stroke fill-red"/>
+        <rect x="434" y="60" width="110" height="36" class="stroke fill-soft"/>
+        <text x="26" y="83" class="big">stopped</text>
+        <text x="245" y="83" class="big on-ink">started</text>
+        <text x="454" y="83" class="big">suspended</text>
+
+        <path d="M126 78 L225 78" class="stroke"/>
+        <path d="M217 74 L225 78 L217 82" class="stroke"/>
+        <text x="146" y="70">start</text>
+
+        <path d="M335 78 L434 78" class="stroke"/>
+        <path d="M426 74 L434 78 L426 82" class="stroke"/>
+        <text x="352" y="70">suspend</text>
+
+        <path d="M489 60 L489 24 L280 24 L280 60" class="stroke-soft"/>
+        <path d="M276 52 L280 60 L284 52" class="stroke-soft"/>
+        <text x="340" y="18" class="dim">resume &mdash; warm, no cold start</text>
+
+        <path d="M280 96 L280 132 L71 132 L71 96" class="stroke-soft"/>
+        <path d="M67 104 L71 96 L75 104" class="stroke-soft"/>
+        <text x="150" y="146" class="dim">stop &mdash; graceful shutdown, releases resources</text>
+      </svg>
+      <figcaption>Two pairs of operations, not one: start/stop rebuilds and releases; suspend/resume just pauses, keeping the route's state warm.</figcaption>
+    </figure>
+
+    <h2 data-anchor="dep-h2-controller">RouteController: fail fast, or supervise?</h2>
+    <p data-anchor="dep-p-controller1">By default, Camel's <span class="term">RouteController</span> is fail-fast:
+    if any route throws while starting, <code>CamelContext</code> startup itself fails, and the whole application
+    refuses to come up &mdash; one route with a database still booting or a broker not yet reachable takes down
+    every other route with it. In a syllabus-sized application with a handful of routes that's a reasonable
+    default. In production, with dozens of routes talking to systems you don't control the uptime of, it's often
+    the wrong one.</p>
+
+    <p data-anchor="dep-p-controller2">The <span class="term">supervising route controller</span> changes the
+    failure mode. <code>CamelContext</code> starts successfully even if some routes fail, and each failed route is
+    retried on an exponential backoff schedule in the background &mdash; independently of every other route.
+    A transient dependency outage delays one route instead of the whole application. Since Camel 4.7, a route that
+    exhausts its retry attempts is marked <em>unhealthy</em> by default, rather than silently vanishing &mdash;
+    which is what makes a readiness probe wired to Chapter 26's health checks correctly report the application as
+    not ready, instead of reporting healthy while quietly missing a route.</p>
+
+    <div class="pre-label">Supervising instead of fail-fast, with a bounded number of retries</div>
+    <pre><code>camel.routecontroller.enabled = <span class="kw">true</span>
+camel.routecontroller.backoff-delay = <span class="num">5000</span>
+camel.routecontroller.backoff-max-attempts = <span class="num">5</span>
+camel.routecontroller.exclude-routes = healthCheckRoute</code></pre>
+
+    <div class="callout key" data-anchor="dep-callout-backoff">
+      <span class="callout-title">An unbounded backoff-max-attempts can hide a route that's never coming back</span>
+      <p>Leave <code>backoff-max-attempts</code> unset and a permanently broken route &mdash; a typo'd hostname, a
+      credential that was rotated everywhere except this one route's config &mdash; retries forever in the
+      background, quietly, instead of ever surfacing as failed. Pair supervision with a bounded attempt count and
+      the unhealthy-on-exhausted behavior from the previous paragraph, so a route that truly cannot recover
+      eventually says so, loudly, to whatever is watching the health endpoint.</p>
+    </div>
+
+    <h2 data-anchor="dep-h2-shutdown">Graceful shutdown and the fate of in-flight messages</h2>
+    <p data-anchor="dep-p-shutdown1">Every deployment eventually stops &mdash; a rolling update, a scale-down, a
+    node eviction. What happens to the order that was halfway through validation when the stop signal arrives is
+    the question this whole chapter has been building toward. Camel answers it with a pluggable
+    <code>ShutdownStrategy</code>, triggered automatically when the <code>CamelContext</code> stops (including
+    when Spring Boot or Quarkus itself shuts down on <code>SIGTERM</code>, the signal a Kubernetes eviction
+    sends). It shuts routes down in the <em>reverse</em> of their start order, and in two phases: first a
+    graceful phase, which stops each route's consumers &mdash; so no new work is accepted &mdash; while letting
+    exchanges already in flight run to completion; then, if a configurable timeout elapses before every route has
+    drained, a forced phase that shuts down whatever's left anyway. That timeout defaults to 45 seconds.</p>
+
+    <figure class="diagram-fig" data-anchor="dep-fig-shutdown">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="depD2t">
+        <title id="depD2t">SIGTERM starts a graceful window in which in-flight exchanges drain; if the shutdown timeout elapses before they finish, a forced shutdown follows</title>
+        <path d="M16 60 L544 60" class="stroke"/>
+        <path d="M16 54 L16 66" class="stroke"/>
+        <path d="M380 46 L380 74" class="stroke"/>
+        <path d="M520 54 L520 66" class="stroke"/>
+        <text x="16" y="40">SIGTERM</text>
+        <text x="330" y="40" class="red">timeout</text>
+        <text x="500" y="40">exit</text>
+
+        <rect x="16" y="82" width="364" height="26" class="stroke fill-soft"/>
+        <text x="26" y="100" class="big">in-flight exchanges drain</text>
+        <rect x="380" y="82" width="140" height="26" class="stroke-red"/>
+        <text x="390" y="100" class="big red">forced shutdown</text>
+
+        <path d="M16 128 L380 128" class="stroke"/>
+        <path d="M24 124 L16 128 L24 132" class="stroke"/>
+        <path d="M372 124 L380 128 L372 132" class="stroke"/>
+        <text x="90" y="146" class="dim">camel.main.shutdown-timeout &mdash; default 45s</text>
+      </svg>
+      <figcaption>Graceful, then forced. The whole window is one configurable number &mdash; how it's spent is up to the routes running inside it.</figcaption>
+    </figure>
+
+    <p data-anchor="dep-p-shutdown2">The timeout and its logging are configured with a small, consistent set of
+    properties &mdash; the same names whether you're on plain camel-main, Spring Boot, or Quarkus &mdash; and the
+    strategy is also adjustable at runtime over JMX, for the rare case where a deploy is stuck waiting and you
+    need to intervene without a restart.</p>
+
+    <div class="pre-label">Tuning how long shutdown is allowed to take, and what gets logged</div>
+    <pre><code>camel.main.shutdown-timeout = <span class="num">60</span>
+camel.main.shutdown-suppress-logging-on-timeout = <span class="kw">false</span>
+camel.main.log-inflight-exchanges-on-timeout = <span class="kw">true</span></code></pre>
+
+    <p data-anchor="dep-p-shutdown3">A single global timeout is a blunt instrument once routes have different
+    needs &mdash; a route that other routes still send work to shouldn't shut down first, and a batch consumer
+    mid-poll shouldn't be cut off after finishing only the message it happened to be holding. Two DSL options,
+    set per route, refine that: <code>shutdownRoute</code> takes <code>ShutdownRoute.Default</code> (shut down as
+    early as possible) or <code>ShutdownRoute.Defer</code> (delay this route to a later stage, because other
+    routes still depend on it &mdash; typically an internal <code>direct:</code> endpoint other routes send to).
+    <code>shutdownRunningTask</code> takes <code>ShutdownRunningTask.CompleteCurrentTaskOnly</code> (finish only
+    the exchange currently being processed, then stop) or <code>ShutdownRunningTask.CompleteAllTasks</code>
+    (finish every task the consumer has already accepted, not just the one in progress &mdash; the option a file
+    or batch consumer usually wants).</p>
+
+    <div class="pre-label">A route other routes still depend on, deferred and drained fully</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"seda:orderIntake"</span>)
+    .<span class="kw">routeId</span>(<span class="str">"orderIntake"</span>)
+    .<span class="kw">shutdownRoute</span>(ShutdownRoute.Defer)
+    .<span class="kw">shutdownRunningTask</span>(ShutdownRunningTask.CompleteAllTasks)
+    .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);</code></pre>
+
+    <div class="callout key" data-anchor="dep-callout-defer">
+      <span class="callout-title">Defer is about dependency order, not importance</span>
+      <p>It's tempting to read <code>ShutdownRoute.Defer</code> as "shut this down carefully" and reach for it on
+      every route that matters. It means something narrower: <em>other routes still send this route work, so
+      don't shut it down until they've finished shutting down first.</em> A route nothing else depends on gains
+      nothing from deferring &mdash; the ordinary reverse-start-order shutdown already handles it correctly.</p>
+    </div>
+
+    <div class="callout warn" data-anchor="dep-callout-sigkill">
+      <span class="callout-title">A grace period shorter than the shutdown timeout defeats the timeout entirely</span>
+      <p><code>ShutdownStrategy</code> only gets to run at all if the process receives <code>SIGTERM</code> and is
+      given time to act on it. A container platform's hard-kill grace period &mdash; Kubernetes's
+      <code>terminationGracePeriodSeconds</code>, most commonly &mdash; that's shorter than
+      <code>camel.main.shutdown-timeout</code> means the orchestrator sends <code>SIGKILL</code> before Camel's
+      own graceful window has elapsed, abandoning whatever was still in flight no matter how carefully the
+      timeout was tuned. The two numbers have to agree: set the grace period comfortably longer than the shutdown
+      timeout, not the other way around.</p>
+    </div>
+
+    <div class="pullquote" data-anchor="dep-pullquote">A route that shuts down instantly isn't fast &mdash; it's
+    the order that never finished validating, discarded by omission instead of by decision.</div>
+
+    <h2 data-anchor="dep-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="dep-p-reflection">A route's code never changes across camel-main, Spring Boot, and Quarkus
+    &mdash; only the packaging around it does, and now you have a real basis for choosing among a plain jar, a
+    Spring Boot fat jar, and a Quarkus JVM or native build. The route lifecycle turned out to have more shape
+    than "running" or "not": <code>start</code>/<code>stop</code> and <code>suspend</code>/<code>resume</code>
+    are genuinely different pairs, and a <code>RouteController</code> can either fail an entire application over
+    one bad route or supervise that route back to health on its own schedule. And graceful shutdown &mdash; the
+    reverse-order, two-phase drain governed by one timeout, refined per route with
+    <code>shutdownRoute</code>/<code>shutdownRunningTask</code> &mdash; is what decides whether "the deployment
+    finished" also means "no order was lost in the process." Part VII puts all of it to work on one real
+    integration, starting from scratch with the order-processing capstone next.</p>
+
+    <div class="review" data-anchor="dep-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>You move a route from Camel Main to Spring Boot and back to test something. What, if anything, has
+        to change in the <code>RouteBuilder</code> itself? What changes outside it?</li>
+        <li>An application has 40 routes. One connects to a database that's still finishing its own startup when
+        the application boots. With the default <code>RouteController</code>, what happens to the other 39
+        routes? What changes if you enable the supervising controller with
+        <code>backoff-max-attempts=5</code>, and what happens once those 5 attempts are exhausted?</li>
+        <li>A route consuming from <code>direct:orderEvents</code> is fed by three other routes. You're deciding
+        whether to mark it <code>ShutdownRoute.Defer</code>. What's the actual failure mode if you leave it at
+        <code>ShutdownRoute.Default</code> instead, and why does <code>Defer</code> fix it?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="27-configuration-and-secrets.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="29-building-an-order-processing-integration.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
