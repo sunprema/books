@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Testing Camel Routes &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VI &mdash; Reliability and Operations</span> &middot; Chapter 25</p>
+    <p class="chapter-no">25</p>
+    <h1 data-anchor="tcr-h1">Testing Camel Routes</h1>
+
+    <p class="lede" data-anchor="tcr-lede">That's the question the last chapter closed on: how do you prove a
+    route retries the right number of times, waits the right amount, and lands in the right dead-letter queue,
+    without sitting through real backoff delays to find out? It's worth taking seriously, because a
+    <code>RouteBuilder</code> is a configuration object, not a black box you have to run in production to trust.
+    Camel routes turn out to be unusually testable compared to most integration code, precisely because the parts
+    that normally make integration hard to test &mdash; real endpoints, real timing, real external systems &mdash;
+    are exactly the parts Camel gives you a first-class way to swap out. This chapter works through four tools of
+    increasing reach: testing a processor with no Camel context at all, mock endpoints standing in for a real
+    destination, AdviceWith rewriting an already-built route for one test, and NotifyBuilder watching a route
+    finish without touching it at all. By the end you'll have exactly what the last chapter promised: a test that
+    proves a route retries three times, waits for none of it, and lands precisely where it should.</p>
+
+    <h2 data-anchor="tcr-h2-processor">The cheapest test you can write: no Camel at all</h2>
+    <p data-anchor="tcr-p-processor1">Start with the smallest unit worth testing. Chapter 9 introduced processors
+    as plain objects implementing <code>process(Exchange)</code> &mdash; and "plain object" is the operative phrase.
+    A processor has no dependency on a running <code>CamelContext</code> to be exercised: build a
+    <code>DefaultExchange</code>, populate its body and headers, call <code>process(exchange)</code> directly, and
+    assert on what comes back. No route, no context startup, no mock endpoints, no network. This is the fastest
+    test in the whole chapter, and the one most worth reaching for first &mdash; a validation rule or a
+    transformation belongs here, tested in isolation, before it ever needs to prove itself inside a route.</p>
+
+    <div class="pre-label">Testing a Processor directly &mdash; no route involved</div>
+    <pre><code><span class="kw">class</span> <span class="ty">OrderNormalizerTest</span> {
+
+    @<span class="at">Test</span>
+    <span class="kw">void</span> <span class="fn">upperCasesTheCountryCode</span>() <span class="kw">throws</span> <span class="ty">Exception</span> {
+        <span class="ty">Exchange</span> exchange = <span class="kw">new</span> <span class="ty">DefaultExchange</span>(<span class="kw">new</span> <span class="ty">DefaultCamelContext</span>());
+        exchange.<span class="fn">getIn</span>().<span class="fn">setBody</span>(<span class="str">"order-42"</span>);
+        exchange.<span class="fn">getIn</span>().<span class="fn">setHeader</span>(<span class="str">"country"</span>, <span class="str">"de"</span>);
+
+        <span class="kw">new</span> <span class="ty">OrderNormalizer</span>().<span class="fn">process</span>(exchange);
+
+        <span class="fn">assertEquals</span>(<span class="str">"DE"</span>, exchange.<span class="fn">getIn</span>().<span class="fn">getHeader</span>(<span class="str">"country"</span>));
+    }
+}</code></pre>
+
+    <p data-anchor="tcr-p-processor2">There's no assertion here about routing, no endpoint, nothing Camel-specific
+    beyond the <code>Exchange</code> itself &mdash; which is exactly the point. This test can't tell you whether
+    <code>OrderNormalizer</code> is wired into the right place in a route, only that it does what it claims to do
+    given an exchange. That's a narrower guarantee than the tools below provide, and a much cheaper one to get.</p>
+
+    <h2 data-anchor="tcr-h2-mock">Mock endpoints: Camel's own test double</h2>
+    <p data-anchor="tcr-p-mock1">Once a test needs to prove something about routing &mdash; that a message reaches
+    a particular destination, in a particular shape, a particular number of times &mdash; it needs a route running,
+    and it needs somewhere to observe what arrives. That's <span class="term">MockEndpoint</span>: a test-only
+    endpoint reached through a <code>mock:</code> URI, purpose-built to record what it receives and assert on it
+    afterward. The base class for writing these tests is <code>org.apache.camel.test.junit5.CamelTestSupport</code>,
+    from the <code>camel-test-junit5</code> module &mdash; extend it, override <code>createRouteBuilder()</code> to
+    supply the route under test, and the base class hands you a running <code>CamelContext</code> plus a
+    <code>ProducerTemplate</code> (<code>template</code>) for sending test messages in.</p>
+
+    <div class="pre-label">A route test built on CamelTestSupport and a mock endpoint</div>
+    <pre><code><span class="kw">class</span> <span class="ty">FileToJmsRouteTest</span> <span class="kw">extends</span> <span class="ty">CamelTestSupport</span> {
+
+    @<span class="at">Override</span>
+    <span class="kw">protected</span> <span class="ty">RouteBuilder</span> <span class="fn">createRouteBuilder</span>() {
+        <span class="kw">return</span> <span class="kw">new</span> <span class="ty">FileToJmsRoute</span>();
+    }
+
+    @<span class="at">Test</span>
+    <span class="kw">void</span> <span class="fn">routesEachFileAsOneMessage</span>() <span class="kw">throws</span> <span class="ty">Exception</span> {
+        <span class="ty">MockEndpoint</span> result = <span class="fn">getMockEndpoint</span>(<span class="str">"mock:result"</span>);
+        result.<span class="fn">expectedMessageCount</span>(<span class="num">1</span>);
+        result.<span class="fn">expectedBodiesReceived</span>(<span class="str">"order-42"</span>);
+
+        template.<span class="fn">sendBodyAndHeader</span>(<span class="str">"direct:start"</span>, <span class="str">"order-42"</span>, <span class="str">"CamelFileName"</span>, <span class="str">"order-42.csv"</span>);
+
+        result.<span class="fn">assertIsSatisfied</span>();
+    }
+}</code></pre>
+
+    <p data-anchor="tcr-p-mock2">Notice the order: expectations are set on the mock <em>before</em> the message is
+    sent, and <code>assertIsSatisfied()</code> is called <em>after</em> &mdash; it's the check, not the setup.
+    <code>expectedMessageCount(int)</code> fixes how many exchanges must arrive; <code>expectedBodiesReceived(...)</code>
+    fixes the exact bodies, in order, and if it's set it overrides whatever count
+    <code>expectedMessageCount</code> implied to match the number of bodies given.
+    <code>expectedHeaderReceived</code> and <code>expectedPropertyReceived</code> do the same for a specific
+    header or exchange property on every exchange the mock sees. And because <code>assertIsSatisfied()</code>
+    polls rather than checks instantaneously &mdash; ten seconds by default, tunable with
+    <code>setResultWaitTime(millis)</code> &mdash; a route with any asynchronous hop still has time to actually
+    deliver before the assertion gives up on it.</p>
+
+    <h2 data-anchor="tcr-h2-replace">Replacing external systems without touching the route</h2>
+    <p data-anchor="tcr-p-replace1">The example above only works because <code>FileToJmsRoute</code> already routes
+    to <code>mock:result</code> &mdash; convenient when a route is written for testability from the start, useless
+    for testing a route that really calls an HTTP API or a database. For that, <code>CamelTestSupport</code> can
+    intercept endpoints without editing the route under test at all. Override <code>isMockEndpoints()</code> or
+    <code>isMockEndpointsAndSkip()</code> with a URI pattern (or <code>"*"</code> for everything), and Camel inserts
+    a mock in front of every matching endpoint before the test context even starts.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Two ways to auto-mock endpoints, and the difference that matters</caption>
+        <thead>
+          <tr><th>Override</th><th>What happens to the real endpoint</th><th>When to reach for it</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>isMockEndpoints()</code></td><td>message still goes to the real endpoint, mock just observes it too</td><td>you want to watch traffic to a real (test) system without changing it</td></tr>
+          <tr><td><code>isMockEndpointsAndSkip()</code></td><td>real endpoint is never called &mdash; the mock fully substitutes for it</td><td>the real endpoint is an external system a test must not actually touch</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pre-label">Skipping a real HTTP call entirely, and scripting the mock's response</div>
+    <pre><code><span class="kw">class</span> <span class="ty">InventoryEnrichRouteTest</span> <span class="kw">extends</span> <span class="ty">CamelTestSupport</span> {
+
+    @<span class="at">Override</span>
+    <span class="kw">protected</span> <span class="ty">RouteBuilder</span> <span class="fn">createRouteBuilder</span>() {
+        <span class="kw">return</span> <span class="kw">new</span> <span class="ty">InventoryEnrichRoute</span>();
+    }
+
+    @<span class="at">Override</span>
+    <span class="kw">public</span> <span class="ty">String</span> <span class="fn">isMockEndpointsAndSkip</span>() {
+        <span class="kw">return</span> <span class="str">"http:*"</span>;           <span class="cm">// never call the real inventory API in this test</span>
+    }
+
+    @<span class="at">Test</span>
+    <span class="kw">void</span> <span class="fn">enrichesOrderWithInventoryStatus</span>() <span class="kw">throws</span> <span class="ty">Exception</span> {
+        <span class="ty">MockEndpoint</span> inventoryApi = <span class="fn">getMockEndpoint</span>(<span class="str">"mock:http:inventory-api"</span>);
+        inventoryApi.<span class="fn">whenAnyExchangeReceived</span>(exchange -&gt;
+            exchange.<span class="fn">getMessage</span>().<span class="fn">setBody</span>(<span class="str">"{\"inStock\":true}"</span>));
+
+        <span class="ty">Exchange</span> result = template.<span class="fn">request</span>(<span class="str">"direct:start"</span>,
+            e -&gt; e.<span class="fn">getIn</span>().<span class="fn">setBody</span>(<span class="str">"{\"sku\":\"ABC-1\"}"</span>));
+
+        <span class="fn">assertTrue</span>(result.<span class="fn">getMessage</span>().<span class="fn">getBody</span>(<span class="ty">String</span>.<span class="kw">class</span>).<span class="fn">contains</span>(<span class="str">"inStock"</span>));
+    }
+}</code></pre>
+
+    <p data-anchor="tcr-p-replace2"><code>whenAnyExchangeReceived(Processor)</code> is what turns a mock from a
+    passive recorder into a scripted stand-in: it runs on every exchange the mock receives, so it can fabricate
+    exactly the response the real inventory API would have sent. Its sibling,
+    <code>whenExchangeReceived(int index, Processor)</code>, targets one specific arrival by position &mdash; the
+    mechanism, further down, for making the first two calls fail and the third succeed.</p>
+
+    <div class="callout warn" data-anchor="tcr-callout-mockendpoints">
+      <span class="callout-title">isMockEndpoints() still calls the real thing</span>
+      <p>It's easy to reach for <code>isMockEndpoints()</code> when the goal is actually to <em>avoid</em> a real
+      call, and be surprised when the test still hits the real endpoint. It's doing exactly what its name says
+      &mdash; mocking, i.e. observing, not intercepting. If a test must not touch an external system, the method
+      that matters is <code>isMockEndpointsAndSkip()</code>.</p>
+    </div>
+
+    <h2 data-anchor="tcr-h2-advicewith">AdviceWith: rewriting a route for one test</h2>
+    <p data-anchor="tcr-p-advicewith1">Auto-mocking is broad &mdash; every matching endpoint, everywhere in the
+    route. Sometimes a test needs surgical precision instead: replace <em>this one</em> <code>.to()</code>, splice a
+    step in before <em>this</em> processor, delete <em>that</em> <code>onException</code> clause entirely.
+    <span class="term">AdviceWithRouteBuilder</span> does exactly that &mdash; it rewrites an already-built route for
+    the duration of one test, without touching the production <code>RouteBuilder</code> source at all.
+    <code>weaveByType(NodeType.class)</code> selects nodes by their EIP type (this includes
+    <code>onException</code> clauses, not just steps in the route body), <code>weaveById(id)</code> selects by a
+    node's declared id, and <code>weaveByToUri(pattern)</code> selects <code>.to()</code> endpoints by URI. Each
+    selection is then acted on with <code>.replace()</code>, <code>.remove()</code>, <code>.before()</code>, or
+    <code>.after()</code>.</p>
+
+    <figure class="diagram-fig" data-anchor="tcr-fig-advicewith">
+      <svg class="diagram" viewBox="0 0 560 180" role="img" aria-labelledby="tcrD1t">
+        <title id="tcrD1t">Before advice the route calls the real inventory HTTP endpoint; after weaveByToUri().replace() it calls a mock endpoint instead, with no change to the production route source</title>
+        <text x="16" y="20">Production route</text>
+        <rect x="16"  y="30" width="150" height="32" class="stroke fill-soft"/>
+        <rect x="250" y="30" width="270" height="32" class="stroke fill-soft"/>
+        <text x="24"  y="51" class="big">enrich processor</text>
+        <text x="258" y="51" class="big">.to("http://inventory-api")</text>
+        <text x="176" y="51" class="mono dim">&rarr;</text>
+
+        <path d="M16 84 L544 84" class="stroke-soft"/>
+
+        <text x="16" y="112" class="red">Under test, after weaveByToUri(...).replace()</text>
+        <rect x="16"  y="122" width="150" height="32" class="stroke fill-soft"/>
+        <rect x="250" y="122" width="270" height="32" class="stroke-red fill-red"/>
+        <text x="24"  y="143" class="big">enrich processor</text>
+        <text x="258" y="143" class="big on-ink">.to("mock:inventory-api")</text>
+        <text x="176" y="143" class="mono dim">&rarr;</text>
+      </svg>
+      <figcaption>The advised route is a copy used only by the test &mdash; the production RouteBuilder never
+      sees a mock endpoint.</figcaption>
+    </figure>
+
+    <p data-anchor="tcr-p-advicewith2">Two shortcuts save a trip to <code>weaveByToUri</code> for the common case:
+    <code>adviceWith()</code> exposes its own <code>mockEndpoints(pattern)</code> and
+    <code>mockEndpointsAndSkip(pattern)</code>, the AdviceWith-scoped equivalents of
+    <code>isMockEndpoints()</code>/<code>isMockEndpointsAndSkip()</code> &mdash; useful when only one route in a
+    multi-route test context needs its endpoints mocked, not every route the test loads. One setup step is easy to
+    forget: AdviceWith needs the route not to have started yet, so <code>CamelTestSupport</code>'s
+    <code>isUseAdviceWith()</code> must return <code>true</code> to hold the context back from auto-starting the
+    route on setup, leaving a window for the test to call <code>adviceWith()</code> before starting the context
+    itself.</p>
+
+    <div class="callout key" data-anchor="tcr-callout-once">
+      <span class="callout-title">Advise a given route only once</span>
+      <p>Calling <code>adviceWith()</code> a second time against the same route id isn't supported, and gets
+      especially unpredictable once an error handler is involved. A test that needs several different weavings of
+      the same route splits them across separate test methods &mdash; each with its own freshly built context and
+      route &mdash; rather than chaining multiple <code>adviceWith</code> calls against one route instance.</p>
+    </div>
+
+    <h2 data-anchor="tcr-h2-retry">Proving retry behavior without waiting for it</h2>
+    <p data-anchor="tcr-p-retry1">Now the question this chapter opened with. A route configured with
+    <code>maximumRedeliveries(3)</code> and exponential backoff is genuinely slow to test the naive way &mdash; a
+    test that lets real delays run doubles as a timer, and a slow, flaky one under CI load at that. AdviceWith is
+    the fix: <code>weaveByType(OnExceptionDefinition.class)</code> selects the route's <code>onException</code>
+    clause and <code>.replace()</code> swaps in a test-only redelivery policy with the delay set to zero, or close
+    to it. The retry mechanism under test is still the real one &mdash; the same counting, the same exhaustion
+    logic &mdash; it just doesn't make the test sit through real-world backoff timings to prove it.</p>
+
+    <div class="pre-label">Proving three attempts, zero delay, correct dead letter</div>
+    <pre><code>@<span class="at">Test</span>
+<span class="kw">void</span> <span class="fn">retriesTwiceThenSucceeds</span>() <span class="kw">throws</span> <span class="ty">Exception</span> {
+    context.<span class="fn">getRouteDefinition</span>(<span class="str">"orders-in"</span>).<span class="fn">adviceWith</span>(context, <span class="kw">new</span> <span class="ty">AdviceWithRouteBuilder</span>() {
+        @<span class="at">Override</span>
+        <span class="kw">public</span> <span class="kw">void</span> <span class="fn">configure</span>() {
+            <span class="fn">weaveByType</span>(<span class="ty">OnExceptionDefinition</span>.<span class="kw">class</span>)
+                .<span class="fn">selectFirst</span>()
+                .<span class="fn">replace</span>()
+                .<span class="fn">onException</span>(<span class="ty">ConnectException</span>.<span class="kw">class</span>)
+                    .<span class="fn">maximumRedeliveries</span>(<span class="num">3</span>)
+                    .<span class="fn">redeliveryDelay</span>(<span class="num">0</span>)     <span class="cm">// no real backoff wait in the test</span>
+                    .<span class="fn">handled</span>(<span class="kw">true</span>)
+                    .<span class="kw">to</span>(<span class="str">"mock:deadLetter"</span>);
+        }
+    });
+    context.<span class="fn">start</span>();
+
+    <span class="ty">MockEndpoint</span> downstream = <span class="fn">getMockEndpoint</span>(<span class="str">"mock:downstream"</span>);
+    downstream.<span class="fn">whenExchangeReceived</span>(<span class="num">0</span>, e -&gt; { <span class="kw">throw</span> <span class="kw">new</span> <span class="ty">ConnectException</span>(<span class="str">"down"</span>); });
+    downstream.<span class="fn">whenExchangeReceived</span>(<span class="num">1</span>, e -&gt; { <span class="kw">throw</span> <span class="kw">new</span> <span class="ty">ConnectException</span>(<span class="str">"down"</span>); });
+    downstream.<span class="fn">expectedMessageCount</span>(<span class="num">3</span>);   <span class="cm">// 2 failures + 1 success, all "received"</span>
+
+    template.<span class="fn">sendBody</span>(<span class="str">"direct:start"</span>, <span class="str">"order-42"</span>);
+
+    downstream.<span class="fn">assertIsSatisfied</span>();
+}</code></pre>
+
+    <p data-anchor="tcr-p-retry2"><code>whenExchangeReceived(0, ...)</code> and
+    <code>whenExchangeReceived(1, ...)</code> script the first two arrivals at the downstream mock to fail, so the
+    third is the first one that actually succeeds &mdash; a precise, repeatable way to force exactly the "fails
+    twice, then works" scenario Chapter 24's redelivery policy exists to survive. <code>expectedMessageCount(3)</code>
+    on the same mock proves all three attempts were actually made, not just that the exchange eventually
+    completed somehow.</p>
+
+    <p data-anchor="tcr-p-retry3">For proving an exchange truly gave up &mdash; exhausted every redelivery and
+    ended in failure &mdash; without adding a mock endpoint or altering the route at all,
+    <span class="term">NotifyBuilder</span> watches the <code>CamelContext</code>'s own event notifications instead.
+    <code>whenDone(n)</code> matches once <code>n</code> exchanges have finished, success or failure both counting
+    as "done"; <code>whenCompleted(n)</code> matches only on successful completions; <code>whenFailed(n)</code>
+    matches only on exchanges that ended in failure. That three-way split is what makes it the right tool for
+    "did this really fail, in the end":</p>
+
+    <div class="pre-label">Confirming exhaustion with NotifyBuilder, no mock endpoint needed</div>
+    <pre><code>@<span class="at">Test</span>
+<span class="kw">void</span> <span class="fn">deadLettersAfterRedeliveriesExhausted</span>() <span class="kw">throws</span> <span class="ty">Exception</span> {
+    <span class="ty">NotifyBuilder</span> notify = <span class="kw">new</span> <span class="ty">NotifyBuilder</span>(context)
+        .<span class="fn">whenFailed</span>(<span class="num">1</span>)
+        .<span class="fn">create</span>();
+
+    template.<span class="fn">sendBody</span>(<span class="str">"direct:start"</span>, <span class="str">"poison-payload"</span>);
+
+    <span class="fn">assertTrue</span>(notify.<span class="fn">matches</span>(<span class="num">5</span>, <span class="ty">TimeUnit</span>.<span class="en">SECONDS</span>));
+}</code></pre>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Four tools, four different questions</caption>
+        <thead>
+          <tr><th>Tool</th><th>Question it answers</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Plain <code>Processor</code> test</td><td>does this one piece of logic do the right thing, given an exchange?</td></tr>
+          <tr><td>Mock endpoint</td><td>did the right message, in the right shape, reach this destination the right number of times?</td></tr>
+          <tr><td>AdviceWith</td><td>can I swap out one endpoint or clause in this route, for this test only, without editing production code?</td></tr>
+          <tr><td>NotifyBuilder</td><td>did the exchange finish &mdash; and specifically, did it finish as a success or a failure &mdash; without me altering the route at all?</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout key" data-anchor="tcr-callout-springquarkus">
+      <span class="callout-title">Spring Boot and Quarkus add their own test layers on top</span>
+      <p>Chapter 4 covered both project styles, and testing follows the same split. On Spring Boot,
+      <code>camel-test-spring-junit5</code> adds <code>@CamelSpringBootTest</code> to boot the Spring context
+      together with Camel, plus class-level <code>@MockEndpoints</code>/<code>@MockEndpointsAndSkip</code>
+      annotations mirroring the method overrides above, and <code>@UseAdviceWith</code> in place of
+      <code>isUseAdviceWith()</code>. On Quarkus, <code>camel-quarkus-junit5</code> builds on
+      <code>@QuarkusTest</code> instead of <code>CamelTestSupport</code>, testing routes through the same
+      CDI-managed context the application boots &mdash; a reflection of Quarkus's build-time wiring rather than a
+      different set of ideas.</p>
+    </div>
+
+    <div class="pullquote" data-anchor="tcr-pullquote">A route that's only ever been trusted in production hasn't
+    been tested &mdash; it's been gambled on. Mock endpoints and AdviceWith are how that same bet gets placed in a
+    test that finishes in milliseconds, on a laptop, instead of in production traffic that finishes in an
+    incident.</div>
+
+    <h2 data-anchor="tcr-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="tcr-p-reflection">A layered way to test a route, cheapest tool first: a bare
+    <code>process(exchange)</code> call for a processor's own logic, with no context and no network; mock
+    endpoints and <code>CamelTestSupport</code>'s auto-mocking for proving what a route sends where, and how many
+    times, with real external systems swapped out via <code>isMockEndpointsAndSkip()</code>; AdviceWith for
+    surgical, test-only rewrites of one endpoint or clause in an already-built route, with the hard rule that a
+    given route gets advised exactly once; and NotifyBuilder for confirming a route finished &mdash; successfully
+    or not &mdash; without touching it at all. Put together, they answer the question Chapter 24 left open: a test
+    can now prove a route retries exactly as many times as configured, waits for none of it, and lands precisely
+    where a failed exchange should. What none of this proves is what happens once the route is actually running
+    against the real world &mdash; a downstream API that's slow instead of down, a queue backing up, a redelivery
+    storm nobody predicted. That's a different kind of watching, done while the route is live rather than before
+    it ships, and it's exactly what the next chapter takes on.</p>
+
+    <div class="review" data-anchor="tcr-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A test overrides <code>isMockEndpoints()</code> to return <code>"jms:*"</code> so it can assert on
+        messages sent to a JMS queue. After the test runs, the CI job fails because it actually connected to a
+        real broker. What went wrong, and which override fixes it?</li>
+        <li>Why does <code>CamelTestSupport</code>'s <code>isUseAdviceWith()</code> need to return <code>true</code>
+        before a test calls <code>adviceWith()</code> &mdash; what would go wrong if the route had already
+        started?</li>
+        <li>A route retries a failing call three times before giving up. Sketch the mock-endpoint scripting
+        (<code>whenExchangeReceived</code>) and assertion needed to prove it made exactly three attempts, and
+        contrast that with what a <code>NotifyBuilder.whenFailed(1)</code> assertion alone would and wouldn't
+        tell you about the same route.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="24-redelivery-and-dead-letter-handling.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="26-observability.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
