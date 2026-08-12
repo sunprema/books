@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Understanding the Exchange &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Working with Messages</span> &middot; Chapter 08</p>
+    <p class="chapter-no">08</p>
+    <h1 data-anchor="exch-h1">Understanding<br>the Exchange</h1>
+
+    <p class="lede" data-anchor="exch-lede">Part II ended with routes that run &mdash; a file copied, an order routed
+    by country, the same logic spelled three different ways. What we skipped, on purpose, was what actually
+    flows through those routes while they run. Chapter 02 gave you the one-sentence version: an Exchange is
+    the envelope, not the letter. That sentence was enough to write a route. It is not enough to debug one.
+    This chapter opens the envelope all the way &mdash; body, headers, properties, pattern, and the one thing
+    Chapter 02 didn't cover at all: what happens to an Exchange the moment something goes wrong.</p>
+
+    <h2 data-anchor="exch-h2-anatomy">Four things, one Exchange</h2>
+    <p data-anchor="exch-p-anatomy1">Say it precisely this time: an <code>org.apache.camel.Exchange</code> is not
+    a message with a fancier name. It's a container holding four distinct things for the lifetime of one route
+    execution, and none of the four get rebuilt mid-route &mdash; a consumer creates the Exchange once, and every
+    processor after it reads and mutates the same instance.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>What an Exchange actually carries</caption>
+        <thead>
+          <tr><th>Piece</th><th>Reached via</th><th>Holds</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="term">Message</span></td><td><code>exchange.getMessage()</code></td><td>the body and its headers</td></tr>
+          <tr><td><span class="term">Properties</span></td><td><code>exchange.getProperty(name)</code></td><td>exchange-scoped key/value state</td></tr>
+          <tr><td><span class="term">Pattern</span></td><td><code>exchange.getPattern()</code></td><td>whether this step expects a reply</td></tr>
+          <tr><td><span class="term">Exception</span></td><td><code>exchange.getException()</code></td><td>what went wrong, if anything did</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="diagram-fig" data-anchor="exch-fig-anatomy">
+      <svg class="diagram" viewBox="0 0 560 220" role="img" aria-labelledby="exchD1t">
+        <title id="exchD1t">An Exchange contains a Message with body and headers, plus separate properties, a pattern, and an exception slot</title>
+
+        <text x="16" y="18" class="dim">One Exchange instance, carried through the whole route</text>
+
+        <rect x="16" y="34" width="528" height="166" class="stroke-soft"/>
+        <text x="30" y="52" class="mono">EXCHANGE</text>
+
+        <rect x="34" y="66" width="230" height="122" class="stroke fill-red"/>
+        <text x="46" y="86" class="mono on-ink">MESSAGE</text>
+        <text x="46" y="112" class="big on-ink">body</text>
+        <text x="46" y="140" class="big on-ink">headers</text>
+        <text x="46" y="164" class="mono on-ink">case-insensitive,</text>
+        <text x="46" y="178" class="mono on-ink">travels with this message</text>
+
+        <rect x="284" y="66" width="130" height="55" class="stroke fill-soft"/>
+        <text x="294" y="84" class="mono">PROPERTIES</text>
+        <text x="294" y="106" class="dim">exchange-scoped,</text>
+        <text x="294" y="118" class="dim">survives a split/enrich</text>
+
+        <rect x="284" y="131" width="130" height="30" class="stroke fill-soft"/>
+        <text x="294" y="150" class="mono">PATTERN</text>
+
+        <rect x="432" y="66" width="112" height="122" class="stroke fill-soft"/>
+        <text x="442" y="86" class="mono">EXCEPTION</text>
+        <text x="442" y="106" class="dim">null until a</text>
+        <text x="442" y="118" class="dim">processor</text>
+        <text x="442" y="130" class="dim">throws</text>
+      </svg>
+      <figcaption>The Message (highlighted) is what most route code touches directly &mdash; but the
+      Exchange around it is carrying three more things the whole time: properties, the exchange pattern,
+      and an exception slot that's empty until something fails.</figcaption>
+    </figure>
+
+    <div class="callout" data-anchor="exch-callout-legacy">
+      <span class="callout-title">If you see <code>getIn()</code> / <code>getOut()</code> in old code</span>
+      <p>Pre-3.x Camel modeled an Exchange as two separate messages &mdash; an "In" message for what arrived
+      and an "Out" message for a step's reply. Both accessors still exist for compatibility, but both are
+      <em>lazy-creating</em>: calling <code>getOut()</code> when no out message exists silently creates an
+      empty one rather than returning <code>null</code>, which is exactly why the old idiom for "did this
+      step actually reply?" was <code>hasOut()</code>, never <code>getOut() != null</code> &mdash; that
+      check would always be true, because asking the question created the answer. Modern Camel collapses
+      both slots into one current message, reached with <code>getMessage()</code>, which is what every
+      example in this book uses.</p>
+    </div>
+
+    <h2 data-anchor="exch-h2-body">The body doesn't have a type until you ask it for one</h2>
+    <p data-anchor="exch-p-body1">A Message's body is stored as a plain <code>Object</code>. It isn't "a
+    String" or "a POJO" until some code demands it be one. Call <code>getBody()</code> with no arguments and
+    you get back whatever object is sitting there, untouched. Call <code>getBody(SomeType.class)</code> and
+    Camel hands the request to its type-converter registry, which searches every converter it has loaded for
+    one that can turn the body's actual runtime type into the type you asked for &mdash; and performs that
+    conversion right there, on the spot.</p>
+
+    <div class="pre-label">Type conversion, on demand</div>
+    <pre><code>.<span class="fn">process</span>(exchange -> {
+    <span class="ty">Message</span> msg = exchange.<span class="fn">getMessage</span>();
+    <span class="ty">String</span> body = msg.<span class="fn">getBody</span>(<span class="ty">String</span>.<span class="kw">class</span>);       <span class="cm">// converted on demand</span>
+    <span class="kw">int</span> orderTotal = msg.<span class="fn">getHeader</span>(<span class="str">"OrderTotal"</span>, <span class="ty">Integer</span>.<span class="kw">class</span>);
+
+    <span class="cm">// exchange-scoped, not message-scoped -- survives a later split/enrich</span>
+    exchange.<span class="fn">setProperty</span>(<span class="str">"originalBody"</span>, body);
+});</code></pre>
+
+    <p data-anchor="exch-p-body2">This is convenient right up until it fails, and when it fails, it fails
+    late. If nothing on the classpath can bridge the body's actual type to the type you asked for, that call
+    throws <code>NoTypeConversionAvailableException</code> &mdash; but only at the moment the conversion is
+    attempted. A body of the "wrong" type can ride through several processors with no complaint at all, until
+    one of them finally asks for a type nothing can produce it from. When that exception shows up, the bug is
+    almost never in the line that threw it.</p>
+
+    <div class="callout warn" data-anchor="exch-callout-type">
+      <span class="callout-title">Where the bug actually is</span>
+      <p><code>NoTypeConversionAvailableException</code> tells you where the conversion was <em>attempted</em>,
+      not where the wrong type was <em>introduced</em>. When you hit one, work backwards: what earlier step
+      set this body to something the later step can't convert, and should that step have converted it
+      itself, closer to the source?</p>
+    </div>
+
+    <h2 data-anchor="exch-h2-headers">Headers are case-insensitive &mdash; on purpose</h2>
+    <p data-anchor="exch-p-headers1">Headers are message-scoped key/value metadata &mdash; a file name, an HTTP
+    status code, a JMS correlation ID &mdash; and Chapter 02 already told you they're scoped to the current
+    message, not the whole exchange. What it didn't tell you: Camel stores them, by default, in a
+    case-insensitive map. <code>header("ContentType")</code>, <code>header("contenttype")</code>, and
+    <code>header("CONTENTTYPE")</code> all resolve to the same entry, because the storage (a
+    <code>CaseInsensitiveMap</code>, selected via the pluggable <code>HeadersMapFactory</code> on
+    CamelContext) folds case before it ever compares keys. This mirrors how HTTP and mail headers are
+    conventionally treated &mdash; genuinely convenient when you're bridging to a protocol that doesn't care
+    about case, genuinely surprising if you were relying on <code>OrderId</code> and <code>orderId</code>
+    being two different headers.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Header vs. exchange property, precisely</caption>
+        <thead>
+          <tr><th></th><th>Scoped to</th><th>Case</th><th>Survives a Splitter/Enrich branch?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="term">Header</span></td><td>the current message</td><td>insensitive by default</td><td>not reliably</td></tr>
+          <tr><td><span class="term">Property</span></td><td>the whole exchange</td><td>exact match</td><td>yes</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="exch-h2-properties">Properties: bookkeeping that outlives the message</h2>
+    <p data-anchor="exch-p-properties1">Exchange properties are managed entirely off the Exchange, not the
+    Message &mdash; <code>setProperty()</code>, <code>getProperty()</code>, <code>getProperties()</code>,
+    <code>removeProperty()</code>, <code>hasProperties()</code>. Reach for one whenever a value needs to
+    survive past a step that builds a fresh Message, which is exactly what Splitter, Multicast, and Enrich do
+    per branch &mdash; a header set before one of those steps is not guaranteed to still be there after it; an
+    exchange property is.</p>
+
+    <p data-anchor="exch-p-properties2">Camel writes to some properties itself, as a route runs, which means
+    exchange properties aren't purely a developer's scratch space &mdash; a few carry framework state a route
+    can legitimately read. The one worth knowing before the next section: <code>Exchange.EXCEPTION_CAUGHT</code>
+    (the string <code>"CamelExceptionCaught"</code>), which holds whatever exception an
+    <code>onException</code> block is currently handling.</p>
+
+    <h2 data-anchor="exch-h2-pattern">Pattern: does this step expect a reply?</h2>
+    <p data-anchor="exch-p-pattern1"><span class="term">ExchangePattern</span> answers one question about a
+    given step: does the caller wait for a response? <span class="term">InOnly</span> is one-way,
+    fire-and-forget &mdash; publish to a queue and move on, no reply expected, none produced.
+    <span class="term">InOut</span> is request-reply &mdash; the caller blocks until a response comes back, the
+    way an HTTP call or a bean method invocation with a return value naturally works. Every endpoint's
+    component picks a sensible default (HTTP and bean calls default to InOut; JMS, file, and most
+    messaging-style endpoints default to InOnly), and a route can override it explicitly wherever the default
+    doesn't fit.</p>
+
+    <div class="pre-label">Forcing request-reply on a single step</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="kw">to</span>(<span class="ty">ExchangePattern</span>.InOut, <span class="str">"bean:pricingService?method=quote"</span>)
+    .<span class="fn">log</span>(<span class="str">"Quoted price: ${body}"</span>);</code></pre>
+
+    <div class="callout key" data-anchor="exch-callout-pattern">
+      <span class="callout-title">The mismatch that produces no error at all</span>
+      <p>Send to a plain InOnly endpoint &mdash; a JMS producer, a file write &mdash; and then read
+      <code>exchange.getMessage()</code> expecting a response, and you won't get an exception. You'll get the
+      same message you sent, unchanged, because InOnly never produced a reply to begin with. Nothing about
+      this fails loudly; the message is just quietly not what you assumed it was.</p>
+    </div>
+
+    <h2 data-anchor="exch-h2-exception">How an exception actually rides along</h2>
+    <p data-anchor="exch-p-exception1">Here's the part Chapter 02 skipped entirely. When a processor &mdash; a
+    built-in EIP or your own <code>.process(&hellip;)</code> lambda &mdash; throws, Camel does not let that
+    exception propagate up the JVM call stack the way a normal Java exception would. It catches it and calls
+    <code>exchange.setException(cause)</code>, attaching it to the Exchange itself.
+    <code>exchange.isFailed()</code> then reports <code>true</code> &mdash; it's really just shorthand for
+    "is <code>getException()</code> non-null" &mdash; and it's Camel's error-handler machinery, the Dead Letter
+    Channel by default, that inspects that exception and decides what happens next: retry, redirect to a
+    dead-letter destination, or let it propagate further. Part VI covers that machinery in full; this chapter
+    only tells you where the exception itself lives.</p>
+
+    <p data-anchor="exch-p-exception2">There's one twist worth knowing now, because it produces a genuinely
+    confusing bug otherwise. Once an <code>onException</code> block (or a <code>doTry</code>/<code>doCatch</code>)
+    has claimed an exception, <code>exchange.getException()</code> goes back to <code>null</code> for the rest
+    of the route &mdash; the exception has been <em>handled</em>, not merely observed, and Camel clears the slot.
+    The exception itself isn't gone, though; it's been relocated to that <code>Exchange.EXCEPTION_CAUGHT</code>
+    property from the last section, where code downstream of the handler can still retrieve it.</p>
+
+    <div class="pre-label">Where the exception ends up after onException claims it</div>
+    <pre><code><span class="fn">onException</span>(<span class="ty">IllegalArgumentException</span>.<span class="kw">class</span>)
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.rejected"</span>)
+.<span class="fn">end</span>();
+
+<span class="cm">// later in the route, once IllegalArgumentException has been "handled":</span>
+<span class="cm">// exchange.getException()                                    -&gt; null</span>
+<span class="cm">// exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Throwable.class) -&gt; the original exception</span></code></pre>
+
+    <div class="pullquote" data-anchor="exch-pullquote">An Exchange isn't one thing carrying a message. It's
+    four: a message, a property bag, a pattern, and &mdash; the instant something breaks &mdash; an exception.
+    Every debugging session in this book is really just asking which of those four holds the answer.</div>
+
+    <h2 data-anchor="exch-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="exch-p-reflection">Not new routing behavior &mdash; nothing on this page changes what a
+    route does. What changed is what you can now read off any Exchange in a debugger or a log line: a body
+    that's a type only once something asks, headers that fold case before they compare, properties that
+    outlive a Splitter branch a header wouldn't, a pattern that decides whether "the response" even exists,
+    and an exception slot that moves &mdash; predictably, once you know to look &mdash; the instant an
+    <code>onException</code> block claims it. Next chapter puts processors and beans to work actually changing
+    what's in that body, using exactly the type-conversion machinery this chapter just opened up.</p>
+
+    <div class="review" data-anchor="exch-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route sets a header called <code>OrderId</code> in one step and reads a header called
+        <code>orderId</code> two steps later, expecting them to be different values. What actually happens,
+        and why does Chapter 02's "header vs. property" advice alone not explain it?</li>
+        <li>A processor three steps into a route throws <code>NoTypeConversionAvailableException</code> on a
+        <code>getBody(Document.class)</code> call. Why might the actual bug be nowhere near that line?</li>
+        <li>Inside an <code>onException(...).handled(true)</code> block, a colleague writes
+        <code>exchange.getException()</code> to log what went wrong and gets <code>null</code> every time.
+        What should they call instead, and why does Camel clear <code>getException()</code> at that point in
+        the first place?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-alternative-route-dsls.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="09-transforming-data.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

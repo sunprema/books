@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Exception Handling &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VI &mdash; Reliability and Operations</span> &middot; Chapter 23</p>
+    <p class="chapter-no">23</p>
+    <h1 data-anchor="eh-h1">Exception Handling</h1>
+
+    <p class="lede" data-anchor="eh-lede">Chapter 22 closed with routes that can reach almost anything &mdash;
+    files, HTTP APIs, databases, queues &mdash; and a checklist for picking the right component to reach them
+    with. None of that changes a harder fact: every one of those systems will, sooner or later, say no. A file
+    lock will be held by another process. An API will time out. A database will refuse a connection at 2 a.m. for
+    no reason anyone can reconcile afterward. Chapter 8 mentioned in passing that a failed exchange carries its
+    exception around and that "Part VI covers that machinery in full" &mdash; this is that chapter, and it starts
+    with the question every route eventually has to answer: when a step throws, what happens next, and who
+    decided that?</p>
+
+    <h2 data-anchor="eh-h2-default">The default: fail once, fail loud</h2>
+    <p data-anchor="eh-p-default1">Start with what happens if you configure nothing at all, because that baseline
+    is what every <code>onException</code> clause in this chapter is going to override. Chapter 8 called the thing
+    that inspects a failed exchange "the Dead Letter Channel, by default" &mdash; useful shorthand for a first
+    look at the Exchange, worth making precise now. The component actually wired in with zero configuration is
+    Camel's <span class="term">DefaultErrorHandler</span>, and the distinction that matters is narrow but real: a
+    <span class="term">Dead Letter Channel</span> is an error handler that, on giving up, moves the failed
+    exchange to a dead-letter destination you name. <code>DefaultErrorHandler</code> has no such destination.
+    Left alone, it logs the failure and lets the exception propagate straight back to whatever called the route
+    &mdash; the exchange simply ends there. Nothing is retried, nothing is redirected, nothing is marked
+    "handled." The next chapter is entirely about deliberately configuring a dead-letter destination and a
+    redelivery policy; this one is about the finer-grained tool you reach for first, on the way to that: deciding,
+    exception type by exception type, what "handled" ought to mean.</p>
+
+    <div class="callout key" data-anchor="eh-callout-default">
+      <span class="callout-title">Fail loud is a reasonable default, not an oversight</span>
+      <p>A route that silently swallowed every exception by default would hide real bugs behind a shrug. Camel's
+      choice &mdash; propagate unless a policy says otherwise &mdash; means an unhandled exception is always
+      visible somewhere: in a log, in a caller's stack trace, in a failed HTTP response. Everything in this
+      chapter is about choosing, on purpose, which failures deserve a gentler ending than that.</p>
+    </div>
+
+    <h2 data-anchor="eh-h2-onexception">onException: a policy per exception type</h2>
+    <p data-anchor="eh-p-onexception1"><span class="term">onException</span> is how you tell a route "when this
+    kind of thing goes wrong, do this instead of the default." It reads like a declaration, not a step in the
+    route &mdash; you write it once, and Camel applies it wherever a matching exception surfaces:</p>
+
+    <div class="pre-label">A policy for one exception type</div>
+    <pre><code><span class="fn">onException</span>(<span class="ty">ValidationException</span>.<span class="kw">class</span>)
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="fn">useOriginalMessage</span>()
+    .<span class="kw">log</span>(<span class="ty">LoggingLevel</span>.<span class="en">WARN</span>, <span class="str">"Rejecting invalid order: ${exception.message}"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:rejectOrder"</span>);</code></pre>
+
+    <p data-anchor="eh-p-onexception2">The exception type isn't matched by a simple equality check against
+    whatever got thrown. A processor rarely throws the exact class you declared &mdash; it throws something that
+    wraps something that wraps the real cause, three levels deep, the way Java exceptions usually do. Camel
+    unwraps that chain from the innermost cause outward and, at each exception along the way, looks for an exact
+    <code>instanceof</code> match among your declared <code>onException</code> clauses; failing an exact match, it
+    falls back to whichever clause's declared exception is the closest matching superclass. Declare both
+    <code>onException(IOException.class)</code> and <code>onException(FileNotFoundException.class)</code>, and a
+    thrown <code>FileNotFoundException</code> goes to the more specific clause &mdash; not because you happened to
+    write it first or last, but because it's the exact match.</p>
+
+    <figure class="diagram-fig" data-anchor="eh-fig-hierarchy">
+      <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="ehD1t">
+        <title id="ehD1t">A thrown FileNotFoundException is tested against declared onException clauses walking outward from the innermost cause; the exact match on FileNotFoundException wins over the broader IOException clause</title>
+
+        <text x="16" y="18" class="dim">thrown, innermost cause first</text>
+        <rect x="16" y="26" width="180" height="36" class="stroke fill-soft"/>
+        <text x="30" y="49" class="mono">FileNotFoundException</text>
+
+        <path d="M106 62 L106 92" class="stroke-soft dash"/>
+        <path d="M102 84 L106 92 L110 84" class="stroke-soft"/>
+        <rect x="16" y="92" width="180" height="36" class="stroke fill-soft"/>
+        <text x="60" y="115" class="mono">IOException</text>
+        <text x="206" y="115" class="dim">(cause of the above)</text>
+
+        <path d="M196 44 L330 44" class="stroke-red dash"/>
+        <path d="M322 40 L330 44 L322 48" class="stroke-red"/>
+        <rect x="330" y="26" width="214" height="36" class="stroke-red fill-red"/>
+        <text x="344" y="49" class="mono on-ink">onException(FileNotFoundException)</text>
+        <text x="344" y="18" class="red">exact match &mdash; wins</text>
+
+        <path d="M196 110 L292 110" class="stroke-soft dash"/>
+        <path d="M284 106 L292 110 L284 114" class="stroke-soft"/>
+        <rect x="292" y="92" width="150" height="36" class="stroke fill-none"/>
+        <text x="306" y="115" class="mono dim">onException(IOException)</text>
+        <text x="292" y="146" class="dim">declared, but not the closest match here</text>
+      </svg>
+      <figcaption>Camel walks the exception's cause chain and picks the closest declared match &mdash; specificity wins, not declaration order.</figcaption>
+    </figure>
+
+    <p data-anchor="eh-p-onexception3">Three settings decide what happens once a clause matches, and they're
+    worth holding side by side, because mixing them up produces exactly the "why did the caller still see an
+    exception" bug you'd expect:</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>What a matched onException clause does next</caption>
+        <thead>
+          <tr><th>Setting</th><th>The caller sees&hellip;</th><th>The route&hellip;</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>handled(false)</code> &mdash; the default</td><td>the exception, rethrown</td><td>stops; the exchange is marked failed</td></tr>
+          <tr><td><code>handled(true)</code></td><td>a normal, non-exceptional result</td><td>stops at the onException clause; the clause's own steps become the ending</td></tr>
+          <tr><td><code>continued(true)</code></td><td>a normal, non-exceptional result</td><td>resumes from the exact point the exception was thrown, as if it hadn't happened</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="eh-p-onexception4">There's a twist worth having ready before it surprises you: once an
+    <code>onException</code> clause has claimed an exception, <code>exchange.getException()</code> goes back to
+    <code>null</code> for the rest of the route &mdash; Chapter 8 showed you this. The exception hasn't vanished;
+    it's living in the <code>Exchange.EXCEPTION_CAUGHT</code> property, which is where a clause's own steps have
+    to look if they want to inspect what actually went wrong: <code>exchange.getProperty(Exchange.EXCEPTION_CAUGHT,
+    Exception.class)</code>. That's exactly what <code>${exception.message}</code> resolves to inside the Simple
+    expression in the snippet above &mdash; it's reading that same property, not the exchange's own exception
+    slot.</p>
+
+    <p data-anchor="eh-p-onexception5">One more knob, for when the exception type alone isn't specific enough:
+    <code>onWhen(Predicate)</code> adds a condition on top of the type match. A clause for
+    <code>SQLException</code> can fire only when the caught exception's SQL state looks transient, and leave every
+    other <code>SQLException</code> to a different, less forgiving clause &mdash; two clauses for the same
+    exception class, split by what the exchange actually looks like when it fails.</p>
+
+    <h2 data-anchor="eh-h2-trycatch">doTry, doCatch, doFinally: the local escape hatch</h2>
+    <p data-anchor="eh-p-trycatch1">Sometimes a policy that spans the whole route is more machinery than the
+    problem needs &mdash; you just want to wrap three steps the way you'd wrap them in Java, handle what goes
+    wrong right there, and move on. Camel's DSL has exactly that, prefixed with "do" so it doesn't collide with
+    Java's own <code>try</code>/<code>catch</code>/<code>finally</code> keywords:</p>
+
+    <div class="pre-label">Java's try/catch/finally, as a route segment</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:start"</span>)
+    .<span class="fn">doTry</span>()
+        .<span class="kw">process</span>(riskyProcessor)
+        .<span class="kw">to</span>(<span class="str">"direct:downstream"</span>)
+    .<span class="fn">doCatch</span>(<span class="ty">IOException</span>.<span class="kw">class</span>, <span class="ty">TimeoutException</span>.<span class="kw">class</span>)
+        .<span class="kw">to</span>(<span class="str">"log:catch?level=WARN"</span>)
+    .<span class="fn">doFinally</span>()
+        .<span class="kw">to</span>(<span class="str">"log:finally"</span>)
+    .<span class="fn">end</span>();</code></pre>
+
+    <p data-anchor="eh-p-trycatch2"><code>doCatch</code> takes exception classes the same way
+    <code>onException</code> does &mdash; and the same way, it accepts its own <code>onWhen()</code> for a
+    conditional catch. <code>doFinally</code> runs whether or not anything was thrown, same as its Java namesake.
+    And the block has to be closed with <code>end()</code>, or the DSL builder never knows where it stops.</p>
+
+    <div class="callout warn" data-anchor="eh-callout-scope">
+      <span class="callout-title">doTry replaces the route's error handler, it doesn't nest inside it</span>
+      <p>This is the detail that trips people up: for the duration of a <code>doTry</code> block, the route's
+      outer error handler &mdash; whatever <code>onException</code> policy or Dead Letter Channel would otherwise
+      apply &mdash; is not in effect. <code>doTry&hellip;doCatch&hellip;doFinally</code> is its own self-contained
+      error handler, scoped to exactly the steps inside it. An outer <code>onException(IOException.class)</code>
+      will not fire for an <code>IOException</code> thrown inside a <code>doTry</code> block unless that block's
+      own <code>doCatch</code> also names it. Reach for <code>onException</code> when a policy should apply
+      broadly; reach for <code>doTry</code> when you want to handle a failure locally, in the middle of one
+      route, without touching the policy that governs everything else.</p>
+    </div>
+
+    <h2 data-anchor="eh-h2-scope">Route-scoped and global error policies</h2>
+    <p data-anchor="eh-p-scope1">Where you write an <code>onException</code> clause decides how far it reaches.
+    Declare it at the top of a <code>RouteBuilder</code>'s <code>configure()</code> method &mdash; before any
+    <code>from(&hellip;)</code> &mdash; and it applies to every route that same <code>RouteBuilder</code> builds.
+    That's the classic way to get one shared policy without repeating it on each route. It has a scope you should
+    know before relying on it, though: this "global" reach is per <code>RouteBuilder</code> instance. Split your
+    routes across several <code>RouteBuilder</code> classes in the same <code>CamelContext</code>, and a
+    top-level <code>onException</code> in one of them does not automatically cover the others &mdash; you'd need
+    a shared base class, or the tool built for exactly this problem: <span class="term">Route Configuration</span>.</p>
+
+    <p data-anchor="eh-p-scope2">A <code>routeConfiguration()</code> is a named, reusable bundle of error-handling
+    policy &mdash; <code>onException</code> clauses, an <code>errorHandler()</code>, whatever a group of routes
+    should share &mdash; defined once and then attached to specific routes by id:</p>
+
+    <div class="pre-label">One named policy, attached to one route by id</div>
+    <pre><code><span class="fn">routeConfiguration</span>(<span class="str">"resilient"</span>)
+    .<span class="fn">onException</span>(<span class="ty">Exception</span>.<span class="kw">class</span>)
+        .<span class="fn">maximumRedeliveries</span>(<span class="num">3</span>)
+        .<span class="fn">handled</span>(<span class="kw">true</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="fn">routeConfigurationId</span>(<span class="str">"resilient"</span>)
+    .<span class="kw">to</span>(<span class="str">"bean:orderService"</span>);</code></pre>
+
+    <p data-anchor="eh-p-scope3"><code>routeConfigurationId</code> isn't limited to one exact name either &mdash;
+    it accepts wildcards and regular expressions, so a single configuration can cover every route whose id
+    matches a pattern. The practical difference from a top-of-configure() global clause: instead of one policy
+    for everything, or a hand-copied policy per route, you get named, composable policies &mdash; a
+    <code>"resilient"</code> configuration for routes that talk to flaky external systems, a
+    <code>"strict"</code> one for routes where any failure should surface immediately, each attached to exactly
+    the routes that need it.</p>
+
+    <h2 data-anchor="eh-h2-business">Business exceptions versus technical exceptions</h2>
+    <p data-anchor="eh-p-business1">Here's a distinction that isn't a Camel API at all &mdash; it's a design habit
+    worth building into your own exception classes before you write a single <code>onException</code> clause. Not
+    every failure deserves the same response. An order with a missing customer ID is <em>wrong</em>, and it'll
+    still be wrong the fifth time you retry it; an API that timed out because a network blip lasted 200
+    milliseconds might succeed on the very next attempt. Treating both the same way &mdash; either retrying
+    everything, or handling nothing &mdash; wastes effort in one direction or the other.</p>
+
+    <p data-anchor="eh-p-business2">The common answer is to make the difference visible in the type system. A
+    <span class="term">business exception</span> &mdash; your own class, something like
+    <code>OrderValidationException</code> &mdash; represents an expected domain-rule failure: the input was bad,
+    Camel didn't cause it, and redelivering won't fix it. A <span class="term">technical exception</span> &mdash;
+    <code>ConnectException</code>, <code>SQLException</code>, the <code>HttpOperationFailedException</code> from
+    Chapter 19 &mdash; represents the environment misbehaving in a way that's often transient. Two
+    <code>onException</code> clauses, one per category, turn that judgment call into policy instead of leaving it
+    to whoever's on call at 2 a.m.:</p>
+
+    <div class="pre-label">Two categories of failure, two different endings</div>
+    <pre><code><span class="fn">onException</span>(<span class="ty">OrderValidationException</span>.<span class="kw">class</span>)
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:rejectOrder"</span>);
+
+<span class="fn">onException</span>(<span class="ty">ConnectException</span>.<span class="kw">class</span>, <span class="ty">SQLException</span>.<span class="kw">class</span>)
+    .<span class="fn">maximumRedeliveries</span>(<span class="num">5</span>)
+    .<span class="fn">redeliveryDelay</span>(<span class="num">2000</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:deadLetter"</span>);</code></pre>
+
+    <p data-anchor="eh-p-business3">Notice what each clause is quietly saying about the failure it names. The
+    business exception is <code>handled(true)</code> with no redelivery at all &mdash; retrying a validation
+    failure just burns time arriving at the same rejection. The technical exceptions get
+    <code>maximumRedeliveries</code>, because the bet there is that the environment recovers before the retries
+    run out. That single default worth remembering from earlier in the chapter still applies:
+    <code>maximumRedeliveries</code> is 0 unless you set it, on any clause, business or technical &mdash;
+    declaring the clause is not the same as asking it to retry. The next chapter is where
+    <code>redeliveryDelay</code>, backoff, and the destination named <code>direct:deadLetter</code> above get the
+    depth they deserve; here, the point is just that the classification comes first, and the redelivery numbers
+    follow from it.</p>
+
+    <div class="pullquote" data-anchor="eh-pullquote">A caught exception is a decision point, not just a stack
+    trace: is this failure the kind that retrying fixes, or the kind that retrying only delays admitting? Camel
+    gives you the mechanism &mdash; onException, doTry, route configurations. The judgment about which failures
+    belong in which bucket is still yours to make, and making it explicit in your own exception hierarchy is what
+    turns that judgment into something the route can act on automatically.</div>
+
+    <h2 data-anchor="eh-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="eh-p-reflection">A precise picture of what "nothing configured" actually does &mdash;
+    <code>DefaultErrorHandler</code> logs and propagates, with no dead-letter destination, which is the honest
+    baseline every policy in this chapter overrides on purpose. <code>onException</code> for a policy scoped to an
+    exception type, matched by walking the cause chain to the closest declared match, with
+    <code>handled</code>, <code>continued</code>, and <code>onWhen</code> as the levers that decide what happens
+    next. <code>doTry&hellip;doCatch&hellip;doFinally</code> for the same idea shrunk down to a few steps in the
+    middle of a route, with its own private error handler that doesn't answer to the route's outer policy. Global,
+    per-<code>RouteBuilder</code> policies for the simple case, and named Route Configurations for when different
+    groups of routes genuinely need different rules. And a habit, not an API &mdash; splitting business
+    exceptions from technical ones &mdash; that turns "should this retry?" from a judgment call made under
+    pressure into a decision already written into the route. What's still missing is the machinery on the other
+    side of that decision: how many times to actually retry, how long to wait between attempts, and where a
+    message goes once every attempt has failed. That's the next chapter.</p>
+
+    <div class="review" data-anchor="eh-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route declares both <code>onException(IOException.class)</code> and
+        <code>onException(FileNotFoundException.class)</code>, in that order. A step throws a
+        <code>FileNotFoundException</code>. Which clause handles it, and why does the declaration order not
+        decide the answer?</li>
+        <li>Inside an <code>onException</code> clause that has <code>handled(true)</code> set, what does
+        <code>exchange.getException()</code> return, and where does the actual exception live instead?</li>
+        <li>A three-step segment inside a larger route is wrapped in <code>doTry&hellip;doCatch&hellip;doFinally</code>.
+        The route also has a route-wide <code>onException(SQLException.class)</code> declared at the top of
+        <code>configure()</code>. A <code>SQLException</code> is thrown inside the wrapped segment, and the
+        <code>doCatch</code> block does not name <code>SQLException</code>. Does the outer <code>onException</code>
+        clause catch it? Why or why not?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="22-choosing-camel-components.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="24-redelivery-and-dead-letter-handling.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

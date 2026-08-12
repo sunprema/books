@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Reliable Message Delivery &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part IV &mdash; Core Integration Patterns</span> &middot; Chapter 16</p>
+    <p class="chapter-no">16</p>
+    <h1 data-anchor="rel-h1">Reliable Message Delivery</h1>
+
+    <p class="lede" data-anchor="rel-lede">Chapter 15 ended on an admission: every <code>enrich()</code> call, every
+    outbound HTTP request, every call to a system you don't own, can fail outright &mdash; and the honest fix for a
+    failed call is to try it again. But "try it again" has a cost nobody mentions in the happy-path tutorial. The
+    first attempt might not have failed cleanly. It might have timed out after the downstream system already
+    processed it, or after your own consumer already received it but crashed before acknowledging. Retry in either
+    case and you haven't recovered from a failure &mdash; you've created a <em>duplicate</em>. Multiply that across a
+    route that reads from several partitions, runs several instances in parallel, or waits on more than one slow
+    dependency, and duplicates aren't your only new problem: messages can also arrive <em>out of order</em>, and
+    a burst of retries can arrive fast enough to overwhelm whatever they're retrying <em>into</em>. This chapter is
+    about the three patterns Camel gives you for exactly those three side effects &mdash; not preventing them,
+    which you mostly can't, but surviving them.</p>
+
+    <h2 data-anchor="rel-h2-atleast">At-least-once is the deal you actually signed</h2>
+    <p data-anchor="rel-p-atleast1">Almost nothing you integrate with promises <em>exactly-once</em> delivery, no
+    matter what the marketing says. A sender that times out waiting for an acknowledgment has no way to know whether
+    its message actually arrived &mdash; the acknowledgment could be lost just as easily as the message itself. The
+    only safe move, and the one every real messaging system, HTTP client, and Camel redelivery policy actually
+    makes, is to resend. That's <strong>at-least-once</strong> delivery: a message is guaranteed to arrive one or
+    more times, never zero, and "more than one" is not a bug in the transport &mdash; it's the transport keeping its
+    one real promise. A route built on the unspoken assumption that each message shows up exactly once will work
+    perfectly in every demo and then quietly double-process a payment, an order, or a shipment notification the
+    first time a network blip forces a retry.</p>
+
+    <p data-anchor="rel-p-atleast2">Camel doesn't try to make the world exactly-once, because it can't &mdash;
+    nothing downstream of an unreliable network can. Instead it gives you three EIPs that each defend against one
+    specific consequence of at-least-once, asynchronous, parallel delivery: <span class="term">Idempotent
+    Consumer</span> catches the duplicates retries create, <span class="term">Resequencer</span> restores the order
+    that parallelism and retries scramble, and <span class="term">Throttler</span> keeps a burst of retries or
+    traffic from overwhelming whatever it's aimed at.</p>
+
+    <h2 data-anchor="rel-h2-idempotent">idempotentConsumer(): catching the duplicate before it reprocesses</h2>
+    <p data-anchor="rel-p-idempotent1">The Idempotent Consumer pattern doesn't try to stop duplicates from being
+    sent &mdash; it can't, any more than Camel can fix the network. It filters them out on arrival instead. Give it
+    an expression that computes a unique key for each message &mdash; something the sender guarantees is stable
+    across every copy of the same logical message, like an order ID or a message UUID &mdash; and a repository to
+    remember which keys it's already seen. The first message with a given key goes through. Every later message
+    with the same key is a duplicate, and Camel filters it out before your route ever touches it.</p>
+
+    <div class="pre-label">Filtering duplicate orders by OrderId</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"seda:orders"</span>)
+    .<span class="fn">idempotentConsumer</span>(<span class="fn">header</span>(<span class="str">"OrderId"</span>), MemoryIdempotentRepository.<span class="fn">memoryIdempotentRepository</span>(<span class="num">1000</span>))
+.<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);</code></pre>
+
+    <p data-anchor="rel-p-idempotent2">The two arguments are the whole pattern: an <code>Expression</code> for the
+    key, and an <code>IdempotentRepository</code> &mdash; a small SPI (<code>org.apache.camel.spi.IdempotentRepository</code>)
+    that Camel ships several implementations of, covered next. Everything else about
+    <code>idempotentConsumer()</code>'s behavior is controlled by three options, and their defaults are doing more
+    work than a first read suggests.</p>
+
+    <div class="callout key" data-anchor="rel-callout-options">
+      <span class="callout-title">eager, skipDuplicate, removeOnFailure &mdash; all default to true, on purpose</span>
+      <p><code>eager</code> (default <code>true</code>) records the key <em>before</em> the exchange finishes
+      processing, not after &mdash; so two copies of the same message racing each other concurrently both get
+      caught, not just a duplicate that arrives after the first one has already completed. <code>skipDuplicate</code>
+      (default <code>true</code>) automatically filters a detected duplicate out of the route, silently. And
+      <code>removeOnFailure</code> (default <code>true</code>) is the one most likely to save you: if the exchange
+      ultimately fails, Camel removes its key from the repository again, specifically so a message that failed for a
+      real reason is still eligible to be retried &mdash; without it, one legitimate failure would look identical to
+      a duplicate and never get a second chance.</p>
+    </div>
+
+    <p data-anchor="rel-p-idempotent3">Sometimes silently filtering a duplicate is the wrong call &mdash; you'd
+    rather see it, log it, or route it somewhere for auditing than have it vanish with no trace. Set
+    <code>skipDuplicate(false)</code> and the duplicate keeps flowing through the route instead of being dropped,
+    with the boolean exchange property <code>Exchange.DUPLICATE_MESSAGE</code> set so your route can act on it
+    explicitly:</p>
+
+    <div class="pre-label">Routing duplicates somewhere visible instead of discarding them</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="fn">idempotentConsumer</span>(<span class="fn">header</span>(<span class="str">"OrderId"</span>))
+        .<span class="fn">messageIdRepository</span>(jdbcRepo)
+        .<span class="fn">skipDuplicate</span>(<span class="kw">false</span>)
+    .<span class="fn">choice</span>()
+        .<span class="fn">when</span>(<span class="fn">exchangeProperty</span>(Exchange.DUPLICATE_MESSAGE).<span class="fn">isEqualTo</span>(<span class="kw">true</span>))
+            .<span class="kw">to</span>(<span class="str">"direct:duplicateOrders"</span>)
+        .<span class="fn">otherwise</span>()
+            .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>)
+    .<span class="fn">end</span>();</code></pre>
+
+    <div class="callout warn" data-anchor="rel-callout-key">
+      <span class="callout-title">A good idempotency key is not optional set-dressing</span>
+      <p>The whole pattern is only as correct as the key you hand it. It has to be something the <em>sender</em>
+      guarantees stays identical across every copy of the same logical message &mdash; an order ID, a message UUID
+      the producer sets once and never regenerates on retry. A key derived from arrival time, from a hash of the
+      whole message body when the body can legitimately change between fields, or from anything the sender doesn't
+      actually keep stable, will either let real duplicates through or, worse, flag two genuinely different messages
+      as the same one and drop one of them for good.</p>
+    </div>
+
+    <h2 data-anchor="rel-h2-repository">Choosing a repository: memory is a single-instance answer</h2>
+    <p data-anchor="rel-p-repository1"><code>MemoryIdempotentRepository</code> is the fastest option and the one
+    every example reaches for first &mdash; a bounded, in-process map, no external dependency, no configuration. It
+    is also the one most likely to lie to you in production. Its memory of what's been seen exists nowhere but that
+    one JVM's heap: restart the process and the history is gone; run a second instance of the same route &mdash;
+    which is exactly what you do to scale, or what a container orchestrator does automatically after a crash &mdash;
+    and neither instance can see what the other has already processed. The moment more than one instance can
+    consume the same source, or the process can restart mid-flight, you need a repository every instance shares.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>IdempotentRepository implementations, by what they trade off</caption>
+        <thead>
+          <tr><th>Repository</th><th>Durable across restarts?</th><th>Shared across instances?</th><th>Typical fit</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>MemoryIdempotentRepository</td><td>No</td><td>No</td><td>Single-instance route, dev/test</td></tr>
+          <tr><td>Caffeine-backed repository</td><td>No</td><td>No</td><td>Single instance, needs eviction/size control the plain memory map lacks</td></tr>
+          <tr><td>JdbcMessageIdRepository</td><td>Yes</td><td>Yes</td><td>Already have a relational database in the deployment</td></tr>
+          <tr><td>KafkaIdempotentRepository</td><td>Yes</td><td>Yes</td><td>Already running Kafka; wants a replicated, compacted store</td></tr>
+          <tr><td>Hazelcast / Infinispan-backed repository</td><td>Yes (cluster-dependent)</td><td>Yes</td><td>Already running that cluster cache for other state</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="rel-p-repository2">None of these is universally "correct" &mdash; the right one is whichever
+    shared store your deployment already trusts to survive a restart. The interface (<code>add</code>,
+    <code>contains</code>, <code>remove</code>, plus the eager-check <code>confirm</code>) is the same regardless,
+    so swapping repositories later is a configuration change, not a route rewrite.</p>
+
+    <h2 data-anchor="rel-h2-resequence">Resequencer: putting a stream back in order</h2>
+    <p data-anchor="rel-p-resequence1">Filtering duplicates solves one side effect of retries and parallelism.
+    Here's another: a splitter that fans work across threads, a set of retried deliveries, or messages arriving
+    from several partitions of the same logical stream can all easily deliver message 3 before message 1. If
+    whatever consumes them downstream cares about order &mdash; applying price updates in sequence, replaying
+    events in the order they happened &mdash; that's a correctness bug, not a cosmetic one. The <span
+    class="term">Resequencer</span> reorders messages passing through a route back into the order the sequence
+    expression says they belong in.</p>
+
+    <figure class="diagram-fig" data-anchor="rel-fig-resequence">
+      <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="reqD1t">
+        <title id="reqD1t">Messages arrive out of order, seq 3 then seq 1 then seq 2; the resequence() step buffers them and releases them downstream back in order as seq 1, seq 2, seq 3</title>
+
+        <text x="16" y="18" class="dim">arrives in this order</text>
+        <rect x="16" y="26" width="70" height="36" class="stroke fill-soft"/>
+        <text x="34" y="49" class="mono">seq 3</text>
+        <rect x="16" y="80" width="70" height="36" class="stroke fill-soft"/>
+        <text x="34" y="103" class="mono">seq 1</text>
+        <rect x="16" y="134" width="70" height="36" class="stroke fill-soft"/>
+        <text x="34" y="157" class="mono">seq 2</text>
+
+        <path d="M86 44 L200 44 L200 96 L246 96" class="stroke-soft dash"/>
+        <path d="M86 98 L200 98 L200 96 L246 96" class="stroke-soft dash"/>
+        <path d="M86 152 L200 152 L200 100 L246 100" class="stroke-soft dash"/>
+
+        <rect x="246" y="78" width="130" height="40" class="stroke fill-red"/>
+        <text x="256" y="103" class="mono on-ink">resequence()</text>
+
+        <path d="M376 98 L430 98" class="stroke-soft dash"/>
+        <path d="M422 94 L430 98 L422 102" class="stroke-soft"/>
+
+        <text x="430" y="18" class="dim">released in order</text>
+        <rect x="430" y="26" width="70" height="36" class="stroke fill-none"/>
+        <text x="448" y="49" class="mono">seq 1</text>
+        <rect x="430" y="80" width="70" height="36" class="stroke fill-none"/>
+        <text x="448" y="103" class="mono">seq 2</text>
+        <rect x="430" y="134" width="70" height="36" class="stroke fill-none"/>
+        <text x="448" y="157" class="mono">seq 3</text>
+      </svg>
+      <figcaption>resequence() buffers a scrambled arrival order and releases messages downstream in sequence-expression order.</figcaption>
+    </figure>
+
+    <p data-anchor="rel-p-resequence2">Two algorithms, chosen with <code>.batch()</code> or <code>.stream()</code>
+    after the sequence expression &mdash; <code>batch()</code> is the default if you don't pick one. They make
+    genuinely different tradeoffs, not just syntax variants of the same idea.</p>
+
+    <div class="pre-label">Batch resequencing: buffer, sort, release</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:priceUpdates"</span>)
+    .<span class="fn">resequence</span>(<span class="fn">header</span>(<span class="str">"seqnum"</span>))
+        .<span class="fn">batch</span>()
+        .<span class="fn">batchSize</span>(<span class="num">200</span>)
+        .<span class="fn">batchTimeout</span>(<span class="num">2000</span>)
+.<span class="kw">to</span>(<span class="str">"direct:applyPriceUpdate"</span>);</code></pre>
+
+    <p data-anchor="rel-p-resequence3"><strong>Batch</strong> mode collects messages into a buffer, sorts the whole
+    buffer by the sequence expression, and releases it once <code>batchSize</code> is reached (default 100) or
+    <code>batchTimeout</code> elapses (default 1000ms), whichever comes first. It only guarantees order <em>within
+    one batch</em> &mdash; a straggler that arrives after its batch has already shipped downstream is never
+    retroactively reordered against messages that already left. A larger <code>batchSize</code> or
+    <code>batchTimeout</code> buys a better chance of catching a late arrival before release, at the direct cost of
+    added latency for everything waiting in that buffer.</p>
+
+    <div class="pre-label">Stream resequencing: release as soon as the next one in line shows up</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:events"</span>)
+    .<span class="fn">resequence</span>(<span class="fn">header</span>(<span class="str">"seqnum"</span>))
+        .<span class="fn">stream</span>()
+        .<span class="fn">capacity</span>(<span class="num">5000</span>)
+        .<span class="fn">timeout</span>(<span class="num">4000</span>)
+.<span class="kw">to</span>(<span class="str">"direct:applyEvent"</span>);</code></pre>
+
+    <p data-anchor="rel-p-resequence4"><strong>Stream</strong> mode doesn't wait for a batch at all: it holds a
+    rolling window of up to <code>capacity</code> in-flight messages and releases each one the moment it's next in
+    the expected sequence, detecting gaps rather than sorting a fixed collection. <code>timeout</code> bounds how
+    long it will hold the window open waiting for a specific gap to fill before giving up and releasing what it has
+    anyway. <code>rejectOld</code> (default <code>false</code>) can drop any message whose sequence number is
+    already lower than one already released &mdash; useful once you've decided a straggler that far behind is no
+    longer worth reordering, only worth discarding.</p>
+
+    <div class="callout warn" data-anchor="rel-callout-resequence-limits">
+      <span class="callout-title">The resequencer can't invent order it was never given</span>
+      <p>It only reorders the messages that actually reach it, using whatever sequence field you point it at. If
+      the field is missing on some messages, isn't actually comparable, or the message that would fill a gap is
+      never coming at all, the resequencer has nothing to correct with. Leave <code>timeout</code> too high (batch)
+      or unset on a stream that can genuinely lose a message and you can end up holding every later message hostage
+      waiting on one that will never arrive.</p>
+    </div>
+
+    <h2 data-anchor="rel-h2-throttle">Throttler: protecting what's on the other end</h2>
+    <p data-anchor="rel-p-throttle1">Duplicates and disorder are about correctness. The last piece is about
+    survival: a retried delivery, a burst of traffic, or simply more concurrency than a downstream system was built
+    for can overwhelm it, turning "resilient" into "the thing that took the database down." <span
+    class="term">Throttler</span> caps how many messages Camel lets through to an endpoint in a given window &mdash;
+    protecting a downstream system that can't handle unlimited load, or keeping you inside an external SLA you don't
+    control.</p>
+
+    <div class="pre-label">At most 5 notifications per second, per tenant, without blocking the caller</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:notifyCustomer"</span>)
+    .<span class="fn">throttle</span>(<span class="num">5</span>).<span class="fn">timePeriodMillis</span>(<span class="num">1000</span>)
+        .<span class="fn">correlationExpression</span>(<span class="fn">header</span>(<span class="str">"tenantId"</span>))
+        .<span class="fn">asyncDelayed</span>()
+.<span class="kw">to</span>(<span class="str">"https://notifications.example.com/send"</span>);</code></pre>
+
+    <p data-anchor="rel-p-throttle2"><code>throttle(n)</code> allows at most <code>n</code> messages through per
+    window; <code>timePeriodMillis</code> (default 1000ms) sets that window's length, so
+    <code>throttle(3).timePeriodMillis(10000)</code> reads as "at most 3 messages in any 10-second span." By
+    default the calling thread simply blocks until it's a given message's turn &mdash; fine for a low-volume route,
+    but on a route with real concurrency it quietly turns a rate limiter into a thread-pool limiter, since every
+    blocked thread is one not available to do other work. <code>asyncDelayed(true)</code> fixes that by scheduling
+    the delayed continuation elsewhere and freeing the calling thread immediately.</p>
+
+    <p data-anchor="rel-p-throttle3"><code>correlationExpression</code> is what turns one global budget into a
+    per-key budget &mdash; the example above gives every tenant its own 5-per-second allowance instead of five
+    tenants fighting over one shared quota, the same instinct as a per-tenant rate limit on any multi-tenant API.
+    And when the right answer is a fast failure instead of a delay, <code>rejectExecution(true)</code> throws a
+    <code>ThrottlerRejectedExecutionException</code> the instant a message is over the limit, rather than queueing
+    it to wait its turn.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Three side effects of at-least-once delivery, three patterns</caption>
+        <thead>
+          <tr><th></th><th>Idempotent Consumer</th><th>Resequencer</th><th>Throttler</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Defends against</td><td>Duplicate arrival</td><td>Out-of-order arrival</td><td>Overload / burst arrival</td></tr>
+          <tr><td>Core EIP call</td><td><code>idempotentConsumer(expr, repo)</code></td><td><code>resequence(expr).batch()/.stream()</code></td><td><code>throttle(n).timePeriodMillis(ms)</code></td></tr>
+          <tr><td>Main knob</td><td>Repository choice (durable + shared, or not)</td><td>batchSize/batchTimeout vs capacity/timeout</td><td>correlationExpression, asyncDelayed</td></tr>
+          <tr><td>Quiet default to watch</td><td>removeOnFailure=true lets a real failure retry cleanly</td><td>batch mode only orders within one batch</td><td>synchronous by default blocks the calling thread</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pullquote" data-anchor="rel-pullquote">Reliable delivery was never about making a message arrive
+    exactly once &mdash; nothing downstream of a network can promise that. It's about making at-least-once,
+    out-of-order, bursty arrival all survivable, on purpose, instead of by accident.</div>
+
+    <h2 data-anchor="rel-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="rel-p-reflection">Three EIPs, each aimed at one specific consequence of the messy, honest way
+    distributed systems actually deliver messages: <code>idempotentConsumer()</code> so a retried delivery doesn't
+    get processed twice, <code>resequence()</code> so parallelism and retries don't scramble an order-sensitive
+    stream, and <code>throttle()</code> so a burst doesn't take down whatever it's aimed at. None of them try to fix
+    the network &mdash; they all assume it will misbehave and give your route a way to stay correct anyway. What
+    this chapter deliberately left out is the other half of "try it again": the retry policy itself, and where a
+    message goes when every retry has been exhausted. That's Chapter 24, Redelivery and Dead-Letter Handling. Up
+    next, Chapter 17 turns to a different question &mdash; not how to survive a retried or reordered message, but
+    how to stop blocking on a downstream call at all.</p>
+
+    <div class="review" data-anchor="rel-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>An <code>idempotentConsumer()</code> route runs as three replicas behind a load balancer, each backed by
+        its own <code>MemoryIdempotentRepository</code>. Will a duplicate message routed to a different replica than
+        the original be caught? What has to change about the repository for it to be?</li>
+        <li>A resequencer is configured with <code>.batch().batchSize(50).batchTimeout(500)</code>. A message with a
+        lower sequence number than everything already released arrives 2 seconds late. What happens to it, and why
+        doesn't batch mode retroactively fix the order?</li>
+        <li>You need to cap outbound calls to a partner API at 10 requests per second <em>per partner</em>, not 10
+        requests per second total across all partners. Which <code>throttle()</code> option makes that distinction,
+        and what would happen without it?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="15-message-enrichment.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="17-asynchronous-integration-patterns.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

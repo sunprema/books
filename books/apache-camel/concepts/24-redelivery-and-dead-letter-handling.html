@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Redelivery and Dead-Letter Handling &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VI &mdash; Reliability and Operations</span> &middot; Chapter 24</p>
+    <p class="chapter-no">24</p>
+    <h1 data-anchor="rd-h1">Redelivery and Dead-Letter Handling</h1>
+
+    <p class="lede" data-anchor="rd-lede">The last chapter closed with a deliberate gap: it told you how to
+    decide, exception type by exception type, whether a failure should be swallowed, rethrown, or resumed &mdash;
+    but it kept saying "the next chapter" every time the conversation turned to how many times to try again, how
+    long to wait, and where a message goes once every attempt has failed. This is that chapter. The two halves fit
+    together as one idea: <code>onException</code> decided <em>whether</em> a failure gets a second chance;
+    everything here decides what that second chance actually looks like, and what happens when you run out of
+    them.</p>
+
+    <h2 data-anchor="rd-h2-policy">The retry knob nobody turns by accident</h2>
+    <p data-anchor="rd-p-policy1">Every <code>onException</code> clause and every <code>errorHandler()</code>
+    carries a <span class="term">RedeliveryPolicy</span> &mdash; the object that decides how many times Camel
+    tries again and how long it waits between attempts. Its most important default is easy to miss precisely
+    because it's quiet: <code>maximumRedeliveries</code> is <code>0</code> unless you say otherwise. Declare
+    <code>onException(SQLException.class).handled(true)</code> with nothing else, and you get exactly one attempt
+    &mdash; the clause changed what happens <em>after</em> the failure, not how many times Camel tried first.
+    Redelivery is opt-in, on every single clause, every time.</p>
+
+    <div class="pre-label">Asking for retries, explicitly</div>
+    <pre><code><span class="fn">onException</span>(<span class="ty">ConnectException</span>.<span class="kw">class</span>, <span class="ty">SQLException</span>.<span class="kw">class</span>)
+    .<span class="fn">maximumRedeliveries</span>(<span class="num">5</span>)
+    .<span class="fn">redeliveryDelay</span>(<span class="num">2000</span>)
+    .<span class="fn">retriesExhaustedLogLevel</span>(<span class="ty">LoggingLevel</span>.<span class="en">ERROR</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:deadLetter"</span>);</code></pre>
+
+    <p data-anchor="rd-p-policy2"><code>maximumRedeliveries(5)</code> means what it says: up to five extra
+    attempts after the original, six chances total for the exchange to succeed. Set it to a negative number and
+    Camel retries forever &mdash; a real setting, occasionally the right one for a route where giving up is worse
+    than waiting, but one that deserves a comment explaining why. <code>redeliveryDelay</code> is the fixed pause
+    between attempts, in milliseconds, defaulting to 1000 (one second) if you enable redeliveries without setting
+    it. Two log levels shape how loud each stage of this gets: <code>retryAttemptedLogLevel</code> (default
+    <code>DEBUG</code>, often raised in production so an operator can see retries happening in real time) covers
+    each individual attempt, and <code>retriesExhaustedLogLevel</code> (default <code>ERROR</code>) covers the one
+    moment that actually deserves a page &mdash; the final give-up.</p>
+
+    <h2 data-anchor="rd-h2-backoff">Backoff: spacing attempts so they don't make things worse</h2>
+    <p data-anchor="rd-p-backoff1">A fixed delay is fine for one failing exchange. It's a bad idea for a
+    thousand of them at once. If a downstream database goes down for thirty seconds, every in-flight exchange
+    fails at roughly the same moment and, with a flat <code>redeliveryDelay</code>, retries in near-lockstep
+    &mdash; hitting the database with a synchronized burst the instant it comes back, which is a good way to knock
+    it back down. <code>useExponentialBackOff()</code> is the fix: each delay becomes the previous delay times
+    <code>backOffMultiplier</code> (default <code>2</code>), so attempts space themselves out as the outage drags
+    on instead of hammering at a constant rate. <code>maximumRedeliveryDelay</code> (default 60000ms, one minute)
+    caps how large that growing delay is allowed to get, so exponential growth doesn't wander off into
+    hours-long waits on a long exhaustion sequence. <code>useCollisionAvoidance()</code> goes one step further,
+    adding a small random jitter to each computed delay &mdash; the difference between a thousand clients retrying
+    at exactly second 8 and a thousand clients retrying somewhere between second 6 and second 10.</p>
+
+    <figure class="diagram-fig" data-anchor="rd-fig-backoff">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="rdD1t">
+        <title id="rdD1t">Delays double with each redelivery attempt, capped at maximumRedeliveryDelay, until maximumRedeliveries is reached and the exchange moves to the dead letter destination</title>
+
+        <path d="M16 130 L544 130" class="stroke"/>
+        <path d="M16 124 L16 136" class="stroke"/>
+        <text x="12" y="150" class="dim">fail</text>
+
+        <rect x="46" y="118" width="18" height="24" class="stroke fill-soft"/>
+        <text x="40" y="112">1s</text>
+
+        <rect x="104" y="118" width="18" height="24" class="stroke fill-soft"/>
+        <text x="96" y="112">2s</text>
+
+        <rect x="182" y="118" width="18" height="24" class="stroke fill-soft"/>
+        <text x="172" y="112">4s</text>
+
+        <rect x="290" y="118" width="18" height="24" class="stroke fill-soft"/>
+        <text x="278" y="112">8s</text>
+
+        <rect x="430" y="118" width="18" height="24" class="stroke-red fill-red"/>
+        <text x="404" y="112" class="red">16s &mdash; capped</text>
+
+        <path d="M64 130 L104 130" class="stroke-soft dash"/>
+        <path d="M122 130 L182 130" class="stroke-soft dash"/>
+        <path d="M200 130 L290 130" class="stroke-soft dash"/>
+        <path d="M308 130 L430 130" class="stroke-soft dash"/>
+
+        <text x="16" y="30" class="big">redeliveryDelay=1000, backOffMultiplier=2</text>
+        <text x="16" y="46" class="dim">each attempt doubles the wait &mdash; until maximumRedeliveryDelay stops the growth</text>
+
+        <path d="M448 118 L448 90 L520 90" class="stroke-red"/>
+        <path d="M512 86 L520 90 L512 94" class="stroke-red"/>
+        <rect x="16" y="70" width="0" height="0" class="fill-none"/>
+        <text x="404" y="80" class="red big">maximumRedeliveries reached</text>
+        <text x="440" y="160" class="mono dim">&rarr; dead letter</text>
+      </svg>
+      <figcaption>Exponential backoff spaces retries out instead of hammering a recovering system in lockstep; the delay growth itself is capped, and the attempt count is capped separately.</figcaption>
+    </figure>
+
+    <p data-anchor="rd-p-backoff2">One more knob, for when neither a flat delay nor a smooth exponential curve
+    fits: <code>delayPattern</code> takes a string like
+    <code>"5:1000;10:5000;20:20000"</code> and reads as a table &mdash; attempts 0&ndash;4 wait 0ms, attempts
+    5&ndash;9 wait 1000ms, attempts 10&ndash;19 wait 5000ms, attempt 20 and beyond wait 20000ms. It's a full
+    replacement for the delay calculation, not an addition to it: set <code>delayPattern</code> and
+    <code>redeliveryDelay</code>, <code>backOffMultiplier</code>, <code>useExponentialBackOff</code>, and
+    <code>useCollisionAvoidance</code> are all ignored. And if the delay itself &mdash; however it's computed
+    &mdash; shouldn't block the thread that's processing the exchange, <code>asyncDelayedRedelivery()</code>
+    schedules the wait on Camel's own redelivery thread pool instead of parking the calling thread for the
+    full duration.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Three ways to space out redelivery attempts</caption>
+        <thead>
+          <tr><th>Strategy</th><th>Setting</th><th>Shape</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Fixed delay</td><td><code>redeliveryDelay(2000)</code></td><td>same wait every attempt</td></tr>
+          <tr><td>Exponential backoff</td><td><code>useExponentialBackOff()</code>, <code>backOffMultiplier</code>, <code>maximumRedeliveryDelay</code></td><td>wait doubles (or more) each attempt, up to a cap</td></tr>
+          <tr><td>Delay pattern</td><td><code>delayPattern("5:1000;10:5000")</code></td><td>a lookup table of wait-by-attempt-number, hand-tuned</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="rd-h2-exhaustion">What "exhausted" actually means</h2>
+    <p data-anchor="rd-p-exhaustion1">Once <code>maximumRedeliveries</code> attempts have all failed, Camel
+    stops trying and marks the exchange exhausted &mdash; recorded as exchange properties, the same way
+    Chapter 23's <code>Exchange.EXCEPTION_CAUGHT</code> lives as a property rather than a field:
+    <code>Exchange.REDELIVERY_COUNTER</code> for how many attempts actually ran, and
+    <code>Exchange.REDELIVERY_MAX_COUNTER</code> for the configured ceiling it hit. What happens next depends
+    entirely on which error handler is in play, which is the distinction the previous chapter drew and this one
+    finally pays off: with the bare <code>DefaultErrorHandler</code>, exhaustion ends exactly like any other
+    unhandled exception &mdash; logged, and propagated straight back to the caller. With a
+    <span class="term">Dead Letter Channel</span> configured, the exhausted exchange is redirected to a
+    dead-letter destination instead, and &mdash; unless you explicitly set <code>handled(false)</code> &mdash;
+    it's marked handled on the way out, so the original caller sees an ordinary completion, not a failure. The
+    problem hasn't been solved. It's been redirected somewhere a human can look at it later.</p>
+
+    <div class="callout warn" data-anchor="rd-callout-onredelivery">
+      <span class="callout-title">onRedelivery fires before each retry, not before the first attempt</span>
+      <p>A RedeliveryPolicy can take its own <code>onRedelivery(Processor)</code>, which runs immediately before
+      every redelivery attempt &mdash; useful for stamping a header with the attempt count, or emitting a metric
+      per retry:</p>
+      <pre><code><span class="fn">onException</span>(<span class="ty">Exception</span>.<span class="kw">class</span>)
+    .<span class="fn">maximumRedeliveries</span>(<span class="num">3</span>)
+    .<span class="fn">onRedelivery</span>(<span class="fn">exchange</span> -&gt; {
+        <span class="kw">int</span> attempt = exchange.<span class="fn">getProperty</span>(<span class="ty">Exchange</span>.<span class="en">REDELIVERY_COUNTER</span>, <span class="ty">Integer</span>.<span class="kw">class</span>);
+        log.<span class="fn">warn</span>(<span class="str">"Retry attempt {}"</span>, attempt);
+    })
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:deadLetter"</span>);</code></pre>
+      <p>It doesn't run before the original, first attempt &mdash; only before each retry that follows a failure,
+      which is exactly what its name promises and exactly the detail that trips people up counting attempts.</p>
+    </div>
+
+    <h2 data-anchor="rd-h2-dlc">Configuring the Dead Letter Channel</h2>
+    <p data-anchor="rd-p-dlc1">There are two places to wire a dead-letter destination in, and they answer two
+    different questions. Make it the route's <em>error handler</em> when you want one destination and one
+    policy to catch anything not already claimed by a more specific <code>onException</code> clause:</p>
+
+    <div class="pre-label">A dead-letter destination as the route's error handler</div>
+    <pre><code><span class="fn">errorHandler</span>(<span class="fn">deadLetterChannel</span>(<span class="str">"jms:queue:orders.dead"</span>)
+    .<span class="fn">useOriginalMessage</span>()
+    .<span class="fn">maximumRedeliveries</span>(<span class="num">5</span>)
+    .<span class="fn">redeliveryDelay</span>(<span class="num">5000</span>)
+    .<span class="fn">retriesExhaustedLogLevel</span>(<span class="ty">LoggingLevel</span>.<span class="en">ERROR</span>));</code></pre>
+
+    <p data-anchor="rd-p-dlc2">Or pair it with a specific <code>onException</code> clause, the pattern Chapter
+    23 already used for <code>ConnectException</code> and <code>SQLException</code>: a redelivery policy followed
+    by <code>.to(deadLetterUri)</code> as the clause's last step. That gives you per-exception-type destinations
+    and policies instead of one blanket rule &mdash; a validation failure never even reaches this machinery
+    (it's <code>handled(true)</code> with no redelivery, straight to a rejection queue), while a database
+    timeout gets five retries with backoff before landing in <code>orders.dead</code>.</p>
+
+    <p data-anchor="rd-p-dlc3">Two smaller options are worth knowing before they surprise you.
+    <code>useOriginalMessage()</code> sends the exchange's <em>original incoming</em> body and headers to the
+    dead-letter destination &mdash; not whatever the route had transformed the message into by the time it
+    failed. Without it, a route that parses CSV into JSON before failing on step four sends the JSON to the
+    dead-letter queue, which is often useless for debugging what actually arrived. And
+    <code>deadLetterHandleNewException</code>, true by default, decides what happens if moving the exchange to
+    the dead-letter destination itself throws &mdash; left true, that second exception is caught so it doesn't
+    mask the original failure that got the exchange there in the first place.</p>
+
+    <h2 data-anchor="rd-h2-replay">Manual recovery and replay</h2>
+    <p data-anchor="rd-p-replay1">A dead-letter destination that's just a log line is only half a dead letter
+    channel. The point of routing failed exchanges somewhere durable &mdash; a JMS queue, a Kafka topic, a
+    database table, a directory of files &mdash; is that "exhausted" doesn't have to mean "lost." A message
+    sitting in <code>orders.dead</code> is one an operator can inspect, understand, and, once the actual problem
+    is fixed, move back to the original input queue to be reprocessed from scratch. That's the entire value of
+    choosing a durable destination over letting <code>DefaultErrorHandler</code> just propagate and vanish into a
+    stack trace.</p>
+
+    <div class="callout key" data-anchor="rd-callout-replay">
+      <span class="callout-title">Replay is a decision, not a default</span>
+      <p>It's tempting to build a scheduled job that automatically requeues everything sitting in the
+      dead-letter destination. Resist it. A message that failed because of a genuinely bad payload or a code
+      defect &mdash; a real poison message &mdash; fails identically the second time, and blind auto-replay just
+      re-poisons the queue on a loop. Replay belongs after a human (or a narrowly-scoped, well-understood
+      automated rule) has confirmed the failure was actually transient, or that whatever caused it has actually
+      been fixed. The dead-letter queue's job is to make that judgment call possible later, not to make it for
+      you now.</p>
+    </div>
+
+    <p data-anchor="rd-p-replay2">There's a second trap waiting in replay specifically, and it connects back to
+    Chapter 16: messaging systems deliver at-least-once, and redelivery plus dead-letter replay are two more
+    ways the same logical message can be processed more than once &mdash; once on the original attempt (which
+    may have partially succeeded downstream before ultimately failing), and again when it's replayed. A route
+    that reprocesses dead-lettered messages without an <code>idempotentConsumer()</code> guarding the
+    reprocessing path can double-apply an order or a payment. The fix isn't new machinery &mdash; it's the same
+    idempotent-consumer pattern from Chapter 16, applied to the replay path as deliberately as it's applied to
+    the original one.</p>
+
+    <div class="pullquote" data-anchor="rd-pullquote">A retry policy is a bet that the world gets better if you
+    wait. A dead-letter destination is the fallback for when that bet doesn't pay off &mdash; not a trash can,
+    but a waiting room, built so that "we tried, and it still didn't work" has somewhere durable to go besides a
+    log line nobody reads until the customer calls.</div>
+
+    <h2 data-anchor="rd-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="rd-p-reflection">The other half of the machinery Chapter 23 promised: a
+    <code>RedeliveryPolicy</code> that defaults to zero retries until you ask for more, fixed or exponential
+    delays with a cap so backoff doesn't run away, jitter for when a whole fleet of exchanges fails at once, and
+    <code>delayPattern</code> for when neither fixed nor exponential fits the shape you actually need. A precise
+    picture of exhaustion &mdash; what the redelivery counter properties record, and how the same "no more
+    attempts" moment ends completely differently depending on whether a Dead Letter Channel is configured. Two
+    places to wire one in, route-wide or per exception, plus <code>useOriginalMessage()</code> for keeping the
+    dead-lettered payload honest. And the piece that's easy to treat as an afterthought but isn't: a dead-letter
+    destination is only useful if something durable receives it and a human, eventually, decides whether it's
+    safe to replay. Redelivery policy and Dead Letter Channel are both configuration &mdash; declarative, testable,
+    inspectable. Whether that configuration actually does what you think under real failure is a different
+    question, and it's the one the next chapter takes on directly: how do you write a test that proves a route
+    retries the right number of times, waits the right amount, and lands in the right dead-letter queue, without
+    waiting through real backoff delays to find out?</p>
+
+    <div class="review" data-anchor="rd-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route declares <code>onException(TimeoutException.class).handled(true).to("direct:deadLetter")</code>
+        with no other settings. A step throws a <code>TimeoutException</code>. How many total attempts does
+        Camel make before the exchange reaches <code>direct:deadLetter</code>, and why?</li>
+        <li>Two routes both configure <code>maximumRedeliveries(4)</code> with a 1000ms
+        <code>redeliveryDelay</code> and <code>useExponentialBackOff()</code>. One also sets
+        <code>maximumRedeliveryDelay(3000)</code>; the other doesn't. What's the wait before the fourth
+        (final) redelivery attempt in each case?</li>
+        <li>An operator sees a dead-letter queue with two thousand messages that all failed with the same
+        <code>NullPointerException</code> from a bug deployed an hour ago. The bug has just been fixed and
+        redeployed. Is it now safe to auto-replay every message in that queue? What would you check first?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="23-exception-handling.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="25-testing-camel-routes.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

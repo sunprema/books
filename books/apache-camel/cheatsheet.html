@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cheatsheet &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Reference</span> &middot; Cheatsheet</p>
+    <h1 data-anchor="cs-h1">Cheatsheet</h1>
+
+    <p class="lede" data-anchor="cs-lede">Apache Camel is a lightweight, embeddable routing and mediation
+    library, not a server: you write routes in a DSL that implement the Enterprise Integration Patterns
+    catalog, and Camel runs them inside your own Spring Boot or Quarkus application. A <code>CamelContext</code>
+    holds every route; a <code>Route</code> is one <code>from()</code> endpoint plus a chain of
+    <code>to()</code>/EIP steps; an <code>Exchange</code> carries one execution's <code>Message</code> (body
+    and headers) plus its own property map. Roughly 300 components share one URI model
+    (<code>scheme:path?option=value</code>), so trading <code>file:</code> for <code>sftp:</code> or
+    <code>kafka:</code> is a one-line change, not a rewrite. Everything below assumes the thirty-one chapters
+    before it &mdash; this page is for looking things up, not for reading start to finish.</p>
+
+    <h2 data-anchor="cs-h2-shape">The route, in one shape</h2>
+    <div class="pre-label">Every route starts here &mdash; a RouteBuilder, overriding configure()</div>
+    <pre><code><span class="kw">public</span> <span class="kw">class</span> <span class="ty">HeartbeatRoute</span> <span class="kw">extends</span> <span class="ty">RouteBuilder</span> {
+    <span class="at">@Override</span>
+    <span class="kw">public</span> <span class="kw">void</span> configure() {
+        <span class="kw">from</span>(<span class="str">"timer:heartbeat?period=5000"</span>)
+            .<span class="fn">routeId</span>(<span class="str">"heartbeat"</span>)
+            .<span class="fn">log</span>(<span class="str">"Tick ${exchangeProperty.CamelTimerCounter}"</span>);
+    }
+}</code></pre>
+    <p>Spring Boot auto-detects every bean that extends <code>RouteBuilder</code> and adds its routes to the
+    one running <code>CamelContext</code> &mdash; no manual <code>addRoutes()</code>. Any DSL (Java, YAML,
+    XML) compiles down to the same internal route model; the DSL only changes how a route is authored, never
+    what it does at runtime.</p>
+
+    <dl class="dl" data-anchor="cs-dl-vocab">
+      <dt>CamelContext</dt>
+      <dd>the runtime container &mdash; wires every route, component, and endpoint together and starts them.</dd>
+      <dt>Component</dt>
+      <dd>the factory behind a URI scheme (the file component, the jms component&hellip;).</dd>
+      <dt>Endpoint</dt>
+      <dd>one concrete configured instance a component produces &mdash; <code>file:incoming?noop=true</code>.</dd>
+      <dt>Processor</dt>
+      <dd>the single-method interface (<code>process(Exchange)</code>) every DSL step compiles down to.</dd>
+      <dt>Exchange</dt>
+      <dd>the envelope for one route execution: a Message, a separate exchange-scoped property map, an
+      <code>ExchangePattern</code> (InOnly/InOut), and &mdash; on failure &mdash; an exception.</dd>
+      <dt>direct: vs seda:</dt>
+      <dd><code>direct:</code> is synchronous, same thread, no queue. <code>seda:</code> is an in-VM
+      <code>BlockingQueue</code> handed to a separate consumer thread &mdash; bounded at <code>size=1000</code>
+      by default, not unbounded.</dd>
+    </dl>
+
+    <h2 data-anchor="cs-h2-core">Core DSL, by task</h2>
+
+    <div class="card" data-anchor="cs-card-routing">
+      <h3>Routing &amp; filtering</h3>
+      <pre><code><span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="fn">choice</span>()
+        .<span class="fn">when</span>(<span class="fn">header</span>(<span class="str">"OrderType"</span>).<span class="fn">isEqualTo</span>(<span class="str">"DOMESTIC"</span>))
+            .<span class="kw">to</span>(<span class="str">"direct:domesticOrders"</span>)
+        .<span class="fn">otherwise</span>()
+            .<span class="kw">to</span>(<span class="str">"direct:unroutedOrders"</span>)
+    .<span class="fn">end</span>();
+
+<span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="fn">filter</span>(<span class="fn">simple</span>(<span class="str">"${header.OrderTotal} &gt; 0"</span>))
+        .<span class="kw">to</span>(<span class="str">"direct:validOrders"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="fn">toD</span>(<span class="str">"jms:queue:orders.${header.region}?cacheSize=20"</span>);</code></pre>
+      <p><code>choice()</code> is first-match-wins, top to bottom; no <code>otherwise()</code> means an
+      unmatched message falls through silently &mdash; not an error. <code>filter()</code> drops silently
+      on false, no "else". <code>toD()</code> computes the destination per exchange (Simple by default).</p>
+    </div>
+
+    <div class="card" data-anchor="cs-card-split">
+      <h3>Splitting &amp; aggregating</h3>
+      <pre><code><span class="kw">from</span>(<span class="str">"file:orders/inbound"</span>)
+    .<span class="fn">split</span>(<span class="fn">bodyAs</span>(<span class="ty">String</span>.<span class="kw">class</span>).<span class="fn">tokenize</span>(<span class="str">"\n"</span>))
+        .<span class="kw">to</span>(<span class="str">"direct:oneOrderLine"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:orderLines"</span>)
+    .<span class="fn">aggregate</span>(<span class="fn">header</span>(<span class="str">"orderId"</span>), <span class="kw">new</span> <span class="ty">MyOrderAggregationStrategy</span>())
+        .<span class="fn">completionSize</span>(<span class="fn">header</span>(<span class="str">"lineCount"</span>))
+        .<span class="fn">completionTimeout</span>(<span class="num">5000</span>)
+        .<span class="kw">to</span>(<span class="str">"direct:completeOrder"</span>)
+    .<span class="fn">end</span>();</code></pre>
+      <p><code>split()</code> defaults to non-streaming (materializes the whole list first); <code>.streaming()</code>
+      processes on demand. No <code>AggregationStrategy</code> anywhere in this family &mdash; split, aggregate,
+      multicast, enrich &mdash; means "keep only the last part, discard the rest," not an error.
+      <code>completionInterval</code> (fixed sweep) cannot combine with <code>completionTimeout</code> (resets
+      per arrival). Default <code>AggregationRepository</code> is in-memory and lost on restart.</p>
+    </div>
+
+    <div class="card" data-anchor="cs-card-fanout">
+      <h3>Fan-out</h3>
+      <pre><code><span class="kw">from</span>(<span class="str">"direct:orderConfirmed"</span>)
+    .<span class="fn">multicast</span>(<span class="kw">new</span> <span class="ty">OrderFanOutAggregationStrategy</span>())
+        .<span class="fn">parallelProcessing</span>()
+        .<span class="fn">stopOnException</span>()
+        .<span class="kw">to</span>(<span class="str">"jms:queue:audit.orders"</span>)
+        .<span class="kw">to</span>(<span class="str">"kafka:analytics.order-events"</span>)
+    .<span class="fn">end</span>();
+
+<span class="kw">from</span>(<span class="str">"jms:queue:orders.validated"</span>)
+    .<span class="fn">wireTap</span>(<span class="str">"direct:auditLog"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);</code></pre>
+      <p><code>multicast()</code> is a fixed destination set baked into the route; <code>recipientList(expr[,
+      delimiter])</code> computes destinations per message (default delimiter comma). Both default to
+      calling-thread sequential; <code>.parallelProcessing()</code> changes how the parts run, not whether the
+      caller waits &mdash; it still blocks until every branch finishes. <code>stopOnException()</code> is
+      <em>not</em> the default. <code>wireTap</code> copies the exchange, forces InOnly, and runs async on a
+      thread pool that falls back to <code>CallerRuns</code> when exhausted &mdash; under load an "async" tap
+      quietly becomes a blocking call, and its failures are invisible to the primary route either way.</p>
+    </div>
+
+    <div class="card" data-anchor="cs-card-enrich">
+      <h3>Enrichment</h3>
+      <pre><code>.<span class="fn">enrich</span>(<span class="str">"direct:customerLookup"</span>, <span class="kw">new</span> <span class="ty">CustomerEnrichmentStrategy</span>());
+
+.<span class="fn">pollEnrich</span>(<span class="str">"file:inbox?fileName=data.txt"</span>, <span class="num">10000</span>, aggregationStrategy);</code></pre>
+      <p><code>enrich()</code> makes an active producer (request-reply) call; <code>pollEnrich()</code> pulls
+      from a Polling Consumer. <code>pollEnrich</code>'s timeout defaults to <code>-1</code> (blocks
+      indefinitely) &mdash; always set one explicitly. <code>aggregateOnException</code> defaults to
+      <code>false</code>: a failed enrichment call skips the strategy entirely and just propagates the
+      failure. In the strategy, <code>newExchange</code> is null on a pollEnrich timeout.</p>
+    </div>
+
+    <div class="card" data-anchor="cs-card-errors">
+      <h3>Error handling</h3>
+      <pre><code><span class="kw">onException</span>(<span class="ty">ValidationException</span>.<span class="kw">class</span>)
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="fn">log</span>(<span class="ty">LoggingLevel</span>.WARN, <span class="str">"Rejecting: ${exception.message}"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:rejectOrder"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:start"</span>)
+    .<span class="fn">doTry</span>()
+        .<span class="kw">to</span>(<span class="str">"direct:downstream"</span>)
+    .<span class="fn">doCatch</span>(<span class="ty">IOException</span>.<span class="kw">class</span>)
+        .<span class="kw">to</span>(<span class="str">"log:catch?level=WARN"</span>)
+    .<span class="fn">doFinally</span>()
+        .<span class="kw">to</span>(<span class="str">"log:finally"</span>)
+    .<span class="fn">end</span>();</code></pre>
+      <p><code>onException()</code> matches by walking the cause chain innermost-out; the more specific
+      declared type wins regardless of declaration order. Default <code>handled(false)</code> still rethrows
+      to the caller. Read the failure via <code>exchange.getProperty(Exchange.EXCEPTION_CAUGHT,
+      Exception.class)</code> &mdash; <code>getException()</code> is null there. <code>doTry/doCatch/doFinally</code>
+      is its own private error handler for that block only; the route's outer Dead Letter Channel does not
+      reach inside it. Attach a shared policy to many routes with
+      <code>routeConfiguration("id").onException(...)</code> plus <code>.routeConfigurationId("id")</code>
+      (accepts an exact id, a wildcard, or a regex, and comma-separated multiples).</p>
+    </div>
+
+    <div class="card" data-anchor="cs-card-reliability">
+      <h3>Reliability</h3>
+      <pre><code>.<span class="fn">idempotentConsumer</span>(<span class="fn">header</span>(<span class="str">"OrderId"</span>), repository);
+
+.<span class="fn">resequence</span>(<span class="fn">header</span>(<span class="str">"seqnum"</span>)).<span class="fn">batch</span>().<span class="fn">batchSize</span>(<span class="num">200</span>);
+
+.<span class="fn">throttle</span>(<span class="num">5</span>).<span class="fn">timePeriodMillis</span>(<span class="num">1000</span>);</code></pre>
+      <p><code>idempotentConsumer</code>: <code>eager</code> defaults true (key added before processing
+      completes, catches concurrent dupes); <code>removeOnFailure</code> defaults true, but a
+      <code>handled(true)</code> dead-lettered exchange is "failure-handled," not "failed," so the key is
+      <em>not</em> removed &mdash; a later replay reads as a duplicate. <code>resequence().batch()</code> only
+      sorts within one batch; a straggler that arrives after its batch shipped is never retroactively
+      reordered. <code>throttle()</code> blocks the calling thread unless <code>.asyncDelayed()</code> is set.</p>
+    </div>
+
+    <div class="card" data-anchor="cs-card-data">
+      <h3>Data, transformation &amp; validation</h3>
+      <pre><code>.<span class="fn">setHeader</span>(<span class="str">"OrderTotal"</span>, <span class="fn">simple</span>(<span class="str">"${body.total}"</span>))
+.<span class="fn">setBody</span>(<span class="fn">simple</span>(<span class="str">"Order ${header.OrderId}"</span>))
+.<span class="fn">bean</span>(<span class="str">"pricingService"</span>, <span class="str">"quote"</span>)
+.<span class="fn">unmarshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.Jackson, <span class="ty">Order</span>.<span class="kw">class</span>)
+.<span class="fn">validate</span>(<span class="fn">header</span>(<span class="str">"OrderId"</span>).<span class="fn">isNotNull</span>())</code></pre>
+      <p>Simple predicate operators: <code>== &gt; &lt; &gt;= &lt;= != contains in is range regex</code>
+      &mdash; spaces required around the operator, string literals need single quotes. Bean method resolution:
+      explicit DSL name &rarr; <code>CamelBeanMethodName</code> header &rarr; <code>@Handler</code> &rarr;
+      best-effort type match; the return value always replaces the body, even <code>void</code> (&rarr; null).
+      Leaving JSON <code>unmarshalType</code> unset gives a generic <code>Map</code> instead of failing fast
+      &mdash; a <code>ClassCastException</code> surfaces downstream instead of at the unmarshal step.
+      <code>validate()</code> throws on false; unlike <code>filter()</code>, it never drops silently.</p>
+    </div>
+
+    <div class="card" data-anchor="cs-card-templates">
+      <h3>Templates, naming &amp; transactions</h3>
+      <pre><code><span class="fn">routeTemplate</span>(<span class="str">"partnerIntake"</span>)
+    .<span class="fn">templateParameter</span>(<span class="str">"remoteDir"</span>)
+    .<span class="kw">from</span>(<span class="str">"sftp:{{partner.host}}?fileName={{remoteDir}}/*.csv"</span>)
+        .<span class="kw">to</span>(<span class="str">"direct:toCanonicalOrder"</span>);
+
+<span class="fn">templatedRoute</span>(<span class="str">"partnerIntake"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"intake-acme"</span>)
+    .<span class="fn">prefixId</span>(<span class="str">"acme"</span>)
+    .<span class="fn">parameter</span>(<span class="str">"remoteDir"</span>, <span class="str">"/acme/orders"</span>);</code></pre>
+      <p><code>{{name}}</code> inside a template; <code>{{?name}}</code> makes it optional (an unset option is
+      omitted, not literal null). A hardcoded node id inside the template throws a duplicate-id error on the
+      second instantiation &mdash; <code>prefixId(...)</code> is what avoids it. <code>transacted()</code>
+      must be the first step after <code>from()</code> and only covers the calling thread &mdash; hopping to
+      <code>seda:</code> breaks it.</p>
+    </div>
+
+    <h2 data-anchor="cs-h2-eip">EIP &rarr; DSL map</h2>
+    <div class="table-wrap">
+      <table>
+        <caption>Every Enterprise Integration Pattern this book named, and its Camel idiom</caption>
+        <thead><tr><th>Pattern</th><th>DSL idiom</th></tr></thead>
+        <tbody>
+          <tr><td>Content-Based Router</td><td><code>choice().when(pred)...otherwise().end()</code></td></tr>
+          <tr><td>Message Filter</td><td><code>filter(predicate)</code> &mdash; silent drop, no else</td></tr>
+          <tr><td>Message Translator</td><td><code>setBody()</code>/<code>transform()</code>, <code>.bean(...)</code>, type converters</td></tr>
+          <tr><td>Splitter</td><td><code>split(expression)...end()</code></td></tr>
+          <tr><td>Aggregator</td><td><code>aggregate(correlationExpr, strategy).completionSize/Timeout/Interval/Predicate(...)</code></td></tr>
+          <tr><td>Recipient List</td><td><code>recipientList(expression[, delimiter])</code> &mdash; runtime-computed</td></tr>
+          <tr><td>Multicast</td><td><code>multicast()...to()...to()...end()</code> &mdash; fixed set</td></tr>
+          <tr><td>Wire Tap</td><td><code>wireTap(uri)</code> &mdash; async fire-and-forget copy</td></tr>
+          <tr><td>Content Enricher (active call)</td><td><code>enrich(uri, strategy)</code></td></tr>
+          <tr><td>Content Enricher (passive poll)</td><td><code>pollEnrich(uri, timeout, strategy)</code></td></tr>
+          <tr><td>Canonical Data Model</td><td>no single keyword &mdash; validate raw shape, then translate into one shared shape downstream trusts</td></tr>
+          <tr><td>Idempotent Consumer</td><td><code>idempotentConsumer(keyExpr, repository)</code></td></tr>
+          <tr><td>Resequencer</td><td><code>resequence(expr).batch()</code> or <code>.stream()</code></td></tr>
+          <tr><td>Point-to-Point Channel</td><td><code>direct:</code>, a JMS/Kafka queue</td></tr>
+          <tr><td>Publish-Subscribe Channel</td><td>JMS <code>topic:</code>, Kafka consumer groups, <code>multicast()</code></td></tr>
+          <tr><td>Dead Letter Channel</td><td><code>errorHandler(deadLetterChannel(uri)...)</code></td></tr>
+          <tr><td>Request-Reply</td><td><code>ExchangePattern.InOut</code>, JMS temp reply queue</td></tr>
+          <tr><td>Throttler</td><td><code>throttle(n).timePeriodMillis(ms)</code></td></tr>
+          <tr><td>Dynamic Router (single destination)</td><td><code>toD(expression)</code></td></tr>
+          <tr><td>Circuit Breaker</td><td><code>circuitBreaker().to(uri).onFallback()...end()</code> (Resilience4j)</td></tr>
+          <tr><td>Route Template</td><td><code>routeTemplate(id).templateParameter(...)</code> / <code>templatedRoute(id).parameter(...)</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="cs-h2-uri">Endpoint URI quick reference</h2>
+
+    <h3 data-anchor="cs-h3-timerlog">timer: &amp; log:</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Option</th><th>Default</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>period</code></td><td>1000ms</td><td>ms between firings</td></tr>
+          <tr><td><code>delay</code></td><td>&mdash;</td><td>wait before first firing; negative fires immediately</td></tr>
+          <tr><td><code>repeatCount</code></td><td>unbounded</td><td>caps total firings</td></tr>
+          <tr><td><code>fixedRate</code></td><td>false</td><td>true = clock-spaced, not delay-after-previous-run-finished</td></tr>
+          <tr><td><code>showHeaders / showBody / showAll</code></td><td>off</td><td><code>log:</code> component; <code>showAll</code> is a dev/debug tool &mdash; masks sensitive data only with <code>logMask</code> also on</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Timer bookkeeping (<code>CamelTimerName</code>, <code>CamelTimerFiredTime</code>,
+    <code>CamelTimerCounter</code>, 1-based) lives in exchange <em>properties</em>, not headers &mdash;
+    <code>${exchangeProperty.CamelTimerCounter}</code>, not <code>${header...}</code>.</p>
+
+    <h3 data-anchor="cs-h3-file">file: / sftp: / aws2-s3:</h3>
+    <div class="table-wrap">
+      <table>
+        <caption>Shared GenericFileEndpoint consumer options (file:, sftp:, ftp:)</caption>
+        <thead><tr><th>Option</th><th>Default</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>noop</code></td><td>false</td><td>true leaves the source file untouched</td></tr>
+          <tr><td><code>delete</code></td><td>false</td><td>&mdash;</td></tr>
+          <tr><td><code>readLock</code></td><td>none</td><td>a naive route can read mid-write; strategies: markerFile, changed, rename, fileLock, idempotent</td></tr>
+          <tr><td><code>readLockTimeout</code></td><td>10000ms</td><td>keep &ge; 2&times; readLockCheckInterval</td></tr>
+          <tr><td><code>move / moveFailed / preMove</code></td><td>&mdash;</td><td>with none of delete/move/noop set, the file moves into a hidden <code>.camel</code> subdirectory</td></tr>
+          <tr><td><code>doneFileName</code></td><td>&mdash;</td><td>supports <code>${file:name}</code>, <code>${file:name.noext}</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Producer: <code>fileExist</code> (Override default, Append, Fail, Ignore, Move, TryRename &mdash;
+    Append can't combine with tempPrefix/tempFileName). <code>CamelFileName</code> header carries the
+    filename consumer&rarr;producer automatically. SFTP auth: <code>username</code>/<code>password</code> or
+    <code>privateKeyFile</code>/<code>privateKeyUri</code>; <code>strictHostKeyChecking</code> defaults to
+    <code>no</code>; <code>streamDownload=true</code> with default <code>stepwise=true</code> has a documented
+    hang risk on files over ~0.5MB. <code>aws2-s3</code>: <code>deleteAfterRead</code> and
+    <code>autoCreateBucket</code> both default <code>true</code>.</p>
+
+    <h3 data-anchor="cs-h3-http">http: / rest DSL</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Option</th><th>Default</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>throwExceptionOnFailure</code></td><td>true</td><td>3xx/4xx/5xx &rarr; HttpOperationFailedException; a connection that never completes raises a different exception, missed by a handler scoped only to that type</td></tr>
+          <tr><td><code>connectTimeout / socketTimeout</code></td><td>&mdash;</td><td>set explicitly</td></tr>
+          <tr><td><code>bridgeEndpoint</code></td><td>false</td><td>true for proxy passthrough &mdash; without it the path double-appends</td></tr>
+          <tr><td><code>restConfiguration().bindingMode(...)</code></td><td>off</td><td>auto, json, xml, json_xml</td></tr>
+          <tr><td><code>restConfiguration().component(...)</code></td><td>platform-http</td><td>netty-http, jetty, undertow, servlet</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 data-anchor="cs-h3-db">sql: / jdbc: / jpa:</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Component</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>sql:</code></td><td>SQL text in the URI; placeholders <code>#</code> positional, <code>:#name</code> named (a literal <code>?</code> breaks URI parsing); <code>outputType</code> SelectOne/StreamList; update/insert/delete row count lands on a header, body is null; <code>batch=true</code> for batch inserts</td></tr>
+          <tr><td><code>jdbc:</code></td><td>SQL from the message body, not the URI; <code>useHeadersAsParameters</code> and <code>useGetGeneratedKeys</code> are mutually exclusive</td></tr>
+          <tr><td><code>jpa:</code></td><td>entity-object based; consumer <code>consumeDelete</code> defaults <code>true</code> &mdash; deletes the polled entity immediately, before downstream confirms success</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 data-anchor="cs-h3-msg">jms: / kafka: / seda: / direct:</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Component</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>jms:queue:name</code></td><td>no prefix = queue; only <code>jms:topic:name</code> is pub-sub. <code>concurrentConsumers</code> default 1. <code>acknowledgementModeName</code> default AUTO_ACKNOWLEDGE &mdash; not meant to combine with <code>transacted=true</code>. Header names sanitized: dots&rarr;<code>_DOT_</code>, hyphens&rarr;<code>_HYPHEN_</code></td></tr>
+          <tr><td><code>kafka:topic</code></td><td><code>autoCommitEnable</code> default true &mdash; a failure after auto-commit means no redelivery. Manual commit must happen on the polling thread. Orders only within one partition. Header values silently dropped unless String/Integer/Long/Double/Boolean/byte[]</td></tr>
+          <tr><td><code>seda:name</code></td><td><code>concurrentConsumers</code> default 1, <code>size</code> default 1000 (bounded), <code>blockWhenFull</code>/<code>discardWhenFull</code> mutually exclusive, <code>multipleConsumers</code> false (true = pub-sub)</td></tr>
+          <tr><td><code>direct:name</code></td><td><code>failIfNoConsumers</code> default true; synchronous, same thread, no queue &mdash; a slow consumer stalls the caller</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="cs-h2-redelivery">Redelivery &amp; dead letter</h2>
+    <pre><code><span class="fn">errorHandler</span>(<span class="fn">deadLetterChannel</span>(<span class="str">"jms:queue:orders.dead"</span>)
+    .<span class="fn">useOriginalMessage</span>()
+    .<span class="fn">maximumRedeliveries</span>(<span class="num">5</span>)
+    .<span class="fn">useExponentialBackOff</span>()
+    .<span class="fn">backOffMultiplier</span>(<span class="num">2</span>)
+    .<span class="fn">maximumRedeliveryDelay</span>(<span class="num">30000</span>)
+    .<span class="fn">retriesExhaustedLogLevel</span>(<span class="ty">LoggingLevel</span>.ERROR));</code></pre>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Option</th><th>Default</th></tr></thead>
+        <tbody>
+          <tr><td><code>maximumRedeliveries</code></td><td>0 &mdash; no retries unless set</td></tr>
+          <tr><td><code>redeliveryDelay</code></td><td>1000ms, fixed</td></tr>
+          <tr><td><code>backOffMultiplier</code></td><td>2.0, needs <code>useExponentialBackOff(true)</code></td></tr>
+          <tr><td><code>maximumRedeliveryDelay</code></td><td>60000ms cap on the backoff</td></tr>
+          <tr><td><code>retriesExhaustedLogLevel / retryAttemptedLogLevel</code></td><td>ERROR / DEBUG</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Business exceptions (<code>OrderValidationException</code>) get <code>handled(true)</code>, no
+    redelivery. Technical exceptions (<code>IOException</code>, <code>SQLException</code>,
+    <code>ConnectException</code>) get redelivery + backoff, then dead-letter. <code>delayPattern</code>
+    replaces the whole delay calculation and isn't composable with the other backoff options. Blind
+    auto-replay of a whole dead-letter queue re-poisons it when the failure was a payload or code defect, not
+    a transient outage.</p>
+
+    <h2 data-anchor="cs-h2-gotchas">Gotchas</h2>
+
+    <div class="callout warn" data-anchor="cs-callout-routing">
+      <span class="callout-title">Routing &amp; messaging</span>
+      <p>No <code>otherwise()</code> &rarr; unmatched message falls through, no error.
+      <code>split()</code>/<code>multicast()</code>/<code>recipientList()</code>/<code>enrich()</code> with
+      no strategy keeps only the last result, silently. <code>.parallelProcessing()</code> doesn't stop the
+      caller from blocking until every part finishes. Wire Tap failures are invisible to the primary route.
+      Kafka <code>autoCommitEnable</code> defaults true, so a mid-processing failure after commit means no
+      redelivery. JMS with no prefix is a queue, not a topic.</p>
+    </div>
+
+    <div class="callout warn" data-anchor="cs-callout-files">
+      <span class="callout-title">Files, data &amp; databases</span>
+      <p>File consumer's default post-processing moves a file into a hidden <code>.camel</code> directory, not
+      leaving it alone or deleting it. <code>readLock</code> defaults to <code>none</code>. SFTP
+      <code>strictHostKeyChecking</code> defaults to <code>no</code> &mdash; a real MITM exposure. aws2-s3
+      <code>deleteAfterRead</code> and <code>autoCreateBucket</code> are both on by default. Unset JSON
+      <code>unmarshalType</code> gives a generic <code>Map</code> instead of failing fast. SQL row counts land
+      on a header, body is null. <code>jpa</code>'s <code>consumeDelete</code> deletes on poll, before
+      downstream confirms success.</p>
+    </div>
+
+    <div class="callout warn" data-anchor="cs-callout-ops">
+      <span class="callout-title">Errors, config &amp; operations</span>
+      <p><code>onException()</code> doesn't retry by default (<code>maximumRedeliveries=0</code>).
+      <code>doTry/doCatch/doFinally</code> is its own private error handler &mdash; the outer Dead Letter
+      Channel doesn't apply inside it. A <code>handled(true)</code> dead-lettered exchange is
+      "failure-handled," not "failed," so an idempotent consumer's key stays and a later replay reads as a
+      duplicate. <code>{{?key}}</code> falls back to the component's own default, not a value you chose.
+      Sending <code>SIGKILL</code> (or too short a termination grace period) skips Camel's graceful shutdown
+      entirely &mdash; in-flight exchanges are simply abandoned. Default fail-fast <code>RouteController</code>
+      means one bad route at startup takes the whole app down; <code>SupervisingRouteController</code>
+      isolates it. <code>MemoryIdempotentRepository</code> loses all history on restart and isn't shared
+      across instances.</p>
+    </div>
+
+    <h2 data-anchor="cs-h2-ref">Naming, VETRO &amp; the rest</h2>
+
+    <div class="callout key" data-anchor="cs-callout-vetro">
+      <span class="callout-title">VETRO &mdash; the shape check for one route</span>
+      <p><strong>V</strong>alidate, <strong>E</strong>nrich, <strong>T</strong>ransform, <strong>R</strong>oute,
+      <strong>O</strong>perate. A route doing meaningfully more than that &mdash; real business decisions,
+      long-lived state &mdash; has quietly stopped being an integration and started being an application that
+      happens to live inside one. That's the moment to extract a bean, not keep growing the route.</p>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Three ways a route documents itself</caption>
+        <thead><tr><th>Mechanism</th><th>Audience</th><th>Runtime effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>routeId("orderIntake")</code></td><td>Operators &mdash; logs, JMX, dashboards</td><td>Yes &mdash; the route's identity</td></tr>
+          <tr><td><code>routeDescription("...")</code></td><td>Anyone reading the route</td><td>None &mdash; documentation only</td></tr>
+          <tr><td><code>routeNote("...")</code> <span class="dim">(4.16+)</span></td><td>The next developer to touch it</td><td>None &mdash; documentation only</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <dl class="dl" data-anchor="cs-dl-ref">
+      <dt>Testing</dt>
+      <dd><code>CamelTestSupport</code> gives a running context + <code>template</code>.
+      <code>MockEndpoint</code>: <code>expectedMessageCount()</code>, <code>expectedBodiesReceived()</code>,
+      <code>assertIsSatisfied()</code>. <code>adviceWith()</code>: <code>weaveByType/weaveById/weaveByToUri</code>
+      + <code>.replace()/.remove()/.before()/.after()</code> &mdash; advise a route once per test.
+      <code>isMockEndpointsAndSkip()</code> mocks and skips the real call, plain
+      <code>isMockEndpoints()</code> mocks but still calls it.</dd>
+      <dt>Observability</dt>
+      <dd>Current MDC is the <code>camel-mdc</code> component (don't combine with the legacy
+      <code>useMDCLogging</code>). <code>breadcrumbId</code> header is set automatically and survives
+      HTTP/JMS transport. Micrometer counters: <code>camel.exchanges.total/succeeded/failed</code>,
+      registered via <code>MicrometerRoutePolicyFactory</code> &mdash; not automatic from classpath presence
+      alone. <code>camel-health</code>: Spring Boot &rarr; <code>/actuator/health</code>, Quarkus &rarr;
+      <code>/q/health/ready</code> and <code>/q/health/live</code> &mdash; a downstream outage is a readiness
+      failure, not a liveness one.</dd>
+      <dt>Config &amp; secrets</dt>
+      <dd><code>{{key}}</code>, <code>{{key:default}}</code>, <code>{{?key}}</code> (optional, component's own
+      default), <code>{{!key}}</code> (negate). Resolution order differs by runtime: camel-main ranks system
+      properties over env vars; Spring Boot ranks system properties above env vars too; Quarkus ranks system
+      properties (400) &gt; env vars (300) &gt; <code>application.properties</code> (250). Vault functions:
+      <code>{{aws:secretName#field:default@version}}</code> and the Hashicorp/Azure/GCP equivalents; refresh
+      needs both <code>refreshEnabled=true</code> and <code>camel.main.context-reload-enabled=true</code>.</dd>
+      <dt>Route lifecycle</dt>
+      <dd><code>start()/stop()</code> is a full graceful rebuild; <code>suspend()/resume()</code> pauses
+      consumers only, keeping the context warm &mdash; faster to resume. <code>autoStartup(false)</code>
+      registers a route without starting it.</dd>
+    </dl>
+
+    <div class="pullquote" data-anchor="cs-pullquote">Every option on this page has a default; nearly every
+    gotcha above is what happens when nobody consciously chose one. Read the default, decide if it's yours,
+    and be the person who wrote it down.</div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="concepts/31-designing-maintainable-camel-applications.html">&lsaquo; Prev</a>
+  <a rel="home" href="index.html">Contents</a>
+  <span class="book-pageno"></span>
+</nav>
+
+<script src="assets/book.js"></script>
+<script src="assets/book-progress.js"></script>
+</body>
+</html>

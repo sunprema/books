@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HTTP and REST APIs &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part V &mdash; Connecting Real Systems</span> &middot; Chapter 19</p>
+    <p class="chapter-no">19</p>
+    <h1 data-anchor="http-h1">HTTP and REST APIs</h1>
+
+    <p class="lede" data-anchor="http-lede">Chapter 18 closed with a promise of its own: the same underlying
+    question &mdash; how does one side know the other side is finished? &mdash; resurfacing in a new shape once the
+    transport is HTTP instead of a filesystem. A file either exists or it doesn't; there's no ambiguity once
+    <code>readLock</code> says it's safe to read. An HTTP call is messier: a request either gets a timely, well-formed
+    answer, or it gets a slow answer, a wrong-shaped answer, an honest error, or no answer at all, and the route has
+    to decide &mdash; explicitly &mdash; what each of those means. This chapter covers both directions Camel talks
+    HTTP: calling out to someone else's service with <code>camel-http</code>, and standing up your own with the REST
+    DSL.</p>
+
+    <h2 data-anchor="http-h2-calling">Calling out: camel-http as a producer</h2>
+    <p data-anchor="http-p-calling1"><code>camel-http</code> is a producer-only component &mdash; there's no
+    <code>from("http://...")</code>, only <code>.to("http://...")</code>. Point a route at a URL and it sends the
+    request using Apache HttpClient 5.x under the hood (that's been true since Camel 4.13), gets back a response, and
+    the exchange carries on with that response as its new body. The <code>http://</code> or <code>https://</code>
+    scheme in the endpoint URI is Camel's own routing prefix, not literally re-sent &mdash; it's how Camel decides
+    which component handles the call; the actual outbound scheme is whatever the URL itself says.</p>
+
+    <div class="pre-label">The plainest possible outbound call</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:lookupCustomer"</span>)
+    .<span class="kw">to</span>(<span class="str">"http://crm.internal.example.com/api/customers/{{header.customerId}}"</span>);</code></pre>
+
+    <p data-anchor="http-p-calling2">That's the shape of it, but it's also the version you should never actually
+    ship. Nothing above bounds how long the call is allowed to take, and nothing decides what "the call went badly"
+    even means. Those two questions &mdash; timeouts and failure handling &mdash; are what the rest of this section is
+    about.</p>
+
+    <h2 data-anchor="http-h2-timeouts">Timeouts: three places a call can hang, three options to bound them</h2>
+    <p data-anchor="http-p-timeouts1">A hung external service doesn't fail in one place &mdash; it can fail in three,
+    and each has its own option:</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>camel-http timeout options &mdash; each bounds a different way a call can hang</caption>
+        <thead>
+          <tr><th>Option</th><th>What it bounds</th><th>What it does <em>not</em> catch</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>connectTimeout</code></td><td>Milliseconds to establish the TCP connection</td><td>A service that accepts the connection, then goes silent</td></tr>
+          <tr><td><code>socketTimeout</code></td><td>Milliseconds of inactivity once connected &mdash; the gap between data chunks</td><td>A service that refuses the connection outright, or is unreachable</td></tr>
+          <tr><td><code>connectionRequestTimeout</code></td><td>Milliseconds to wait for a free connection from the client's own pool</td><td>Anything about the remote service at all &mdash; this one's about your own client being saturated</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="http-p-timeouts2">A route that sets <code>socketTimeout</code> alone and calls the endpoint
+    "protected" has only covered one of those three failure modes. A service that never accepts the TCP connection in
+    the first place &mdash; a firewall drop, a host that's down &mdash; is a <code>connectTimeout</code> problem, and
+    <code>socketTimeout</code> never enters the picture because there was no connection for data to go quiet on.</p>
+
+    <div class="pre-label">Bounding all three failure modes explicitly</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:lookupCustomer"</span>)
+    .<span class="kw">to</span>(<span class="str">"http://crm.internal.example.com/api/customers/{{header.customerId}}"</span>
+        + <span class="str">"?connectTimeout=3000&amp;socketTimeout=5000&amp;connectionRequestTimeout=2000"</span>);</code></pre>
+
+    <div class="callout key" data-anchor="http-callout-circuitbreaker">
+      <span class="callout-title">Timeouts bound one call. They don't stop you from hammering a struggling service.</span>
+      <p>A tight <code>socketTimeout</code> makes each individual retry fail fast &mdash; it doesn't stop the route
+      from immediately trying again, and again, against a downstream service that's already struggling. That's a
+      different problem, and Camel has a different tool for it: the Circuit Breaker EIP
+      (<code>circuitBreaker()</code>, backed by Resilience4j) sits in front of the call and can stop attempts
+      entirely once a failure threshold is crossed, giving the other side room to recover. Pair it with your
+      timeouts; it isn't a replacement for them.</p>
+    </div>
+
+    <h2 data-anchor="http-h2-failures">throwExceptionOnFailure and HttpOperationFailedException</h2>
+    <p data-anchor="http-p-failures1">By default, <code>throwExceptionOnFailure</code> is <code>true</code>, and
+    Camel treats a 3xx (redirection) or 4xx/5xx (client or server error) response as an operation failure, not just a
+    status code to read &mdash; it raises <code>HttpOperationFailedException</code> instead of quietly handing the
+    exchange a 404 body. That exception carries everything you'd otherwise have to re-derive:
+    <code>getStatusCode()</code>, <code>getStatusText()</code>, <code>getResponseBody()</code>,
+    <code>getResponseHeaders()</code>, <code>getUri()</code>, and &mdash; for redirects specifically &mdash;
+    <code>getRedirectLocation()</code> and <code>hasRedirectLocation()</code>.</p>
+
+    <div class="pre-label">Catching the exception, reading its structured fields</div>
+    <pre><code><span class="kw">onException</span>(HttpOperationFailedException.<span class="kw">class</span>)
+    .<span class="fn">process</span>(exchange <span class="kw">-&gt;</span> {
+        HttpOperationFailedException e = exchange.<span class="fn">getProperty</span>(
+            Exchange.EXCEPTION_CAUGHT, HttpOperationFailedException.<span class="kw">class</span>);
+        exchange.<span class="fn">getMessage</span>().<span class="fn">setHeader</span>(<span class="str">"FailedStatusCode"</span>, e.<span class="fn">getStatusCode</span>());
+        exchange.<span class="fn">getMessage</span>().<span class="fn">setBody</span>(e.<span class="fn">getResponseBody</span>());
+    })
+    .<span class="kw">to</span>(<span class="str">"direct:handleUpstreamFailure"</span>);</code></pre>
+
+    <p data-anchor="http-p-failures2">Setting <code>throwExceptionOnFailure=false</code> takes the opposite approach:
+    no exception, ever, from a bad status code. The exchange just carries whatever the server actually sent, and the
+    route reads <code>CamelHttpResponseCode</code> itself to decide what happened. Neither approach is more "correct"
+    &mdash; an <code>onException</code> clause centralizes failure handling across a whole route, while an inline
+    <code>choice()</code> on the response code keeps the success and failure paths visible side by side, right where
+    the call happens. Pick the shape that matches how the rest of the route already handles branching.</p>
+
+    <div class="pre-label">The inline alternative: inspect the code instead of catching an exception</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:lookupCustomer"</span>)
+    .<span class="kw">to</span>(<span class="str">"http://crm.internal.example.com/api/customers/{{header.customerId}}"</span>
+        + <span class="str">"?throwExceptionOnFailure=false&amp;connectTimeout=3000&amp;socketTimeout=5000"</span>)
+    .<span class="kw">choice</span>()
+        .<span class="kw">when</span>(header(Exchange.HTTP_RESPONSE_CODE).<span class="fn">isEqualTo</span>(<span class="num">200</span>))
+            .<span class="fn">unmarshal</span>().<span class="fn">json</span>(JsonLibrary.Jackson, Customer.<span class="kw">class</span>)
+        .<span class="kw">otherwise</span>()
+            .<span class="fn">log</span>(<span class="str">"Customer lookup failed with status ${header.CamelHttpResponseCode}"</span>)
+            .<span class="kw">to</span>(<span class="str">"direct:customerLookupFailed"</span>)
+    .<span class="kw">end</span>();</code></pre>
+
+    <div class="callout warn" data-anchor="http-callout-scope">
+      <span class="callout-title">throwExceptionOnFailure only covers responses &mdash; not the absence of one</span>
+      <p>The default catches 3xx/4xx/5xx <em>responses</em>. It says nothing about a call that never gets a response
+      at all &mdash; DNS failure, connection refused, a <code>connectTimeout</code> or <code>socketTimeout</code>
+      expiring. Those raise a different exception entirely. An <code>onException</code> clause scoped only to
+      <code>HttpOperationFailedException</code> silently misses that whole class of failure; catch the broader
+      <code>Exception</code> (or the specific timeout exception types) alongside it if a route needs to treat "no
+      answer" the same as "a bad answer."</p>
+    </div>
+
+    <p data-anchor="http-p-bridge">One more producer option worth knowing before it costs you a debugging session:
+    <code>bridgeEndpoint=true</code>. It's for building a proxy or passthrough route, and it does two things &mdash;
+    it stops Camel from appending the <em>incoming</em> request's path and query string onto the outbound URI a
+    second time, and it forces a no-op cookie store, since a bridging route is relaying someone else's session, not
+    running its own. Skip it on a proxy route and the outbound call ends up hitting a path with the segment doubled
+    up, which reads as a broken upstream far more readily than it reads as a missing URI option.</p>
+
+    <h2 data-anchor="http-h2-restdsl">Building a REST API: the REST DSL is a facade, not a server</h2>
+    <p data-anchor="http-p-restdsl1">Everything so far has been the calling side. The REST DSL &mdash;
+    <code>rest()</code> and <code>restConfiguration()</code> &mdash; is Camel's tool for the other direction:
+    exposing your own routes as REST operations. The important thing to internalize first is that <code>rest()</code>
+    itself doesn't run a web server. It's a facade for declaring operations &mdash; a verb, a path template, optional
+    request/response types &mdash; and <code>restConfiguration().component(...)</code> is where you pick which actual
+    HTTP server component serves them. <code>platform-http</code> is Camel 4's default binding for Spring Boot,
+    Quarkus, and standalone Camel Main; <code>netty-http</code>, <code>jetty</code>, <code>undertow</code>, and
+    <code>servlet</code> are the alternatives for when a specific server is already part of the deployment.</p>
+
+    <p data-anchor="http-p-restdsl2">In practice you're rarely bringing your own HTTP server: <code>platform-http</code>
+    plugs into whatever server the runtime already has. On Camel Quarkus, that's Quarkus's own Vert.x server via
+    <code>quarkus-vertx-http</code>. On Spring Boot or a standalone Camel Main application, it's an embedded Vert.x
+    server supplied by <code>camel-platform-http-main</code>. Either way, writing a <code>rest()</code> route doesn't
+    mean standing up a servlet container by hand &mdash; the platform already has one running, and
+    <code>platform-http</code> is what wires Camel's routes into it.</p>
+
+    <figure class="diagram-fig" data-anchor="http-fig-restdsl">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="httpD1t">
+        <title id="httpD1t">The REST DSL as a facade in front of a swappable HTTP server component: rest() and restConfiguration() declare the operations, while a chosen component such as platform-http, netty-http, jetty, or servlet actually serves the requests, and each operation delegates to an ordinary route</title>
+
+        <rect x="16" y="16" width="230" height="40" class="stroke fill-soft"/>
+        <text x="26" y="32" class="big">rest("/orders").get("/{id}")</text>
+        <text x="26" y="48" class="mono dim">.to("direct:getOrder")</text>
+
+        <path d="M246 36 L298 36" class="stroke"/>
+        <path d="M290 32 L298 36 L290 40" class="stroke"/>
+
+        <rect x="306" y="16" width="120" height="40" class="stroke fill-red"/>
+        <text x="316" y="40" class="on-ink">platform-http</text>
+
+        <path d="M366 56 L366 90" class="stroke-soft dash"/>
+        <text x="316" y="106" class="dim mono">or netty-http / jetty / servlet</text>
+
+        <path d="M131 56 L131 142" class="stroke"/>
+        <path d="M127 134 L131 142 L135 134" class="stroke"/>
+        <rect x="16" y="150" width="230" height="30" class="stroke"/>
+        <text x="26" y="169">from("direct:getOrder") &hellip;</text>
+      </svg>
+      <figcaption>Two independent choices: which server component actually listens on the port, and which route
+      implements each operation. rest() only wires them together.</figcaption>
+    </figure>
+
+    <div class="pre-label">Declaring operations, delegating each one to a route</div>
+    <pre><code><span class="fn">restConfiguration</span>()
+    .<span class="fn">component</span>(<span class="str">"platform-http"</span>)
+    .<span class="fn">bindingMode</span>(RestBindingMode.json)
+    .<span class="fn">apiContextPath</span>(<span class="str">"/api-doc"</span>)
+    .<span class="fn">apiProperty</span>(<span class="str">"api.title"</span>, <span class="str">"Order Service API"</span>)
+    .<span class="fn">apiProperty</span>(<span class="str">"api.version"</span>, <span class="str">"1.0"</span>);
+
+<span class="fn">rest</span>(<span class="str">"/orders"</span>)
+    .<span class="fn">get</span>(<span class="str">"/{id}"</span>).<span class="fn">outType</span>(Order.<span class="kw">class</span>)
+        .<span class="kw">to</span>(<span class="str">"direct:getOrder"</span>)
+    .<span class="fn">post</span>().<span class="fn">type</span>(Order.<span class="kw">class</span>).<span class="fn">outType</span>(OrderConfirmation.<span class="kw">class</span>)
+        .<span class="kw">to</span>(<span class="str">"direct:createOrder"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:getOrder"</span>)
+    .<span class="fn">process</span>(exchange <span class="kw">-&gt;</span> { <span class="cm">/* look up the order by ${header.id} */</span> });</code></pre>
+
+    <p data-anchor="http-p-restdsl3">Notice the shape: each <code>rest()</code> verb still ends in an ordinary
+    <code>.to("direct:...")</code>. The REST DSL only replaces <em>how a request enters a route</em> &mdash; the
+    routing, transformation, and error-handling vocabulary from every earlier chapter still applies once you're
+    inside <code>direct:getOrder</code>.</p>
+
+    <h2 data-anchor="http-h2-binding">bindingMode: request/response transformation, declared instead of written</h2>
+    <p data-anchor="http-p-binding1">Chapter 9 and Chapter 10 covered <code>marshal()</code>/<code>unmarshal()</code>
+    and the Simple language's own conversions in general terms; <code>bindingMode</code> is that same Jackson-backed
+    machinery, offered as a REST DSL convenience instead of an explicit step you write yourself. It has five values:
+    <code>off</code> (the default &mdash; the route sees and returns a raw body, and marshals it manually, exactly as
+    in every earlier chapter), <code>auto</code> (bind only if a data format can be inferred from the
+    <code>Content-Type</code> header), <code>json</code>, <code>xml</code>, and <code>json_xml</code> (negotiate
+    either, based on <code>Accept</code>). Set <code>bindingMode=json</code> and pair it with <code>type()</code> /
+    <code>outType()</code> on a verb, as in the snippet above, and the request body is unmarshalled to that POJO
+    before your route sees it, and the returned object is marshalled back to JSON on the way out &mdash; no explicit
+    <code>marshal().json(...)</code> call needed inside <code>direct:createOrder</code> itself.</p>
+
+    <h2 data-anchor="http-h2-openapi">Two ways to bring an OpenAPI spec into the picture</h2>
+    <p data-anchor="http-p-openapi1">A REST API and its OpenAPI (formerly Swagger) description can come into being in
+    either order, and Camel supports both directions:</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Code-first versus contract-first REST APIs in Camel</caption>
+        <thead>
+          <tr><th></th><th>Code-first</th><th>Contract-first</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Source of truth</td><td>Your <code>rest()</code> routes</td><td>An existing OpenAPI YAML/JSON file</td></tr>
+          <tr><td>Tool</td><td><code>camel-openapi-java</code></td><td><code>rest-dsl-openapi</code></td></tr>
+          <tr><td>What happens</td><td>The spec is <em>derived</em> from your routes and served at <code>apiContextPath</code></td><td>The spec is <em>loaded</em> at startup; Camel generates one endpoint per operation</td></tr>
+          <tr><td>Route wiring</td><td>Whatever <code>.to(...)</code> you wrote per verb</td><td>Convention: each operation routes to <code>direct:&lt;operationId&gt;</code></td></tr>
+          <tr><td>Startup safety net</td><td>&mdash;</td><td>Fails to start if any operationId has no matching route, unless <code>missingOperation</code> allows it</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="http-p-openapi2">Contract-first's startup validation is worth calling out on its own: if a
+    typo lands in either the spec's <code>operationId</code> or the route's <code>direct:</code> name, the mismatch
+    fails the whole application at boot, not at the first request that happens to hit that operation. That's a
+    feature &mdash; a silently-missing operation is a much worse failure to discover in production &mdash; but only
+    if you know to check the startup log rather than assume every declared operation quietly has an implementation.</p>
+
+    <p data-anchor="http-p-openapi3">There's a calling-side mirror of contract-first, too: the
+    <code>rest-openapi</code> component lets a producer target an <code>operationId</code> from an external OpenAPI
+    spec &mdash; <code>.to("rest-openapi:partner-api.yaml#getUserById")</code> &mdash; and Camel resolves the host,
+    path, and required parameters from that document instead of you hand-assembling the URL the way the earlier
+    <code>camel-http</code> examples did. The spec becomes the single source of truth for both directions: what your
+    API accepts, and what a partner's API expects when you call it.</p>
+
+    <div class="pullquote" data-anchor="http-pullquote">A file either exists to be read or it doesn't. An HTTP call
+    can fail in a connection that never opens, a socket that goes quiet, a pool that's exhausted, a status code that
+    means "no," or a body that means "yes" but isn't shaped the way you expected. None of those failure modes share
+    one option or one exception type &mdash; which is exactly why <code>camel-http</code> gives you three separate
+    timeouts and a structured exception instead of one blunt "it broke" flag. Naming the failure precisely is most of
+    the work of handling it well.</div>
+
+    <h2 data-anchor="http-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="http-p-reflection">Two components that mirror each other across the same boundary:
+    <code>camel-http</code> for calling out, with <code>connectTimeout</code>/<code>socketTimeout</code>/
+    <code>connectionRequestTimeout</code> bounding the three places a call can hang and
+    <code>HttpOperationFailedException</code> giving a failed response structured fields instead of a bare message;
+    and the REST DSL for exposing your own operations, which is deliberately just a facade &mdash;
+    <code>restConfiguration()</code> picks the real server (<code>platform-http</code> by default), and
+    <code>bindingMode</code> plugs the same marshalling machinery from Chapters 9 and 10 in as a declared option
+    instead of a written step. OpenAPI ties the two directions together, code-first or contract-first, so the shape
+    of the API is documented in one place whichever side of the call you're building. Chapter 20 stays inside "Real
+    Systems" but swaps the transport again &mdash; from a stateless HTTP request to a database connection that
+    expects you to think about transactions, not just timeouts.</p>
+
+    <div class="review" data-anchor="http-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route calls an external service with only <code>socketTimeout</code> set. The service's host has been
+        decommissioned and no longer accepts connections at all. Does <code>socketTimeout</code> catch this? Which
+        option would?</li>
+        <li>A teammate's <code>onException(HttpOperationFailedException.class)</code> handler never fires, even
+        though the external service is clearly down. What's the most likely explanation, given what
+        <code>HttpOperationFailedException</code> does and doesn't cover?</li>
+        <li>You're handed an existing OpenAPI spec for a service you need to implement from scratch. Which Camel
+        approach fits &mdash; code-first or contract-first &mdash; and what does Camel check for you at startup that
+        it wouldn't check in the other approach?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="18-files-sftp-and-object-storage.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="20-databases-and-persistence.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

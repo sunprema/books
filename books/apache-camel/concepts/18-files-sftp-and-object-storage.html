@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Files, SFTP, and Object Storage &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part V &mdash; Connecting Real Systems</span> &middot; Chapter 18</p>
+    <p class="chapter-no">18</p>
+    <h1 data-anchor="files-h1">Files, SFTP, and Object Storage</h1>
+
+    <p class="lede" data-anchor="files-lede">Chapter 17 closed on a promise: from patterns for moving a message
+    inside your own JVM to the real external systems those messages actually come from and go to. Files are the
+    oldest of those systems &mdash; Hohpe and Woolf's own catalog names File Transfer as one of the four base
+    integration styles, back in Chapter 1 &mdash; and they're still everywhere: a partner drops a nightly batch on an
+    SFTP server, a nightly job writes a report to an S3 bucket, a legacy system's only integration point is a shared
+    folder. Camel's <code>file:</code> component turns "watch a directory, pick up files safely, do something with
+    each one" into a handful of URI options instead of a hand-rolled polling loop, and &mdash; this is the part
+    worth knowing early &mdash; <code>sftp:</code> and the object-storage components use almost the same option set,
+    because they're built on the same abstraction underneath.</p>
+
+    <h2 data-anchor="files-h2-genericfile">One abstraction, three transports: GenericFile</h2>
+    <p data-anchor="files-p-genericfile1">Camel's <code>file:</code>, <code>ftp:</code>, and <code>sftp:</code>
+    components all extend the same <code>GenericFileComponent</code> / <code>GenericFileEndpoint</code> base class.
+    That's not an implementation detail &mdash; it's the reason the polling, locking, and archival options you're
+    about to learn on <code>file:</code> carry over to <code>sftp:</code> almost unchanged. Only the connection and
+    authentication options differ: a local directory needs a path; a remote server needs a host, a port, and
+    credentials. Everything about <em>how a file is safely claimed, processed, and archived</em> is shared.</p>
+
+    <div class="pre-label">Same options, different transport &mdash; only host/auth changes</div>
+    <pre><code><span class="cm">// Local directory</span>
+<span class="kw">from</span>(<span class="str">"file:data/incoming?readLock=changed&amp;delete=true"</span>)
+    .<span class="kw">to</span>(<span class="str">"file:data/processed"</span>);
+
+<span class="cm">// Same options, a remote SFTP server instead</span>
+<span class="kw">from</span>(<span class="str">"sftp://partner.example.com:22/incoming?username=integ&amp;privateKeyFile=/secrets/id_rsa&amp;readLock=changed&amp;delete=true"</span>)
+    .<span class="kw">to</span>(<span class="str">"file:data/processed"</span>);</code></pre>
+
+    <p data-anchor="files-p-genericfile2">Object storage doesn't share that exact base class &mdash; a bucket isn't a
+    directory tree the way FTP is &mdash; but <code>aws2-s3:</code> was deliberately designed to feel the same way
+    from the route's point of view: a scheduled-poll consumer, an options-driven producer, and the same instinct that
+    "process a thing, then decide what happens to it" should be a URI option rather than code you write yourself.
+    We'll come back to it once the file-based vocabulary is in place.</p>
+
+    <h2 data-anchor="files-h2-polling">Polling a directory: delay, recursion, and filtering</h2>
+    <p data-anchor="files-p-polling1">A file consumer is a scheduled poll consumer under the hood, and its defaults
+    are worth knowing precisely rather than assuming. <code>initialDelay</code> defaults to <code>1000</code>ms
+    before the very first poll; <code>delay</code> defaults to <code>500</code>ms between polls after that.
+    <code>recursive</code> defaults to <code>false</code> &mdash; a directory endpoint will not descend into
+    subdirectories unless you say so. <code>include</code> and <code>exclude</code> take a regex tested against the
+    filename, so a poll can consider only <code>.*\.csv</code> and ignore everything else sitting in the same
+    directory. And <code>maxMessagesPerPoll</code> caps how many files one poll cycle will claim &mdash; useful the
+    first time a route points at a directory with ten thousand files already sitting in it, so the route doesn't try
+    to swallow the entire backlog in one pass.</p>
+
+    <div class="pre-label">A bounded, filtered, recursive poll</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"file:data/incoming?recursive=true&amp;include=.*\\.csv&amp;maxMessagesPerPoll=50&amp;delay=30000"</span>)
+    .<span class="fn">log</span>(<span class="str">"Picked up ${header.CamelFileName}"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);</code></pre>
+
+    <h2 data-anchor="files-h2-readlock">readLock: the option that's easy to skip and expensive to skip</h2>
+    <p data-anchor="files-p-readlock1">Here's the default that matters most in this whole chapter:
+    <code>readLock</code> is <code>none</code> out of the box, on <code>file:</code>, <code>ftp:</code>, and
+    <code>sftp:</code> alike. Nothing stops a fresh route from picking up a file that some other process is still in
+    the middle of writing &mdash; Camel will happily hand a half-written CSV to your route, because you never told
+    it to check. This isn't a corner case worth a footnote; it's the single most common cause of "the file consumer
+    processed a truncated file" bug reports.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>readLock strategies &mdash; how a file consumer decides a file is safe to claim</caption>
+        <thead>
+          <tr><th>Strategy</th><th>How it decides</th><th>Caveat</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>none</code> (default)</td><td>Doesn't check &mdash; claims immediately</td><td>Can read a file mid-write</td></tr>
+          <tr><td><code>markerFile</code></td><td>Creates and holds a sibling <code>&lt;name&gt;.camelLock</code> file</td><td>Near-atomic, but not cluster-safe; not every remote server supports it</td></tr>
+          <tr><td><code>changed</code></td><td>Polls length/mtime twice, <code>readLockCheckInterval</code> apart; proceeds once both match</td><td>Needs a genuinely idle window &mdash; a slow trickle-write can never look "changed"</td></tr>
+          <tr><td><code>rename</code></td><td>Attempts an exclusive rename as the lock test itself</td><td>Requires rename permission on the source location</td></tr>
+          <tr><td><code>fileLock</code></td><td>A Java NIO <code>FileLock</code></td><td>Local filesystems only</td></tr>
+          <tr><td><code>idempotent</code></td><td>Uses an <code>IdempotentRepository</code> as the lock</td><td>The one strategy that can coordinate across a cluster &mdash; if the repository backing it can</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="files-p-readlock2"><code>changed</code> is the common default choice for a real filesystem or a
+    network mount where the producer doesn't rename atomically. <code>readLockTimeout</code> (default
+    <code>10000</code>ms) bounds how long a file is allowed to sit waiting for its lock before that poll cycle gives
+    up and reconsiders it later &mdash; the documented rule of thumb is to keep it at least twice
+    <code>readLockCheckInterval</code>, so a <code>changed</code> comparison actually gets more than one window to
+    run before timing out.</p>
+
+    <div class="callout warn" data-anchor="files-callout-readlock">
+      <span class="callout-title">idempotent readLock is Chapter 16's Idempotent Consumer, wearing a different hat</span>
+      <p>The <code>idempotent</code> readLock strategy uses the same <code>IdempotentRepository</code> interface
+      Chapter 16's <code>idempotentConsumer()</code> EIP used to filter duplicate messages. The warning from that
+      chapter applies here without modification: an in-memory repository's history doesn't exist anywhere another
+      route instance, or a fresh process after a restart, can see it. If more than one instance of this route might
+      poll the same directory, the repository backing <code>readLock=idempotent</code> needs to be something all of
+      them share &mdash; not the default in-memory one.</p>
+    </div>
+
+    <h2 data-anchor="files-h2-naming">Naming a write so a reader knows it's finished</h2>
+    <p data-anchor="files-p-naming1">Locking solves the problem from the reader's side: keep checking until the file
+    looks stable. <code>tempFileName</code> and <code>tempPrefix</code> solve the same problem from the
+    <em>writer's</em> side instead &mdash; the producer writes under a temporary name and renames to the real name
+    only once the write is complete. A downstream consumer watching for the final filename to simply <em>appear</em>
+    is then a reliable completion signal on its own, without needing a <code>readLock</code> at all. This is the
+    cleaner fix when you control both ends of a hand-off.</p>
+
+    <div class="pre-label">Write under a temp name, rename on completion</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:writeReport"</span>)
+    .<span class="kw">to</span>(<span class="str">"file:data/outgoing?tempPrefix=.inprogress-"</span>);
+
+<span class="cm">// Downstream: no readLock needed &mdash; the filename itself is the signal</span>
+<span class="kw">from</span>(<span class="str">"file:data/outgoing"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:shipReport"</span>);</code></pre>
+
+    <p data-anchor="files-p-naming2"><code>doneFileName</code> is the same idea, mirrored for a producer that
+    <em>can't</em> rename atomically &mdash; a legacy job that streams a growing file, say. Instead of inspecting the
+    data file's own stability, the consumer waits for a separate, named companion file to appear, and Camel supports
+    two dynamic tokens for deriving that name: <code>${file:name}</code> and <code>${file:name.noext}</code>.</p>
+
+    <div class="pre-label">Wait for a companion .done file instead of inspecting the data file</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"file:data/incoming?doneFileName=${file:name}.done"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);</code></pre>
+
+    <p data-anchor="files-p-naming3">On the producer side, one more option decides what happens when the target
+    name is already taken: <code>fileExist</code>, with six values &mdash; <code>Override</code> (the default,
+    overwrite), <code>Append</code>, <code>Fail</code> (throw), <code>Ignore</code> (skip the write silently),
+    <code>Move</code> (move the pre-existing file aside first, per <code>moveExisting</code>), and
+    <code>TryRename</code> (only meaningful with <code>tempFileName</code> &mdash; rename straight to the final name
+    with no exists-check at all, faster on filesystems, and especially FTP servers, where a check is its own network
+    round trip). One combination is rejected outright: <code>fileExist=Append</code> together with
+    <code>tempPrefix</code>/<code>tempFileName</code> &mdash; pick one write strategy, not both.</p>
+
+    <h2 data-anchor="files-h2-archival">After a successful read: delete, move, and the default you didn't ask for</h2>
+    <p data-anchor="files-p-archival1">What happens to a file once its exchange completes is controlled by
+    <code>delete</code>, <code>move</code>, <code>moveFailed</code>, and <code>preMove</code> &mdash; and choosing
+    none of them is itself a default, not an omission. If a route sets neither <code>delete=true</code>,
+    <code>move</code>, nor <code>noop=true</code>, Camel's out-of-the-box behavior is to move the processed file into
+    a hidden <code>.camel</code> subdirectory next to the original. The file isn't deleted &mdash; it just looks
+    that way, until someone knows to go look in <code>.camel</code>.</p>
+
+    <figure class="diagram-fig" data-anchor="files-fig-archival">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="filesD1t">
+        <title id="filesD1t">Four ways a consumed file can end up after a successful exchange: deleted, moved to a named archive location, moved to the hidden default .camel subfolder if nothing was configured, or left in place with noop</title>
+
+        <rect x="16" y="16" width="150" height="34" class="stroke fill-soft"/>
+        <text x="26" y="38" class="big">data/incoming/order.csv</text>
+
+        <path d="M91 50 L91 172" class="stroke-soft dash"/>
+
+        <rect x="16" y="80" width="150" height="30" class="stroke"/>
+        <text x="26" y="99">delete=true &rarr; gone</text>
+
+        <rect x="196" y="80" width="150" height="30" class="stroke"/>
+        <text x="206" y="99">move=archive/ &rarr; archive/</text>
+
+        <rect x="376" y="80" width="168" height="30" class="stroke fill-red"/>
+        <text x="386" y="99" class="on-ink">none set &rarr; .camel/ (default)</text>
+
+        <rect x="196" y="130" width="150" height="30" class="stroke fill-none"/>
+        <text x="206" y="149">noop=true &rarr; left in place</text>
+      </svg>
+      <figcaption>Four outcomes, one of which happens even if you configure nothing &mdash; a consumed file always ends up somewhere, it just isn't always where you expected to look.</figcaption>
+    </figure>
+
+    <div class="pre-label">Archive successes, quarantine failures, separately</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"file:data/incoming?move=processed/${file:name}&amp;moveFailed=failed/${file:name}"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);</code></pre>
+
+    <h2 data-anchor="files-h2-sftp">SFTP: the same model, over SSH, with two defaults worth changing</h2>
+    <p data-anchor="files-p-sftp1">An SFTP endpoint is addressed as <code>sftp://host:port/directory?options</code>,
+    defaulting to port <code>22</code>, and layers SSH-specific configuration on top of the same
+    <code>GenericFile</code> option set covered above &mdash; the same <code>readLock</code>,
+    <code>move</code>/<code>delete</code>, and <code>doneFileName</code> options all apply unchanged. Authentication
+    is either <code>username</code>/<code>password</code>, or key-based via <code>privateKeyFile</code> /
+    <code>privateKeyUri</code> (plus <code>privateKeyPassphrase</code> if the key needs one).</p>
+
+    <p data-anchor="files-p-sftp2">Two defaults deserve a second look before this goes anywhere near production.
+    <code>strictHostKeyChecking</code> defaults to <code>no</code> &mdash; host-key verification is effectively
+    disabled unless a route sets it explicitly, which is a real man-in-the-middle exposure, not a lint warning to
+    silence. And <code>useUserKnownHostsFile</code> defaults to <code>true</code>, meaning Camel will silently read
+    the running process's own <code>~/.ssh/known_hosts</code> unless <code>knownHostsFile</code> (or
+    <code>knownHostsUri</code>) points it at a dedicated, deployment-managed file instead.</p>
+
+    <div class="pre-label">Overriding both insecure defaults on purpose</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"sftp://partner.example.com:22/outbound?username=integ&amp;privateKeyFile=/secrets/id_rsa"</span>
+    + <span class="str">"&amp;knownHostsFile=/secrets/known_hosts&amp;strictHostKeyChecking=yes&amp;delay=30000"</span>)
+    .<span class="kw">to</span>(<span class="str">"file:data/from-partner"</span>);</code></pre>
+
+    <div class="callout warn" data-anchor="files-callout-hostkey">
+      <span class="callout-title">"It connected fine" is not the same as "it connected to the right server"</span>
+      <p>With <code>strictHostKeyChecking=no</code>, a route that silently starts talking to a different host &mdash;
+      DNS poisoning, a compromised jump box, an attacker sitting between you and the partner's server &mdash; looks
+      exactly like a route that's working. There's no exception, no log line, nothing to notice. Setting
+      <code>strictHostKeyChecking=yes</code> with an explicit, deployment-managed <code>knownHostsFile</code> turns a
+      silent failure mode into a loud one: the connection simply refuses to proceed against an unrecognized or
+      changed host key.</p>
+    </div>
+
+    <h2 data-anchor="files-h2-largefiles">Large files: streamDownload, and a hang worth knowing about</h2>
+    <p data-anchor="files-p-large1">By default, an SFTP (or FTP) consumer downloads a file completely to a local
+    temp file before handing it to the route. <code>streamDownload=true</code> changes that: the route body becomes
+    a live <code>InputStream</code> instead, so processing can start without buffering the entire object in memory
+    or on disk first &mdash; the option to reach for once "large file" stops being hypothetical.</p>
+
+    <p data-anchor="files-p-large2">It comes with a documented catch worth knowing before it costs you a debugging
+    session: combining <code>streamDownload=true</code> with the default <code>stepwise=true</code> directory
+    navigation has a tracked hang/deadlock on files past roughly half a megabyte (CAMEL-12472, CAMEL-14506). The
+    recorded workarounds are either disabling <code>stepwise</code> or pairing <code>streamDownload</code> with
+    <code>localWorkDirectory</code>, so the "stream" is backed by a temp file instead of held open directly against
+    the live SSH channel.</p>
+
+    <div class="pre-label">The safer pairing for a large-file SFTP pull</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"sftp://reports.example.com/exports?username=integ&amp;password={{sftp.password}}"</span>
+    + <span class="str">"&amp;streamDownload=true&amp;stepwise=false"</span>)
+    .<span class="kw">to</span>(<span class="str">"file:data/large-imports"</span>);</code></pre>
+
+    <h2 data-anchor="files-h2-s3">Object storage: aws2-s3, the bucket as a directory</h2>
+    <p data-anchor="files-p-s31">An <code>aws2-s3:</code> endpoint is addressed as
+    <code>aws2-s3://bucketName?options</code>, authenticating with <code>accessKey</code>/<code>secretKey</code>/
+    <code>region</code> (or a configured default AWS credentials chain, the usual choice once you're past local
+    testing). The consumer polls a bucket the same scheduled-poll way a <code>file:</code> endpoint polls a
+    directory &mdash; but two of its defaults are the opposite of what you might expect, coming from
+    <code>file:</code>.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Two aws2-s3 defaults that flip file:'s defaults</caption>
+        <thead>
+          <tr><th>Option</th><th>aws2-s3 default</th><th>file: equivalent default</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>deleteAfterRead</code></td><td><code>true</code></td><td><code>delete</code> defaults <code>false</code> (files move to <code>.camel</code> instead)</td></tr>
+          <tr><td><code>autoCreateBucket</code></td><td><code>true</code></td><td>No equivalent &mdash; a bad <code>file:</code> path just fails</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="files-p-s32"><code>deleteAfterRead=true</code> means an object is removed from the bucket as
+    soon as its exchange commits &mdash; only on commit, not on a rollback &mdash; which is the S3 analogue of
+    <code>file:</code>'s <code>delete</code> option, except on by default rather than opt-in. And
+    <code>autoCreateBucket=true</code> means a route pointed at a misspelled or not-yet-provisioned bucket name will
+    silently create a new, empty bucket rather than fail loudly &mdash; a configuration mistake that hides behind
+    what looks like a working, if suspiciously empty, integration.</p>
+
+    <div class="callout key" data-anchor="files-callout-s3defaults">
+      <span class="callout-title">Read both defaults before the first deploy, not after the first incident</span>
+      <p>Set <code>deleteAfterRead=false</code> on purpose if a bucket is meant to be a durable archive rather than
+      an inbox to drain, and set <code>autoCreateBucket=false</code> on purpose once bucket provisioning is meant to
+      be someone else's deliberate, tracked decision &mdash; not a side effect of a route starting up with a typo in
+      its URI.</p>
+    </div>
+
+    <p data-anchor="files-p-s33">On the producer side, <code>streamingUploadMode=true</code> switches to a
+    multipart upload so a large body can be sent without knowing its total size up front, completing once
+    <code>batchSize</code> or <code>batchMessageNumber</code> is reached &mdash; conceptually the S3 counterpart of
+    the file producer's <code>tempFileName</code> pattern from earlier in this chapter, except the atomicity boundary
+    is the multipart-complete call rather than a filesystem rename.</p>
+
+    <div class="pre-label">Streaming a large upload to S3, chapter 18's two transports end to end</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"sftp://reports.example.com/exports?username=integ&amp;password={{sftp.password}}&amp;streamDownload=true&amp;stepwise=false"</span>)
+    .<span class="kw">to</span>(<span class="str">"aws2-s3://ingest-bucket?accessKey={{aws.key}}&amp;secretKey={{aws.secret}}&amp;region=US_EAST_1&amp;streamingUploadMode=true"</span>);</code></pre>
+
+    <div class="pullquote" data-anchor="files-pullquote">Every option in this chapter answers the same underlying
+    question in a different guise: how does one side know the other side is finished? A lock says "wait until it
+    stops changing." A rename says "the name itself is the answer." A done-file says "I'll tell you separately."
+    Object storage's commit-then-delete says "only count it once it's certain." Pick the mechanism the write side can
+    actually guarantee &mdash; the read side's safety depends on it, not the other way around.</div>
+
+    <h2 data-anchor="files-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="files-p-reflection">A vocabulary that travels: <code>readLock</code>, <code>move</code>,
+    <code>delete</code>, and <code>doneFileName</code> mean the same thing whether the endpoint is a local directory
+    or a partner's SFTP server, because both sit on the same <code>GenericFile</code> abstraction. What changes
+    &mdash; and what deserves the most attention before a route goes anywhere near production &mdash; are the
+    defaults: <code>readLock=none</code>, <code>strictHostKeyChecking=no</code>, and object storage's
+    <code>deleteAfterRead=true</code>/<code>autoCreateBucket=true</code> are all defaults chosen for convenience in a
+    quick test, not for a partner-facing production pipeline. Chapter 19 moves to the transport most integrations
+    reach for first &mdash; HTTP and REST APIs &mdash; where the same underlying question resurfaces in a new shape:
+    a request either gets a timely answer or it doesn't, and the route has to decide what "doesn't" means.</p>
+
+    <div class="review" data-anchor="files-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route consumes from <code>file:data/incoming</code> with no <code>readLock</code>,
+        <code>delete</code>, or <code>move</code> set. A teammate says "the files must be getting deleted, I can't
+        find them anywhere." Where should you actually look, and why did that happen without anyone configuring
+        it?</li>
+        <li>A partner's SFTP drop connects successfully every time, with the component's defaults untouched. What
+        two settings would you check first, and what silent risk does leaving them at their defaults create?</li>
+        <li>An aws2-s3 consumer route has been running for a week against a bucket name that turns out to have a typo
+        in it, yet nobody got an error. Which default explains that, and which one explains why the objects
+        it "processed" can no longer be found in the bucket it meant to read from?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="17-asynchronous-integration-patterns.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="19-http-and-rest-apis.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

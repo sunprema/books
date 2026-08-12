@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Java DSL &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; Building Your First Routes</span> &middot; Chapter 06</p>
+    <p class="chapter-no">06</p>
+    <h1 data-anchor="dsl-h1">The Java DSL</h1>
+
+    <p class="lede" data-anchor="dsl-lede">Chapter 05 ended with a promise: take the two YAML routes we
+    just got running, rewrite them as <code>RouteBuilder</code> classes, and explain why this book
+    leans on Java as its default from here on. You've actually already seen the shape once &mdash;
+    Chapter 04's <code>OrderRoute</code> example was a <code>RouteBuilder</code> all along. This
+    chapter is where that shape stops being a thing you copied and becomes a thing you understand:
+    what <code>from</code>, <code>to</code>, and <code>process</code> are actually doing, what a
+    <code>RouteBuilder</code> buys you that a YAML file can't, and how <code>direct:</code> endpoints
+    let you build routes out of other routes.</p>
+
+    <h2 data-anchor="dsl-h2-rewrite">Same routes, real Java</h2>
+    <p data-anchor="dsl-p-rewrite1">A <code>RouteBuilder</code> is an ordinary class with one job:
+    override <code>configure()</code>, and whatever routes you build inside it get registered with
+    the <code>CamelContext</code> when Camel calls that method once at startup. Nothing stops you
+    from defining more than one route in a single <code>configure()</code> &mdash; here are both of
+    Chapter 05's routes, side by side, in one class:</p>
+
+    <div class="pre-label">FirstRoutes.java &mdash; heartbeat.yaml and orders-copy.yaml, as Java</div>
+    <pre><code><span class="mac">@Component</span>
+<span class="kw">public</span> <span class="kw">class</span> <span class="ty">FirstRoutes</span> <span class="kw">extends</span> <span class="ty">RouteBuilder</span> {
+
+    <span class="mac">@Override</span>
+    <span class="kw">public</span> <span class="kw">void</span> <span class="fn">configure</span>() <span class="kw">throws</span> <span class="ty">Exception</span> {
+
+        <span class="kw">from</span>(<span class="str">"timer:heartbeat?period=5000"</span>)
+            .<span class="kw">routeId</span>(<span class="str">"heartbeat"</span>)
+            .<span class="kw">log</span>(<span class="str">"Tick ${exchangeProperty.CamelTimerCounter}"</span>);
+
+        <span class="kw">from</span>(<span class="str">"file:data/incoming?noop=true"</span>)
+            .<span class="kw">routeId</span>(<span class="str">"orders-copy"</span>)
+            .<span class="kw">log</span>(<span class="str">"Copying ${header.CamelFileName}"</span>)
+            .<span class="kw">to</span>(<span class="str">"file:data/outgoing"</span>);
+    }
+}</code></pre>
+
+    <p data-anchor="dsl-p-rewrite2">Read that against the YAML from Chapter 05 and there's genuinely
+    nothing new in it &mdash; same URIs, same <code>routeId</code>, same log message, same
+    <code>noop</code>. Only the spelling changed, exactly as promised. What <em>is</em> new is what
+    that spelling is made of: <code>@Component</code> is what gets <code>FirstRoutes</code> noticed
+    by Spring Boot's auto-configuration (skip it and the class compiles fine but Camel never starts
+    the routes inside it &mdash; a quiet, easy mistake); <code>configure()</code> is a real Java
+    method, so it can contain more than a static list of steps, which is the whole subject of this
+    chapter.</p>
+
+    <h2 data-anchor="dsl-h2-chain">from, to, and the shape of the chain</h2>
+    <p data-anchor="dsl-p-chain1"><code>from(uri)</code> is special: it's the only call that starts a
+    route, and every route has exactly one. Everything chained after it &mdash; <code>.routeId</code>,
+    <code>.log</code>, <code>.to</code>, <code>.process</code> &mdash; is a method on the object
+    <code>from</code> handed back, which is why the whole thing reads as one fluent sentence instead
+    of a sequence of separate statements. <code>to(uri)</code> is not similarly limited: a route can
+    call <code>.to(...)</code> as many times as it needs, and by default each one is a sequential hop
+    &mdash; the message goes to the first <code>to</code>, whatever comes back continues to the
+    second, and so on. That's worth saying plainly because it's easy to expect multiple
+    <code>to</code> calls to mean "send a copy to each" &mdash; that's a real pattern (multicast), but
+    it isn't what plain chained <code>to</code> calls do; multicast gets its own <code>.multicast()</code>
+    call in Part IV.</p>
+
+    <div class="callout" data-anchor="dsl-callout-multiline">
+      <span class="callout-title">One route, however you format it</span>
+      <p>The line breaks in every example on this page are cosmetic &mdash; Java doesn't care where a
+      statement wraps, and neither does Camel. What matters is that the whole chain, from
+      <code>from(...)</code> to the trailing <code>;</code>, is one Java statement building one
+      <code>RouteDefinition</code>. Break it wherever it reads best; a step per line is simply the
+      convention this book (and most Camel code you'll read) follows.</p>
+    </div>
+
+    <h2 data-anchor="dsl-h2-process">process(): when the built-in steps run out</h2>
+    <p data-anchor="dsl-p-process1">Chapter 02 named the interface underneath every step in a route:
+    <code>Processor</code>, one method, <code>process(Exchange)</code>. <code>.log(...)</code> and
+    <code>.to(...)</code> are Processors Camel wrote for you; <code>.process(...)</code> is where you
+    write your own, and because <code>Processor</code> is a single-method interface, a lambda is all
+    it takes:</p>
+
+    <div class="pre-label">A Processor as a lambda, with the full Exchange in hand</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"file:data/incoming?noop=true"</span>)
+    .<span class="kw">routeId</span>(<span class="str">"orders-copy"</span>)
+    .<span class="kw">process</span>(exchange -&gt; {
+        <span class="ty">String</span> name = exchange.<span class="fn">getMessage</span>().<span class="fn">getHeader</span>(<span class="str">"CamelFileName"</span>, <span class="ty">String</span>.<span class="kw">class</span>);
+        <span class="kw">if</span> (name == <span class="kw">null</span> || !name.<span class="fn">endsWith</span>(<span class="str">".csv"</span>)) {
+            <span class="kw">throw</span> <span class="kw">new</span> <span class="ty">IllegalArgumentException</span>(<span class="str">"not a CSV file: "</span> + name);
+        }
+    })
+    .<span class="kw">to</span>(<span class="str">"file:data/outgoing"</span>);</code></pre>
+
+    <p data-anchor="dsl-p-process2">That's real power &mdash; the whole <code>Exchange</code>, body,
+    headers, properties, and all &mdash; but it's also the option that costs the most to read later.
+    A route that's mostly <code>.process(exchange -&gt; { ... })</code> blocks reads like a program with
+    the plot summary removed; the intent is buried inside Java rather than visible in the chain of
+    method names. Match the tool to the job, the same discipline Chapter 05 asked of you for logging:</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Three ways to touch a message, in order of how much they cost to read</caption>
+        <thead>
+          <tr><th>&nbsp;</th><th>Built-in step</th><th><code>.bean(...)</code></th><th><code>.process(...)</code></th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="term">Example</span></td><td><code>.setHeader("x", simple("..."))</code></td><td><code>.bean(OrderValidator.class, "validate")</code></td><td><code>.process(exchange -&gt; { ... })</code></td></tr>
+          <tr><td><span class="term">What it sees</span></td><td>one value, via an expression language</td><td>whatever parameters Camel can bind for you &mdash; often just the body</td><td>the entire Exchange</td></tr>
+          <tr><td><span class="term">Best for</span></td><td>a single header, body, or property change</td><td>logic that already exists as a plain, testable Java method</td><td>anything that genuinely needs headers, properties, <em>and</em> the body at once</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="dsl-p-process3">Reach for <code>.process()</code> last, not first &mdash; it's the
+    escape hatch for when the DSL's own vocabulary runs out, not the default way to touch a message.</p>
+
+    <h2 data-anchor="dsl-h2-direct">direct: endpoints and building routes out of routes</h2>
+    <p data-anchor="dsl-p-direct1">Chapter 03's pattern table named <code>direct:</code> as Camel's
+    point-to-point option; here's what that means in practice. <code>direct:name</code> is the
+    closest thing Camel has to a plain Java method call: a producer <code>.to("direct:name")</code>
+    invokes whatever route has <code>.from("direct:name")</code> as its consumer, <em>synchronously</em>,
+    on the caller's own thread, with no queue, no serialization, and no boundary crossed &mdash; both
+    routes have to live in the same <code>CamelContext</code>. That makes it the natural tool for
+    factoring a step or two shared by more than one entry point out into their own named route, the
+    same instinct that pulls a repeated block of code out into a method:</p>
+
+    <div class="pre-label">Two entry points, one shared validation route</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:validateOrder"</span>)
+    .<span class="kw">process</span>(exchange -&gt; {
+        <span class="ty">String</span> body = exchange.<span class="fn">getMessage</span>().<span class="fn">getBody</span>(<span class="ty">String</span>.<span class="kw">class</span>);
+        <span class="kw">if</span> (body == <span class="kw">null</span> || body.<span class="fn">isBlank</span>()) {
+            <span class="kw">throw</span> <span class="kw">new</span> <span class="ty">IllegalArgumentException</span>(<span class="str">"empty order body"</span>);
+        }
+    });
+
+<span class="kw">from</span>(<span class="str">"file:data/incoming?noop=true"</span>)
+    .<span class="kw">routeId</span>(<span class="str">"orders-copy"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:validateOrder"</span>)
+    .<span class="kw">log</span>(<span class="str">"Copying ${header.CamelFileName}"</span>)
+    .<span class="kw">to</span>(<span class="str">"file:data/outgoing"</span>);</code></pre>
+
+    <figure class="diagram-fig" data-anchor="dsl-fig-direct">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="dslD1t">
+        <title id="dslD1t">A producer route calls into a consumer route through a direct: endpoint synchronously, on the caller's own thread, and control returns to the caller once the callee route finishes</title>
+
+        <text x="16" y="18" class="dim">direct:validateOrder &mdash; a synchronous, in-JVM call, not a queue</text>
+
+        <rect x="16" y="54" width="190" height="92" class="stroke fill-soft"/>
+        <text x="26" y="74" class="big">orders-copy route</text>
+        <text x="26" y="94" class="mono">from(file:incoming)</text>
+        <text x="26" y="110" class="mono">.to(direct:validateOrder)</text>
+        <text x="26" y="126" class="mono">.to(file:outgoing)</text>
+
+        <rect x="354" y="54" width="190" height="92" class="stroke fill-red"/>
+        <text x="364" y="74" class="big on-ink">validateOrder route</text>
+        <text x="364" y="94" class="mono on-ink">from(direct:validateOrder)</text>
+        <text x="364" y="110" class="mono on-ink">.process(validate)</text>
+
+        <path d="M206 84 L354 84" class="stroke-red"/>
+        <text x="222" y="76" class="dim red">call</text>
+
+        <path d="M354 118 L206 118" class="dash stroke"/>
+        <text x="216" y="134" class="dim">return &mdash; same thread</text>
+
+        <text x="16" y="168" class="dim">no consumer on validateOrder? failIfNoConsumers=true (default) throws</text>
+      </svg>
+      <figcaption>Calling <code>to("direct:validateOrder")</code> blocks <code>orders-copy</code> on
+      its own thread until the <code>validateOrder</code> route finishes, then execution continues
+      right where it left off &mdash; a subroutine call, not a message drop.</figcaption>
+    </figure>
+
+    <div class="callout warn" data-anchor="dsl-callout-direct-sync">
+      <span class="callout-title">Not a queue</span>
+      <p><code>direct:</code>'s synchronous, same-thread behavior is exactly what makes it feel like a
+      method call &mdash; and exactly why it's the wrong tool the moment you want the caller to move on
+      without waiting. A slow or blocking consumer route stalls its caller too, because there's no
+      buffer between them. When you actually want an asynchronous hand-off, Part IV's <code>seda:</code>
+      component and Wire Tap pattern are built for that; for now, treat <code>direct:</code> as
+      Camel's answer to "extract a method," not "send this and forget it."</p>
+    </div>
+
+    <h2 data-anchor="dsl-h2-why">A RouteBuilder is just a class</h2>
+    <p data-anchor="dsl-p-why1">Here's the promised answer to why this book leans on Java from here:
+    <code>configure()</code> is ordinary Java, which means it has ordinary Java in it &mdash; loops,
+    conditionals, private helper methods, constructor-injected dependencies. A YAML or XML route file
+    is data Camel reads and interprets; a <code>RouteBuilder</code> is code that runs once, at
+    startup, and <em>produces</em> routes. That difference stops being academic the moment you need
+    the same route shape more than once:</p>
+
+    <div class="pre-label">Three near-identical routes, without writing any of them three times</div>
+    <pre><code><span class="kw">for</span> (<span class="ty">String</span> region : <span class="ty">List</span>.<span class="fn">of</span>(<span class="str">"us"</span>, <span class="str">"eu"</span>, <span class="str">"apac"</span>)) {
+    <span class="kw">from</span>(<span class="str">"file:data/incoming/"</span> + region + <span class="str">"?noop=true"</span>)
+        .<span class="kw">routeId</span>(<span class="str">"orders-copy-"</span> + region)
+        .<span class="kw">log</span>(<span class="str">"Copying "</span> + region + <span class="str">" order: ${header.CamelFileName}"</span>)
+        .<span class="kw">to</span>(<span class="str">"file:data/outgoing/"</span> + region);
+}</code></pre>
+
+    <p data-anchor="dsl-p-why2">A declarative DSL has no equivalent move &mdash; you'd write out three
+    routes by hand, or reach for tooling outside Camel entirely to generate the YAML. That's a
+    genuine, structural advantage, but it's not the everyday one. The everyday advantage is duller and
+    matters more: a typo in a URI, a misspelled method name, a missing import all fail at
+    <em>compile</em> time instead of showing up as a startup error in a log line you have to go
+    trace back to a source file. Your IDE autocompletes endpoint options because they're real method
+    signatures, not string keys it has to guess at. Renaming a bean or a constant is a refactor the
+    whole codebase feels, route code included, instead of a manual find-and-replace across route
+    files that might miss one. And a breakpoint set inside a <code>.process()</code> lambda is a real
+    breakpoint &mdash; you step through it, inspect the <code>Exchange</code> live, exactly like
+    debugging any other Java code, because it <em>is</em> other Java code.</p>
+
+    <p data-anchor="dsl-p-why3">None of that makes the Java DSL strictly better &mdash; Chapter 07
+    takes on YAML and XML next, and both have real strengths this chapter deliberately hasn't
+    covered. But for a book whose examples need to compile, refactor cleanly, and step through a
+    debugger without a second toolchain, Java is the default from here on for those reasons, not out
+    of habit.</p>
+
+    <div class="callout key" data-anchor="dsl-callout-recap">
+      <span class="callout-title">What actually changed today</span>
+      <p>Nothing about the routes &mdash; the heartbeat and file-copy routes from Chapter 05 do exactly
+      what they did before. What changed is the tool: <code>configure()</code> is a real method, so a
+      route can be built with a loop instead of copy-pasted; <code>.process()</code> is the escape
+      hatch for logic the DSL's own steps can't express; and <code>direct:</code> turns "call this
+      route from that one" into one line, as long as both live in the same <code>CamelContext</code>.</p>
+    </div>
+
+    <h2 data-anchor="dsl-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="dsl-p-reflection">The same two routes, now written in a language that can generate
+    routes instead of only listing them, catches its own typos before you run it, and lets a debugger
+    step inside a <code>.process()</code> block line by line. Nothing here required abandoning what
+    Chapter 05 built &mdash; it's the same shape, spelled differently, with more of a real programming
+    language available when a route needs one. Chapter 07 looks at when you'd reach for YAML or XML
+    instead, and why "instead" is sometimes the right answer.</p>
+
+    <div class="review" data-anchor="dsl-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A teammate writes a <code>RouteBuilder</code> subclass, runs the Spring Boot app, and its
+        route never starts &mdash; no error, nothing in the logs. What's the single most likely thing
+        missing from the class?</li>
+        <li>You're deciding between <code>.setHeader("status", simple("VALID"))</code> and a
+        <code>.process(exchange -&gt; exchange.getMessage().setHeader("status", "VALID"))</code> lambda
+        that does the exact same thing. Which should you write, and why?</li>
+        <li>Route A calls <code>.to("direct:enrichOrder")</code>, but route B &mdash; the one with
+        <code>.from("direct:enrichOrder")</code> &mdash; hasn't started yet when the first message
+        arrives. What happens, and why does that happen immediately rather than the message just
+        queuing up until route B is ready?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="05-your-first-camel-route.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="07-alternative-route-dsls.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

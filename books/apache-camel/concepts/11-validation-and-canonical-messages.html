@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Validation and Canonical Messages &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Working with Messages</span> &middot; Chapter 11</p>
+    <p class="chapter-no">11</p>
+    <h1 data-anchor="val-h1">Validation and Canonical Messages</h1>
+
+    <p class="lede" data-anchor="val-lede">Chapter 10 ended on a question it deliberately left open: once
+    <code>unmarshal</code> has handed you back a Java object, how much do you actually trust what's in it? Not
+    much, it turns out &mdash; and for a good reason. Marshalling and unmarshalling are forgiving by design;
+    Chapter 10 already showed you a JSON unmarshal that quietly hands back a generic <code>Map</code> instead
+    of failing, and XML that "salvages what JAXB can" from something malformed. Getting a Java object back
+    tells you the bytes were parseable. It tells you nothing about whether they were <em>right</em>. This
+    chapter closes that gap two ways: first with a set of tools for rejecting a message before it does damage,
+    then with a design decision &mdash; the canonical model &mdash; that lets every route downstream of this
+    one stop asking the question at all.</p>
+
+    <h2 data-anchor="val-h2-two-questions">Two different questions, easy to run together</h2>
+    <p data-anchor="val-p-two-questions">"Is this message valid?" is really two separate questions wearing one
+    sentence. The first is a gate: is this thing shaped the way it claims to be, with the fields it needs,
+    holding values that make sense? That's <span class="term">validation</span>, and it's this chapter's first
+    half. The second is a design question that has nothing to do with any one message: once something passes
+    the gate, what shape does the rest of your system get to assume it's in? That's the
+    <span class="term">canonical data model</span>, and it's the second half. Conflate them and you get routes
+    that re-validate a message five different ways because nobody ever wrote down what "valid" was supposed to
+    mean &mdash; which is exactly the kind of thing this chapter exists to stop.</p>
+
+    <h2 data-anchor="val-h2-tools">Three tools, escalating weight &mdash; again</h2>
+    <p data-anchor="val-p-tools1">If that "escalating weight" framing sounds familiar, it should &mdash;
+    Chapter 09 organized transformation the same way, and validation splits along nearly the same lines. A
+    predicate check is the lightest: no schema, no annotated class, just a boolean answer inline in the route.
+    Schema validation is heavier: it checks an entire message's structure against a document written
+    independently of any one route. Bean validation sits in between, checking constraints on a Java object you
+    already trust the shape of. None of the three replaces the others; each one answers a question the lighter
+    ones can't.</p>
+
+    <figure class="diagram-fig" data-anchor="val-fig-tiers">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="valD1t">
+        <title id="valD1t">A predicate check with validate() is the lightest validation tool, schema validation against an XSD or JSON Schema is heavier, and bean validation on a POJO's annotations sits in between them in what it checks</title>
+
+        <rect x="60" y="16" width="440" height="36" class="stroke fill-red"/>
+        <text x="72" y="39" class="big on-ink">validate() &mdash; a predicate, inline in the route</text>
+
+        <rect x="60" y="66" width="440" height="36" class="stroke fill-soft"/>
+        <text x="72" y="89" class="big">Bean Validator &mdash; annotations on an already-built object</text>
+
+        <rect x="60" y="116" width="440" height="36" class="stroke fill-soft"/>
+        <text x="72" y="139" class="big">Schema validator &mdash; a whole message against an XSD / JSON Schema</text>
+
+        <text x="512" y="39" class="dim">lightest</text>
+        <text x="512" y="139" class="dim">heaviest</text>
+      </svg>
+      <figcaption>Reach for the lightest tool that actually answers the question &mdash; a predicate for one
+      field, a schema for an entire message's shape, bean validation for the object in between.</figcaption>
+    </figure>
+
+    <h2 data-anchor="val-h2-validate">The lightest check: validate() and predicates</h2>
+    <p data-anchor="val-p-validate1">You've already met the machinery behind <code>validate()</code> twice.
+    Chapter 03's <code>filter()</code> uses a predicate to decide whether an exchange continues; Chapter 09's
+    Simple language builds the predicates that both steps evaluate. <code>validate(predicate)</code> is a third
+    use of the same idea, with one deliberate difference from <code>filter()</code>: where a failed filter
+    quietly drops the message and the route moves on as if nothing happened, a failed <code>validate()</code>
+    throws a <code>PredicateValidationException</code> and stops the exchange right there. Filtering says
+    "skip this one, no big deal." Validating says "this one is wrong, and something needs to know."</p>
+
+    <div class="pre-label">Two predicate checks, either one can stop the exchange</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="fn">validate</span>(<span class="fn">header</span>(<span class="str">"OrderId"</span>).<span class="fn">isNotNull</span>())
+    .<span class="fn">validate</span>(<span class="fn">simple</span>(<span class="str">"${body.total} &gt; 0"</span>))
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.checked"</span>);</code></pre>
+
+    <p data-anchor="val-p-validate2">That's the whole tool. It's exactly as good as the predicates you write for
+    it &mdash; which is precisely its limit. A predicate can check that one field is present, or that one
+    number is positive. It has no way to check that an entire message is shaped the way a contract says it
+    should be &mdash; that every field a downstream system expects is actually there, correctly typed, nested
+    where it's supposed to be. For that, you need something that reads a whole message at once.</p>
+
+    <h2 data-anchor="val-h2-schema">Schema validation: checking the wire bytes, not the object</h2>
+    <p data-anchor="val-p-schema1">Camel ships two components purpose-built for exactly that: the
+    <span class="term">Validator</span> component (<code>validator:resourceUri</code>) checks an XML body
+    against an XSD using JAXP, and the <span class="term">JSON Schema Validator</span> component
+    (<code>json-validator:resourceUri</code>) checks a JSON body against a JSON Schema document &mdash; drafts
+    v4, v6, v7, 2019-09, and 2020-12 (partial), via the NetworkNT library. Both point <code>resourceUri</code>
+    at a schema file on the classpath, the filesystem, or a remote URL; both parse and cache that schema once
+    and reuse it across every message. One difference worth knowing before you reach for either: the XML
+    Validator can sit anywhere in a route, but <code>json-validator</code> is producer-only &mdash; it's always
+    a <code>.to(...)</code> step, never a route's <code>from(...)</code>.</p>
+
+    <div class="pre-label">XML: validate against an XSD before unmarshalling</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"file:inbox/xml"</span>)
+    .<span class="kw">to</span>(<span class="str">"validator:schemas/order.xsd"</span>)
+    .<span class="fn">unmarshal</span>(orderXml)
+    .<span class="kw">to</span>(<span class="str">"bean:orderService?method=process"</span>);</code></pre>
+
+    <div class="pre-label">JSON: same shape, a JSON Schema instead of an XSD</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="kw">to</span>(<span class="str">"json-validator:schemas/order-schema.json"</span>)
+    .<span class="fn">unmarshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.<span class="ty">Jackson</span>, <span class="ty">Order</span>.<span class="kw">class</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.validated"</span>);</code></pre>
+
+    <p data-anchor="val-p-schema2">Notice where both steps sit: <em>before</em> <code>unmarshal</code>, not
+    after. That's not a style preference &mdash; it's the whole point. Both checks run against the raw wire
+    bytes, the String or byte array that arrived on the endpoint, exactly the thing Chapter 10's forgiving
+    converters are willing to guess about. Validate first and a malformed message never gets the chance to
+    become a half-trusted <code>Order</code>. There's also a third way to get the same schema check, one
+    Chapter 10 already introduced without naming it as validation: <code>JaxbDataFormat</code>'s
+    <code>schema</code> option turns on XSD validation as part of the unmarshal call itself, one step instead
+    of two, failing the exchange on invalid XML rather than letting JAXB salvage something from it.</p>
+
+    <div class="callout warn" data-anchor="val-callout-order">
+      <span class="callout-title">Validate the bytes, not the object you already trust</span>
+      <p>It's tempting to unmarshal first &mdash; you already need the object anyway &mdash; and validate
+      second. But by the time <code>unmarshal</code> has run, Chapter 10's forgiving converters have already
+      made a call about what to do with anything odd: a JSON unmarshal with no <code>unmarshalType</code>
+      silently becomes a <code>Map</code>; XML with no schema check silently becomes whatever JAXB could
+      salvage. If validation is meant to be a gate that rejects malformed input, it has to run against the raw
+      wire body, before or during unmarshal &mdash; not on the object that unmarshal already decided to hand
+      you.</p>
+    </div>
+
+    <p data-anchor="val-p-mismatch">One more mismatch worth calling out explicitly, because it fails in a
+    confusing way rather than a loud one: <code>validator:</code> expects XML and an XSD;
+    <code>json-validator:</code> expects JSON and a JSON Schema document. Point either one at the other
+    format's body and you don't get a clean "invalid message" &mdash; you get the wrong tool trying to parse
+    bytes it was never built to read.</p>
+
+    <h2 data-anchor="val-h2-bean">Bean validation: checking the object, on the other side</h2>
+    <p data-anchor="val-p-bean1">Schema validation guards the edge, before a message becomes Java. Once it is
+    Java &mdash; after <code>unmarshal</code>, or built by hand &mdash; the <span class="term">Bean
+    Validator</span> component (<code>bean-validator://label</code>) is the corresponding check on the object
+    itself: Jakarta Bean Validation annotations (<code>@NotNull</code>, <code>@Size</code>, and the rest)
+    declared right on the class, evaluated by Hibernate Validator by default. Only the default validation
+    group runs unless a route asks for another one with <code>?group=SomeGroup</code>, which lets one class
+    carry both an always-on baseline and a stricter set of checks only some routes opt into.</p>
+
+    <div class="pre-label">Annotations on the class, one .to() step to check them</div>
+    <pre><code><span class="kw">public</span> <span class="kw">class</span> <span class="ty">Order</span> {
+    <span class="at">@NotNull</span>
+    <span class="kw">private</span> <span class="ty">String</span> orderId;
+
+    <span class="at">@NotNull</span>
+    <span class="at">@Min</span>(<span class="num">1</span>)
+    <span class="kw">private</span> <span class="ty">BigDecimal</span> total;
+}
+
+<span class="cm">// route:</span>
+<span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="fn">unmarshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.<span class="ty">Jackson</span>, <span class="ty">Order</span>.<span class="kw">class</span>)
+    .<span class="kw">to</span>(<span class="str">"bean-validator://order"</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.validated"</span>);</code></pre>
+
+    <div class="callout key" data-anchor="val-callout-complementary">
+      <span class="callout-title">Schema and bean validation check different things</span>
+      <p>It's easy to assume that if the JSON already matched its schema, bean validation is redundant. It
+      usually isn't. A schema checks the wire shape &mdash; is <code>total</code> present, and is it a number?
+      A bean-validation constraint can encode a business rule the schema never expressed &mdash; is
+      <code>total</code> at least <code>1</code>? Both can be true or false independently of each other, which
+      is exactly why they're two checks at two different points in the pipeline, not one check written twice.</p>
+    </div>
+
+    <h2 data-anchor="val-h2-rejected">What happens to a message that fails</h2>
+    <p data-anchor="val-p-rejected1">Every validation step in this chapter does the same thing on failure: it
+    throws, and the exchange stops right there unless something catches it. <code>validate()</code> throws
+    <code>PredicateValidationException</code>; the schema validators throw their own validation exception on a
+    schema mismatch. Left alone, either one crashes the route. Chapter 23 covers Camel's full exception-handling
+    machinery, but the shape is worth previewing here, because a rejected message is the single most common
+    reason to reach for it early:</p>
+
+    <div class="pre-label">Catch it by name, send it somewhere a human can look</div>
+    <pre><code><span class="fn">onException</span>(<span class="ty">PredicateValidationException</span>.<span class="kw">class</span>)
+    .<span class="fn">handled</span>(<span class="kw">true</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.rejected"</span>);
+
+<span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="fn">validate</span>(<span class="fn">header</span>(<span class="str">"OrderId"</span>).<span class="fn">isNotNull</span>())
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.checked"</span>);</code></pre>
+
+    <p data-anchor="val-p-rejected2">A route that mixes more than one kind of validation generally needs one
+    <code>onException</code> clause per exception type it wants to handle differently &mdash; a predicate
+    failure and a schema failure aren't the same exception class, and treating them identically (or letting
+    either one propagate unhandled) is how "we validate our orders" quietly becomes "we validate our orders,
+    except when we don't notice we didn't."</p>
+
+    <h2 data-anchor="val-h2-canonical">The canonical data model: one shape, agreed on once</h2>
+    <p data-anchor="val-p-canonical1">Validation answers "is this message admissible?" It says nothing about
+    what shape a message should be <em>in</em> once it's admitted &mdash; and that turns out to matter just as
+    much. Picture an integration that receives orders from three sources: a partner's XML feed, a web
+    storefront's JSON, and a legacy batch job's CSV. Without a shared answer to "what does an Order look like,"
+    every route that touches an order has to know all three shapes, and every new consumer of order data has to
+    learn them too. Hohpe and Woolf named the fix a <span class="term">Canonical Data Model</span>: one
+    integration-owned shape that every source is translated into, and every consumer reads from &mdash; never
+    the other way around, and never source-to-source directly.</p>
+
+    <figure class="diagram-fig" data-anchor="val-fig-canonical">
+      <svg class="diagram" viewBox="0 0 560 210" role="img" aria-labelledby="valD2t">
+        <title id="valD2t">Three source formats — partner XML, storefront JSON, legacy CSV — each translate into one canonical Order shape, which every downstream route then reads from</title>
+
+        <rect x="16" y="16" width="140" height="34" class="stroke fill-soft"/>
+        <text x="86" y="38" class="big" text-anchor="middle">Partner XML</text>
+
+        <rect x="16" y="88" width="140" height="34" class="stroke fill-soft"/>
+        <text x="86" y="110" class="big" text-anchor="middle">Storefront JSON</text>
+
+        <rect x="16" y="160" width="140" height="34" class="stroke fill-soft"/>
+        <text x="86" y="182" class="big" text-anchor="middle">Legacy CSV</text>
+
+        <path d="M156 33 L230 33 L230 95 L268 95" class="stroke"/>
+        <path d="M260 91 L268 95 L260 99" class="stroke"/>
+        <path d="M156 105 L268 105" class="stroke"/>
+        <path d="M260 101 L268 105 L260 109" class="stroke"/>
+        <path d="M156 177 L230 177 L230 115 L268 115" class="stroke"/>
+        <path d="M260 111 L268 115 L260 119" class="stroke"/>
+
+        <rect x="270" y="78" width="150" height="50" class="stroke fill-red"/>
+        <text x="345" y="99" class="big on-ink" text-anchor="middle">Canonical</text>
+        <text x="345" y="115" class="big on-ink" text-anchor="middle">Order</text>
+
+        <path d="M420 103 L500 103" class="stroke"/>
+        <path d="M492 99 L500 103 L492 107" class="stroke"/>
+
+        <rect x="404" y="16" width="140" height="34" class="stroke-soft dash fill-none"/>
+        <text x="474" y="38" class="big dim" text-anchor="middle">Pricing route</text>
+        <rect x="404" y="160" width="140" height="34" class="stroke-soft dash fill-none"/>
+        <text x="474" y="182" class="big dim" text-anchor="middle">Fulfillment route</text>
+        <path d="M474 78 L474 50" class="stroke-soft dash"/>
+        <path d="M474 128 L474 160" class="stroke-soft dash"/>
+      </svg>
+      <figcaption>Three source formats, three Message Translators, one canonical shape. Every downstream route
+      reads the canonical Order and never needs to know a partner ever sent XML at all.</figcaption>
+    </figure>
+
+    <p data-anchor="val-p-canonical2">Count the translators each design needs and the payoff stops being
+    abstract. Let every source format talk directly to every consumer that needs it and the number of
+    translators grows with each new pairing &mdash; up to N(N&minus;1) of them as sources and consumers both
+    multiply, the same combinatorial growth Chapter 01 showed you for point-to-point system integration in the
+    first place. Route everything through one canonical shape instead and it's N translators, full stop &mdash;
+    one per source, once, no matter how many downstream routes end up reading the result. The canonical model
+    is the point-to-point problem from Chapter 01, solved again at the level of a single message format.</p>
+
+    <p data-anchor="val-p-canonical3">Designing one isn't a Camel feature to configure &mdash; it's a
+    modeling decision you make before you write a route. Pick field names, types, which fields are required,
+    which units a number is in, all independent of any one source's native shape. Then the tools this book
+    already gave you build the bridge: Chapter 09's <code>setBody</code>/bean/<code>Processor</code> and
+    Chapter 10's <code>marshal</code>/<code>unmarshal</code>, each one a Message Translator doing exactly one
+    format-to-canonical or canonical-to-format conversion, sitting right at the edge where a message enters or
+    leaves your system.</p>
+
+    <div class="callout" data-anchor="val-callout-not-first">
+      <span class="callout-title">A canonical model modeled on "whatever we integrated first" isn't canonical</span>
+      <p>The trap is subtle because it's easy to miss in the moment: designing the shared Order shape by
+      copying the first partner's XML field-for-field. It looks like a canonical model &mdash; there's one
+      shape, everything gets translated into it &mdash; but it's really that partner's format with an extra
+      hop. The next new source still has to bend awkwardly to fit a shape that was never actually neutral, and
+      the combinatorial cost the model was supposed to remove creeps back in, one asymmetric translator at a
+      time.</p>
+    </div>
+
+    <div class="pullquote" data-anchor="val-pullquote">Validation decides whether a message gets to enter your
+    system at all. The canonical model decides what it looks like once it's in. Get both right at the edge,
+    and every route behind that edge gets to stop asking either question.</div>
+
+    <h2 data-anchor="val-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="val-p-reflection">A precise answer to the question Chapter 10 left hanging: trust isn't
+    something <code>unmarshal</code> gives you for free, it's something you build deliberately, in layers
+    &mdash; a predicate for a quick business rule, a schema check against the raw wire bytes for structural
+    correctness, bean validation on the resulting object for constraints a schema can't express. And a design
+    principle that outlasts any one route: settle on one canonical shape at the edge, translate every source
+    into and out of it, and let every route behind that boundary work with a message it never has to
+    re-validate. Part III closes here, with a message you can trust and a shape everything downstream agrees
+    on. Part IV starts using that trust: Chapter 12 picks the route a validated, canonical message takes next.</p>
+
+    <div class="review" data-anchor="val-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route calls <code>filter(predicate)</code> where it actually meant <code>validate(predicate)</code>.
+        What's the practical difference the next time a message fails that check?</li>
+        <li>A teammate unmarshal's a JSON order and only then runs it through <code>json-validator:...</code>.
+        Why does that ordering undermine what schema validation is supposed to guarantee?</li>
+        <li>A JSON body passes <code>json-validator:order-schema.json</code> cleanly but still fails
+        <code>bean-validator://order</code>. Give a concrete example of a constraint that could cause that, and
+        explain why the schema wouldn't have caught it.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="10-working-with-data-formats.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="12-content-based-routing.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Working with Data Formats &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Working with Messages</span> &middot; Chapter 10</p>
+    <p class="chapter-no">10</p>
+    <h1 data-anchor="fmt-h1">Working with Data Formats</h1>
+
+    <p class="lede" data-anchor="fmt-lede">Chapter 09 closed with a promise: this chapter would put JSON, XML,
+    and CSV to work "using exactly the type-converter machinery this chapter just opened up." That's close
+    enough to be useful and wrong enough to be worth stopping on, because the gap between "close enough" and
+    "exact" is precisely the gap that bites people the first time they reach for <code>convertBodyTo</code>
+    where they needed something else entirely. So let's be exact. Marshalling and unmarshalling use a second
+    machine &mdash; related to type conversion, built the same way, but not the same registry, and not the
+    same DSL entry point.</p>
+
+    <h2 data-anchor="fmt-h2-machine">A second machine, not the one Chapter 09 promised</h2>
+    <p data-anchor="fmt-p-machine1">Chapter 09's type-converter registry answers one question: given a value
+    of type A, can you hand me type B? <code>getBody(Class)</code> and <code>convertBodyTo(Class)</code> both
+    ask it, and it answers from converters scanned off the classpath at startup &mdash; <code>String</code> to
+    <code>InputStream</code>, <code>byte[]</code> to <code>String</code>, and anything else a
+    <code>@Converter</code> class happens to register. It is genuinely useful for exactly this chapter's
+    subject &mdash; but it is not what does the work when a message crosses the edge of your system as JSON,
+    XML, or CSV. That's a second, purpose-built mechanism: the <span class="term">Data Format</span>, reached
+    through the <code>marshal()</code> and <code>unmarshal()</code> EIPs, not through
+    <code>getBody</code>.</p>
+
+    <p data-anchor="fmt-p-machine2">The distinction earns its keep once you say what each one is actually
+    good at. A type converter changes <em>one Java type into another Java type</em> &mdash; still Java on both
+    sides. A data format changes <em>a Java object into an external wire representation</em>, or back &mdash;
+    the whole current message body, going out as bytes a JMS broker or an HTTP client can carry, or coming in
+    as bytes that need to become an <code>Order</code> again before anything downstream can read a field off
+    it. <code>marshal(dataFormat)</code> does the outbound half; <code>unmarshal(dataFormat)</code> does the
+    inbound half. Both delegate to a pluggable <code>DataFormat</code> implementation &mdash; Jackson for
+    JSON, JAXB for XML, Apache Commons CSV for CSV &mdash; the same way a converter delegates to whatever
+    <code>@Converter</code> method matches.</p>
+
+    <figure class="diagram-fig" data-anchor="fmt-fig-machine">
+      <svg class="diagram" viewBox="0 0 560 195" role="img" aria-labelledby="fmtD1t">
+        <title id="fmtD1t">marshal() turns a Java object into wire bytes through a pluggable Data Format; unmarshal() reverses it &mdash; a separate mechanism from the type-converter registry</title>
+
+        <rect x="20" y="70" width="140" height="50" class="stroke fill-soft"/>
+        <text x="90" y="91" class="big" text-anchor="middle">Java object</text>
+        <text x="90" y="107" class="dim" text-anchor="middle">e.g. an Order</text>
+
+        <rect x="210" y="70" width="140" height="50" class="stroke fill-red"/>
+        <text x="280" y="91" class="big on-ink" text-anchor="middle">Data Format</text>
+        <text x="280" y="107" class="mono on-ink" text-anchor="middle">Jackson &middot; JAXB &middot; Commons CSV</text>
+
+        <rect x="400" y="70" width="140" height="50" class="stroke fill-soft"/>
+        <text x="470" y="91" class="big" text-anchor="middle">Wire bytes</text>
+        <text x="470" y="107" class="dim" text-anchor="middle">JSON / XML / CSV</text>
+
+        <path d="M90 70 L90 40 L470 40 L470 70" class="stroke"/>
+        <path d="M462 62 L470 70 L478 62" class="stroke"/>
+        <text x="280" y="30" class="big" text-anchor="middle">.marshal(format)</text>
+
+        <path d="M470 120 L470 150 L90 150 L90 120" class="stroke"/>
+        <path d="M82 128 L90 120 L98 128" class="stroke"/>
+        <text x="280" y="168" class="big" text-anchor="middle">.unmarshal(format)</text>
+      </svg>
+      <figcaption>Not <code>getBody(Class)</code>. The Data Format that runs inside <code>marshal</code>/
+      <code>unmarshal</code> is a different, pluggable component &mdash; one per wire format, not one per
+      pair of Java types.</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Two machines that both "convert" something</caption>
+        <thead>
+          <tr><th></th><th>Type converter (Ch. 08&ndash;09)</th><th>Data format (this chapter)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Converts</td><td>one Java type &rarr; another Java type</td><td>a Java object &rarr; an external wire format, or back</td></tr>
+          <tr><td>Lives in</td><td>the type-converter registry</td><td>a pluggable <code>DataFormat</code> &mdash; Jackson, JAXB, Commons CSV, &hellip;</td></tr>
+          <tr><td>Reached via</td><td><code>getBody(Class)</code> / <code>convertBodyTo(Class)</code></td><td><code>marshal(format)</code> / <code>unmarshal(format)</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout" data-anchor="fmt-callout-convertbodyto">
+      <span class="callout-title">Why <code>convertBodyTo(String.class)</code> won't give you JSON</span>
+      <p>It's tempting to reach for the tool you already know. But <code>convertBodyTo</code> only ever asks
+      the type-converter registry, and camel-core ships no built-in converter from an arbitrary POJO to a JSON
+      string &mdash; that conversion needs a library (Jackson) to walk the object's fields, which is exactly
+      what a <code>DataFormat</code> exists to do. Reach for <code>marshal().json()</code> instead; it's the
+      tool actually built for this job.</p>
+    </div>
+
+    <h2 data-anchor="fmt-h2-json">JSON with Jackson</h2>
+    <p data-anchor="fmt-p-json1">JSON isn't wired into camel-core &mdash; it's library-pluggable. Camel
+    supports several JSON libraries (Jackson, Gson, Johnzon, and historically XStream), selected with a
+    <code>JsonLibrary</code> argument or by which JSON dataformat dependency is on the classpath. Jackson,
+    via the <code>camel-jackson</code> dependency, is the one you'll reach for by default and the one this
+    book uses.</p>
+
+    <div class="pre-label">Unmarshal in, marshal out</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="fn">unmarshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.<span class="ty">Jackson</span>, <span class="ty">Order</span>.<span class="kw">class</span>)
+    .<span class="fn">bean</span>(<span class="str">"orderService"</span>, <span class="str">"process"</span>)
+    .<span class="fn">marshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.<span class="ty">Jackson</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:queue:orders.confirmed"</span>);</code></pre>
+
+    <p data-anchor="fmt-p-json2">Notice the asymmetry: <code>unmarshal</code> needs to be told
+    <code>Order.class</code> so it knows what to build; <code>marshal</code> doesn't &mdash; it only ever
+    needs to know the object it already has. That's the same shape you'll see repeat across every format in
+    this chapter.</p>
+
+    <div class="callout warn" data-anchor="fmt-callout-unmarshaltype">
+      <span class="callout-title">Skipping <code>unmarshalType</code> doesn't fail &mdash; it just stops being
+      what you expected</span>
+      <p>Leave the target class off <code>.json(JsonLibrary.Jackson)</code> and Camel doesn't complain. It
+      hands you a <code>java.util.Map</code> (or a <code>List</code> of them, for a JSON array) instead of the
+      <code>Order</code> you were picturing. The route keeps running; the failure shows up two steps later as
+      a <code>ClassCastException</code> the moment something calls <code>order.getTotal()</code> on what is
+      actually a <code>Map</code>, and the stack trace points at the wrong line.</p>
+    </div>
+
+    <h2 data-anchor="fmt-h2-xml">XML with JAXB</h2>
+    <p data-anchor="fmt-p-xml1">Camel's standard XML data format is JAXB &mdash; the same annotation-driven
+    binding used throughout the Java EE/Jakarta EE world. <code>JaxbDataFormat</code> is configured with a
+    <code>contextPath</code>: not one class, but the <em>package</em> to scan for JAXB-annotated classes, so a
+    single instance marshals and unmarshals every JAXB type in that package.</p>
+
+    <div class="pre-label">One JaxbDataFormat, one package of classes</div>
+    <pre><code><span class="ty">JaxbDataFormat</span> orderXml = <span class="kw">new</span> <span class="ty">JaxbDataFormat</span>();
+orderXml.<span class="fn">setContextPath</span>(<span class="ty">Order</span>.<span class="kw">class</span>.<span class="fn">getPackageName</span>());
+
+<span class="kw">from</span>(<span class="str">"file:inbox/xml"</span>)
+    .<span class="fn">unmarshal</span>(orderXml)
+    .<span class="fn">bean</span>(<span class="str">"orderService"</span>, <span class="str">"process"</span>)
+    .<span class="fn">marshal</span>(orderXml)
+    .<span class="kw">to</span>(<span class="str">"file:outbox/xml"</span>);</code></pre>
+
+    <p data-anchor="fmt-p-xml2">Two things worth knowing before your first surprise. First: a class needs a
+    JAXB root &mdash; either annotated <code>@XmlRootElement</code> or wrapped in a <code>JAXBElement</code>
+    &mdash; before JAXB can marshal it, and a class that skips this doesn't fail to compile, it fails the
+    first time a message actually reaches that <code>marshal</code> step. Second: <code>JaxbDataFormat</code>
+    accepts an optional <code>schema</code> &mdash; one or more XSD locations &mdash; which turns on schema
+    validation during both directions; without it, malformed XML unmarshals into whatever JAXB can salvage
+    rather than failing loudly.</p>
+
+    <h2 data-anchor="fmt-h2-csv">CSV with Apache Commons CSV</h2>
+    <p data-anchor="fmt-p-csv1">Camel's CSV data format wraps Apache Commons CSV. <code>marshal()</code> takes
+    a <code>Map</code> (or anything convertible to one) and writes it out as a line. <code>unmarshal()</code>
+    is where the defaults deserve a close look, because the out-of-the-box shape surprises almost everyone
+    once.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>CSV unmarshal, two shapes for the same file</caption>
+        <thead>
+          <tr><th>Configuration</th><th>Result type</th><th>Reading a field</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>default</td><td><code>List&lt;List&lt;String&gt;&gt;</code></td><td>by position &mdash; <code>row.get(0)</code></td></tr>
+          <tr><td><code>useMaps(true)</code></td><td><code>List&lt;Map&lt;String,String&gt;&gt;</code></td><td>by header name &mdash; <code>row.get("OrderId")</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="fmt-p-csv2">By default there's no notion of column names at all &mdash; a CSV file becomes
+    a list of lists, one inner list of raw field values per row. Set <code>useMaps(true)</code> and Camel
+    treats the first row as a header line, using its values as the key for every row after it &mdash; the
+    difference between reading a row positionally and reading it by name.</p>
+
+    <div class="pre-label">Splitting a CSV file into per-row processing</div>
+    <pre><code><span class="ty">CsvDataFormat</span> ordersCsv = <span class="kw">new</span> <span class="ty">CsvDataFormat</span>();
+ordersCsv.<span class="fn">setUseMaps</span>(<span class="kw">true</span>);
+
+<span class="kw">from</span>(<span class="str">"file:inbox/csv"</span>)
+    .<span class="fn">unmarshal</span>(ordersCsv)
+    .<span class="fn">split</span>(<span class="fn">body</span>())
+        .<span class="fn">setBody</span>(<span class="fn">simple</span>(<span class="str">"${body[OrderId]} : ${body[Total]}"</span>))
+        .<span class="kw">to</span>(<span class="str">"log:orders"</span>);</code></pre>
+
+    <p data-anchor="fmt-p-csv3">That's the Splitter EIP from Chapter 03's overview, put to real work: unmarshal
+    the whole file into a list of rows, then split hands each row through the rest of the route on its own,
+    one CSV line at a time.</p>
+
+    <h2 data-anchor="fmt-h2-shape">One shape, everywhere you plug it in</h2>
+    <p data-anchor="fmt-p-shape1">Every example above used the short fluent form &mdash;
+    <code>.marshal().json(&hellip;)</code>, or a named <code>JaxbDataFormat</code>/<code>CsvDataFormat</code>
+    instance passed straight to <code>marshal(&hellip;)</code>/<code>unmarshal(&hellip;)</code>. Both are the
+    same underlying idea Chapter 09 already showed you for converters: configure a data format once, reuse it
+    &mdash; the instance form is just that pattern made explicit, useful the moment two routes need to agree
+    on the exact same XML or CSV shape. And because the DSL is the DSL, the YAML form (Chapter 07) nests the
+    same options under the same format name &mdash; <code>marshal: / json: / library: Jackson</code> &mdash;
+    with nothing available in Java that YAML can't also say.</p>
+
+    <div class="callout key" data-anchor="fmt-callout-contenttype">
+      <span class="callout-title">Marshalling can label its own output</span>
+      <p>Most data formats implement an optional <code>contentTypeHeader</code> behavior: when it's on, a
+      successful <code>marshal</code> sets the message's <code>Content-Type</code> header to match &mdash;
+      <code>application/json</code>, <code>application/xml</code> &mdash; so a route that marshals straight
+      onto an HTTP or messaging endpoint doesn't need a separate <code>setHeader</code> step just to say what
+      it just produced.</p>
+    </div>
+
+    <div class="pullquote" data-anchor="fmt-pullquote">Marshal and unmarshal aren't a fancier type
+    conversion. They're the point where a route stops being an internal pipeline of Java objects and becomes
+    a citizen of the wire &mdash; something JSON, XML, or CSV, that another system entirely has to be able to
+    read.</div>
+
+    <h2 data-anchor="fmt-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="fmt-p-reflection">A precise fix to last chapter's teaser: marshalling and unmarshalling
+    run on a second, purpose-built machine &mdash; the <code>DataFormat</code> SPI, reached through
+    <code>marshal()</code>/<code>unmarshal()</code> &mdash; not the type-converter registry
+    <code>convertBodyTo</code> reaches into. And three working formats on top of it: JSON through Jackson,
+    with the <code>unmarshalType</code> that keeps you out of the generic-<code>Map</code> trap; XML through
+    JAXB, with its package-scoped <code>contextPath</code> and its root-element requirement; CSV through
+    Apache Commons CSV, with the default list-of-lists shape and the <code>useMaps(true)</code> switch that
+    turns it into something you can read by column name. Every one of them hands you back a Java object
+    &mdash; which raises the next question this book has been quietly setting aside: now that it's a Java
+    object again, how much do you actually trust what's in it? That's next chapter's subject &mdash;
+    validating the shape and content of what just arrived, and settling on one canonical model the rest of
+    your routes can agree to trust.</p>
+
+    <div class="review" data-anchor="fmt-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A teammate writes <code>exchange.getMessage().getBody(String.class)</code> to turn an
+        <code>Order</code> into JSON before sending it to a REST endpoint. Why won't that work, and what
+        should they write instead?</li>
+        <li>An unmarshal step reads <code>.json(JsonLibrary.Jackson)</code> with no target class, and a
+        later step throws a <code>ClassCastException</code> trying to call a getter on the body. What
+        actually happened, two steps earlier?</li>
+        <li>A route unmarshals a CSV file and immediately writes <code>${body[OrderId]}</code> in a Simple
+        expression, but it fails. What configuration is missing, and what would the same expression have to
+        look like without it?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="09-transforming-data.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="11-validation-and-canonical-messages.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

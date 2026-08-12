@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Designing Maintainable Camel Applications &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VII &mdash; Capstone Project</span> &middot; Chapter 31</p>
+    <p class="chapter-no">31</p>
+    <h1 data-anchor="maint-h1">Designing Maintainable Camel Applications</h1>
+
+    <p class="lede" data-anchor="maint-lede">Every route in this book fit on one screen. That wasn't luck &mdash; a
+    book teaches one idea per chapter, so every example was small on purpose. A real integration codebase doesn't
+    get that luxury: it accumulates routes the way any codebase accumulates functions, and by the fiftieth route
+    the question stops being "does Camel support this?" and becomes "can the next person find the route that
+    handles this, read it, trust its name, and change it without breaking three others?" This closing chapter is
+    about that question &mdash; four decisions, made early, that decide whether a Camel codebase ages like Chapter 5's
+    file-to-file route or like the God Route nobody wants to touch.</p>
+
+    <h2 data-anchor="maint-h2-shape">One CamelContext, many small RouteBuilders</h2>
+    <p data-anchor="maint-p-shape1">Chapter 6 already showed the mechanism without dwelling on why it matters:
+    <code>camel-spring-boot-starter</code> auto-detects <em>every</em> Spring bean that extends
+    <code>RouteBuilder</code> and adds its routes to the one running <code>CamelContext</code>. Nothing forces all
+    of an application's routes into a single <code>configure()</code> method &mdash; that's a choice, and it's the
+    wrong one past a handful of routes. The natural unit of modularity is one <code>RouteBuilder</code> class per
+    cohesive concern &mdash; intake, validation, one per outbound integration &mdash; wired together over
+    <code>direct:</code> endpoints exactly the way this book's own capstone split intake from mapping from
+    enrichment.</p>
+
+    <p data-anchor="maint-p-shape2">A useful shape check for what belongs inside one of those routes, borrowed from
+    integration architecture generally, is <strong>VETRO</strong>: Validate, Enrich, Transform, Route, Operate. If a
+    route is doing meaningfully more than that &mdash; real business decisions, long-lived state, logic a downstream
+    service should own &mdash; it has quietly stopped being an integration and started being an application that
+    happens to live inside one. That's usually the moment to extract a bean and call it, rather than keep growing
+    the route.</p>
+
+    <figure class="diagram-fig" data-anchor="maint-fig-god">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="maintD1t">
+        <title id="maintD1t">Intended shape above: several small, named routes connected by direct endpoints. The God Route anti-pattern below: every stage accreted into one unreadable route over time</title>
+        <text x="16" y="20">Intended</text>
+        <rect x="16"  y="30" width="110" height="32" class="stroke fill-soft"/>
+        <rect x="150" y="30" width="110" height="32" class="stroke fill-soft"/>
+        <rect x="284" y="30" width="110" height="32" class="stroke fill-soft"/>
+        <rect x="418" y="30" width="126" height="32" class="stroke fill-soft"/>
+        <text x="24"  y="51" class="big">intake</text>
+        <text x="158" y="51" class="big">validate</text>
+        <text x="292" y="51" class="big">enrich</text>
+        <text x="426" y="51" class="big">publish</text>
+        <text x="136" y="51" class="dim">&rarr;</text>
+        <text x="270" y="51" class="dim">&rarr;</text>
+        <text x="404" y="51" class="dim">&rarr;</text>
+
+        <path d="M16 84 L544 84" class="stroke-soft"/>
+
+        <text x="16" y="112" class="red">God Route</text>
+        <rect x="16" y="122" width="528" height="34" class="stroke-red"/>
+        <text x="28" y="144" class="big red">from(&quot;sftp:...&quot;) &mdash; intake, parse, validate, enrich, route, publish in one .configure()</text>
+        <text x="16" y="176" class="dim">Every requirement added a branch instead of a new route &mdash; now nobody reads it end to end.</text>
+      </svg>
+      <figcaption>The shape VETRO asks for, and the shape a God Route accretes into when every new requirement is
+      added to whatever route is already open.</figcaption>
+    </figure>
+
+    <p data-anchor="maint-p-shape3">Cross-cutting policy &mdash; error handling chief among them &mdash; is the one
+    thing that genuinely wants to be shared across many of those small routes, and copy-pasting an
+    <code>onException</code> block into every <code>RouteBuilder</code> defeats the whole point of splitting them
+    apart. Camel's answer, since 3.12, is <code>RouteConfigurationBuilder</code>: a configuration defined once and
+    opted into by id.</p>
+
+    <div class="pre-label">One error policy, shared by every route that opts in with routeConfigurationId</div>
+    <pre><code><span class="kw">public</span> <span class="kw">class</span> <span class="ty">OrderIntakeRoutes</span> <span class="kw">extends</span> <span class="ty">RouteBuilder</span> {
+    <span class="at">@Override</span>
+    <span class="kw">public</span> <span class="kw">void</span> configure() {
+        <span class="kw">from</span>(<span class="str">"sftp:{{partner.host}}?fileName={{partner.dir}}/*.csv"</span>)
+            .<span class="fn">routeId</span>(<span class="str">"orderIntake"</span>)
+            .<span class="fn">routeConfigurationId</span>(<span class="str">"orderErrors"</span>)
+            .<span class="kw">to</span>(<span class="str">"direct:toCanonicalOrder"</span>);
+    }
+}
+
+<span class="kw">public</span> <span class="kw">class</span> <span class="ty">OrderErrorPolicy</span> <span class="kw">extends</span> <span class="ty">RouteConfigurationBuilder</span> {
+    <span class="at">@Override</span>
+    <span class="kw">public</span> <span class="kw">void</span> configuration() {
+        <span class="fn">routeConfiguration</span>(<span class="str">"orderErrors"</span>)
+            .<span class="kw">onException</span>(<span class="ty">Exception</span>.<span class="kw">class</span>)
+                .<span class="fn">handled</span>(<span class="kw">true</span>)
+                .<span class="fn">log</span>(<span class="ty">LoggingLevel</span>.ERROR, <span class="str">"${routeId} failed: ${exception.message}"</span>)
+                .<span class="kw">to</span>(<span class="str">"direct:orderDeadLetter"</span>);
+    }
+}</code></pre>
+
+    <p data-anchor="maint-p-shape4"><code>routeConfigurationId</code> doesn't only match one exact id &mdash; it
+    also accepts a wildcard (<code>"java*"</code>) or a regular expression, and multiple ids separated by commas.
+    That's what makes it a genuine alternative to a global catch-all: a team can group routes by concern
+    (<code>"order*"</code>, <code>"*Reporting"</code>) and give each group its own policy without touching every
+    individual <code>RouteBuilder</code> whenever the policy changes.</p>
+
+    <h2 data-anchor="maint-h2-processors">Reusable processors: pulling the HOW out of the route</h2>
+    <p data-anchor="maint-p-proc1">Chapter 9 introduced <code>process(Processor)</code> as a way to drop custom Java
+    into a route; the capstone then leaned on a related, more reusable form &mdash;
+    <code>.bean(OrderMapper.class, "fromCsvRow")</code>. The difference between those two isn't cosmetic. An inline
+    lambda is fine for a genuine one-off. The moment the same logic is needed in a second route, or needs to be
+    unit-tested without a running <code>CamelContext</code> at all, it belongs in a named class instead &mdash; a
+    <code>Processor</code> implementation or a plain bean method Camel binds by reflection.</p>
+
+    <p data-anchor="maint-p-proc2">That extraction buys two things at once. The logic itself becomes testable in
+    isolation, the same way Chapter 25's <code>OrderMapper</code> tests never needed a route running to prove the
+    mapping was correct. And the route reads differently: <code>.bean(OrderMapper.class, "fromCsvRow")</code> is
+    the <em>what</em> &mdash; map this CSV row to an order &mdash; with the <em>how</em> pulled out of sight into a
+    class whose name already says what it's for. A route that's mostly named bean calls reads like a table of
+    contents; a route that's mostly inline lambdas reads like the appendix.</p>
+
+    <div class="callout key" data-anchor="maint-callout-proc">
+      <span class="callout-title">You already lived this trade-off</span>
+      <p>This isn't a new pattern &mdash; it's naming what Chapters 9, 25, and 29 already did. <code>OrderMapper</code>
+      exists as a class, not an inline lambda in <code>direct:toCanonicalOrder</code>, precisely because Chapter 25
+      needed to unit-test <code>fromCsvRow</code> without standing up a route, and because the capstone's later
+      chapters kept calling it from more than one place. The rule this chapter names is: reach for a bean the moment
+      either of those becomes true, not after the third copy-paste.</p>
+    </div>
+
+    <h2 data-anchor="maint-h2-templates">Route Templates: one shape, many instances</h2>
+    <p data-anchor="maint-p-tmpl1">A reusable processor solves duplicated <em>logic</em>. A different kind of
+    duplication shows up when the <em>route</em> itself repeats &mdash; the capstone's SFTP intake route, say, is
+    exactly the shape a second, third, and tenth trading partner would also need: same stages, different remote
+    directory and credentials. Copy-pasting a <code>RouteBuilder</code> per partner is exactly the anti-pattern this
+    chapter is trying to head off. A <strong>Route Template</strong> is Camel's answer: <em>route template</em> +
+    <em>input parameters</em> =&gt; <em>route</em>, defined once and instantiated as many times as there are
+    partners.</p>
+
+    <div class="pre-label">One template, two partner-specific routes instantiated from it</div>
+    <pre><code><span class="fn">routeTemplate</span>(<span class="str">"partnerIntake"</span>)
+    .<span class="fn">templateParameter</span>(<span class="str">"partnerId"</span>)
+    .<span class="fn">templateParameter</span>(<span class="str">"remoteDir"</span>)
+    .<span class="kw">from</span>(<span class="str">"sftp:{{partner.host}}?fileName={{remoteDir}}/*.csv"</span>)
+        .<span class="kw">to</span>(<span class="str">"direct:toCanonicalOrder"</span>);
+
+<span class="fn">templatedRoute</span>(<span class="str">"partnerIntake"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"intake-acme"</span>)
+    .<span class="fn">prefixId</span>(<span class="str">"acme"</span>)
+    .<span class="fn">parameter</span>(<span class="str">"partnerId"</span>, <span class="str">"acme"</span>)
+    .<span class="fn">parameter</span>(<span class="str">"remoteDir"</span>, <span class="str">"/acme/orders"</span>);
+
+<span class="fn">templatedRoute</span>(<span class="str">"partnerIntake"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"intake-globex"</span>)
+    .<span class="fn">prefixId</span>(<span class="str">"globex"</span>)
+    .<span class="fn">parameter</span>(<span class="str">"partnerId"</span>, <span class="str">"globex"</span>)
+    .<span class="fn">parameter</span>(<span class="str">"remoteDir"</span>, <span class="str">"/globex/orders"</span>);</code></pre>
+
+    <p data-anchor="maint-p-tmpl2">Template parameters are referenced inside the template with <code>{{name}}</code>
+    &mdash; the same property-placeholder syntax Chapter 27 covered, and template parameters take precedence over a
+    same-named regular property. A parameter can be made optional with <code>{{?name}}</code>, in which case an
+    unset option (or, using <code>templateOptionalParameter</code>, an entire unset step) is simply omitted from the
+    generated route rather than resolving to a literal <code>null</code>.</p>
+
+    <div class="callout warn" data-anchor="maint-callout-prefix">
+      <span class="callout-title">A hardcoded node id inside a template breaks the second instance</span>
+      <p>If any step inside a route template carries a hardcoded <code>.id("new-order")</code>, every route created
+      from that template inherits the identical id &mdash; and the second <code>templatedRoute(...)</code> call
+      throws a duplicate-id error at startup. <code>prefixId("acme")</code> above is what avoids this: it prefixes
+      every node id in that one instance, so <code>intake-acme</code> and <code>intake-globex</code> can coexist.
+      Also watch the Simple language specifically: a template's <code>simple("{{color}}").isEqualTo("red")</code>
+      fluent form is <em>not</em> supported for parameter substitution across instances &mdash; it has to be a
+      literal string expression, <code>simple("'{{color}}' == 'red'")</code>, instead.</p>
+    </div>
+
+    <p data-anchor="maint-p-tmpl3">Templates can also bind a <strong>locally-scoped bean</strong> &mdash; a client
+    configured from that instance's own parameters, private to the one route it was created for &mdash; via
+    <code>templateBean(...)</code> or <code>TemplatedRouteBuilder.bean(...)</code>. Instantiating the same template
+    twice then produces two independent bean instances, not one shared client both routes would otherwise contend
+    for.</p>
+
+    <h2 data-anchor="maint-h2-naming">Naming and documentation conventions</h2>
+    <p data-anchor="maint-p-name1">Every code sample in Chapters 29 and 30 gave its route an explicit
+    <code>.routeId(...)</code>, and that wasn't incidental style &mdash; it's the difference between logs, JMX, and
+    a Micrometer dashboard that mean something and ones built on Camel's auto-assigned <code>route1</code>,
+    <code>route2</code>. A route id is documentation that the runtime enforces: it has to be unique, and it shows up
+    everywhere the route is observed.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Three ways a route documents itself, and who each one is for</caption>
+        <thead>
+          <tr><th>Mechanism</th><th>Audience</th><th>Runtime effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>routeId("orderIntake")</code></td><td>Operators &mdash; logs, JMX, dashboards, start/stop by id</td><td>Yes &mdash; the route's identity</td></tr>
+          <tr><td><code>routeDescription("...")</code></td><td>Anyone reading the route definition</td><td>None &mdash; read-only metadata</td></tr>
+          <tr><td><code>routeNote("...")</code> <span class="dim">(Camel 4.16+)</span></td><td>The next developer to touch this route</td><td>None &mdash; read-only metadata</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pre-label">Naming and documenting a route as part of defining it, not after</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:toCanonicalOrder"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"toCanonicalOrder"</span>)
+    .<span class="fn">routeDescription</span>(<span class="str">"Maps a raw SFTP CSV row into a canonical Order"</span>)
+    .<span class="fn">routeNote</span>(<span class="str">"Partner CSV headers changed in 2026-06; see ORD-114 before touching column indexes"</span>)
+    .<span class="fn">bean</span>(<span class="ty">OrderMapper</span>.<span class="kw">class</span>, <span class="str">"fromCsvRow"</span>);</code></pre>
+
+    <p data-anchor="maint-p-name2"><code>routeDescription</code> and <code>routeNote</code> have zero effect on
+    what the route does &mdash; they exist purely so a route's purpose, and any sharp edge a future maintainer needs
+    to know about, travels with the route definition itself instead of living only in a wiki page nobody finds at
+    2 a.m. A consistent <code>routeId</code> naming scheme &mdash; picking, and sticking to, a convention like
+    <code>&lt;stage&gt;&lt;Subject&gt;</code> across a whole codebase &mdash; is what makes <code>routeConfigurationId</code>'s
+    wildcard matching from earlier in this chapter actually useful: <code>"order*"</code> only groups the routes you
+    mean it to if every one of them was named according to the same rule.</p>
+
+    <h2 data-anchor="maint-h2-antipatterns">Common integration anti-patterns</h2>
+    <p data-anchor="maint-p-anti1">Five ways a Camel codebase degrades, each one this chapter's positive advice
+    turned inside out.</p>
+
+    <div class="card" data-anchor="maint-card-god">
+      <h3>The God Route</h3>
+      <p>One route absorbs every new requirement &mdash; "just one more <code>.choice()</code> branch" &mdash;
+      until it's a single, long, untestable chain doing intake, validation, routing, and enrichment all at once.
+      <strong>Fix:</strong> split by concern into several named routes the moment VETRO's shape check stops fitting
+      one route.</p>
+    </div>
+
+    <div class="card" data-anchor="maint-card-spaghetti">
+      <h3>Spaghetti direct: wiring</h3>
+      <p>With no project-wide rule for when to reach for <code>direct:</code>, when to start a new
+      <code>RouteBuilder</code>, or which DSL to use, every route in a codebase ends up structured a little
+      differently, and nothing learned reading one route transfers to the next. <strong>Fix:</strong> a written
+      convention, applied consistently &mdash; the same discipline this book applied one chapter at a time.</p>
+    </div>
+
+    <div class="card" data-anchor="maint-card-copypaste">
+      <h3>Copy-pasted near-identical routes</h3>
+      <p>Ten trading partners, ten hand-copied <code>RouteBuilder</code> classes that differ in one directory name
+      &mdash; a fix to the shared logic now needs ten edits, and the tenth is the one that gets missed.
+      <strong>Fix:</strong> a Route Template instantiated per partner, as shown earlier in this chapter.</p>
+    </div>
+
+    <div class="card" data-anchor="maint-card-hardcoded">
+      <h3>Hardcoded endpoint values</h3>
+      <p>A host, port, credential, or environment-specific path written directly into a route (rather than a
+      property placeholder, Chapter 27) means every environment promotion is a code change, and there's no way to
+      tell at a glance which values are meant to vary. <strong>Fix:</strong> <code>{{key}}</code> placeholders for
+      anything that differs by environment, full stop.</p>
+    </div>
+
+    <div class="card" data-anchor="maint-card-swallow">
+      <h3>Silent exception swallowing</h3>
+      <p>A bare <code>.onException(Exception.class).handled(true)</code> with no logging and no dead-letter
+      destination marks the exchange as not-failed and lets the caller believe nothing went wrong &mdash; the
+      failure is real, but invisible. <strong>Fix:</strong> every <code>handled(true)</code> clause logs and routes
+      somewhere a human can find it, the same pattern Chapters 23 and 30 both insisted on.</p>
+    </div>
+
+    <div class="pullquote" data-anchor="maint-pullquote">None of these four decisions are advanced Camel features
+    &mdash; they're the same modularity, naming, and error-handling discipline this book already asked of every
+    route it built. The only thing that changes at fifty routes instead of five is that skipping the discipline
+    stops being a shortcut and starts being the thing that made the codebase unmaintainable.</div>
+
+    <h2 data-anchor="maint-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="maint-p-reflection">Nothing in this chapter introduced a feature the rest of the book hadn't
+    already used somewhere &mdash; <code>RouteBuilder</code> and <code>direct:</code> from Chapter 6,
+    <code>onException</code> from Chapter 23, <code>OrderMapper</code>-as-bean from the capstone, property
+    placeholders from Chapter 27. What's new is naming the pattern behind each one, and the failure mode you get by
+    skipping it: a God Route instead of several small ones, ten copy-pasted routes instead of one template
+    instantiated ten times, an anonymous <code>route7</code> instead of a route whose id, description, and note
+    tell the next person what it does and why. A Camel application that's easy to change in year two isn't the one
+    written with more advanced patterns &mdash; it's the one where every route still looks, three years on, like it
+    was written by someone who knew a fiftieth route was coming.</p>
+
+    <div class="review" data-anchor="maint-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>The <code>partnerIntake</code> route template earlier in this chapter is instantiated with
+        <code>prefixId("acme")</code> and <code>prefixId("globex")</code>. Suppose a third instantiation omitted
+        <code>prefixId(...)</code> entirely, and the template itself has no hardcoded node ids. Would that third
+        route still start up cleanly alongside the other two? Why or why not?</li>
+        <li>This chapter's VETRO check says a route doing "real business decisions" has stopped being an
+        integration and started being an application. Pick one route from Chapter 29's capstone build and argue
+        whether it stays on the right side of that line &mdash; and if it doesn't, what you'd extract out of it and
+        where it would go.</li>
+        <li><code>routeConfigurationId("order*")</code> only groups the routes you intend it to if every matching
+        route was actually named according to the same convention. Describe a routeId naming scheme for a Camel
+        application with intake, validation, enrichment, and publishing stages across three different business
+        domains, and explain how you'd verify no route accidentally falls outside every wildcard group meant to
+        cover it.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="30-making-the-order-integration-production-ready.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="../cheatsheet.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

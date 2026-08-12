@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Message Splitting and Aggregation &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part IV &mdash; Core Integration Patterns</span> &middot; Chapter 13</p>
+    <p class="chapter-no">13</p>
+    <h1 data-anchor="split-h1">Message Splitting and Aggregation</h1>
+
+    <p class="lede" data-anchor="split-lede">Chapter 12 answered "given this message, where does it go?" without
+    ever changing the message itself &mdash; <code>choice()</code>, <code>filter()</code>, and <code>toD()</code>
+    all read the exchange and route it whole. Sooner or later you'll hit a message that's whole in name only: an
+    order file with forty order lines in it, an XML batch with a hundred records, a JSON array of events that each
+    need their own validation and their own destination. Routing the file is the wrong unit of work &mdash; you
+    need to route the lines. This chapter covers the two EIPs built for exactly that mismatch: the
+    <span class="term">Splitter</span>, which turns one exchange into many, and the <span class="term">Aggregator</span>,
+    which turns many exchanges back into one. They're mirror images of each other, and &mdash; as you'll see partway
+    through &mdash; Camel actually gives you two different tools that both look like "aggregation," solving two
+    different problems. Telling them apart is most of this chapter.</p>
+
+    <h2 data-anchor="split-h2-basic">split(): one exchange becomes many</h2>
+    <p data-anchor="split-p-basic1"><code>split()</code> takes one incoming exchange and an expression that says
+    how to cut its body into parts, then sends one sub-exchange down the rest of the route <em>per part</em>. Each
+    sub-exchange is a copy of the original &mdash; same headers, same properties &mdash; with the body replaced by
+    just that one part. A route that reads a newline-delimited order file and hands each line to its own processing
+    branch looks like this:</p>
+
+    <div class="pre-label">One sub-exchange per line of the inbound file</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"file:orders/inbound"</span>)
+    .<span class="fn">split</span>(<span class="fn">bodyAs</span>(String.<span class="fn">class</span>).<span class="fn">tokenize</span>(<span class="str">"\n"</span>))
+        .<span class="kw">to</span>(<span class="str">"direct:oneOrderLine"</span>)
+    .<span class="fn">end</span>();</code></pre>
+
+    <p data-anchor="split-p-basic2">The split expression can be almost anything: <code>tokenize()</code> for
+    delimited text like the example above, <code>xpath("//order")</code> to split an XML document into a node per
+    match, <code>jsonpath("$.orders")</code> to split a JSON array element by element. If the body is already a
+    <code>java.util.Collection</code>, array, <code>Iterable</code>, or <code>Iterator</code>, you don't even need
+    an expression that names a field &mdash; plain <code>body()</code> is enough, and Camel splits it element by
+    element on its own.</p>
+
+    <figure class="diagram-fig" data-anchor="split-fig-basic">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="splitD1t">
+        <title id="splitD1t">One exchange containing three order lines enters split(); three sub-exchanges leave it, each carrying one line and the same headers as the original</title>
+
+        <rect x="16" y="76" width="140" height="40" class="stroke fill-soft"/>
+        <text x="26" y="100" class="big">1 exchange</text>
+        <text x="26" y="114" class="dim">3 order lines</text>
+
+        <path d="M156 96 L210 96" class="stroke"/>
+        <path d="M202 92 L210 96 L202 100" class="stroke"/>
+        <rect x="210" y="70" width="70" height="52" class="stroke fill-red"/>
+        <text x="222" y="101" class="mono on-ink">split()</text>
+
+        <path d="M280 82 L340 82 L340 24 L380 24" class="stroke-soft dash"/>
+        <path d="M280 96 L380 96" class="stroke-soft dash"/>
+        <path d="M280 110 L340 110 L340 168 L380 168" class="stroke-soft dash"/>
+
+        <rect x="380" y="8" width="164" height="32" class="stroke fill-none"/>
+        <text x="392" y="29" class="mono">line 1</text>
+        <rect x="380" y="80" width="164" height="32" class="stroke fill-none"/>
+        <text x="392" y="101" class="mono">line 2</text>
+        <rect x="380" y="152" width="164" height="32" class="stroke fill-none"/>
+        <text x="392" y="173" class="mono">line 3</text>
+
+        <text x="16" y="150" class="dim">each sub-exchange keeps the original</text>
+        <text x="16" y="164" class="dim">headers &amp; properties, body replaced</text>
+      </svg>
+      <figcaption>split() copies the exchange once per part; only the body changes between copies.</figcaption>
+    </figure>
+
+    <div class="callout" data-anchor="split-callout-streaming">
+      <span class="callout-title">Non-streaming by default; streaming() trades memory for an unknown total</span>
+      <p>By default <code>split()</code> materializes every part first &mdash; so it knows the total count up
+      front &mdash; before processing any of them, which means the whole split result sits in memory at once.
+      <code>.streaming()</code> switches to producing and processing one part at a time, without holding the rest,
+      at the cost of never knowing the total part count in advance. For a ten-line order file the difference is
+      invisible; for a multi-gigabyte export it's the difference between a route that runs and one that runs out
+      of heap.</p>
+    </div>
+
+    <h2 data-anchor="split-h2-recombine">Recombining the parts, inline: split()'s own AggregationStrategy</h2>
+    <p data-anchor="split-p-recombine1">Here's the detail that trips people up. Leave the example above exactly as
+    written, with no second argument to <code>split()</code>, and ask: what does the <em>original</em> exchange
+    look like once all three lines have been processed? Camel's answer, if you never say otherwise, is
+    <code>UseLatestAggregationStrategy</code> &mdash; the outgoing exchange after <code>.end()</code> simply
+    becomes whatever the <em>last</em> sub-exchange turned into. Lines one and two, and anything their processing
+    produced, are gone. Not errored, not logged &mdash; gone, the same quiet-drop failure mode Chapter 12's
+    <code>choice()</code> without <code>otherwise()</code> warned you about, wearing a different EIP's clothes.</p>
+
+    <p data-anchor="split-p-recombine2">If you want the pieces back &mdash; a running order total built line by
+    line, or a list of every priced line collected into one result &mdash; give <code>split()</code> a second
+    argument: an <code>AggregationStrategy</code> that folds each processed sub-exchange into a running result,
+    <em>inline, in the same block</em>, before the split completes.</p>
+
+    <div class="pre-label">Fold each priced line back into a running order total</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="fn">split</span>(<span class="fn">body</span>(), <span class="kw">new</span> MyOrderTotalsStrategy())
+        .<span class="kw">to</span>(<span class="str">"direct:priceOneLine"</span>)
+    .<span class="fn">end</span>();
+
+<span class="cm">// MyOrderTotalsStrategy.aggregate(Exchange oldExchange, Exchange newExchange)</span>
+<span class="cm">//   if (oldExchange == null) return newExchange;   // first line starts the running result</span>
+<span class="cm">//   // otherwise fold newExchange's priced line into oldExchange's running total, return oldExchange</span></code></pre>
+
+    <p data-anchor="split-p-recombine3">The shape &mdash; <code>oldExchange</code> is <code>null</code> on the
+    first call, and the running result on every call after &mdash; is one you'll see again in a moment, because
+    the standalone Aggregator EIP uses the exact same interface. But don't let that similarity blur the two
+    together: this strategy only ever combines pieces of the <em>one exchange that <code>split()</code> just cut
+    up</em>, in this one block, on this one route. It has no idea whether another message arrives five minutes
+    later that should join the same group &mdash; and that's precisely the problem it can't solve.</p>
+
+    <div class="callout warn" data-anchor="split-callout-parallel">
+      <span class="callout-title">parallelProcessing() changes how parts run, not whether the route waits</span>
+      <p><code>.parallelProcessing()</code> processes sub-exchanges concurrently, but the thread that called
+      <code>split()</code> still blocks at that point in the route until every part has finished &mdash; the rest
+      of the route doesn't see the split's output early. Turn it on with a custom
+      <code>AggregationStrategy</code> and that strategy's <code>aggregate()</code> method can now be invoked
+      from multiple threads at once; Camel synchronizes the calls for you by default, so it's safe even if your
+      strategy isn't written to be thread-safe &mdash; just no faster than sequential aggregation would be.</p>
+    </div>
+
+    <h2 data-anchor="split-h2-aggregate">The real Aggregator EIP: correlating exchanges that arrive separately</h2>
+    <p data-anchor="split-p-aggregate1">Now the problem <code>split()</code>'s inline strategy can't touch: order
+    lines that don't arrive together as one exchange at all. Picture line items streaming in one at a time from a
+    queue, each one its own independent exchange, independently consumed, and you need to know when all the lines
+    for order <code>#4471</code> have shown up so you can release the completed order downstream. That's the
+    <span class="term">Aggregator EIP</span> &mdash; Camel's <code>aggregate()</code> &mdash; and it solves a
+    genuinely different problem from the last section: correlating and combining exchanges that arrive from many
+    separate route invocations over time, grouped by a key you compute from each one.</p>
+
+    <div class="pre-label">Group order lines by orderId; release the group once complete</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orderLines"</span>)
+    .<span class="fn">aggregate</span>(<span class="fn">header</span>(<span class="str">"orderId"</span>), <span class="kw">new</span> MyOrderAggregationStrategy())
+        .<span class="fn">completionSize</span>(<span class="fn">header</span>(<span class="str">"lineCount"</span>))
+        .<span class="fn">completionTimeout</span>(5000)
+        .<span class="kw">to</span>(<span class="str">"direct:completeOrder"</span>)
+    .<span class="fn">end</span>();</code></pre>
+
+    <p data-anchor="split-p-aggregate2">The first argument, <code>header("orderId")</code>, is the
+    <span class="term">correlation expression</span>: evaluated once per incoming exchange, its result is the key
+    that decides which group an exchange joins. Every exchange whose <code>orderId</code> header evaluates the same
+    joins the same running aggregate; a different <code>orderId</code> starts (or joins) a different group
+    entirely. The second argument is an <code>AggregationStrategy</code> with the identical
+    <code>aggregate(Exchange oldExchange, Exchange newExchange)</code> shape you just saw on <code>split()</code>
+    &mdash; <code>oldExchange</code> is <code>null</code> for the first exchange to arrive under a given key, and
+    the running aggregate-so-far for every exchange after that. Same interface, same null-check idiom, applied to
+    a completely different kind of grouping.</p>
+
+    <figure class="diagram-fig" data-anchor="split-fig-aggregate">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="splitD2t">
+        <title id="splitD2t">Three separately-arriving order-line exchanges, all correlated by orderId #4471, join one running aggregate; once completionSize is reached the aggregate releases downstream as a single exchange</title>
+
+        <text x="16" y="20" class="dim">arrive separately over time, same orderId</text>
+
+        <rect x="16" y="30" width="130" height="30" class="stroke fill-none"/>
+        <text x="26" y="50" class="mono">line 1 &middot; #4471</text>
+        <rect x="16" y="70" width="130" height="30" class="stroke fill-none"/>
+        <text x="26" y="90" class="mono">line 2 &middot; #4471</text>
+        <rect x="16" y="110" width="130" height="30" class="stroke fill-none"/>
+        <text x="26" y="130" class="mono">line 3 &middot; #4471</text>
+
+        <path d="M146 45 L230 45 L230 92 L268 92" class="stroke-soft dash"/>
+        <path d="M146 85 L230 85 L230 92 L268 92" class="stroke-soft dash"/>
+        <path d="M146 125 L230 125 L230 96 L268 96" class="stroke-soft dash"/>
+
+        <rect x="268" y="70" width="90" height="44" class="stroke fill-red"/>
+        <text x="278" y="97" class="mono on-ink">aggregate()</text>
+
+        <path d="M358 92 L420 92" class="stroke"/>
+        <path d="M412 88 L420 92 L412 96" class="stroke"/>
+
+        <rect x="420" y="66" width="124" height="52" class="stroke fill-soft"/>
+        <text x="432" y="88" class="big">1 exchange</text>
+        <text x="432" y="106" class="dim">complete order</text>
+
+        <text x="16" y="164" class="dim">completes on completionSize / Timeout / Interval / Predicate</text>
+      </svg>
+      <figcaption>aggregate() correlates exchanges that were never one message to begin with &mdash; the mirror
+      image of split(), one group at a time, per correlation key.</figcaption>
+    </figure>
+
+    <h2 data-anchor="split-h2-completion">Completion strategies: deciding when a group is "done"</h2>
+    <p data-anchor="split-p-completion1">A group can't stay open forever, so <code>aggregate()</code> needs a rule
+    for when to release it. You can configure more than one, and whichever fires first for a given key wins:</p>
+
+    <ul>
+      <li><code>completionSize(n)</code> &mdash; complete once <code>n</code> exchanges have joined that key. In
+      the example above, the size comes from a header rather than a fixed number, because different orders have
+      different line counts.</li>
+      <li><code>completionTimeout(ms)</code> &mdash; an <em>inactivity</em> timeout: it resets every time a new
+      exchange joins that key, so it fires only once a key has gone quiet.</li>
+      <li><code>completionInterval(ms)</code> &mdash; a fixed periodic sweep that completes whatever has
+      accumulated so far, on a schedule independent of any single key's activity.</li>
+      <li><code>completionPredicate(...)</code> &mdash; evaluated against the aggregated exchange after every new
+      arrival; the group completes the moment it returns true.</li>
+    </ul>
+
+    <div class="callout warn" data-anchor="split-callout-timeout">
+      <span class="callout-title">completionTimeout and completionInterval answer different questions &mdash; and can't both be set</span>
+      <p><code>completionTimeout</code> asks "has this particular order gone quiet?" &mdash; every new line for
+      <code>#4471</code> pushes its deadline back out. <code>completionInterval</code> asks "what's the state of
+      every open order, right now, on the clock?" &mdash; it doesn't care whether a given order is still receiving
+      lines. Camel won't let you configure both on the same <code>aggregate()</code>, because they're two
+      incompatible definitions of "time's up." Either can be combined with <code>completionSize</code>, though
+      &mdash; a size that completes early, and a timeout or interval that completes late orders anyway.</p>
+    </div>
+
+    <p data-anchor="split-p-completion2">The example route uses <code>completionSize</code> and
+    <code>completionTimeout</code> together deliberately: a complete order releases the instant its last line
+    shows up, but an order that's missing a line for five seconds releases anyway &mdash; incomplete, but not
+    stuck open forever waiting for a line that may never come.</p>
+
+    <h2 data-anchor="split-h2-repository">Where an in-flight group actually lives: the AggregationRepository</h2>
+    <p data-anchor="split-p-repository1">Every not-yet-completed group has to be stored somewhere between the
+    exchanges that build it &mdash; that storage is a pluggable <code>AggregationRepository</code>. Camel's default
+    is a plain in-memory repository, which is fine for a single-instance route with modest group sizes, but it has
+    an unforgiving failure mode: an in-flight group is only ever in that process's heap, so a restart at the wrong
+    moment loses every order that hadn't yet completed, with no trace that it ever existed. A production aggregator
+    that has to survive a restart plugs in a persistent implementation instead &mdash; Camel ships JDBC-, Infinispan-,
+    and similarly backed repositories for exactly this.</p>
+
+    <div class="callout key" data-anchor="split-callout-force">
+      <span class="callout-title">forceCompletionOnStop closes the door on shutdown</span>
+      <p>Even with a persistent repository, a route that's stopping needs somewhere for its open groups to go.
+      <code>forceCompletionOnStop</code> tells the aggregator to complete and release every in-flight group when
+      the <code>CamelContext</code> stops, instead of leaving partially-built orders sitting in the repository with
+      no consumer left running to ever finish them.</p>
+    </div>
+
+    <div class="pullquote" data-anchor="split-pullquote">split() breaks one exchange into many; aggregate()
+    correlates many separately-arriving exchanges back into one. They look like mirror images, and mostly are
+    &mdash; but split() also carries its own miniature aggregation step for recombining the pieces of the message
+    it just cut up, which is not the same machine as the standalone Aggregator EIP correlating messages that were
+    never one exchange to begin with. Confuse the two and you'll reach for a correlation key you don't need, or
+    miss the one you do.</div>
+
+    <h2 data-anchor="split-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="split-p-reflection">A way to change the unit of work, in both directions. <code>split()</code>
+    turns one exchange with many things in it into many exchanges, each processed on its own &mdash; with an
+    explicit <code>AggregationStrategy</code> standing between "the pieces are gone the moment you don't ask for
+    them back" and "the pieces fold into a result you actually get to use." <code>aggregate()</code> turns many
+    separately-arriving exchanges into one, correlated by a key and released once a completion condition you chose
+    actually fires. Both patterns leave the individual message untouched while they work &mdash; they change how
+    many exchanges there are, not what's inside any one of them, the same separation of concerns Chapter 12's
+    routing EIPs held onto. The next chapter asks a related but different question: not "how many exchanges should
+    this become," but "how many <em>destinations</em> should the same message reach" &mdash; multicast and
+    recipient lists send one exchange to several places at once, no splitting required.</p>
+
+    <div class="review" data-anchor="split-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route calls <code>.split(body())</code> with no second argument, processes each part, and continues
+        past <code>.end()</code>. What ends up in the exchange after <code>.end()</code>, and why does adding a
+        custom <code>AggregationStrategy</code> change that?</li>
+        <li>You need to combine three order lines that arrive as one message into a running total, and separately,
+        combine order lines that arrive as three independent messages over the next minute into a completed order.
+        Which EIP handles which case, and why can't <code>split()</code>'s own <code>AggregationStrategy</code>
+        handle the second one?</li>
+        <li>An <code>aggregate()</code> is configured with <code>completionSize(header("lineCount"))</code> and
+        <code>completionTimeout(5000)</code>. An order is missing its last line. What happens to that order's
+        group, and which of the two completion conditions is responsible?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="12-content-based-routing.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="14-multicast-and-recipient-lists.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

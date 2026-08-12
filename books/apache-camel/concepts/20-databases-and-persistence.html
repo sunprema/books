@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Databases and Persistence &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part V &mdash; Connecting Real Systems</span> &middot; Chapter 20</p>
+    <p class="chapter-no">20</p>
+    <h1 data-anchor="db-h1">Databases and Persistence</h1>
+
+    <p class="lede" data-anchor="db-lede">Chapter 19 closed on a promise: the same transport swap that turned a
+    filesystem into an HTTP call now turns an HTTP call into a database connection. A relational database doesn't
+    hang the way a socket does &mdash; it's usually right there, on the same network, fast &mdash; but it asks a
+    question neither the file component nor <code>camel-http</code> ever had to: when more than one statement has to
+    succeed or fail <em>together</em>, who is holding that guarantee? This chapter covers three ways Camel talks to a
+    database (<code>sql</code>, <code>jdbc</code>, and <code>jpa</code>), how to call a stored procedure, and how
+    <code>transacted()</code> answers the together-or-not-at-all question &mdash; including two threads from earlier
+    chapters, the idempotent repository from Chapter 16 and the aggregator from Chapter 13, that turn out to be
+    database rows underneath.</p>
+
+    <h2 data-anchor="db-h2-three">Three components, three levels of abstraction</h2>
+    <p data-anchor="db-p-three1">There isn't one "database component" in Camel &mdash; there are three, and they
+    disagree on purpose about how close to the raw SQL you want to sit:</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>sql, jdbc, and jpa &mdash; the same database, three different distances from raw SQL</caption>
+        <thead>
+          <tr><th></th><th><code>sql</code></th><th><code>jdbc</code></th><th><code>jpa</code></th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Underneath</td><td>Spring's <code>JdbcTemplate</code></td><td>the raw JDBC API</td><td>a JPA provider (e.g. Hibernate)</td></tr>
+          <tr><td>What a route exchanges</td><td>rows as <code>Map&lt;String,Object&gt;</code></td><td>rows as <code>Map&lt;String,Object&gt;</code></td><td><code>@Entity</code> objects</td></tr>
+          <tr><td>SQL lives in&hellip;</td><td>the endpoint URI</td><td>the message body</td><td>nowhere &mdash; JPQL/native query options, or none at all</td></tr>
+          <tr><td>Consumer (<code>from(...)</code>)?</td><td>yes, polling</td><td>no &mdash; producer only</td><td>yes, polling</td></tr>
+          <tr><td>Reach for it when&hellip;</td><td>you want named parameters and query flexibility</td><td>you want the lightest possible dependency, no Spring</td><td>the rest of the app already thinks in JPA entities</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="db-p-three2">None of the three is strictly "better" &mdash; they're answers to different
+    questions about how much SQL you want to write and how much your route should know about rows versus objects.
+    The rest of this chapter takes them roughly in that order: <code>sql</code> first, because it's the one you'll
+    reach for most often; <code>jdbc</code> as the lighter alternative; <code>jpa</code> for when entities are
+    already the currency of the rest of the application.</p>
+
+    <h2 data-anchor="db-h2-sql">The sql component: named parameters, and where the result actually lands</h2>
+    <p data-anchor="db-p-sql1">A <code>sql</code> endpoint URI carries the SQL text directly:
+    <code>sql:select * from orders where id = :#id</code>. That's immediately worth stopping on, because the URI
+    already uses <code>?</code> to separate the address from its own options &mdash; the same collision Chapter 19's
+    REST DSL and Chapter 4's project setup never had to think about. So a literal <code>?</code> placeholder in SQL
+    text is off the table; Camel repurposes <code>#</code> for a positional parameter and <code>:#name</code> (or
+    <code>:#${expression}</code>) for a named one.</p>
+
+    <div class="pre-label">Named parameters, bound straight from a header</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:findCustomerOrders"</span>)
+    .<span class="kw">to</span>(<span class="str">"sql:select id, status, total from orders "</span>
+        + <span class="str">"where customer_id = :#customerId order by created_at desc"</span>
+        + <span class="str">"?dataSource=#myDS"</span>);</code></pre>
+
+    <p data-anchor="db-p-sql2">Named-parameter values are resolved in a fixed order: first a Simple expression
+    written directly in the placeholder, then the message body if it's a <code>java.util.Map</code>, then message
+    headers, then exchange variables. In the snippet above, <code>:#customerId</code> falls through to the header of
+    the same name with no processor step needed to move it there first.</p>
+
+    <p data-anchor="db-p-sql3">A <code>select</code> puts <code>List&lt;Map&lt;String,Object&gt;&gt;</code> in the
+    body by default &mdash; one map per row, keyed by column name. Two options reshape that:
+    <code>outputType=SelectOne</code> collapses a known single-row result down to one object instead of a
+    one-element list, and <code>outputType=StreamList</code> streams rows one at a time rather than materializing
+    the whole result set, the same memory concern Chapter 18 raised about large files. <code>outputHeader</code>
+    redirects the result onto a header instead of overwriting the body &mdash; useful when the route is enriching a
+    message (Chapter 15) and still needs the original body afterward.</p>
+
+    <div class="callout warn" data-anchor="db-callout-updatebody">
+      <span class="callout-title">An update, insert, or delete does not return a body</span>
+      <p>Run <code>sql:update orders set status = 'SHIPPED' where id = :#id</code> and the OUT body is
+      <code>null</code>. The affected row count exists, but only as a header
+      (<code>SqlConstants.SQL_UPDATE_COUNT</code>, i.e. <code>CamelSqlUpdateCount</code>) &mdash; code that expects an
+      update to hand back rows the way a select does will find an empty body and needs to read that header
+      instead.</p>
+    </div>
+
+    <p data-anchor="db-p-sql4">One more option worth knowing before it's needed: <code>batch=true</code> changes
+    what the inbound body means. Instead of one set of parameters, Camel expects an iterable of
+    parameter-iterables &mdash; one inner list per statement execution &mdash; so a bulk insert of many rows is
+    driven by wrapping many parameter lists into a single outer collection, not by looping <code>.to("sql:...")</code>
+    once per row.</p>
+
+    <h2 data-anchor="db-h2-jdbc">The jdbc component: lighter, producer-only, SQL in the body</h2>
+    <p data-anchor="db-p-jdbc1"><code>jdbc</code> makes the opposite tradeoff. Its endpoint URI names only a
+    <code>DataSource</code> bean &mdash; <code>jdbc:myDS</code> &mdash; and the SQL text always comes from the
+    message body, never the URI. It talks to the JDBC driver directly instead of going through Spring's
+    <code>JdbcTemplate</code>, so it has no Spring dependency at all; the tradeoff is that it's producer-only
+    (there's no <code>from("jdbc:...")</code> consumer) and, per its own documentation, an application that needs
+    Spring-managed transactions around its database calls should reach for <code>sql</code> instead.</p>
+
+    <div class="pre-label">jdbc: SQL travels in the body, not the URI</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:adHocQuery"</span>)
+    .<span class="fn">setBody</span>(<span class="fn">simple</span>(<span class="str">"select * from orders where id = ${header.orderId}"</span>))
+    .<span class="kw">to</span>(<span class="str">"jdbc:myDS"</span>);</code></pre>
+
+    <p data-anchor="db-p-jdbc2">Results default to the same shape as <code>sql</code> &mdash; a list of maps, one
+    per row. <code>useHeadersAsParameters</code> enables its own named-parameter substitution from headers, and
+    <code>useGetGeneratedKeys</code> together with a <code>CamelRetrieveGeneratedKeys</code> header exposes
+    auto-generated keys from an insert. Those two conveniences don't combine, though &mdash; generated-key retrieval
+    and named-parameter binding are documented as mutually exclusive on this component, not just an
+    uncommon pairing.</p>
+
+    <p data-anchor="db-p-jdbc3">In practice, most routes in this book's style reach for <code>sql</code>: named
+    parameters read better than string-concatenating a query into the body, and the polling consumer is genuinely
+    useful. <code>jdbc</code> earns its place when the dependency footprint matters more than the convenience, or
+    when a query is already dynamically built and the body is the natural place for it to live anyway.</p>
+
+    <h2 data-anchor="db-h2-jpa">The jpa component: entities in, entities out</h2>
+    <p data-anchor="db-p-jpa1"><code>jpa</code> is the odd one out in a good way &mdash; a route using it exchanges
+    <code>@Entity</code> objects, not rows. As a consumer it polls entities of a configured
+    <code>entityClassName</code> and, by default (<code>consumeDelete=true</code>), deletes each one from the
+    database the moment it's handed to the route. That default is worth pausing on: a route that fails
+    <em>downstream</em> of consumption has already lost the record, unless <code>consumeDelete</code> is set to
+    <code>false</code> and the route instead relies on a status column or a lock to control what gets re-polled &mdash;
+    the same "how do I know this was really handled" question Chapter 16's idempotent consumer answers for messaging
+    sources, now on a table you own directly.</p>
+
+    <div class="callout key" data-anchor="db-callout-maxresults">
+      <span class="callout-title">maximumResults exists because a first poll can be a very large poll</span>
+      <p>Point a fresh <code>jpa</code> consumer at a table that already has a large backlog of unprocessed rows and,
+      with no cap, the first poll tries to load the entire matching result set into memory at once.
+      <code>maximumResults</code> bounds how many entities a single poll loads &mdash; set it the way Chapter 18 set
+      bounds on file-consumer batch sizes, before the backlog is the thing that teaches you it was missing.</p>
+    </div>
+
+    <p data-anchor="db-p-jpa2">On the producer side, sending an entity object persists or merges it; sending a
+    <code>java.util.List</code> of entities needs <code>entityType=java.util.List</code> so the component knows to
+    iterate the list rather than treat it as one entity. For reads and bulk operations, three query options cover
+    different starting points: <code>query</code> takes JPQL directly on the endpoint, <code>namedQuery</code>
+    references a <code>@NamedQuery</code> already declared on the entity class, and <code>nativeQuery</code> runs SQL
+    directly &mdash; but without an explicit <code>resultClass</code>, a native query hands back raw
+    <code>Object[]</code> rows instead of typed entities, the JPA equivalent of the un-marshalled body Chapter 9
+    warned about.</p>
+
+    <h2 data-anchor="db-h2-stored">Calling a stored procedure: sql-stored's method-signature template</h2>
+    <p data-anchor="db-p-stored1">Some databases put real logic behind a stored procedure rather than a table, and
+    <code>sql-stored</code> is Camel's way in. Its endpoint URI is a template that reads like a Java method
+    signature &mdash; a name, then IN/OUT/INOUT parameters, each with an SQL type and either a value expression (IN)
+    or a result name (OUT/INOUT):</p>
+
+    <div class="pre-label">One IN, one INOUT, one OUT parameter</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:runPayoutCalc"</span>)
+    .<span class="kw">to</span>(<span class="str">"sql-stored:CALC_PAYOUT("</span>
+        + <span class="str">"INTEGER ${header.accountId}, "</span>
+        + <span class="str">"INOUT INTEGER ${header.attempt} attemptOut, "</span>
+        + <span class="str">"OUT DECIMAL payoutOut)"</span>)
+    .<span class="fn">log</span>(<span class="str">"payout=${header.payoutOut}, attempt=${header.attemptOut}"</span>);</code></pre>
+
+    <p data-anchor="db-p-stored2">Every OUT and INOUT parameter names a result, and that name is where the value
+    lands &mdash; as a message <em>header</em>, not the body. <code>payoutOut</code> above is both the SQL parameter
+    identifier and the header key the result shows up under afterward. It's the same header-not-body habit the
+    update-count callout raised for plain <code>sql</code> statements: a write-shaped operation tends to report back
+    through headers, and a read-shaped one through the body.</p>
+
+    <h2 data-anchor="db-h2-transactions">transacted(): when more than one statement must succeed together</h2>
+    <p data-anchor="db-p-tx1">Everything so far has been one statement per call. The moment a route needs two or
+    more database writes to succeed or fail as a unit &mdash; write an order, then write its audit trail, and never
+    end up with one but not the other &mdash; a single call's own success isn't enough anymore. That's what
+    <code>transacted()</code> is for. Placed as the first step after <code>from(...)</code>, it marks the remainder
+    of the route as one Spring-managed transaction: under the covers, that remainder runs inside a
+    <code>TransactionTemplate</code> driven by a configured <code>PlatformTransactionManager</code>, and any
+    transactional endpoint invoked from inside it &mdash; a <code>sql</code> or <code>jdbc</code> call, a JMS send
+    under a JMS transaction manager &mdash; automatically enlists in that already-open transaction instead of opening
+    its own.</p>
+
+    <div class="pre-label">Two writes, one unit of work</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:createOrder"</span>)
+    .<span class="fn">transacted</span>()
+    .<span class="kw">to</span>(<span class="str">"sql:insert into orders (id, customer_id, total) "</span>
+        + <span class="str">"values (:#id, :#customerId, :#total)?dataSource=#myDS"</span>)
+    .<span class="kw">to</span>(<span class="str">"sql:insert into order_audit (order_id, event) "</span>
+        + <span class="str">"values (:#id, 'CREATED')?dataSource=#myDS"</span>);</code></pre>
+
+    <p data-anchor="db-p-tx2">If the second insert fails, the first one rolls back too &mdash; that's the whole
+    point of naming both statements as one transaction instead of hoping they both individually succeed.
+    Camel also supports Spring's propagation behaviors, so a route calling into a second transacted route can choose
+    whether that nested unit of work joins the caller's transaction (<code>PROPAGATION_REQUIRED</code>, the common
+    case) or always starts a fresh one that commits or rolls back independently
+    (<code>PROPAGATION_REQUIRES_NEW</code>).</p>
+
+    <figure class="diagram-fig" data-anchor="db-fig-tx">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="dbD1t">
+        <title id="dbD1t">transacted() wraps the remainder of a route in one Spring PlatformTransactionManager-backed transaction; a route that hands the exchange to another thread, such as a seda endpoint, steps outside that transaction</title>
+
+        <rect x="16" y="16" width="330" height="40" class="stroke fill-red"/>
+        <text x="26" y="32" class="on-ink big">transacted()</text>
+        <text x="26" y="48" class="mono on-ink dim">one PlatformTransactionManager unit of work</text>
+
+        <path d="M181 56 L181 78" class="stroke"/>
+        <path d="M177 70 L181 78 L185 70" class="stroke"/>
+
+        <rect x="36" y="86" width="130" height="34" class="stroke fill-soft"/>
+        <text x="46" y="107" class="mono">to("sql:insert...")</text>
+
+        <rect x="196" y="86" width="150" height="34" class="stroke fill-soft"/>
+        <text x="206" y="107" class="mono">to("sql:insert audit")</text>
+
+        <text x="366" y="107" class="dim">both commit, or both roll back</text>
+
+        <path d="M362 40 L430 40" class="stroke-soft dash"/>
+        <path d="M422 36 L430 40 L422 44" class="stroke-soft"/>
+        <rect x="438" y="20" width="106" height="34" class="stroke-soft"/>
+        <text x="446" y="41" class="dim mono">to("seda:...")</text>
+        <text x="366" y="150" class="dim">new thread &rarr; outside the transaction</text>
+      </svg>
+      <figcaption>Everything called on the route's own thread inside transacted() shares one commit/rollback; handing
+      the exchange to another thread (seda:, an async listener) steps outside it.</figcaption>
+    </figure>
+
+    <div class="callout warn" data-anchor="db-callout-thread">
+      <span class="callout-title">transacted() only protects the calling thread</span>
+      <p>A Spring transaction context is bound to the thread that opened it. <code>transacted()</code> must be the
+      first step after <code>from(...)</code>, and every statement meant to share the transaction has to stay on
+      that same thread to be covered by it. Route into a <code>seda:</code> endpoint or hand the exchange to an
+      async listener midway through, and whatever runs on the other side executes outside the original transaction
+      entirely &mdash; Chapter 17's SEDA queue is exactly this kind of thread boundary, and it is not transaction-aware
+      just because the route that fed it was.</p>
+    </div>
+
+    <p data-anchor="db-p-tx3">One more distinction worth naming precisely, because it collides with vocabulary from
+    Chapters 16, 23, and 24: redelivery inside a transacted route is the backing resource's job, not Camel's.
+    A failed insert rolls back and, depending on the resource, may be retried by the database or a JMS broker's own
+    redelivery &mdash; not by Camel's <code>redeliverPolicy</code> or Dead Letter Channel. Bolting Camel-level
+    redelivery onto a transacted route without accounting for that can mean a failure gets retried twice, by two
+    different systems that don't know about each other, or masked entirely by whichever one gives up first.</p>
+
+    <h2 data-anchor="db-h2-idempotent">Two threads from earlier chapters, now open on the table</h2>
+    <p data-anchor="db-p-idempotent1">Chapter 16 named <code>JdbcMessageIdRepository</code> in a comparison table
+    and moved on: durable, shareable across instances, reach for it when there's already a relational database in
+    the deployment. It's worth opening up now that the SQL underneath it is no longer a mystery. Its default table
+    is <code>CAMEL_MESSAGEPROCESSED(processorName, messageId, createdAt)</code>; a lookup runs
+    <code>SELECT COUNT(*) FROM CAMEL_MESSAGEPROCESSED WHERE processorName = ? AND messageId = ?</code>, and a new key
+    is recorded with a plain <code>INSERT</code>.</p>
+
+    <div class="pre-label">The default schema JdbcMessageIdRepository expects</div>
+    <pre><code><span class="kw">CREATE</span> <span class="kw">TABLE</span> CAMEL_MESSAGEPROCESSED (
+    processorName VARCHAR(<span class="num">255</span>),
+    messageId VARCHAR(<span class="num">100</span>),
+    createdAt TIMESTAMP,
+    <span class="kw">PRIMARY KEY</span> (processorName, messageId)
+);</code></pre>
+
+    <p data-anchor="db-p-idempotent2">That primary key is doing real work, not just enforcing tidiness. With
+    concurrent consumer instances, the safety of the whole idempotent-consumer pattern rests on a unique constraint
+    over <code>(processorName, messageId)</code>: without one, two instances can both pass the
+    <code>SELECT COUNT(*)</code> check before either finishes its <code>INSERT</code>, and the same "new" message
+    gets waved through twice. The guarantee comes from the constraint rejecting the second insert, not from the
+    check that ran before it &mdash; a distinction that only becomes visible once you can see the actual statements.</p>
+
+    <p data-anchor="db-p-idempotent3">The same module ships a database-backed counterpart for Chapter 13's
+    aggregator: <code>JdbcAggregationRepository</code> persists in-flight aggregated exchanges to a table instead of
+    holding them only in memory, so an aggregation in progress survives a process restart rather than losing
+    whatever had been accumulated so far. It needs its own <code>PlatformTransactionManager</code> to orchestrate its
+    writes, and, like any other transactional resource, can be given a propagation behavior when it's used inside a
+    route that's already wrapped in <code>transacted()</code>.</p>
+
+    <h2 data-anchor="db-h2-pooling">Where the connection actually comes from</h2>
+    <p data-anchor="db-p-pooling1">None of <code>sql</code>, <code>jdbc</code>, or <code>jpa</code> need an explicit
+    <code>dataSource=#myDS</code> option if the deployment only has one <code>DataSource</code> bean. Camel's
+    <code>#autowired</code> property binding looks up the registry for a single bean matching the option's declared
+    type and uses it automatically when none is configured &mdash; in a Spring Boot application, that means the
+    framework's own auto-configured <code>DataSource</code> is normally picked up with zero Camel-side wiring at
+    all.</p>
+
+    <p data-anchor="db-p-pooling2">That auto-configured <code>DataSource</code> has been backed by HikariCP as
+    Spring Boot's default pool since Spring Boot 2, tunable through <code>spring.datasource.hikari.*</code>
+    properties such as <code>maximum-pool-size</code>, <code>connection-timeout</code>, <code>idle-timeout</code>,
+    and <code>max-lifetime</code>. Camel doesn't run a pool of its own on top of it &mdash; every <code>sql</code>,
+    <code>jdbc</code>, or <code>jpa</code> call borrows a connection from whatever <code>DataSource</code> (or
+    <code>EntityManagerFactory</code>) it was handed. A burst of concurrent routes competing for a pool sized for a
+    quiet afternoon is an application-wide sizing problem, the same way Chapter 19's
+    <code>connectionRequestTimeout</code> was about a client's own pool being saturated, not about the far side of
+    the call.</p>
+
+    <div class="pullquote" data-anchor="db-pullquote">A file either exists or it doesn't. An HTTP call answers or it
+    doesn't. A database sits in between: almost always there, almost always fast, and the one transport in this book
+    so far that lets you ask for more than "did this one thing work" &mdash; you can ask "did this whole set of
+    things happen together, or not at all." transacted() is Camel's way of actually meaning that, instead of hoping
+    two separate calls both quietly succeed.</div>
+
+    <h2 data-anchor="db-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="db-p-reflection">Three components at three distances from raw SQL &mdash; <code>sql</code> with
+    named parameters and a polling consumer, <code>jdbc</code> lighter and producer-only with SQL in the body,
+    <code>jpa</code> trading rows for entities &mdash; plus <code>sql-stored</code> for logic that already lives
+    behind a procedure. Underneath all four, the same two habits recur: writes report back through headers, not the
+    body, and a <code>DataSource</code> is usually resolved for you rather than configured by hand.
+    <code>transacted()</code> layered on top answers the question none of the earlier "Real Systems" chapters could:
+    when more than one statement has to succeed together, a <code>PlatformTransactionManager</code> is what makes
+    that true, on one thread, with redelivery left to the resource underneath rather than to Camel. And two patterns
+    from earlier chapters turned out to be ordinary tables all along &mdash; the idempotent repository from Chapter
+    16 and the aggregator's durable store from Chapter 13 &mdash; which is as good a sign as any that "database" was
+    never really a new topic in this book, just a transport this chapter finally named. Chapter 21 stays inside Real
+    Systems once more, trading the request/response shape of HTTP and SQL for the queues and topics of a messaging
+    system.</p>
+
+    <div class="review" data-anchor="db-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route runs <code>sql:update orders set status = 'SHIPPED' where id = :#id</code> and the next step
+        tries to read the updated row count from the message body. What actually happens, and where does the row
+        count really live?</li>
+        <li>A teammate wraps two <code>sql</code> inserts in <code>transacted()</code>, but routes the exchange
+        through a <code>seda:</code> endpoint between them. Why doesn't the second insert share the first one's
+        transaction, even though both are inside the same route?</li>
+        <li>Two instances of a route are both backed by <code>JdbcMessageIdRepository</code> against the same
+        <code>CAMEL_MESSAGEPROCESSED</code> table. What, specifically, stops them from both processing the same
+        "new" message if they check for it at almost the same moment?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="19-http-and-rest-apis.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="21-messaging-systems.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

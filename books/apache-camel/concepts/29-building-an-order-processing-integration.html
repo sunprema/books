@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Building an Order Processing Integration &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VII &mdash; Capstone Project</span> &middot; Chapter 29</p>
+    <p class="chapter-no">29</p>
+    <h1 data-anchor="ord-h1">Building an Order Processing Integration</h1>
+
+    <p class="lede" data-anchor="ord-lede">Twenty-eight chapters have each handed you one piece: a polling
+    consumer, a data format, a validation step, an enricher, a router, a producer. This chapter doesn't teach a
+    new one. It builds the thing those pieces were always for &mdash; a single, real integration that takes an
+    order from a CSV file sitting on a partner's SFTP server all the way to a fulfillment event on a topic,
+    stopping at every seam a production system actually has: a format it can't trust yet, data it doesn't have
+    yet, a decision it has to make, an event someone else is waiting on. If a piece here looks unfamiliar, it
+    isn't &mdash; it's Chapter 18, or 10, or 15, or 12, or 21, wearing an order's clothes.</p>
+
+    <h2 data-anchor="ord-h2-shape">The shape of this integration</h2>
+    <p data-anchor="ord-p-shape1">Stripped of Java, the requirement from the top of this chapter reads as six
+    stages, strictly in order: pull the file, turn its rows into orders, refuse to touch a bad one, find out what
+    the order actually needs (a customer's address, an item's stock), decide where it ships from, and tell the
+    rest of the system it's ready to go. Each stage is exactly one EIP or component you've already met.</p>
+
+    <figure class="diagram-fig" data-anchor="ord-fig-pipeline">
+      <svg class="diagram" viewBox="0 0 560 100" role="img" aria-labelledby="ordD1t">
+        <title id="ordD1t">An order flows through six stages in order: SFTP intake, CSV to canonical Order, validation, two chained enrichments, a content-based choice between domestic and international, and finally publishing a fulfillment event &mdash; the choice stage is the one genuinely new decision this chapter adds</title>
+
+        <rect x="20" y="54" width="92" height="36" class="stroke fill-soft"/>
+        <text x="28" y="77" class="big">SFTP intake</text>
+
+        <path d="M112 72 L124 72" class="stroke"/>
+        <path d="M116 68 L124 72 L116 76" class="stroke"/>
+
+        <rect x="124" y="54" width="92" height="36" class="stroke fill-soft"/>
+        <text x="132" y="77" class="big">CSV &rarr; Order</text>
+
+        <path d="M216 72 L228 72" class="stroke"/>
+        <path d="M220 68 L228 72 L220 76" class="stroke"/>
+
+        <rect x="228" y="54" width="70" height="36" class="stroke fill-soft"/>
+        <text x="236" y="77" class="big">Validate</text>
+
+        <path d="M298 72 L310 72" class="stroke"/>
+        <path d="M302 68 L310 72 L302 76" class="stroke"/>
+
+        <rect x="310" y="54" width="74" height="36" class="stroke fill-soft"/>
+        <text x="317" y="77" class="big">Enrich &times;2</text>
+
+        <path d="M384 72 L396 72" class="stroke"/>
+        <path d="M388 68 L396 72 L388 76" class="stroke"/>
+
+        <rect x="396" y="54" width="64" height="36" class="stroke fill-red"/>
+        <text x="406" y="77" class="big on-ink">Choice</text>
+
+        <path d="M460 72 L472 72" class="stroke"/>
+        <path d="M464 68 L472 72 L464 76" class="stroke"/>
+
+        <rect x="472" y="54" width="68" height="36" class="stroke fill-soft"/>
+        <text x="480" y="77" class="big">Publish</text>
+
+        <text x="396" y="24" class="dim">domestic / international &mdash; the new decision</text>
+        <path d="M396 32 L396 52" class="stroke-soft dash"/>
+        <path d="M392 46 L396 52 L400 46" class="stroke-soft"/>
+      </svg>
+      <figcaption>Six stages, six earlier chapters. The Choice stage is the only genuinely new idea this chapter
+      adds &mdash; everything on either side of it is a pattern you already own, aimed at an order.</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Where each stage was actually taught</caption>
+        <thead>
+          <tr><th>Stage</th><th>Pattern</th><th>Chapter</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>SFTP intake</td><td>Polling consumer, <code>readLock</code></td><td>18 &mdash; Files, SFTP, and Object Storage</td></tr>
+          <tr><td>CSV &rarr; Order</td><td><code>unmarshal()</code>, a Data Format</td><td>10 &mdash; Working with Data Formats</td></tr>
+          <tr><td>Validate</td><td><code>validate()</code></td><td>11 &mdash; Validation and Canonical Messages</td></tr>
+          <tr><td>Enrich &times;2</td><td><code>enrich()</code>, <code>AggregationStrategy</code></td><td>15 &mdash; Message Enrichment</td></tr>
+          <tr><td>Choice</td><td><code>choice()</code>/<code>when()</code>/<code>otherwise()</code></td><td>12 &mdash; Content-Based Routing</td></tr>
+          <tr><td>Publish</td><td>Kafka producer, message key</td><td>21 &mdash; Messaging Systems</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="ord-h2-intake">Step 1: pulling order files off SFTP</h2>
+    <p data-anchor="ord-p-intake1">A partner drops a CSV of new orders onto an SFTP server on no schedule you
+    control. The consumer that picks it up needs Chapter 18's whole toolkit: a lock strategy that tolerates a
+    server that doesn't write atomically, and host-key checking that isn't switched off.</p>
+
+    <div class="pre-label">Order intake &mdash; the SFTP polling consumer, reused</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"sftp://partner.example.com:22/orders/incoming"</span>
+        + <span class="str">"?username={{sftp.username}}&amp;privateKeyFile={{sftp.key}}"</span>
+        + <span class="str">"&amp;knownHostsFile={{sftp.knownHosts}}&amp;strictHostKeyChecking=yes"</span>
+        + <span class="str">"&amp;readLock=changed&amp;readLockCheckInterval=2000&amp;readLockTimeout=20000"</span>
+        + <span class="str">"&amp;include=.*\\.csv&amp;delay=30000"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"orderIntake"</span>)
+    .<span class="fn">log</span>(<span class="str">"Picked up order file: ${header.CamelFileName}"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:parseOrders"</span>);</code></pre>
+
+    <p data-anchor="ord-p-intake2"><code>readLock=changed</code> is doing real work here: a partner's export job
+    almost never renames a file into place atomically, so Camel checks the file's size and timestamp twice,
+    <code>readLockCheckInterval</code> apart, and only picks it up once both snapshots agree it's stopped
+    growing. <code>strictHostKeyChecking=yes</code> plus an explicit <code>knownHostsFile</code> is the deliberate
+    override of both of SFTP's insecure defaults &mdash; leaving either one off trusts whatever key the server
+    happens to present on a given connection.</p>
+
+    <h2 data-anchor="ord-h2-canonical">Step 2: from CSV rows to a canonical Order</h2>
+    <p data-anchor="ord-p-canonical1">A CSV row is not an order &mdash; it's a line of text with commas in it,
+    and the very next thing every later stage needs is a real <code>Order</code>, addressed by field name rather
+    than by column position. Chapter 10's <code>CsvDataFormat</code> with <code>useMaps(true)</code> gets you
+    partway: each row unmarshals into a <code>Map&lt;String,String&gt;</code> keyed by the header row, so
+    <code>row.get("OrderId")</code> replaces a fragile <code>row.get(0)</code>. A small bean finishes the job,
+    turning that map into the <code>Order</code> every later stage expects.</p>
+
+    <div class="pre-label">CsvDataFormat.useMaps(true), then a bean that builds the canonical Order</div>
+    <pre><code><span class="ty">CsvDataFormat</span> ordersCsv = <span class="kw">new</span> <span class="ty">CsvDataFormat</span>();
+ordersCsv.<span class="fn">setUseMaps</span>(<span class="kw">true</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:parseOrders"</span>)
+    .<span class="fn">unmarshal</span>(ordersCsv)
+    .<span class="fn">split</span>(<span class="fn">body</span>())
+        .<span class="kw">to</span>(<span class="str">"direct:toCanonicalOrder"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:toCanonicalOrder"</span>)
+    .<span class="fn">bean</span>(<span class="ty">OrderMapper</span>.<span class="kw">class</span>, <span class="str">"fromCsvRow"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:validateOrder"</span>);</code></pre>
+
+    <p data-anchor="ord-p-canonical2">Notice what <code>split(body())</code> is doing here: the file unmarshals
+    into one list of row-maps, and <code>split()</code> hands each one down the rest of the pipeline as its own
+    exchange. Everything from here to the Kafka publish at the end operates on <strong>one order at a time</strong>
+    &mdash; a hundred-row file becomes a hundred independent trips through validate, enrich, and route.</p>
+
+    <h2 data-anchor="ord-h2-validate">Step 3: validating before anything downstream trusts it</h2>
+    <p data-anchor="ord-p-validate1">Validation belongs here, before enrichment, not after &mdash; there's no
+    point spending an HTTP call looking up a customer for an order whose <code>orderId</code> is missing.
+    <code>validate()</code> is the right weight for this check: a boolean predicate over fields the mapper just
+    set, no schema, no annotated class.</p>
+
+    <div class="pre-label">A hard gate on the fields everything downstream assumes are present</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:validateOrder"</span>)
+    .<span class="fn">validate</span>(<span class="fn">simple</span>(<span class="str">"${body.orderId} != null &amp;&amp; ${body.sku} != null &amp;&amp; ${body.quantity} &gt; 0"</span>))
+    .<span class="kw">to</span>(<span class="str">"direct:enrichOrder"</span>);</code></pre>
+
+    <p data-anchor="ord-p-validate2">A failing predicate throws <code>PredicateValidationException</code>
+    immediately &mdash; this route doesn't yet say what happens to that exception. That's deliberate: this
+    chapter builds the happy path end to end first, and Chapter 30 is where <code>onException</code>, retries,
+    and a dead-letter destination for exactly this exception get wired in. Building it in two passes &mdash; get
+    an order through cleanly, <em>then</em> harden what happens when one can't be &mdash; keeps each pass small
+    enough to reason about.</p>
+
+    <h2 data-anchor="ord-h2-enrich">Step 4: two enrichments, chained</h2>
+    <p data-anchor="ord-p-enrich1">A validated order still isn't a shippable one. It has a customer ID, not a
+    shipping address or a country; a SKU, not a confirmation that the item is actually in stock. Two separate
+    external systems answer those two separate questions, so this stage is two <code>enrich()</code> calls, one
+    after the other &mdash; not one call trying to do both.</p>
+
+    <div class="pre-label">Customer lookup, then inventory lookup, on the same order</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:enrichOrder"</span>)
+    .<span class="fn">enrich</span>(<span class="str">"http://customer-api/customers/${body.customerId}"</span>, <span class="kw">new</span> <span class="ty">CustomerEnrichmentStrategy</span>())
+    .<span class="fn">enrich</span>(<span class="str">"http://inventory-api/items/${body.sku}"</span>, <span class="kw">new</span> <span class="ty">InventoryEnrichmentStrategy</span>())
+    .<span class="kw">to</span>(<span class="str">"direct:routeOrder"</span>);</code></pre>
+
+    <p data-anchor="ord-p-enrich2">Chaining works because of what each <code>AggregationStrategy</code> is asked
+    to return. <code>oldExchange</code> is always the order as it stood before that particular <code>enrich()</code>
+    ran; <code>newExchange</code> is always that call's resource reply. As long as each strategy folds the reply's
+    fields onto the order and returns <code>oldExchange</code> &mdash; not a fresh exchange, not
+    <code>newExchange</code> &mdash; the second <code>enrich()</code> in the chain sees the first enrichment's
+    result as its own starting point. Two calls compose with nothing extra wired between them.</p>
+
+    <div class="pre-label">CustomerEnrichmentStrategy &mdash; read old and new, mutate and return old</div>
+    <pre><code><span class="kw">public</span> <span class="kw">class</span> <span class="ty">CustomerEnrichmentStrategy</span> <span class="kw">implements</span> <span class="ty">AggregationStrategy</span> {
+    <span class="kw">public</span> <span class="ty">Exchange</span> <span class="fn">aggregate</span>(<span class="ty">Exchange</span> oldExchange, <span class="ty">Exchange</span> newExchange) {
+        <span class="ty">Order</span> order = oldExchange.<span class="fn">getMessage</span>().<span class="fn">getBody</span>(<span class="ty">Order</span>.<span class="kw">class</span>);
+        <span class="ty">Customer</span> customer = newExchange.<span class="fn">getMessage</span>().<span class="fn">getBody</span>(<span class="ty">Customer</span>.<span class="kw">class</span>);
+        order.<span class="fn">setCustomerCountry</span>(customer.<span class="fn">getCountry</span>());
+        order.<span class="fn">setShippingAddress</span>(customer.<span class="fn">getAddress</span>());
+        oldExchange.<span class="fn">getMessage</span>().<span class="fn">setBody</span>(order);
+        <span class="kw">return</span> oldExchange;
+    }
+}</code></pre>
+
+    <div class="callout warn" data-anchor="ord-callout-noaggregation">
+      <span class="callout-title">Drop the AggregationStrategy from either call and the chain breaks silently</span>
+      <p>An <code>enrich()</code> with no second argument doesn't merge &mdash; it replaces the whole body with
+      the resource's reply. Omit it from the customer lookup here and the exchange going into the inventory
+      lookup is a bare <code>Customer</code>, not an order; the inventory API gets called with whatever
+      <code>${body.sku}</code> evaluates to on a <code>Customer</code>, which is nothing. Nothing throws. The
+      route just quietly stops being about an order midway through.</p>
+    </div>
+
+    <h2 data-anchor="ord-h2-route">Step 5: routing domestic vs international</h2>
+    <p data-anchor="ord-p-route1">Only now &mdash; after enrichment, not before &mdash; does the order actually
+    know where the customer is. That ordering matters: a <code>choice()</code> placed before the enrich calls
+    would be routing on a field that hasn't been set yet. Once <code>customerCountry</code> is real, deriving an
+    <code>OrderType</code> header and branching on it is exactly Chapter 12's pattern.</p>
+
+    <div class="pre-label">Content-based routing, keyed on a field the enrichment stage just filled in</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:routeOrder"</span>)
+    .<span class="fn">setHeader</span>(<span class="str">"OrderType"</span>, <span class="fn">simple</span>(<span class="str">"${body.customerCountry} == 'US' ? 'DOMESTIC' : 'INTERNATIONAL'"</span>))
+    .<span class="fn">choice</span>()
+        .<span class="fn">when</span>(<span class="fn">header</span>(<span class="str">"OrderType"</span>).<span class="fn">isEqualTo</span>(<span class="str">"DOMESTIC"</span>))
+            .<span class="kw">to</span>(<span class="str">"direct:domesticFulfillment"</span>)
+        .<span class="fn">when</span>(<span class="fn">header</span>(<span class="str">"OrderType"</span>).<span class="fn">isEqualTo</span>(<span class="str">"INTERNATIONAL"</span>))
+            .<span class="kw">to</span>(<span class="str">"direct:internationalFulfillment"</span>)
+        .<span class="fn">otherwise</span>()
+            .<span class="kw">to</span>(<span class="str">"direct:manualReview"</span>)
+    .<span class="fn">end</span>();</code></pre>
+
+    <div class="callout key" data-anchor="ord-callout-otherwise">
+      <span class="callout-title">otherwise() is what makes this choice() safe to ship</span>
+      <p>Recall Chapter 12: a <code>choice()</code> with no matching <code>when()</code> and no
+      <code>otherwise()</code> does nothing &mdash; no branch runs, no exception is thrown, the exchange falls
+      through to whatever follows <code>.end()</code>. Here that would mean an order whose
+      <code>customerCountry</code> came back blank, or some third value nobody planned for, is simply never
+      fulfilled and never flagged. Routing the unmatched case to <code>direct:manualReview</code> instead of
+      leaving <code>otherwise()</code> off turns a silent gap into a queue someone actually watches.</p>
+    </div>
+
+    <h2 data-anchor="ord-h2-publish">Step 6: publishing the fulfillment event</h2>
+    <p data-anchor="ord-p-publish1">Domestic and international orders diverge only in <em>where</em> they're
+    fulfilled from &mdash; both need the same last step, so both branches converge on one <code>direct:</code>
+    endpoint rather than duplicating the publish logic. Marshalling to JSON and keying the Kafka message on
+    <code>orderId</code> are both Chapter 21 moves, aimed at this order specifically.</p>
+
+    <div class="pre-label">Two branches, one publish step, keyed for per-order ordering</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:domesticFulfillment"</span>)
+    .<span class="fn">setHeader</span>(<span class="str">"FulfillmentCenter"</span>, <span class="fn">constant</span>(<span class="str">"US-EAST"</span>))
+    .<span class="kw">to</span>(<span class="str">"direct:publishFulfillment"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:internationalFulfillment"</span>)
+    .<span class="fn">setHeader</span>(<span class="str">"FulfillmentCenter"</span>, <span class="fn">constant</span>(<span class="str">"INTL-HUB"</span>))
+    .<span class="kw">to</span>(<span class="str">"direct:publishFulfillment"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:publishFulfillment"</span>)
+    .<span class="fn">marshal</span>().<span class="fn">json</span>(<span class="ty">JsonLibrary</span>.Jackson)
+    .<span class="fn">setHeader</span>(<span class="ty">KafkaConstants</span>.KEY, <span class="fn">simple</span>(<span class="str">"${body[orderId]}"</span>))
+    .<span class="kw">to</span>(<span class="str">"kafka:order.fulfillment.events?brokers={{kafka.brokers}}"</span>);</code></pre>
+
+    <p data-anchor="ord-p-publish2">Keying on <code>orderId</code> isn't cosmetic. Kafka sends every message with
+    the same key to the same partition, and a partition is the only unit Kafka guarantees ordering within &mdash;
+    so every event this integration ever publishes about one order lands in the order it was published, and a
+    consumer reading that partition sees them that way too. Leave the key off and Camel's default partitioner
+    scatters events for the same order across partitions, with no guarantee about which one a consumer reads
+    first.</p>
+
+    <div class="pullquote" data-anchor="ord-pullquote">Nothing in this route is new. What's new is that a bad row,
+    a slow API, and an unrouted order all had to be decided <em>somewhere</em> &mdash; and building the whole
+    pipeline at once is what forces those decisions to actually get made, instead of staying implicit.</div>
+
+    <h2 data-anchor="ord-h2-edgecases">Edge cases this route already has to answer for</h2>
+    <p data-anchor="ord-p-edge1">Wiring six familiar patterns together surfaces failure modes none of them show
+    on their own:</p>
+
+    <ul>
+      <li data-anchor="ord-li-edge1"><strong>A malformed CSV row.</strong> <code>validate()</code> catches a
+      missing field, but a row with the wrong number of columns fails earlier, inside <code>unmarshal()</code>
+      itself &mdash; before the mapper bean, and before <code>orderId</code> exists to log. That failure needs
+      its own handling, not the same predicate <code>validate()</code> checks downstream.</li>
+      <li data-anchor="ord-li-edge2"><strong>A slow or failing enrichment call.</strong> <code>camel-http</code>'s
+      <code>throwExceptionOnFailure</code> default (<code>true</code>) means a 4xx or 5xx from either API raises
+      an <code>HttpOperationFailedException</code> rather than quietly aggregating an error body into the order
+      &mdash; the failure is visible, but this chapter hasn't decided yet whether it's retried, defaulted, or
+      dead-lettered.</li>
+      <li data-anchor="ord-li-edge3"><strong>Reprocessing the same file.</strong> Nothing in this route yet
+      checks whether an <code>orderId</code> has already been published. A file re-picked-up after a partial
+      failure &mdash; the SFTP connection dropped halfway through the last run, say &mdash; republishes every
+      order in it, duplicates included.</li>
+    </ul>
+
+    <p data-anchor="ord-p-edge2">None of these are bugs in what's built so far &mdash; they're exactly what
+    "happy path first, harden second" leaves open on purpose. Chapter 30 closes all three: idempotency to make
+    reprocessing safe, an error-handling policy for the two failure points above, and the tests and observability
+    that let you trust the answer without re-reading the route.</p>
+
+    <h2 data-anchor="ord-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="ord-p-reflection">A working integration, first &mdash; SFTP intake through CSV parsing,
+    validation, two chained enrichments, content-based routing, and a keyed Kafka publish, all six stages wired
+    into one order's actual journey. But the bigger gain is what building it end to end revealed that no single
+    chapter could: enrichment has to run before you can route on what it fills in, two <code>enrich()</code>
+    calls only chain cleanly if every strategy returns <code>oldExchange</code>, and an <code>otherwise()</code>
+    branch is the difference between an edge case you handle and one you never even see. Chapter 30 takes this
+    same route and asks the harder question &mdash; not "does it work," but "does it keep working when a file
+    repeats, an API times out, or a bad row shows up at 3 a.m."</p>
+
+    <div class="review" data-anchor="ord-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>The <code>choice()</code> in Step 5 reads <code>${body.customerCountry}</code>. What breaks if that
+        <code>choice()</code> is moved to run <em>before</em> the two <code>enrich()</code> calls instead of
+        after, and why doesn't Camel warn you at build time?</li>
+        <li>Both enrichment strategies in Step 4 must return <code>oldExchange</code>, not
+        <code>newExchange</code>, for the chain to work. Trace through what the second <code>enrich()</code>
+        call's <code>oldExchange</code> would actually contain if <code>CustomerEnrichmentStrategy</code>
+        returned <code>newExchange</code> instead.</li>
+        <li>Step 6 keys the Kafka message on <code>orderId</code>. Suppose two different orders, published
+        moments apart, need to be processed in the exact order they were published, regardless of which order
+        they belong to. Does keying on <code>orderId</code> still deliver that guarantee? What would you key on
+        instead, and what do you give up by doing that?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="28-deployment-and-route-lifecycle.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="30-making-the-order-integration-production-ready.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

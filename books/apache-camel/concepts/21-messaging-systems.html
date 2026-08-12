@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Messaging Systems &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part V &mdash; Connecting Real Systems</span> &middot; Chapter 21</p>
+    <p class="chapter-no">21</p>
+    <h1 data-anchor="msg-h1">Messaging Systems</h1>
+
+    <p class="lede" data-anchor="msg-lede">Chapter 20 ended on a question every transport in this book has had to answer sooner
+    or later: what happens to a message once you've handed it off? A file sits on disk until something moves it. An
+    HTTP call gets an answer or it doesn't, right now, on the calling thread. A database row is exactly as durable as
+    the transaction that wrote it. A message broker answers differently again &mdash; it takes the message off your
+    hands entirely, holds onto it, and delivers it on its own schedule to whoever is listening. That's the whole
+    point of messaging middleware, and it's also why <code>jms</code> and <code>kafka</code> are two of the most
+    important components in Camel's catalog. This chapter covers both: JMS's queues and topics, request-reply over a
+    broker, Kafka's partitioned log and consumer groups, and how each shapes the way you write an event-driven
+    route.</p>
+
+    <h2 data-anchor="msg-h2-jms">JMS: queues and topics, over any compliant broker</h2>
+    <p data-anchor="msg-p-jms1">Camel's core <code>jms</code> component speaks the Java Message Service API &mdash;
+    JMS 1.1 or 2.0, through Spring's JMS support underneath &mdash; to whatever broker is on the other end: ActiveMQ
+    Classic, ActiveMQ Artemis, IBM MQ, and others all qualify. <code>camel-activemq</code> is not a separate protocol;
+    it's a thin extension of <code>camel-jms</code> pre-configured for ActiveMQ 5.x, and its own documentation just
+    points back at the JMS component for the real reference. (ActiveMQ 6.x uses <code>camel-activemq6</code> instead,
+    and Artemis is usually driven through the generic <code>jms</code> component rather than a dedicated one.) Learn
+    <code>jms</code> once and you've learned how Camel talks to most of the broker world.</p>
+
+    <p data-anchor="msg-p-jms2">A <code>jms</code> endpoint URI names a destination and, optionally, its kind:
+    <code>jms:FOO.BAR</code> and <code>jms:queue:FOO.BAR</code> are the same thing &mdash; queue is the default when
+    no prefix is given &mdash; while a topic needs the prefix spelled out: <code>jms:topic:Stocks.Prices</code>.
+    There's no silent default toward pub-sub; you always opt into a topic explicitly.</p>
+
+    <div class="pre-label">A queue load-balances; a topic fans out</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.new?connectionFactory=#jmsCF&amp;concurrentConsumers=5"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);
+
+<span class="kw">from</span>(<span class="str">"direct:publishOrderEvent"</span>)
+    .<span class="kw">to</span>(<span class="str">"jms:topic:order.events?connectionFactory=#jmsCF"</span>);</code></pre>
+
+    <p data-anchor="msg-p-jms3">That difference in prefix is the difference in delivery model. A <strong>queue</strong>
+    is point-to-point: each message goes to exactly one consumer, so five <code>concurrentConsumers</code> threads
+    (or five instances of the same route) compete for messages and share the load &mdash; the queue is doing exactly
+    what Chapter 17's SEDA queue did in-process, now durably, out of process. A <strong>topic</strong> is
+    publish-subscribe: every active subscriber gets its own copy of every message. A subscriber that isn't connected
+    when a message is published simply misses it, unless it holds a <em>durable</em> subscription &mdash;
+    <code>durableSubscriptionName</code> alone under JMS 2.0, or that plus a <code>clientId</code> that must be
+    unique per connection network-wide under JMS 1.1, which is exactly the kind of coordination problem ActiveMQ's
+    Virtual Topics exist to sidestep.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Queue versus topic &mdash; the same broker, two different delivery guarantees</caption>
+        <thead>
+          <tr><th></th><th>Queue (point-to-point)</th><th>Topic (publish-subscribe)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Each message delivered to&hellip;</td><td>exactly one consumer</td><td>every active subscriber, its own copy</td></tr>
+          <tr><td>Multiple consumers</td><td>compete &mdash; share the load</td><td>each one sees everything independently</td></tr>
+          <tr><td>Consumer offline at publish time</td><td>message waits on the queue</td><td>message is missed, unless subscription is durable</td></tr>
+          <tr><td>URI</td><td><code>jms:name</code> or <code>jms:queue:name</code></td><td><code>jms:topic:name</code></td></tr>
+          <tr><td>Reach for it when&hellip;</td><td>work should happen exactly once, by whichever worker picks it up</td><td>more than one independent listener needs its own view of every event</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="msg-h2-config">Configuring the connection: caching, acknowledgement, and delivery</h2>
+    <p data-anchor="msg-p-config1"><code>connectionFactory</code> is required &mdash; there's no default, because
+    there's no default broker. <code>concurrentConsumers</code> sets how many consumer threads a <code>jms</code>
+    consumer runs (default 1), and <code>maxConcurrentConsumers</code> lets that pool grow under load.
+    <code>cacheLevelName</code> decides what Spring's listener container keeps warm between deliveries &mdash; a
+    connection, a session, or a consumer &mdash; and it auto-selects based on <code>transacted</code>:
+    <code>CACHE_CONSUMER</code> when <code>transacted=false</code>, but <code>CACHE_NONE</code> when
+    <code>transacted=true</code>, because XA transactions need a fresh session and consumer every time. If a route
+    uses a plain local (non-XA) transaction, setting <code>cacheLevelName=CACHE_CONSUMER</code> by hand gets that
+    caching back.</p>
+
+    <div class="callout warn" data-anchor="msg-callout-ackmode">
+      <span class="callout-title">acknowledgementModeName and transacted aren't meant to be combined</span>
+      <p><code>acknowledgementModeName</code> (<code>AUTO_ACKNOWLEDGE</code>, <code>CLIENT_ACKNOWLEDGE</code>, or
+      <code>DUPS_OK_ACKNOWLEDGE</code>; default <code>AUTO_ACKNOWLEDGE</code>) governs plain JMS session
+      acknowledgement. Setting <code>transacted=true</code> switches the whole session into a JMS-transacted
+      session that commits or rolls back as one unit at the end of route processing &mdash; the same
+      commit-or-roll-back-together idea Chapter 20's <code>transacted()</code> gave to SQL, just now scoped to a
+      JMS session instead of a <code>PlatformTransactionManager</code>. Once <code>transacted=true</code> is set, the
+      acknowledgement mode is no longer what decides delivery outcome.</p>
+    </div>
+
+    <p data-anchor="msg-p-config2">On the producer side, <code>deliveryPersistent</code> (default <code>true</code>)
+    sets the JMS <code>PERSISTENT</code> delivery mode, so the broker writes the message to disk before acknowledging
+    it &mdash; the JMS equivalent of Chapter 20's database commit. <code>priority</code> (0&ndash;9, default 4) and
+    <code>timeToLive</code> (unset by default, which usually means "no expiry" on the broker) are ordinary JMS
+    message properties exposed as URI options. On the consumer side, <code>selector</code> takes a JMS selector
+    &mdash; SQL-92-like syntax over headers and properties &mdash; so a route only ever receives the messages
+    matching a filter the <em>broker</em> evaluates before delivery, not something Camel filters after the fact.</p>
+
+    <div class="callout key" data-anchor="msg-callout-headers">
+      <span class="callout-title">Why my.custom-header still works over JMS</span>
+      <p>The JMS spec requires header names to be valid Java identifiers &mdash; no dots, no hyphens. Camel rewrites
+      what it sends: a dot becomes <code>_DOT_</code>, a hyphen becomes <code>_HYPHEN_</code>, and both are reversed
+      on the way back in. A header named <code>my.custom-header</code> round-trips through the wire looking nothing
+      like itself, and you never have to think about it &mdash; unless you're debugging with a raw JMS browser tool
+      and wondering where <code>_DOT_</code> came from.</p>
+    </div>
+
+    <h2 data-anchor="msg-h2-reqreply">Request-reply over JMS: temporary queues and JMSCorrelationID</h2>
+    <p data-anchor="msg-p-reqreply1">Chapter 17 named the mechanism without opening it up: <code>jms</code> defaults
+    its base exchange pattern to <code>InOnly</code>, but auto-promotes an individual message to <code>InOut</code>
+    whenever a <code>JMSReplyTo</code> header is present on it. Send an <code>InOut</code> exchange to a
+    <code>jms</code> endpoint and, with no extra configuration, Camel creates a <em>temporary</em> reply queue, sets
+    it as the outgoing message's <code>JMSReplyTo</code>, and correlates the eventual reply using
+    <code>JMSCorrelationID</code>.</p>
+
+    <div class="pre-label">A temporary reply queue, created automatically</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:priceCheck"</span>)
+    .<span class="fn">inOut</span>(<span class="str">"jms:queue:pricing.requests?connectionFactory=#jmsCF&amp;requestTimeout=5000"</span>)
+    .<span class="fn">log</span>(<span class="str">"price=${body}"</span>);</code></pre>
+
+    <figure class="diagram-fig" data-anchor="msg-fig-reqreply">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="msgD1t">
+        <title id="msgD1t">A temporary reply queue is created per request, set as JMSReplyTo, and the reply is matched back using JMSCorrelationID</title>
+
+        <rect x="16" y="18" width="120" height="40" class="stroke fill-soft"/>
+        <text x="26" y="42" class="mono">producer</text>
+
+        <path d="M136 38 L246 38" class="stroke"/>
+        <path d="M238 33 L246 38 L238 43" class="stroke"/>
+        <text x="150" y="30" class="dim">send + JMSReplyTo=temp-queue</text>
+
+        <rect x="246" y="18" width="130" height="40" class="stroke fill-red"/>
+        <text x="256" y="38" class="on-ink">pricing.requests</text>
+        <text x="256" y="52" class="mono on-ink dim">queue</text>
+
+        <path d="M376 38 L486 38" class="stroke"/>
+        <path d="M478 33 L486 38 L478 43" class="stroke"/>
+
+        <rect x="416" y="18" width="128" height="40" class="stroke fill-soft"/>
+        <text x="426" y="42" class="mono">consumer</text>
+
+        <path d="M480 58 L480 108" class="stroke-soft dash"/>
+        <path d="M476 100 L480 108 L484 100" class="stroke-soft"/>
+        <text x="366" y="128" class="dim">reply, JMSCorrelationID set</text>
+
+        <rect x="246" y="140" width="150" height="36" class="stroke fill-soft"/>
+        <text x="256" y="162" class="mono">temp-queue</text>
+
+        <path d="M246 158 L146 158" class="stroke-soft dash"/>
+        <path d="M154 153 L146 158 L154 163" class="stroke-soft"/>
+
+        <text x="20" y="128" class="dim">requestTimeout elapses &rarr;</text>
+        <text x="20" y="144" class="dim">ExchangeTimedOutException</text>
+      </svg>
+      <figcaption>The default request-reply path: a temporary queue per request, correlated by JMSCorrelationID, torn
+      down once the reply arrives or requestTimeout expires.</figcaption>
+    </figure>
+
+    <p data-anchor="msg-p-reqreply2">Temporary queues are fast and need nothing extra configured, which is why
+    they're the default. A route can instead set a fixed <code>replyTo</code> destination that every reply lands on;
+    Camel then filters that shared queue with a JMS selector keyed on <code>JMSCorrelationID</code>, which works
+    fine in a cluster but costs more than a temporary queue because of the selector evaluation on every message.
+    <code>replyToType=Exclusive</code> skips the selector entirely for a fixed reply queue &mdash; at the cost of that
+    queue name needing to be genuinely unique to the one endpoint using it.</p>
+
+    <p data-anchor="msg-p-reqreply3"><code>requestTimeout</code> (default 20000ms) bounds how long the producer
+    waits, overridable per message with the <code>CamelJmsRequestTimeout</code> header. A timeout raises an
+    <code>ExchangeTimedOutException</code> on the original exchange &mdash; structurally the same failure Chapter
+    17 described for a SEDA producer giving up on a slow consumer, just crossing a broker instead of an in-VM
+    queue.</p>
+
+    <h2 data-anchor="msg-h2-kafka">Kafka: a partitioned log, not a queue or a topic</h2>
+    <p data-anchor="msg-p-kafka1">A <code>kafka:</code> endpoint URI names one topic &mdash; or a comma-separated
+    list, or a regex when <code>topicIsPattern=true</code>: <code>kafka:orders.created</code>. But "topic" means
+    something different here than it did in the JMS section. Every Kafka topic is a partitioned, retained log; there
+    is no queue-versus-topic choice to make. What decides whether messages are shared out across competing workers
+    or fanned out to every independent listener isn't the topic &mdash; it's the <strong>consumer group</strong>.</p>
+
+    <p data-anchor="msg-p-kafka2"><code>brokers</code> names the bootstrap servers; <code>groupId</code> identifies
+    the group a consumer joins. Kafka assigns each partition of a topic to exactly one consumer instance within a
+    group at a time &mdash; a rebalance reassigns partitions as instances join or leave &mdash; and two different
+    groups reading the same topic each see every message independently, the Kafka equivalent of two topic
+    subscribers in JMS. <code>autoOffsetReset</code> (<code>earliest</code>, <code>latest</code>, or
+    <code>none</code>) decides where a brand-new group starts reading, since unlike a JMS queue there's no concept
+    of "the messages waiting for you" &mdash; there's only a position in the log.</p>
+
+    <div class="callout key" data-anchor="msg-callout-ordering">
+      <span class="callout-title">Ordering is per-partition, not per-topic</span>
+      <p>A single JMS queue naturally preserves the order messages were enqueued in. Kafka only guarantees order
+      <em>within one partition</em> &mdash; two messages on different partitions of the same topic can be delivered
+      out of relative order, because different partitions are consumed in parallel with no coordination between
+      them. A route that needs strict ordering for one logical entity (every event for one order, say) has to key
+      its producer calls so all of that entity's events land on the same partition &mdash; ordering is something
+      you design for, not something the topic hands you by default.</p>
+    </div>
+
+    <div class="pre-label">Keying by orderId keeps one order's events in order</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:publishOrderEvent"</span>)
+    .<span class="fn">setHeader</span>(KafkaConstants.<span class="mac">KEY</span>, <span class="fn">simple</span>(<span class="str">"${body.orderId}"</span>))
+    .<span class="kw">to</span>(<span class="str">"kafka:order.events?brokers=localhost:9092"</span>);</code></pre>
+
+    <h2 data-anchor="msg-h2-commit">Committing offsets: automatic, or on your own terms</h2>
+    <p data-anchor="msg-p-commit1"><code>autoCommitEnable</code> defaults to <code>true</code>, committing offsets
+    on Kafka's own schedule &mdash; simplest, but if the offset auto-commits before a route finishes handling that
+    record and processing then fails, the broker already considers the record consumed. It will not be
+    redelivered; that failure is now the route's problem alone, with no help from Kafka's own redelivery, because
+    from Kafka's point of view there was nothing left to redeliver.</p>
+
+    <p data-anchor="msg-p-commit2">Setting <code>autoCommitEnable=false</code> and <code>allowManualCommit=true</code>
+    exposes a <code>KafkaManualCommit</code> object on the <code>CamelKafkaManualCommit</code> header, which a
+    processor calls once it has genuinely finished with a record &mdash; commit only after success, not before.</p>
+
+    <div class="pre-label">Manual commit, after processing actually succeeds</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"kafka:orders.created?brokers=localhost:9092&amp;groupId=order-fulfillment"</span>
+    + <span class="str">"&amp;autoOffsetReset=earliest&amp;autoCommitEnable=false&amp;allowManualCommit=true"</span>)
+    .<span class="fn">process</span>(exchange -&gt; {
+        <span class="cm">// ... handle the record ...</span>
+        KafkaManualCommit commit = exchange.getIn()
+            .<span class="fn">getHeader</span>(KafkaConstants.<span class="mac">MANUAL_COMMIT</span>, KafkaManualCommit.<span class="kw">class</span>);
+        commit.<span class="fn">commit</span>();
+    });</code></pre>
+
+    <div class="callout warn" data-anchor="msg-callout-manualcommit">
+      <span class="callout-title">Manual commit has to happen on the consumer's own thread</span>
+      <p>Kafka's client-side contract requires records from a partition to be committed by the same thread that
+      polled them. Route a manual-commit exchange through an async EIP, or hand it to a different thread before
+      calling <code>commit()</code>, and the risk isn't a clean error &mdash; it's a
+      <code>ConcurrentModificationException</code> from the underlying Kafka client. Keep the whole
+      poll-process-commit cycle on the consumer's own thread, the same discipline Chapter 20's
+      <code>transacted()</code> demanded of a database transaction bound to one thread.</p>
+    </div>
+
+    <p data-anchor="msg-p-commit3">Two more knobs shape what happens when things go wrong.
+    <code>pollOnError</code> (default <code>ERROR_HANDLER</code>) governs a failure in <em>polling itself</em>:
+    <code>DISCARD</code> drops the batch, <code>RECONNECT</code> tears the consumer down and recreates it,
+    <code>RETRY</code> polls again, <code>STOP</code> halts the route, and <code>ERROR_HANDLER</code> routes the
+    failure into Camel's own error handling. <code>breakOnFirstError</code> (default <code>false</code>) governs a
+    failure in <em>route processing</em> of one record: enabled, the consumer commits the current offset and
+    reconnects so that failing record is retried on the next poll rather than the batch marching past it &mdash; though
+    with auto-commit already in effect for everything earlier in the batch, this can't retroactively undo records
+    that auto-committed before the failure happened.</p>
+
+    <h2 data-anchor="msg-h2-txn-idem">Transactions and idempotency, Kafka-style</h2>
+    <p data-anchor="msg-p-txn1">Setting <code>transacted=true</code> with a <code>transactionalId</code> turns on
+    Kafka's own producer transactions, committing or aborting a batch of produced records atomically together
+    (driven by the exchange's success, failure, or an explicit <code>RollbackOnly</code>). It's tempting to read
+    that as "the Kafka version of Chapter 20's <code>transacted()</code>," but the guarantee is narrower: Kafka
+    transactions are not an XA/JTA two-phase-commit participant. A route that needs a database row and a Kafka
+    event to succeed or fail together as one atomic unit cannot get that from Kafka transactions alone &mdash; that's
+    a distributed-transaction problem Kafka was never designed to solve on its own.</p>
+
+    <p data-anchor="msg-p-txn2">Chapter 16 listed <code>KafkaIdempotentRepository</code> in a comparison table
+    alongside <code>JdbcMessageIdRepository</code>; here's what it actually does. Instead of a database table, it
+    publishes each processed key as an event to a dedicated Kafka topic, and every instance rebuilds its in-memory
+    cache of "already seen" keys from that topic on startup &mdash; finishing after either 30 seconds or an empty
+    poll, whichever comes first. No database in the picture, but the same underlying idea as Chapter 16's
+    idempotent consumer: check a key against a shared repository before letting a message through twice.</p>
+
+    <div class="callout warn" data-anchor="msg-callout-headers-kafka">
+      <span class="callout-title">Not every header value survives onto Kafka</span>
+      <p>Kafka message headers only serialize a narrow set of types: <code>String</code>, <code>Integer</code>,
+      <code>Long</code>, <code>Double</code>, <code>Boolean</code>, and <code>byte[]</code>. A header holding
+      anything else is silently skipped, not rejected with an error &mdash; a header that worked fine in-memory or
+      over JMS can quietly go missing the moment the same route is pointed at <code>kafka:</code> instead, with
+      nothing in the logs to explain why.</p>
+    </div>
+
+    <h2 data-anchor="msg-h2-choosing">JMS or Kafka: two answers to "what happens after I hand this off?"</h2>
+    <div class="table-wrap">
+      <table>
+        <caption>JMS versus Kafka &mdash; different messaging models, different defaults</caption>
+        <thead>
+          <tr><th></th><th>JMS (queue/topic)</th><th>Kafka (partitioned log)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Once consumed&hellip;</td><td>gone from the queue</td><td>still on the log, replayable by offset</td></tr>
+          <tr><td>Sharing work across workers</td><td>a queue, by definition</td><td>a consumer group, explicitly configured</td></tr>
+          <tr><td>Independent listeners each seeing everything</td><td>a topic subscription (durable to survive downtime)</td><td>a second, separate consumer group</td></tr>
+          <tr><td>Ordering guarantee</td><td>preserved on a single queue</td><td>only within one partition</td></tr>
+          <tr><td>Request-reply</td><td>native (temporary reply queue + JMSCorrelationID)</td><td>not a built-in pattern &mdash; modeled with two topics if needed</td></tr>
+          <tr><td>Reach for it when&hellip;</td><td>work items need broker-managed delivery to exactly one consumer</td><td>events need to be retained, replayed, or fanned out to many independent readers</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="msg-p-choosing1">Neither is a strict upgrade of the other &mdash; they encode different answers
+    to the same question. A JMS queue's message is <em>gone</em> once a consumer takes it, which is exactly what you
+    want for "process this order once." A Kafka topic's message stays on the log after every current consumer group
+    has read it, which is exactly what you want when a new service six months from now needs to replay everything
+    that ever happened to build its own view of history. In event-driven route design, that distinction usually
+    settles the choice before any performance number does: is this a work item to be claimed and consumed, or an
+    event other things might want to read again later?</p>
+
+    <div class="pullquote" data-anchor="msg-pullquote">Every transport so far in Part V has answered the same
+    question &mdash; what happens to a message once you hand it off &mdash; a little differently. A file sits until
+    something moves it. An HTTP call answers on the spot or doesn't. A database row is as durable as its
+    transaction. A broker takes the message off your hands and promises to deliver it on its own terms: once, to one
+    worker, off a queue &mdash; or forever, to anyone who asks, off a log. Event-driven route design is mostly the
+    discipline of picking the promise your route actually needs, instead of defaulting to whichever component was
+    already running.</div>
+
+    <h2 data-anchor="msg-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="msg-p-reflection">Two messaging models, both reachable from the same <code>from(...)</code> /
+    <code>to(...)</code> vocabulary this book has used since Chapter 6. JMS gives queues (point-to-point, competing
+    consumers, native request-reply through temporary queues and <code>JMSCorrelationID</code>) and topics
+    (publish-subscribe, durable subscriptions for offline listeners). Kafka gives one model &mdash; a partitioned,
+    retained log &mdash; and lets the consumer group decide whether that log is shared out or fanned out, at the cost
+    of ordering only ever being guaranteed within a partition and offset management being something a route has to
+    reason about explicitly rather than get for free. Both reuse ideas this book already built: JMS's
+    <code>transacted</code> session echoes Chapter 20's <code>transacted()</code>; Kafka's manual-commit thread
+    discipline echoes that same chapter's warning about transactions bound to one thread; and
+    <code>KafkaIdempotentRepository</code> turns out to be Chapter 16's idempotent consumer pattern with a Kafka
+    topic standing in for a database table. Chapter 22 turns from these two specific components to the catalog
+    they came from &mdash; how to read a component's options, and how to judge whether a connector belongs in a
+    route at all.</p>
+
+    <div class="review" data-anchor="msg-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route consumes from <code>jms:topic:order.events</code> without setting a durable subscription, then
+        the consuming service goes offline for an hour during a deploy. What happens to the events published during
+        that hour, and what single option would change that?</li>
+        <li>A Kafka consumer route has <code>autoCommitEnable</code> left at its default and fails partway through
+        handling a record after the offset has already auto-committed. Will that record be redelivered? Why or why
+        not, and what would you change to get a stronger guarantee?</li>
+        <li>Two events for the same order are published to a Kafka topic without setting a key. Why might they be
+        delivered out of order relative to each other, and what change to the producer route would fix it?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="20-databases-and-persistence.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="22-choosing-camel-components.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
