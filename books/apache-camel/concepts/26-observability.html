@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Observability &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VI &mdash; Reliability and Operations</span> &middot; Chapter 26</p>
+    <p class="chapter-no">26</p>
+    <h1 data-anchor="obs-h1">Observability</h1>
+
+    <p class="lede" data-anchor="obs-lede">Chapter 25 ended on a deliberate limit: tests prove a route retries the
+    right number of times and lands in the right dead letter queue <em>before</em> it ships, but they can't tell
+    you what a route is actually doing at two in the morning against a real, misbehaving downstream system. That's
+    "a different kind of watching, done while the route is live" &mdash; and it has a name. Observability isn't one
+    feature; it's four separate instruments, each answering a question the others can't: logs answer <em>what
+    happened to this one message</em>, metrics answer <em>how is the system behaving in aggregate</em>, traces
+    answer <em>where did the time go across every service this message touched</em>, and health checks answer
+    <em>should traffic be routed here right now</em>. Camel has a building block for each.</p>
+
+    <h2 data-anchor="obs-h2-logging">Structured logging: two tools, two very different jobs</h2>
+    <p data-anchor="obs-p-logging1">Camel gives you two ways to write a log line from a route, and confusing them
+    is the single most common observability mistake in a Camel codebase. The <span class="term">Log EIP</span>
+    &mdash; the <code>log()</code> DSL step &mdash; takes a Simple-language message template and an optional
+    level, and is the tool for steady-state production logging: you decide exactly what appears in the line.</p>
+
+    <div class="pre-label">The Log EIP: you choose what's in the line</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="fn">routeId</span>(<span class="str">"orders"</span>)
+    .<span class="fn">log</span>(<span class="ty">LoggingLevel</span>.<span class="en">INFO</span>, <span class="str">"Processing order ${header.orderId} for customer ${header.customerId}"</span>)
+    .<span class="kw">to</span>(<span class="str">"bean:orderService"</span>);</code></pre>
+
+    <p data-anchor="obs-p-logging2">The <code>log:</code> component &mdash; a genuine endpoint, reached with
+    <code>to("log:orderRoute?showAll=true")</code> &mdash; is a different tool for a different moment:
+    <code>showAll=true</code> dumps the <em>entire</em> exchange, every header, every property, and the body,
+    exactly as it stands at that point in the route. That's invaluable while you're building or debugging a
+    route and want to see everything without writing a single field name. It is a poor choice to leave running in
+    production: it's noisy by design, and without <code>logMask</code> also enabled, it will print whatever
+    happens to be sitting in a header or property &mdash; including a credential, if one is.</p>
+
+    <div class="callout warn" data-anchor="obs-callout-mask">
+      <span class="callout-title">logMask doesn't mask by default &mdash; and it isn't limited to log:</span>
+      <p>Set <code>camel.main.logMask=true</code> (or <code>context.setLogMask(true)</code> in Java) and Camel
+      automatically redacts over five dozen well-known sensitive keywords &mdash; <code>password</code>,
+      <code>apiKey</code>, <code>token</code>, <code>secret</code>, and more &mdash; wherever the Log EIP or the
+      <code>log:</code> component would otherwise print a matching header or property value verbatim.
+      <code>camel.main.additionalSensitiveKeywords</code> extends that list with names specific to your domain
+      (<code>ssn</code>, <code>cardNumber</code>, whatever your payloads actually carry). It's off by default,
+      which means a fresh project logging full exchanges for debugging is, by default, also logging secrets in
+      plain text.</p>
+    </div>
+
+    <h2 data-anchor="obs-h2-correlation">Correlation: naming one message across every hop it takes</h2>
+    <p data-anchor="obs-p-correlation1">A single log line is nearly useless on its own; what you actually need is
+    every log line touched by <em>one logical message</em>, in order, across every route and every service it
+    passed through. Camel's answer starts with the <span class="term">breadcrumbId</span>: with
+    <code>useBreadcrumb</code> enabled &mdash; the default &mdash; Camel stamps a <code>breadcrumbId</code>
+    header on an exchange, falling back to the exchange's own <code>messageId</code> when no breadcrumb already
+    exists on an inbound message. Because it's an ordinary header rather than internal exchange state, it survives
+    any transport that preserves headers &mdash; HTTP, JMS, and the rest &mdash; so the same value can be grepped
+    across every service the message visits.</p>
+
+    <figure class="diagram-fig" data-anchor="obs-fig-breadcrumb">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="obsD1t">
+        <title id="obsD1t">One breadcrumbId header travels with the message from the intake route through an HTTP call into a downstream service, letting logs from both be correlated</title>
+        <text x="60" y="20" class="big">Intake route</text>
+        <text x="430" y="20" class="big">Downstream service</text>
+        <path d="M90 30 L90 170" class="stroke-soft dash"/>
+        <path d="M470 30 L470 170" class="stroke-soft dash"/>
+
+        <rect x="46" y="50" width="88" height="30" class="stroke fill-soft"/>
+        <text x="54" y="70">receive order</text>
+
+        <path d="M90 96 L470 96" class="stroke-red"/>
+        <path d="M462 92 L470 96 L462 100" class="stroke-red"/>
+        <text x="150" y="88" class="red mono">breadcrumbId: 8f2c-01</text>
+
+        <rect x="426" y="112" width="88" height="30" class="stroke fill-soft"/>
+        <text x="434" y="132">validate order</text>
+
+        <text x="16" y="160" class="dim">grep 8f2c-01 across both services' logs &rarr; the full path this order took</text>
+      </svg>
+      <figcaption>A breadcrumbId is just a header, so it survives any hop that keeps headers &mdash; the same id names one logical message end to end.</figcaption>
+    </figure>
+
+    <p data-anchor="obs-p-correlation2">Don't confuse this with <code>Exchange.CORRELATION_ID</code>, a
+    separate, Camel-internal exchange <em>property</em> that certain EIPs set on a sub-exchange to link it back to
+    the parent exchange it was split or copied from &mdash; the machinery behind the Splitter and Aggregator
+    correlation you saw in Chapter 13, not something you'd grep in a log file. A route is also free to define its
+    own application-level correlation id &mdash; an <code>orderId</code> or a <code>tenantId</code> header set once
+    near the top of a flow and read back downstream &mdash; and that's often more useful for debugging than
+    <code>breadcrumbId</code> alone, because it means something to the business, not just to Camel.</p>
+
+    <p data-anchor="obs-p-correlation3">Having a correlation id in a header is only half the job; getting it into
+    <em>every</em> log line without threading it through every single <code>log()</code> call by hand is what
+    <span class="term">MDC</span> (Mapped Diagnostic Context) is for. The legacy mechanism,
+    <code>camel.main.useMdcLogging=true</code> (or <code>context.setUseMDCLogging(true)</code>), populates SLF4J's
+    MDC with <code>camel.breadcrumbId</code>, <code>camel.exchangeId</code>, <code>camel.messageId</code>,
+    <code>camel.correlationId</code>, <code>camel.routeId</code>, <code>camel.stepId</code>,
+    <code>camel.contextId</code>, and <code>camel.transactionKey</code> for the duration of processing &mdash; a
+    log pattern referencing <code>%X{camel.exchangeId}</code> ties every line for one exchange together with zero
+    changes to any individual <code>log()</code> call. It's deprecated as of Camel 4.19 in favor of the newer
+    <code>camel-mdc</code> component, which does the same job declaratively: <code>camel.mdc.enabled=true</code>
+    plus <code>camel.mdc.customHeaders</code> promotes chosen exchange headers straight into MDC, instead of a
+    processor calling <code>org.slf4j.MDC.put</code> directly.</p>
+
+    <div class="pre-label">Promoting an order id into every log line, the current way</div>
+    <pre><code>camel.mdc.enabled=<span class="kw">true</span>
+camel.mdc.customHeaders=orderId,tenantId</code></pre>
+
+    <div class="callout warn" data-anchor="obs-callout-mdc-thread">
+      <span class="callout-title">MDC lives on a thread, not on the exchange</span>
+      <p>SLF4J's MDC is thread-local. If a processor calls <code>MDC.put("orderId", id)</code> by hand, that value
+      is only visible to log lines emitted on <em>that same thread</em>. Camel is deeply asynchronous &mdash; a
+      SEDA hop, a thread pool, a redelivery on a scheduler thread &mdash; and a value set by hand does not
+      automatically follow the exchange onto whichever thread picks it up next. It's exactly the failure mode
+      Chapter 17's async endpoints introduce: correct on the thread you tested, silently missing on the one
+      production actually uses. The <code>camel-mdc</code> component sidesteps this entirely, because the value
+      travels with the <em>exchange</em> (as a header), not with a thread.</p>
+    </div>
+
+    <h2 data-anchor="obs-h2-metrics">Metrics: counting and timing without touching every route</h2>
+    <p data-anchor="obs-p-metrics1">Logs answer what happened to one message; metrics answer how the whole system
+    is behaving, in aggregate, over time. Camel's <code>camel-micrometer</code> component ships a
+    <span class="term">MicrometerRoutePolicyFactory</span> that instruments <em>every</em> route in a
+    <code>CamelContext</code> with counters and timers, with no per-route code at all &mdash; register it once:</p>
+
+    <div class="pre-label">One factory, every route instrumented</div>
+    <pre><code><span class="mac">@Bean</span>
+<span class="ty">MicrometerRoutePolicyFactory</span> <span class="fn">micrometerRoutePolicyFactory</span>() {
+    <span class="kw">return</span> <span class="kw">new</span> <span class="ty">MicrometerRoutePolicyFactory</span>();
+}</code></pre>
+
+    <p data-anchor="obs-p-metrics2">That single bean produces <code>camel.exchanges.total</code>,
+    <code>camel.exchanges.succeeded</code>, <code>camel.exchanges.failed</code>,
+    <code>camel.exchanges.failures.handled</code>, and <code>camel.exchanges.external.redeliveries</code> as
+    counters, plus a <code>camel.route.policy</code> timer capturing exchange duration, per route, automatically.
+    (Camel 3.21 and later use Micrometer's dotted naming convention shown here; older versions used camelCase
+    names like <code>CamelExchangesTotal</code> &mdash; worth knowing if you're reading a dashboard built against
+    an older Camel version.) It's easy to assume adding <code>camel-micrometer-starter</code> to a Spring Boot
+    project is enough on its own &mdash; it isn't. Spring Boot's autoconfiguration wires Camel's metrics into
+    whatever <code>MeterRegistry</code> bean is on the classpath (typically from
+    <code>spring-boot-starter-actuator</code>), but the route-policy factory itself still needs the explicit bean
+    above, or the equivalent <code>camelContext.addRoutePolicyFactory(...)</code> call in plain Java. Once it's
+    registered, the counters land on the same <code>/actuator/prometheus</code> endpoint as the JVM and HTTP
+    metrics &mdash; no separate registry to stand up.</p>
+
+    <p data-anchor="obs-p-metrics3">The route policy factory gives you Camel's own operational numbers for free.
+    For a business metric &mdash; orders processed, dollars refunded, files rejected &mdash; use the
+    <code>micrometer:counter</code> and <code>micrometer:timer</code> endpoints directly inside a route:</p>
+
+    <div class="pre-label">A business-level counter and a timed block</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:orders"</span>)
+    .<span class="kw">to</span>(<span class="str">"micrometer:timer:order.process?action=start"</span>)
+    .<span class="kw">to</span>(<span class="str">"bean:orderService"</span>)
+    .<span class="kw">to</span>(<span class="str">"micrometer:timer:order.process?action=stop"</span>)
+    .<span class="kw">to</span>(<span class="str">"micrometer:counter:orders.processed"</span>);</code></pre>
+
+    <p data-anchor="obs-p-metrics4"><code>micrometer:counter</code> increments by 1 by default, or by whatever
+    the <code>increment</code>/<code>decrement</code> URI option (or the matching
+    <code>CamelMetricsCounterIncrement</code>/<code>CamelMetricsCounterDecrement</code> header) says.
+    <code>micrometer:timer</code> works as a pair &mdash; <code>action=start</code> before the block you're
+    measuring, <code>action=stop</code> after it &mdash; and reports the elapsed time between the two as one named
+    Micrometer timer, independent of whatever the automatic route-policy timer is already recording for the route
+    as a whole.</p>
+
+    <h2 data-anchor="obs-h2-tracing">Distributed tracing: where did the time actually go</h2>
+    <p data-anchor="obs-p-tracing1">A metric tells you the p99 latency went up. It doesn't tell you
+    <em>where</em>, when the request touched Camel, a downstream REST API, a database, and a message broker along
+    the way. That's what a <span class="term">trace</span> is for: one request, one trace id, a span per hop, so a
+    slow request shows up as one wide bar instead of four separate, disconnected numbers. Camel's
+    <code>camel-opentelemetry</code> component captures a span for every message sent to or from Camel; add
+    <code>camel-opentelemetry-starter</code> to a Spring Boot project and configure it through either the
+    OpenTelemetry Java agent or Spring Boot Actuator plus <code>micrometer-tracing-bridge-otel</code>. Incoming
+    trace context arrives on the standard W3C <code>traceparent</code> header, which shows up in a route like any
+    other header.</p>
+
+    <div class="callout key" data-anchor="obs-callout-otel2">
+      <span class="callout-title">camel-opentelemetry is deprecated &mdash; new work should use camel-opentelemetry2</span>
+      <p>As of Camel 4.19.0, <code>camel-opentelemetry</code> is deprecated in favor of
+      <code>camel-opentelemetry2</code>, its replacement and the recommended choice for new tracing work. Both
+      ship in the 4.18 LTS / 4.20 lines this book targets, so existing code on the older component keeps working
+      &mdash; but reach for the v2 component when you're starting something new.</p>
+    </div>
+
+    <p data-anchor="obs-p-tracing2">Tracing and MDC logging meet at exactly one point, and it's worth knowing
+    about deliberately rather than discovering by accident: OpenTelemetry's logger auto-instrumentation adds
+    <code>trace_id</code> and <code>span_id</code> into the very same MDC map Camel's own MDC keys populate. One
+    log line can then be filtered by a Camel-native identifier (<code>camel.exchangeId</code>,
+    <code>camel.routeId</code>) <em>and</em> a distributed trace identifier (<code>trace_id</code>) at the same
+    time &mdash; the local exchange and the cross-service trace it belongs to, in one grep.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Four instruments, four different questions</caption>
+        <thead>
+          <tr><th>Instrument</th><th>Answers</th><th>Camel building block</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Logs</td><td>What happened to this one message?</td><td>Log EIP, breadcrumbId, MDC / camel-mdc</td></tr>
+          <tr><td>Metrics</td><td>How is the system behaving in aggregate?</td><td>camel-micrometer, MicrometerRoutePolicyFactory</td></tr>
+          <tr><td>Traces</td><td>Where did the time go, across every service?</td><td>camel-opentelemetry2</td></tr>
+          <tr><td>Health checks</td><td>Should traffic be routed here right now?</td><td>camel-health</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="obs-h2-health">Health checks: readiness and liveness are different questions</h2>
+    <p data-anchor="obs-p-health1">With <code>camel-health</code> on the classpath, Camel automatically registers
+    four kinds of check: a <b>context</b> check (is the <code>CamelContext</code> started), a <b>routes</b> check
+    (are all discovered routes started), a <b>consumers</b> check (per-consumer input checks), and a
+    <b>registry</b> check (any custom <code>HealthCheck</code> beans you've added). Producer checks are opt-in
+    &mdash; <code>camel.health.producersEnabled=true</code> &mdash; and each category can be toggled independently
+    with <code>camel.health.routesEnabled</code>, <code>camel.health.consumersEnabled</code>, and
+    <code>camel.health.registryEnabled</code>.</p>
+
+    <p data-anchor="obs-p-health2">A health check is, by default, used for <em>both</em> readiness and liveness
+    &mdash; and those are genuinely different questions that deserve different answers. <b>Readiness</b> asks
+    "should traffic be routed to this instance right now?" <b>Liveness</b> asks "is this process healthy enough to
+    keep running, or should the platform restart it?" A custom check overrides <code>isReadiness()</code> and/or
+    <code>isLiveness()</code> to restrict itself to one:</p>
+
+    <div class="pre-label">A downstream outage should stop traffic, not trigger a restart</div>
+    <pre><code><span class="kw">public</span> <span class="kw">class</span> <span class="ty">DownstreamHealthCheck</span> <span class="kw">extends</span> <span class="ty">AbstractHealthCheck</span> {
+    <span class="kw">public</span> <span class="fn">DownstreamHealthCheck</span>() { <span class="kw">super</span>(<span class="str">"custom"</span>, <span class="str">"downstream-order-api"</span>); }
+
+    <span class="mac">@Override</span>
+    <span class="kw">protected</span> <span class="kw">void</span> <span class="fn">doCall</span>(<span class="ty">HealthCheckResultBuilder</span> builder, <span class="ty">Map</span>&lt;<span class="ty">String</span>, <span class="ty">Object</span>&gt; options) {
+        <span class="kw">if</span> (orderApiClient.<span class="fn">isReachable</span>()) {
+            builder.<span class="fn">up</span>();
+        } <span class="kw">else</span> {
+            builder.<span class="fn">down</span>().<span class="fn">message</span>(<span class="str">"order-api unreachable"</span>);
+        }
+    }
+
+    <span class="mac">@Override</span>
+    <span class="kw">public</span> <span class="kw">boolean</span> <span class="fn">isLiveness</span>() { <span class="kw">return</span> <span class="kw">false</span>; } <span class="cm">// readiness-only</span>
+}</code></pre>
+
+    <div class="callout warn" data-anchor="obs-callout-readiness">
+      <span class="callout-title">Failing liveness for a problem you can't fix by restarting is a self-inflicted outage</span>
+      <p>If the downstream order API check above answered both readiness <em>and</em> liveness, a thirty-second
+      blip in that API would make Kubernetes conclude the pod itself is unhealthy and restart it &mdash; which
+      does nothing for an API that's down, throws away in-flight work, and adds a cold-start delay on top of the
+      original outage. Restricting the check to readiness gets the same protective effect &mdash; the load
+      balancer stops sending it traffic &mdash; without the process being killed for a problem that was never
+      its own.</p>
+    </div>
+
+    <p data-anchor="obs-p-health3">Spring Boot exposes the aggregated result at <code>/actuator/health</code>,
+    folding Camel's checks into Spring's own health groups; Quarkus exposes the equivalent at
+    <code>/q/health</code>, split into <code>/q/health/ready</code> and <code>/q/health/live</code> &mdash; the
+    same readiness/liveness split, just at two separate URLs instead of one document.</p>
+
+    <div class="pullquote" data-anchor="obs-pullquote">A route that's never been watched in production is running
+    on faith. Logs, metrics, traces, and health checks are how "it's probably fine" becomes something you can
+    actually check &mdash; four different windows onto the same running system, each one blind to what the others
+    see clearly.</div>
+
+    <h2 data-anchor="obs-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="obs-p-reflection">A vocabulary for the four separate jobs "observability" quietly bundles
+    together, and a Camel building block for each: the Log EIP for deliberate production log lines, and the
+    <code>log:</code> component reserved for debugging, both aware of <code>logMask</code>; a breadcrumbId that
+    names one message across every header-preserving hop, and MDC (now <code>camel-mdc</code>) to get that id, and
+    whatever else you choose, into every log line without threading it through every call by hand;
+    <code>MicrometerRoutePolicyFactory</code> for automatic per-route counters and timers, plus
+    <code>micrometer:counter</code>/<code>timer</code> for the business metrics only your route knows about;
+    <code>camel-opentelemetry2</code> for a trace that shows where time actually went across every service a
+    message touched; and <code>camel-health</code>'s context/routes/consumers/registry checks, deliberately split
+    into readiness and liveness so a downstream outage stops traffic instead of restarting a perfectly healthy
+    process. None of this fixes anything by itself &mdash; it's how you find out something needs fixing, and where
+    to look. The next chapter turns to a quieter but no less operational concern: how the configuration and
+    secrets these components read &mdash; the JMS broker URL, the API key, the feature flag &mdash; get into a
+    Camel application in the first place, safely, per environment.</p>
+
+    <div class="review" data-anchor="obs-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route logs <code>to("log:orders?showAll=true")</code> in production, and a customer's card number
+        shows up in a log aggregator. Name two independent settings that, applied together, would have prevented
+        this without removing the log line.</li>
+        <li>You enable <code>camel.main.useMdcLogging=true</code> and call <code>MDC.put("tenantId", id)</code>
+        by hand inside a processor just before a SEDA hop. On the far side of that hop, the log lines are missing
+        <code>tenantId</code>. Why, and what's the fix that doesn't involve threading the value through every
+        downstream <code>log()</code> call?</li>
+        <li>A custom <code>HealthCheck</code> pings a downstream payments API and, by default, answers both
+        readiness and liveness questions. The payments API has a thirty-second blip. What happens to the pod, and
+        what one-line change avoids it?</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="25-testing-camel-routes.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="27-configuration-and-secrets.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
