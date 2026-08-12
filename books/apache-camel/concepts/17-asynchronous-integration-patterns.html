@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Asynchronous Integration Patterns &middot; Apache Camel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="apache-camel">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part IV &mdash; Core Integration Patterns</span> &middot; Chapter 17</p>
+    <p class="chapter-no">17</p>
+    <h1 data-anchor="async-h1">Asynchronous Integration Patterns</h1>
+
+    <p class="lede" data-anchor="async-lede">Chapter 6 made a promise it didn't keep yet: <code>direct:</code>
+    endpoints call a route the way a method call invokes a function &mdash; same thread, no queue, no boundary
+    &mdash; and when you actually want to hand a message off and move on without waiting, Part IV's
+    <code>seda:</code> component and the Wire Tap pattern are built for that. Chapter 16 ended on the same open
+    question from a different angle: three EIPs for surviving a retried, reordered, or bursty delivery, and then
+    the admission that none of them touch the more basic question of whether your route should be <em>blocking on
+    the downstream call at all</em>. This chapter is where both threads close. We'll put <code>direct:</code> and
+    <code>seda:</code> side by side to see exactly what "asynchronous" buys you and what it costs, revisit Wire Tap
+    with the machinery this time instead of just the idea, and turn Chapter 8's InOnly/InOut vocabulary from a fact
+    about the Exchange into a design decision you make on purpose.</p>
+
+    <h2 data-anchor="async-h2-direct-vs-seda">direct: and seda: are the same interface, opposite threading models</h2>
+    <p data-anchor="async-p-directseda1">Both <code>direct:</code> and <code>seda:</code> connect two routes inside
+    one <code>CamelContext</code> &mdash; no network, no serialization, both routes live in the same JVM. That's
+    where the resemblance ends. A <code>direct:</code> producer calls straight into the consumer's processor chain,
+    in the same method call, on the same thread; there's no queue anywhere in the path, which is exactly why a slow
+    <code>direct:</code> consumer route stalls whatever called it, as Chapter 6's callout warned. A
+    <code>seda:</code> producer does something structurally different: it builds a copy of the Exchange, places
+    that copy on an in-memory <code>BlockingQueue</code>, and returns &mdash; a separate consumer thread pulls the
+    copy off the queue and processes it independently. The producer's thread and the consumer's thread are no
+    longer the same thread, which is the entire trick.</p>
+
+    <div class="pre-label">Same shape, opposite threading &mdash; direct: blocks, seda: hands off</div>
+    <pre><code><span class="cm">// direct: — synchronous, one thread does the whole thing</span>
+<span class="kw">from</span>(<span class="str">"direct:orderReceived"</span>)
+    .<span class="kw">to</span>(<span class="str">"direct:validateOrder"</span>);   <span class="cm">// caller waits here</span>
+
+<span class="cm">// seda: — producer hands off, a separate thread consumes</span>
+<span class="kw">from</span>(<span class="str">"direct:orderReceived"</span>)
+    .<span class="kw">to</span>(<span class="str">"seda:notifyWarehouse?concurrentConsumers=5"</span>);   <span class="cm">// returns immediately</span>
+
+<span class="kw">from</span>(<span class="str">"seda:notifyWarehouse"</span>)
+    .<span class="fn">log</span>(<span class="str">"Notifying warehouse for order ${header.OrderId}"</span>)
+    .<span class="kw">to</span>(<span class="str">"http:warehouse.internal/notify"</span>);</code></pre>
+
+    <figure class="diagram-fig" data-anchor="async-fig-seda">
+      <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="asyncD1t">
+        <title id="asyncD1t">A producer thread enqueues a copy of the exchange onto a bounded SEDA queue and returns; two independent consumer threads pull from the queue in parallel</title>
+
+        <rect x="16" y="82" width="120" height="40" class="stroke fill-soft"/>
+        <text x="26" y="106" class="big">Producer thread</text>
+
+        <path d="M136 102 L192 102" class="stroke"/>
+        <path d="M184 98 L192 102 L184 106" class="stroke"/>
+        <text x="140" y="88" class="dim">enqueue copy</text>
+
+        <rect x="192" y="60" width="160" height="84" class="stroke fill-red"/>
+        <text x="202" y="80" class="big on-ink">seda: queue</text>
+        <text x="202" y="98" class="mono on-ink">LinkedBlockingQueue</text>
+        <text x="202" y="114" class="mono on-ink">size = 1000 (default)</text>
+        <text x="202" y="132" class="on-ink">returns to caller now</text>
+
+        <path d="M352 84 L430 50" class="stroke-soft"/>
+        <path d="M422 48 L430 50 L426 57" class="stroke-soft"/>
+        <path d="M352 120 L430 154" class="stroke-soft"/>
+        <path d="M424 149 L430 154 L422 156" class="stroke-soft"/>
+
+        <rect x="430" y="28" width="114" height="40" class="stroke fill-none"/>
+        <text x="440" y="52" class="big">Consumer 1</text>
+        <rect x="430" y="134" width="114" height="40" class="stroke fill-none"/>
+        <text x="440" y="158" class="big">Consumer 2</text>
+        <text x="430" y="18" class="dim">concurrentConsumers=2</text>
+      </svg>
+      <figcaption>seda: decouples producer and consumer threads through a bounded in-memory queue; direct: has no queue at all &mdash; the producer's own thread runs the consumer's route directly.</figcaption>
+    </figure>
+
+    <div class="callout warn" data-anchor="async-callout-jvmonly">
+      <span class="callout-title">Decoupled, not durable</span>
+      <p>A <code>seda:</code> queue lives entirely in one JVM's heap. It isn't shared across other instances of the
+      same route, and it isn't persisted. If the process crashes or the route stops with messages still queued,
+      those messages are simply gone &mdash; <code>seda:</code> doesn't give you at-least-once delivery the way a
+      broker would; it only gives you a thread hand-off inside the process that's currently running. If you need the
+      queue itself to survive a restart or to be visible from a second instance, that's what Chapter 21's JMS and
+      Kafka components are for.</p>
+    </div>
+
+    <h2 data-anchor="async-h2-tuning">Tuning the queue: concurrentConsumers, size, and what happens when it's full</h2>
+    <p data-anchor="async-p-tuning1">Three URI options decide how a <code>seda:</code> queue actually behaves under
+    load, and the defaults are worth knowing precisely, because they're easy to assume wrong.
+    <code>concurrentConsumers</code> defaults to <code>1</code> &mdash; a fresh <code>seda:</code> endpoint is
+    single-threaded on the consuming side until you say otherwise, capped at 500 by
+    <code>limitConcurrentConsumers</code> (default <code>true</code>) so a typo doesn't spin up an unbounded thread
+    pool. The queue's capacity, <code>size</code>, defaults to <code>1000</code> &mdash; not unbounded, a common
+    assumption that doesn't hold. And what happens once that queue is full is controlled by two mutually exclusive
+    flags: <code>blockWhenFull</code> and <code>discardWhenFull</code>, both <code>false</code> by default.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>What a seda: producer does when the queue is full, by option</caption>
+        <thead>
+          <tr><th>Configuration</th><th>Behavior on a full queue</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>blockWhenFull=false, discardWhenFull=false</code> (default)</td><td>Throws <code>IllegalStateException</code> immediately</td></tr>
+          <tr><td><code>blockWhenFull=true</code></td><td>Producer thread blocks until space frees up, or until <code>offerTimeout</code> elapses</td></tr>
+          <tr><td><code>discardWhenFull=true</code></td><td>Message is silently dropped &mdash; no exception, no trace</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="async-p-tuning2">Enabling both <code>blockWhenFull</code> and <code>discardWhenFull</code> at
+    once isn't a subtle configuration &mdash; Camel throws <code>IllegalArgumentException</code> at startup rather
+    than let you define a queue that can't decide what it wants to do. Pick one on purpose: block if a producer that
+    briefly pausing is an acceptable cost for never losing a message; discard if losing an occasional message under
+    a genuine spike is fine and you'd rather keep the producer moving.</p>
+
+    <div class="pre-label">A wider, blocking queue for a bursty upstream</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:incomingEvents"</span>)
+    .<span class="kw">to</span>(<span class="str">"seda:eventLog?size=5000&amp;blockWhenFull=true&amp;offerTimeout=2000"</span>);</code></pre>
+
+    <p data-anchor="async-p-tuning3">Two more options round out the picture. <code>multipleConsumers</code>
+    (default <code>false</code>) flips <code>seda:</code> from point-to-point &mdash; one message, one consumer
+    &mdash; into publish-subscribe: every consumer registered on that endpoint gets its own copy of each message,
+    the in-VM equivalent of a JMS topic. And <code>purgeWhenStopping</code> (default <code>false</code>) discards
+    whatever's still queued when the route stops, letting shutdown finish faster at the cost of dropping that
+    backlog rather than draining it &mdash; consistent with the "decoupled, not durable" warning above.</p>
+
+    <h2 data-anchor="async-h2-wait">waitForTaskToComplete: choosing whether the producer waits at all</h2>
+    <p data-anchor="async-p-wait1">Enqueueing is only half the story. The other half is what the <em>producer's</em>
+    thread does next, and that's governed by <code>waitForTaskToComplete</code>, which takes three values.
+    <code>Never</code> returns to the caller the instant the message is on the queue, full stop.
+    <code>Always</code> makes the producer wait for the consumer to finish, regardless of exchange pattern.
+    <code>IfReplyExpected</code> &mdash; the default &mdash; splits the difference along exactly the line Chapter 8
+    drew: it waits only if the exchange is request-reply (<code>InOut</code>), and returns immediately for a
+    one-way (<code>InOnly</code>) exchange. A default <code>seda:to()</code> call on the ordinary <code>InOnly</code>
+    exchanges most routes carry behaves like <code>Never</code> without anyone having to say so.</p>
+
+    <p data-anchor="async-p-wait2">When you do wait &mdash; <code>Always</code>, or <code>IfReplyExpected</code> on
+    an <code>InOut</code> exchange &mdash; <code>timeout</code> (default <code>30000</code>ms) bounds how long. Let
+    it elapse and Camel sets an <code>ExchangeTimedOutException</code> on the exchange the producer is holding and
+    removes the still-queued, unconsumed copy from the queue outright &mdash; the consumer never gets a chance to
+    process a message its own producer has already given up waiting for.</p>
+
+    <div class="pre-label">Forcing a wait, with a real timeout instead of the indefinite default</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"direct:priceQuote"</span>)
+    .<span class="kw">to</span>(<span class="str">"seda:pricingEngine?waitForTaskToComplete=Always&amp;timeout=5000"</span>);</code></pre>
+
+    <div class="callout key" data-anchor="async-callout-copy">
+      <span class="callout-title">The producer and consumer never share one mutable Exchange</span>
+      <p>Whichever <code>waitForTaskToComplete</code> mode is in play, the producer never hands the consumer thread
+      its own live Exchange object. It builds a correlated <em>copy</em> &mdash; a separate instance, with its own
+      unit of work &mdash; and queues that. If the producer is waiting, Camel copies the results back onto the
+      original exchange once the consumer finishes, rather than the two threads ever touching one shared, mutable
+      Exchange at the same time. That's what makes <code>seda:</code> safe to use with concurrent consumers in the
+      first place &mdash; there's nothing to race on.</p>
+    </div>
+
+    <h2 data-anchor="async-h2-wiretap">Wire Tap, properly this time: always a copy, always InOnly, always another thread</h2>
+    <p data-anchor="async-p-wiretap1">Chapter 3 introduced Wire Tap as "copy a message to a secondary destination
+    without disturbing the primary flow." Now that <code>seda:</code>'s machinery is on the table, here's precisely
+    how that promise is kept. <code>wireTap()</code> always copies the Exchange and forces the copy's pattern to
+    <code>InOnly</code> &mdash; fire-and-forget &mdash; no matter what pattern the main route is running, then
+    dispatches that copy on a separate thread so it runs alongside the primary route instead of in front of it.</p>
+
+    <div class="pre-label">Tapping a validated order for an audit trail, without slowing the primary route</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.validated"</span>)
+    .<span class="fn">wireTap</span>(<span class="str">"direct:auditLog"</span>)
+        .<span class="fn">executorService</span>(auditThreadPool)
+        .<span class="fn">onPrepare</span>(<span class="kw">new</span> DeepCloneOrder())
+    .<span class="kw">to</span>(<span class="str">"direct:processOrder"</span>);</code></pre>
+
+    <p data-anchor="async-p-wiretap2">Two details in that snippet aren't decoration. <code>wireTap()</code>'s copy
+    is <em>shallow</em> by default &mdash; it copies the Exchange, not a deep clone of the message body and headers,
+    so the tap and the original can end up sharing the same underlying mutable objects. <code>onPrepare()</code> is
+    the escape hatch: hand it a <code>Processor</code> and it runs against the copy before dispatch, which is where
+    a genuine deep clone belongs if the primary route or the tapped route might mutate shared state.
+    <code>executorService()</code> is the other detail: without one, Wire Tap falls back to Camel's shared default
+    async pool (10 core threads, 20 max, a queue of 1000, <code>CallerRuns</code> as the rejection policy).</p>
+
+    <div class="callout warn" data-anchor="async-callout-callerruns">
+      <span class="callout-title">CallerRuns means "async" can quietly become "synchronous" under load</span>
+      <p>Once the default pool and its queue are both saturated, Java's <code>CallerRunsPolicy</code> does exactly
+      what its name says: it runs the rejected task on the calling thread instead of throwing it away. A wire tap
+      you configured expecting it to never touch the primary route's latency can, under sustained load, start
+      running synchronously on that very thread &mdash; a source of unexplained latency spikes that looks nothing
+      like an obvious failure. A dedicated <code>executorService</code> with its own sizing is the fix, not a
+      symptom to chase after the fact.</p>
+      <p>The same fire-and-forget design has a second, quieter cost: because the primary route's callback fires
+      before the tapped copy finishes routing, an exception thrown <em>inside</em> the tapped route is recorded on
+      the tap's own exchange, never the original. The primary route has no idea the tap failed unless the tapped
+      route is given its own error handling &mdash; its own <code>onException</code> or dead-letter destination.</p>
+    </div>
+
+    <h2 data-anchor="async-h2-mep">InOnly and InOut, as a decision instead of a fact</h2>
+    <p data-anchor="async-p-mep1">Chapter 8 introduced <code>ExchangePattern</code> as a fact riding along on every
+    Exchange: <code>InOnly</code> for one-way, fire-and-forget delivery, <code>InOut</code> for request-reply, where
+    the caller waits and a response comes back. What's worth adding here is where that fact comes from by default,
+    because it's what makes <code>seda:</code>'s <code>waitForTaskToComplete=IfReplyExpected</code> do the right
+    thing without any extra configuration on most routes: <span class="term">SEDA</span>, <span
+    class="term">JMS</span>, and <span class="term">File</span> all default to <code>InOnly</code>. JMS is the one
+    exception worth knowing in detail &mdash; it auto-detects per message, based on whether the incoming message
+    carries a <code>JMSReplyTo</code> header. If it does, the JMS consumer treats that exchange as <code>InOut</code>
+    and the producer side honors it by creating a temporary reply queue, setting <code>JMSReplyTo</code> and a
+    <code>JMSCorrelationID</code> on the outbound request, and matching the eventual reply back to it by that
+    correlation ID.</p>
+
+    <p data-anchor="async-p-mep2">Overriding the pattern is a route-side decision, and it only works in one
+    direction from the URI: <code>exchangePattern=InOnly</code> or <code>InOut</code> as a URI parameter is only
+    honored on a <em>consumer</em> endpoint, inside a <code>from(...)</code>. Trying the same parameter on a
+    <code>to(...)</code> producer URI to control whether that one step waits doesn't do what it looks like &mdash;
+    for that, reach for <code>.setExchangePattern(ExchangePattern.InOnly|InOut)</code> in the DSL, which takes
+    effect from that point in the route onward, or the two-argument form Chapter 8 already showed for a single step.</p>
+
+    <div class="pre-label">Forcing InOut on one step, the form Chapter 8 introduced</div>
+    <pre><code><span class="kw">from</span>(<span class="str">"jms:queue:orders.raw"</span>)
+    .<span class="kw">to</span>(<span class="ty">ExchangePattern</span>.InOut, <span class="str">"bean:pricingService?method=quote"</span>)
+    .<span class="fn">log</span>(<span class="str">"Quoted price: ${body}"</span>);</code></pre>
+
+    <h2 data-anchor="async-h2-designdecision">Request-reply versus event-driven: the design question underneath all of it</h2>
+    <p data-anchor="async-p-design1">Every option in this chapter &mdash; <code>direct:</code> versus
+    <code>seda:</code>, <code>InOnly</code> versus <code>InOut</code>, whether a Wire Tap can afford to lose its
+    own errors &mdash; is really one design question wearing different clothes: does the producer need to know the
+    outcome before it can move on? Hohpe and Woolf named the two answers <span class="term">Request-Reply</span>
+    and <span class="term">Event-Driven Consumer</span>, and Camel's two exchange patterns are a direct
+    implementation of that same choice, not a coincidence of naming.</p>
+
+    <figure class="diagram-fig" data-anchor="async-fig-compare">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="asyncD2t">
+        <title id="asyncD2t">Request-reply: the caller sends a request and blocks until a reply arrives. Event-driven: the caller fires a message and continues immediately, while a separate consumer processes it whenever it's handed the message</title>
+
+        <text x="16" y="20">Request-Reply &mdash; InOut</text>
+        <rect x="16" y="30" width="130" height="32" class="stroke fill-soft"/>
+        <text x="26" y="51" class="big">Caller thread</text>
+        <path d="M146 40 L330 40" class="stroke"/>
+        <path d="M322 36 L330 40 L322 44" class="stroke"/>
+        <text x="180" y="34" class="dim">request</text>
+        <rect x="330" y="30" width="130" height="32" class="stroke"/>
+        <text x="340" y="51" class="big">Quote service</text>
+        <path d="M330 56 L146 56" class="stroke-soft dash"/>
+        <path d="M154 52 L146 56 L154 60" class="stroke-soft"/>
+        <text x="180" y="70" class="red">blocked waiting for reply</text>
+
+        <path d="M16 92 L544 92" class="stroke-soft"/>
+
+        <text x="16" y="112">Event-Driven &mdash; InOnly</text>
+        <rect x="16" y="122" width="130" height="32" class="stroke fill-red"/>
+        <text x="26" y="143" class="big on-ink">Caller thread</text>
+        <path d="M146 132 L280 132" class="stroke"/>
+        <path d="M272 128 L280 132 L272 136" class="stroke"/>
+        <text x="150" y="126" class="dim">fire</text>
+        <text x="284" y="137">continues immediately &mdash; no wait</text>
+        <path d="M60 154 L60 162 L280 162 L280 154" class="stroke-soft dash"/>
+        <text x="120" y="170" class="dim">consumer processes it independently, on its own schedule</text>
+      </svg>
+      <figcaption>The same tradeoff Hohpe &amp; Woolf described for messaging generally: InOut ties the caller's own thread to the round trip; InOnly frees it, at the cost of never directly knowing how the tap or the queued consumer turned out.</figcaption>
+    </figure>
+
+    <p data-anchor="async-p-design2">Neither shape is the "correct" default &mdash; each is the right tool for a
+    different question. Reach for request-reply (<code>InOut</code>, a synchronous <code>to()</code>, or
+    <code>seda:</code> with <code>waitForTaskToComplete=Always</code>) when the route's own next step genuinely
+    can't proceed without the answer: a price quote it has to embed in the response, a validation result that
+    decides which branch runs next. Reach for event-driven (<code>InOnly</code>, plain <code>seda:</code>, Wire Tap)
+    when the producer's job is done the moment the message is handed off: an audit log entry, a notification, a
+    downstream system that will get to the message on its own schedule. The cost of the second choice isn't
+    hypothetical &mdash; it's exactly the "decoupled, not durable" and "CallerRuns" callouts above. Event-driven
+    integration buys you a caller that doesn't wait; it doesn't buy you a caller that automatically finds out when
+    something downstream went wrong.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Three tools, one underlying axis: does the caller wait?</caption>
+        <thead>
+          <tr><th></th><th>direct:</th><th>seda:</th><th>wireTap()</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Threading</td><td>Same thread as caller</td><td>Separate consumer thread(s)</td><td>Separate thread, own pool</td></tr>
+          <tr><td>Default exchange pattern</td><td>Follows the route</td><td>InOnly</td><td>Always forced to InOnly</td></tr>
+          <tr><td>Caller waits by default?</td><td>Always (it's a direct call)</td><td>Only if InOut (IfReplyExpected)</td><td>Never</td></tr>
+          <tr><td>Survives a crash mid-flight?</td><td>N/A &mdash; nothing queued</td><td>No &mdash; in-memory only</td><td>No &mdash; in-memory only</td></tr>
+          <tr><td>Best fit</td><td>"Extract a method" between routes</td><td>Decoupled hand-off, still in-JVM</td><td>Audit/log/notify a copy, unmodified primary flow</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pullquote" data-anchor="async-pullquote">Async isn't a performance switch you flip &mdash; it's a
+    promise you stop making. The moment a route stops waiting for an answer, it also stops knowing one, and every
+    option in this chapter is really about deciding, on purpose, which of those two things you'd rather have.</div>
+
+    <h2 data-anchor="async-h2-reflection">So what did we actually gain?</h2>
+    <p data-anchor="async-p-reflection">A vocabulary for exactly one question: should this step wait? <code>direct:</code>
+    always does, because there's no queue to hand off to. <code>seda:</code> lets you choose, per endpoint and per
+    exchange, through <code>waitForTaskToComplete</code> and the pattern on the exchange itself. Wire Tap answers
+    the question by never waiting, on purpose, in exchange for never directly knowing if the tap succeeded. None of
+    this makes a route more reliable on its own &mdash; that was Chapter 16's job, and it still applies equally to
+    an asynchronous hand-off, which can drop a queued message on a crash just as easily as a synchronous one drops a
+    connection. What changes here is only who's waiting, and for how long. Chapter 18 turns from patterns for
+    moving a message inside your own JVM to the real external systems those messages actually come from and go to
+    &mdash; starting with files, SFTP, and object storage.</p>
+
+    <div class="review" data-anchor="async-review">
+      <h4>Check yourself</h4>
+      <ol>
+        <li>A route sends to <code>seda:notify?waitForTaskToComplete=Always&amp;timeout=2000</code>, but the
+        exchange it sends is <code>InOnly</code>. Does the producer wait? For how long, and what happens to the
+        exchange if the consumer hasn't finished by the time the timeout elapses?</li>
+        <li>A <code>seda:</code> endpoint is configured with the defaults for <code>blockWhenFull</code> and
+        <code>discardWhenFull</code>. A burst of traffic fills its queue past <code>size</code>. What does the next
+        producer that tries to send to it observe, and how would that change if you set <code>discardWhenFull=true</code>
+        instead?</li>
+        <li>A <code>wireTap()</code> call has no <code>executorService</code> configured and the tapped route throws
+        an exception under heavy load. Name two separate ways this can go wrong for the primary route that a reader
+        who only knows "Wire Tap runs async" wouldn't expect.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="16-reliable-message-delivery.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="18-files-sftp-and-object-storage.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
