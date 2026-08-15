@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Guided Project: Build a Minimal EDI Service &mdash; EDI - Intro</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="edi-intro">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="book-runner">
+      <span class="runner-title">EDI &mdash; Intro</span>
+      <a rel="home" href="../index.html">Contents</a>
+    </header>
+
+    <h1 data-anchor="ch16-h1"><span class="chapter-number">Chapter Sixteen</span>A Guided Project: Build a Minimal EDI Service</h1>
+    <p class="lede" data-anchor="ch16-lede">One transaction set, one partner, one afternoon &mdash;
+    but with the four properties that separate a parser demo from something you could actually
+    operate.</p>
+
+    <p class="dropcap" data-anchor="ch16-p1">Time to build. The scope is deliberately narrow: receive
+    an X12 850 over SFTP or HTTP, validate it against one partner profile, map it to a canonical JSON
+    order, persist it, and return a 997. That is it &mdash; and it is a complete, useful integration.</p>
+
+    <h2 data-anchor="ch16-h2-scope">Define the narrow scope</h2>
+
+    <ul data-anchor="ch16-list1">
+      <li><strong>In</strong>: 850 purchase orders from one partner, <code>acme-retail</code>, at
+      <code>005010</code>.</li>
+      <li><strong>Out</strong>: a 997 for every interchange, accepted or rejected.</li>
+      <li><strong>Store</strong>: raw payloads, normalized orders, processing status, findings.</li>
+      <li><strong>Prove</strong>: idempotency, tests, logging, metrics, replay.</li>
+    </ul>
+
+    <h2 data-anchor="ch16-h2-shape">The whole thing, in one function</h2>
+
+    <p data-anchor="ch16-p2">Here is the spine. Read the order of the first four steps carefully
+    &mdash; that ordering <em>is</em> the lesson of Part IV, and everything else is detail.</p>
+
+<pre data-anchor="ch16-code1"><code><span class="kw">def</span> <span class="fn">process</span>(raw: <span class="ty">bytes</span>, partner: <span class="ty">str</span>) -&gt; <span class="ty">Result</span>:
+    <span class="fn">archive</span>(raw, partner)                       <span class="cm"># 1. raw bytes first, always</span>
+    d = <span class="fn">read_delimiters</span>(raw.decode(<span class="str">"latin-1"</span>))  <span class="cm"># 2. delimiters from the ISA</span>
+    env = <span class="fn">parse_envelopes</span>(raw, d)               <span class="cm"># 3. ISA/GS/ST structure</span>
+
+    <span class="kw">if</span> <span class="fn">seen_before</span>(partner, env.control_numbers, <span class="fn">sha256</span>(raw)):
+        <span class="kw">return</span> Result.<span class="fn">duplicate</span>(env)            <span class="cm"># 4. before ANY side effect</span>
+
+    errors = <span class="fn">validate</span>(env, <span class="fn">profile_for</span>(partner))
+    <span class="kw">if</span> errors:
+        <span class="kw">return</span> Result.<span class="fn">rejected</span>(env, errors,
+                               ack=<span class="fn">build_997</span>(env, errors))
+
+    order = <span class="fn">to_canonical</span>(env)                   <span class="cm"># 5. map</span>
+    <span class="fn">publish</span>(order)                              <span class="cm"># 6. the only external effect</span>
+    <span class="kw">return</span> Result.<span class="fn">accepted</span>(env, ack=<span class="fn">build_997</span>(env, []))</code></pre>
+
+    <div class="callout warn" data-anchor="ch16-callout1">
+      <span class="callout-label">The one line you cannot move</span>
+      <p><code>publish()</code> must come after <code>seen_before()</code>. Every other statement can
+      be reordered with only aesthetic consequences; move that one and every partner resend becomes a
+      duplicate order in the ERP. If you take one thing from this book to your own codebase, take the
+      position of that check.</p>
+    </div>
+
+    <h2 data-anchor="ch16-h2-steps">Building it, a piece at a time</h2>
+
+    <h3 data-anchor="ch16-h3-1">Step 1 &mdash; receive and archive</h3>
+    <p data-anchor="ch16-p3">An HTTP endpoint that accepts a body, or a poller that lists an SFTP
+    directory. Write the bytes to object storage keyed by partner and date before doing anything else,
+    and record the reference. If the process dies on the next line, the document is safe.</p>
+
+    <h3 data-anchor="ch16-h3-2">Step 2 &mdash; envelopes</h3>
+    <p data-anchor="ch16-p4">Chapter 8's <code>read_delimiters</code>, then split into segments, then
+    walk ISA&#8594;GS&#8594;ST. Verify the pairings and the trailer counts here; a truncated file should
+    fail now, cheaply, rather than producing forty confusing errors later.</p>
+
+    <h3 data-anchor="ch16-h3-3">Step 3 &mdash; the partner profile</h3>
+    <p data-anchor="ch16-p5">A JSON document, not code:</p>
+
+<pre data-anchor="ch16-code2"><code>{
+  <span class="str">"partner"</span>: <span class="str">"acme-retail"</span>,
+  <span class="str">"interchangeId"</span>: <span class="str">"ACMEBUYER"</span>, <span class="str">"qualifier"</span>: <span class="str">"ZZ"</span>,
+  <span class="str">"version"</span>: <span class="str">"005010"</span>,
+  <span class="str">"inbound"</span>: [<span class="str">"850"</span>],
+  <span class="str">"rules"</span>: {
+    <span class="str">"requiredSegments"</span>: [<span class="str">"BEG"</span>, <span class="str">"N1"</span>, <span class="str">"PO1"</span>, <span class="str">"CTT"</span>],
+    <span class="str">"allowedUom"</span>: [<span class="str">"CA"</span>, <span class="str">"EA"</span>, <span class="str">"PL"</span>],
+    <span class="str">"requireDeptRef"</span>: <span class="kw">true</span>
+  },
+  <span class="str">"cadence"</span>: <span class="str">"weekdays-by-0600"</span>
+}</code></pre>
+
+    <h3 data-anchor="ch16-h3-4">Step 4 &mdash; validate, and report precisely</h3>
+    <p data-anchor="ch16-p6">Structural, then semantic, then the profile's rules. Collect findings per
+    transaction set with the full address from chapter 8 &mdash; segment, position, element, rule
+    &mdash; so a rejection can be explained without opening the raw file.</p>
+
+    <h3 data-anchor="ch16-h3-5">Step 5 &mdash; map and persist</h3>
+    <p data-anchor="ch16-p7">Into chapter 9's canonical order, keeping <code>sourceControl</code>.
+    Persist the normalized record beside the raw reference and the status.</p>
+
+    <h3 data-anchor="ch16-h3-6">Step 6 &mdash; acknowledge</h3>
+    <p data-anchor="ch16-p8">Build the 997 from the findings: <code>AK5*A</code> when clean,
+    <code>AK5*R</code> with <code>AK3</code>/<code>AK4</code> detail when not, and
+    <code>AK9</code> summarising the group &mdash; including <code>P</code> for a partial acceptance.
+    Send it <em>after</em> the document is durably stored.</p>
+
+    <h2 data-anchor="ch16-h2-production">The four things that make it real</h2>
+
+    <div class="table-wrap" data-anchor="ch16-tbl1">
+      <table>
+        <caption>Parser demo &#8594; operable service</caption>
+        <thead><tr><th>Property</th><th>Concretely</th></tr></thead>
+        <tbody>
+          <tr><td>Idempotency</td><td>The <code>edi_received</code> table from chapter 12; duplicates re-send the stored 997.</td></tr>
+          <tr><td>Tests</td><td>Fixture files for each failure in appendix D; golden files for the generated 997.</td></tr>
+          <tr><td>Logging &amp; metrics</td><td>Identifiers not bodies; counts by partner and transaction type.</td></tr>
+          <tr><td>Replay</td><td>An endpoint that re-runs <code>process()</code> from an archived payload &mdash; safe because of row one.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="ch16-h2-extend">Extending it</h2>
+
+    <p data-anchor="ch16-p9">Two natural next steps, both of which reuse what you have rather than
+    adding new machinery.</p>
+
+    <p data-anchor="ch16-p10"><strong>Emit an 810 invoice.</strong> This exercises chapter 10: envelope
+    generation, the persisted control-number allocator, <code>SE01</code> arithmetic, and a golden-file
+    test. The canonical order you already store is the input.</p>
+
+    <p data-anchor="ch16-p11"><strong>Consume an 856.</strong> This exercises the parser against a
+    genuinely hierarchical document &mdash; the <code>HL</code> loops nesting shipment, order, pack and
+    item &mdash; and forces the canonical model to grow a shipment alongside its order. It is the
+    honest test of whether your parse stage handles loops or merely segments.</p>
+
+    <div class="callout note" data-anchor="ch16-callout2">
+      <span class="callout-label">Resist the temptation to generalise early</span>
+      <p>With one partner and one transaction set, the profile is a JSON file and the validator is a
+      hundred lines. That is correct. The abstractions that make a multi-partner EDI platform good are
+      discoverable only from two or three real partner guides &mdash; build those first and let the
+      shape emerge.</p>
+    </div>
+
+    <h2 data-anchor="ch16-h2-reflect">So what did we actually gain?</h2>
+
+    <p data-anchor="ch16-p12">A working service, and a demonstration that everything in Parts III and
+    IV fits in one readable function. The appendices that follow are the reference material: the
+    segments, the sample documents, the failure taxonomy, and the tests that prove you handled it.</p>
+
+    <section class="sources" data-anchor="ch16-sources">
+      <h4>Sources</h4>
+      <ul>
+        <li>Acknowledgments &mdash; stedi.com/docs/edi-platform/configure/trading-partners/functional-acknowledgments</li>
+        <li>EDI 850: Purchase Order &mdash; 1edisource.com/resources/edi-transactions-sets/edi-850/</li>
+        <li>EDI 997 functional acknowledgment &mdash; celigo.com/blog/edi-997/</li>
+        <li>Idempotency in Data Pipelines &mdash; dev.to/137foundry/idempotency-in-data-pipelines-how-to-prevent-duplicate-records-1ek2</li>
+      </ul>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="15-architecture.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="17-appendix-x12-cheatsheet.html">Next &#8250;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reliability, Idempotency, and Recovery &mdash; EDI - Intro</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="edi-intro">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="book-runner">
+      <span class="runner-title">EDI &mdash; Intro</span>
+      <a rel="home" href="../index.html">Contents</a>
+    </header>
+
+    <h1 data-anchor="ch12-h1"><span class="chapter-number">Chapter Twelve</span>Reliability, Idempotency, and Recovery</h1>
+    <p class="lede" data-anchor="ch12-lede">Every EDI transport delivers at least once. Exactly-once
+    business effects are something you build, in one specific place, on a key the sender already gave
+    you.</p>
+
+    <p class="dropcap" data-anchor="ch12-p1">Let's be precise about the guarantee we actually have.
+    Documents get redelivered because of network timeouts, TCP retransmission, upstream retry queues,
+    VAN redelivery, and &mdash; most often of all &mdash; a human at the partner clicking "resend"
+    because they did not see an acknowledgment. None of these are exotic. All of them are Tuesday.</p>
+
+    <p data-anchor="ch12-p2">So the transport gives you <strong>at-least-once delivery</strong>, and
+    what the business needs is <strong>exactly-once effect</strong>: one order, one shipment, one
+    invoice. The gap between those two is bridged in exactly one place in your pipeline, and it is
+    worth being deliberate about where.</p>
+
+    <h2 data-anchor="ch12-h2-key">The key you were already given</h2>
+
+    <p data-anchor="ch12-p3">You do not need to invent an idempotency key. The sender assigns one, at
+    three levels, and repeats it on a resend: the interchange, group and transaction set
+    <strong>control numbers</strong> from chapter 3.</p>
+
+    <p data-anchor="ch12-p4">Together with the partner and direction, they form a natural primary key:</p>
+
+<pre data-anchor="ch12-code1"><code><span class="kw">CREATE TABLE</span> <span class="fn">edi_received</span> (
+  partner_id      <span class="ty">text</span>        <span class="kw">NOT NULL</span>,
+  direction       <span class="ty">text</span>        <span class="kw">NOT NULL</span>,
+  interchange_ctl <span class="ty">text</span>        <span class="kw">NOT NULL</span>,
+  group_ctl       <span class="ty">text</span>        <span class="kw">NOT NULL</span>,
+  txn_ctl         <span class="ty">text</span>        <span class="kw">NOT NULL</span>,
+  payload_sha256  <span class="ty">bytea</span>       <span class="kw">NOT NULL</span>,
+  received_at     <span class="ty">timestamptz</span> <span class="kw">NOT NULL DEFAULT</span> <span class="fn">now</span>(),
+  <span class="kw">PRIMARY KEY</span> (partner_id, direction,
+               interchange_ctl, group_ctl, txn_ctl)
+);</code></pre>
+
+    <p data-anchor="ch12-p5">Two details in that table do real work.</p>
+
+    <p data-anchor="ch12-p6"><strong><code>partner_id</code> and <code>direction</code> are part of the
+    key.</strong> Control numbers are only unique within one partner relationship and one direction.
+    Two partners will both send interchange <code>000000117</code> eventually, and they are not the
+    same document.</p>
+
+    <p data-anchor="ch12-p7"><strong>The payload hash is stored alongside.</strong> <code>ISA13</code>
+    is nine digits and partners recycle it &mdash; over a long enough relationship the same number
+    comes round again on a genuinely different document. Comparing the hash distinguishes "this is the
+    resend we expected" from "this is a new document that happens to reuse a number", and the two
+    demand opposite responses.</p>
+
+    <figure class="diagram-fig" data-anchor="ch12-fig1">
+      <svg class="diagram" viewBox="0 0 560 178" role="img" aria-labelledby="ch12d1t">
+        <title id="ch12d1t">The deduplication check sits after archiving and parsing but before any downstream publish</title>
+
+        <rect x="16" y="20" width="118" height="30" class="stroke fill-soft"/>
+        <text x="26" y="40" class="mono">archive raw</text>
+        <path d="M134 35 L170 35" class="stroke"/>
+        <path d="M162 31 L170 35 L162 39" class="stroke"/>
+
+        <rect x="170" y="20" width="118" height="30" class="stroke fill-soft"/>
+        <text x="180" y="40" class="mono">parse envelope</text>
+        <path d="M288 35 L324 35" class="stroke"/>
+        <path d="M316 31 L324 35 L316 39" class="stroke"/>
+
+        <rect x="324" y="20" width="220" height="30" class="stroke-red fill-bg"/>
+        <text x="334" y="40" class="mono red">seen before?</text>
+
+        <path d="M434 50 L434 84" class="stroke-red"/>
+        <path d="M430 76 L434 84 L438 76" class="stroke-red"/>
+        <text x="446" y="72" class="red">yes</text>
+
+        <rect x="324" y="84" width="220" height="30" class="stroke-soft"/>
+        <text x="334" y="104" class="mono dim">re-send the stored 997, stop</text>
+
+        <path d="M324 35 L240 35" class="fill-none"/>
+        <path d="M434 20 L434 8 L200 8 L200 130" class="stroke"/>
+        <path d="M196 122 L200 130 L204 122" class="stroke"/>
+        <text x="212" y="126" class="dim">no</text>
+
+        <rect x="80" y="134" width="200" height="30" class="stroke fill-soft"/>
+        <text x="90" y="154" class="mono">validate &#8594; map &#8594; publish</text>
+        <text x="300" y="154" class="dim">the only side effects live here</text>
+      </svg>
+      <figcaption><b>Position is everything.</b> The check must sit after you can read the control
+      numbers and before anything with a business effect &mdash; publishing first and deduplicating
+      afterwards is not deduplication.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ch12-h2-dupe">What to do with a duplicate</h2>
+
+    <p data-anchor="ch12-p8">Not "ignore it". A duplicate usually means the partner never saw your
+    acknowledgment, so the correct response is to <strong>re-send the stored acknowledgment</strong>
+    and take no further action. That closes the loop that caused the resend in the first place; simply
+    dropping the document silently leaves the partner resending forever.</p>
+
+    <div class="callout warn" data-anchor="ch12-callout1">
+      <span class="callout-label">Don't deduplicate on the filename</span>
+      <p>Filenames are a transport convention, not part of the document. VANs rename files, partners
+      change their patterns, and the same interchange can arrive twice under two names. The control
+      numbers are inside the document, chosen by the sender, and stable across every transport it
+      might traverse.</p>
+    </div>
+
+    <h2 data-anchor="ch12-h2-replay">Making reprocessing safe</h2>
+
+    <p data-anchor="ch12-p9">Chapter 7 insisted on archiving raw bytes at stage 2. This is the payoff.
+    If the raw payload survives and the transformation is <em>deterministic</em> &mdash; same bytes in,
+    same canonical document out &mdash; then reprocessing is a safe, ordinary operation rather than a
+    tense one. You can fix a mapping bug and replay six months of documents through the corrected code.</p>
+
+    <p data-anchor="ch12-p10">Determinism is a constraint you have to keep deliberately. A map that
+    reads "today" for a defaulted date, or looks up a mutable product table without recording what it
+    found, is not reproducible &mdash; replaying it next year gives different answers. Inject the
+    clock; snapshot or version the lookups that matter.</p>
+
+    <h2 data-anchor="ch12-h2-dlq">Dead letters and humans</h2>
+
+    <p data-anchor="ch12-p11">Some documents cannot be processed no matter how many times you try: an
+    unsupported version, a code the partner has never used before, a ship-to that does not exist in
+    your system. These belong in a <strong>dead-letter</strong> path with a human resolution workflow
+    &mdash; a queue someone actually looks at, with the raw document, the findings, and a button to
+    reprocess after a fix.</p>
+
+    <p data-anchor="ch12-p12">The alternative &mdash; retrying forever with exponential backoff &mdash;
+    is worse than useless: it turns a document that needed five minutes of human attention into a
+    permanent background error rate that everyone learns to ignore.</p>
+
+    <div class="callout note" data-anchor="ch12-callout2">
+      <span class="callout-label">Out of order, late, missing</span>
+      <p>Three cousins of the duplicate. An <em>856 arriving before its 855</em> is normal and your
+      state machine should tolerate it. A <em>late</em> document may reference an order already closed.
+      A <em>missing</em> one produces no event at all &mdash; which is why chapter 13 alerts on
+      absence, not just on errors.</p>
+    </div>
+
+    <h2 data-anchor="ch12-h2-reflect">So what did we actually gain?</h2>
+
+    <p data-anchor="ch12-p13">One deduplication check, correctly placed, on a key the sender already
+    provides &mdash; and with it, exactly-once business effects over an at-least-once transport. Plus
+    the ability to replay history through fixed code, which is the closest thing to a superpower an
+    integration team has.</p>
+
+    <section class="sources" data-anchor="ch12-sources">
+      <h4>Sources</h4>
+      <ul>
+        <li>Idempotency in Data Pipelines: How to Prevent Duplicate Records &mdash; dev.to/137foundry/idempotency-in-data-pipelines-how-to-prevent-duplicate-records-1ek2</li>
+        <li>X12 EDI Format: A Technical Guide to Structure &amp; Segments &mdash; intuitionlabs.ai/articles/x12-edi-format-technical-guide</li>
+        <li>Acknowledgments &mdash; stedi.com/docs/edi-platform/configure/trading-partners/functional-acknowledgments</li>
+      </ul>
+    </section>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="11-transport-security.html">&#8249; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="13-observability.html">Next &#8250;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
