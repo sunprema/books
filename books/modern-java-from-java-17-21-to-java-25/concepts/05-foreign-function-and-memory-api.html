@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Foreign Function &amp; Memory API &middot; Modern Java</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="modern-java-from-java-17-21-to-java-25">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; What you can reach</span> &middot; Chapter 05</p>
+    <p class="chapter-no">05</p>
+    <h1 data-anchor="ffm-h1">Foreign Function &amp; Memory API</h1>
+
+    <p class="lede" data-anchor="ffm-lede">Calling C from Java used to mean JNI: a header generator, a C shim, a native build in your pipeline, and a class of bug where the JVM does not throw an exception because the JVM is no longer running. The FFM API replaces all of that with ordinary Java &mdash; and, more importantly, turns the worst failure mode into a stack trace.</p>
+
+    <div class="objectives" data-anchor="ffm-objectives">
+      <span class="box-label">By the end of this chapter you will be able to</span>
+      <ul>
+        <li>call a C function from plain Java with no native build step;</li>
+        <li>allocate and free off-heap memory deterministically with an <code>Arena</code>;</li>
+        <li>explain why use-after-free is an exception here and undefined behaviour in JNI;</li>
+        <li>decide when <em>not</em> to reach for this API &mdash; which is most of the time.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="ffm-h2-problem">The old bargain</h2>
+
+    <p data-anchor="ffm-p1">Suppose you need one function from a C library. With JNI, "one function" costs you: a <code>native</code> method declaration, a generated header, a C file implementing it, a compiler and toolchain per target platform, a shared library shipped alongside your jar, and <code>System.loadLibrary</code> at the right moment. Every one of those is a place for the build to break on somebody else's machine.</p>
+
+    <p data-anchor="ffm-p2">And then there is the memory. JNI hands you raw pointers. So did <code>sun.misc.Unsafe</code>, which is how half the ecosystem did off-heap work for a decade.</p>
+
+    <div class="box predict" data-anchor="ffm-predict-1">
+      <span class="box-label">Make a Prediction</span>
+      <p>You allocate an off-heap buffer, free it, and then &mdash; through a stale reference you forgot about &mdash; read from it. What does the JVM do?</p>
+      <p class="answer"><span class="answer-label">Answer</span> With <code>Unsafe</code> or a raw JNI pointer: whatever the operating system feels like. Usually you read someone else's data and carry on with a wrong answer. Occasionally you get a hard crash &mdash; a <code>hs_err_pid</code> file, no stack trace, no exception, the whole process gone. Debugging that is archaeology.</p>
+      <p>With the FFM API: <code>IllegalStateException</code>, with a stack trace pointing at the line that read too late. <strong>This is the feature.</strong> The convenience is nice; the safety is why it exists.</p>
+    </div>
+
+    <div class="box brain" data-anchor="ffm-brain">
+      <span class="box-label">Your Brain on the FFM API</span>
+      <p>Two ideas, and everything else is detail.</p>
+      <p><strong>A <code>MemorySegment</code> is a pointer that knows its own bounds and its own lifetime.</strong> A C pointer is just a number, so the language cannot tell a valid read from a wild one. A segment carries its size and a reference to the scope that owns it, so every access can be checked &mdash; spatially (am I inside the segment?) and temporally (is it still alive?).</p>
+      <p><strong>An <code>Arena</code> is who decides when the memory dies.</strong> Not the garbage collector, not a finalizer &mdash; an object with a <code>close()</code>. Which means <code>try</code>-with-resources is your <code>free()</code>, and the compiler helps you place it.</p>
+    </div>
+
+    <h2 data-anchor="ffm-h2-call">Calling C, in full</h2>
+
+    <p data-anchor="ffm-p3">Here is the whole thing &mdash; the canonical <code>strlen</code> call<span class="since">Final Java 22</span>. No C file, no header generator, no build plugin.</p>
+
+    <div class="pre-label">Complete and runnable &mdash; java --enable-native-access=ALL-UNNAMED Strlen.java</div>
+    <pre><code><span class="kw">import</span> java.lang.foreign.*;
+<span class="kw">import</span> java.lang.invoke.<span class="ty">MethodHandle</span>;
+
+<span class="kw">public class</span> <span class="ty">Strlen</span> {
+    <span class="kw">public static void</span> <span class="fn">main</span>(<span class="ty">String</span>[] args) <span class="kw">throws</span> <span class="ty">Throwable</span> {
+
+        <span class="ty">Linker</span> linker = <span class="ty">Linker</span>.<span class="fn">nativeLinker</span>();          <span class="cm">// the platform ABI</span>
+
+        <span class="ty">MethodHandle</span> strlen = linker.<span class="fn">downcallHandle</span>(
+            linker.<span class="fn">defaultLookup</span>().<span class="fn">find</span>(<span class="str">"strlen"</span>).<span class="fn">orElseThrow</span>(),
+            <span class="ty">FunctionDescriptor</span>.<span class="fn">of</span>(<span class="ty">ValueLayout</span>.JAVA_LONG,     <span class="cm">// size_t return</span>
+                                  <span class="ty">ValueLayout</span>.ADDRESS));      <span class="cm">// const char*</span>
+
+        <span class="kw">try</span> (<span class="ty">Arena</span> arena = <span class="ty">Arena</span>.<span class="fn">ofConfined</span>()) {
+            <span class="ty">MemorySegment</span> cString = arena.<span class="fn">allocateFrom</span>(<span class="str">"modern java"</span>);
+            <span class="kw">long</span> len = (<span class="kw">long</span>) strlen.<span class="fn">invokeExact</span>(cString);
+            <span class="ty">System</span>.out.<span class="fn">println</span>(len);      <span class="cm">// 11</span>
+        }   <span class="cm">// memory freed here, deterministically</span>
+    }
+}</code></pre>
+
+    <p data-anchor="ffm-p4">Read it as four moves. Get the linker for this platform's calling convention. Look up the symbol &mdash; <code>defaultLookup()</code> covers the libraries the JVM already has open, libc among them. Describe the C signature with <code>ValueLayout</code> constants. Then call it like any <code>MethodHandle</code>.</p>
+
+    <p data-anchor="ffm-p5"><code>allocateFrom(String)</code> is doing the fiddly part: copying the Java string into off-heap memory as a NUL-terminated UTF-8 sequence, which is what a <code>char*</code> means to C.</p>
+
+    <figure class="diagram-fig" data-anchor="ffm-fig">
+      <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="ffm-fig-t">
+        <title id="ffm-fig-t">JNI requires a native shim and a platform build; the FFM API goes from Java straight to the shared library through the platform linker</title>
+
+        <text x="16" y="18">JNI</text>
+        <rect x="16"  y="28" width="96" height="30" class="stroke fill-soft"/>
+        <text x="26"  y="47" class="big">Java</text>
+        <rect x="140" y="28" width="112" height="30" class="stroke-red"/>
+        <text x="150" y="47" class="big red">C shim + header</text>
+        <rect x="280" y="28" width="112" height="30" class="stroke-red"/>
+        <text x="290" y="47" class="big red">native build</text>
+        <rect x="420" y="28" width="124" height="30" class="stroke fill-soft"/>
+        <text x="430" y="47" class="big">libc.so</text>
+
+        <path d="M112 43 L140 43" class="stroke"/>
+        <path d="M132 39 L140 43 L132 47" class="stroke"/>
+        <path d="M252 43 L280 43" class="stroke-red"/>
+        <path d="M272 39 L280 43 L272 47" class="stroke-red"/>
+        <path d="M392 43 L420 43" class="stroke-red"/>
+        <path d="M412 39 L420 43 L412 47" class="stroke-red"/>
+        <text x="150" y="74">two artifacts you must ship and build per platform</text>
+
+        <path d="M16 100 L544 100" class="stroke-soft"/>
+
+        <text x="16" y="126">FFM</text>
+        <rect x="16"  y="136" width="96" height="30" class="stroke fill-soft"/>
+        <text x="26"  y="155" class="big">Java</text>
+        <rect x="280" y="136" width="112" height="30" class="stroke fill-ink"/>
+        <text x="290" y="155" class="big on-ink">Linker</text>
+        <rect x="420" y="136" width="124" height="30" class="stroke fill-soft"/>
+        <text x="430" y="155" class="big">libc.so</text>
+
+        <path d="M112 151 L280 151" class="stroke"/>
+        <path d="M272 147 L280 151 L272 155" class="stroke"/>
+        <path d="M392 151 L420 151" class="stroke"/>
+        <path d="M412 147 L420 151 L412 155" class="stroke"/>
+        <text x="130" y="182">no shim, no native build, one jar</text>
+      </svg>
+      <figcaption><b>The Big Picture.</b> The red boxes are the two artifacts JNI forces into your build pipeline. FFM deletes both &mdash; the platform linker is already in the JVM.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ffm-h2-arena">Arenas: choosing a lifetime</h2>
+
+    <p data-anchor="ffm-p6">Every segment belongs to an arena, and the arena decides when the memory goes away. There are four, and picking the right one is most of the safety story.</p>
+
+    <div class="table-wrap" data-anchor="ffm-table-arena">
+      <table>
+        <caption>The four arenas</caption>
+        <thead>
+          <tr><th>Arena</th><th>Freed when</th><th>Accessible from</th><th>Use for</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ofConfined()</code></td><td><code>close()</code></td><td>the creating thread only</td><td>the default &mdash; a bounded native call</td></tr>
+          <tr><td><code>ofShared()</code></td><td><code>close()</code></td><td>any thread</td><td>a buffer several threads read</td></tr>
+          <tr><td><code>ofAuto()</code></td><td>the GC decides</td><td>any thread</td><td>a segment with no clear owner</td></tr>
+          <tr><td><code>global()</code></td><td>never</td><td>any thread</td><td>process-lifetime constants</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="ffm-p7">Reach for <code>ofConfined()</code> unless you have a specific reason not to. It is the cheapest to check &mdash; no cross-thread coordination &mdash; and it is the one that makes the mistake in the prediction box impossible to miss:</p>
+
+    <div class="pre-label">The error you want</div>
+    <pre><code><span class="ty">MemorySegment</span> escaped;
+<span class="kw">try</span> (<span class="ty">Arena</span> arena = <span class="ty">Arena</span>.<span class="fn">ofConfined</span>()) {
+    escaped = arena.<span class="fn">allocate</span>(<span class="ty">ValueLayout</span>.JAVA_INT);
+    escaped.<span class="fn">set</span>(<span class="ty">ValueLayout</span>.JAVA_INT, <span class="num">0</span>, <span class="num">42</span>);
+}
+
+escaped.<span class="fn">get</span>(<span class="ty">ValueLayout</span>.JAVA_INT, <span class="num">0</span>);
+<span class="cm">// IllegalStateException: Already closed</span></code></pre>
+
+    <p data-anchor="ffm-p8">Access a confined segment from the wrong thread and you get <code>WrongThreadException</code> instead. Read past its end and you get <code>IndexOutOfBoundsException</code>. Three whole categories of native memory bug, converted into ordinary Java exceptions with ordinary stack traces.</p>
+
+    <p class="pullquote" data-anchor="ffm-pull">The FFM API did not make native code safe. It made <em>your side of the boundary</em> safe, which is the half you were going to get wrong.</p>
+
+    <h2 data-anchor="ffm-h2-access">Two flags and a warning</h2>
+
+    <p data-anchor="ffm-p9">Calling native code is a <span class="term">restricted operation</span>: it can violate the JVM's own invariants, so the runtime wants it declared. Modules permitted to do it are named with <code>--enable-native-access</code>; unnamed code on the classpath uses <code>ALL-UNNAMED</code>.</p>
+
+    <div class="pre-label">Run it like this</div>
+    <pre><code>java --enable-native-access=ALL-UNNAMED -jar app.jar
+java --enable-native-access=com.example.imaging -m com.example.app/...</code></pre>
+
+    <p data-anchor="ffm-p10">Leave it off today and you get a warning. JEP 472 is the standing plan to make it an error in a future release, so treat the warning as a deprecation notice with your name on it and pass the flag now.</p>
+
+    <div class="callout warn" data-anchor="ffm-vt">
+      <span class="callout-title">This is the pinning exception from Chapter 3</span>
+      <p>A virtual thread executing a native frame &mdash; which is exactly what an FFM downcall is &mdash; <strong>cannot unmount from its carrier</strong>. That did not change in JEP 491, and it will not.</p>
+      <p>A quick <code>strlen</code> is irrelevant. A native call that blocks for 200ms, invoked from ten thousand virtual threads, will pin every carrier you have and stall the scheduler. If you must do slow native work under virtual threads, bound it with a semaphore sized well below the carrier count &mdash; the same technique as the connection pool, for the same reason.</p>
+    </div>
+
+    <div class="box wrong" data-anchor="ffm-wrong">
+      <span class="box-label">What Could Go Wrong?</span>
+      <p><strong><code>invokeExact</code> is fussier than it looks.</strong> It is signature-polymorphic: the static types at the call site must match the <code>FunctionDescriptor</code> exactly. The cast in <code>(long) strlen.invokeExact(seg)</code> is not decoration &mdash; it is part of the signature. Drop it, or assign to an <code>int</code>, and you get <code>WrongMethodTypeException</code> at runtime. Use <code>invoke</code> (no <code>Exact</code>) if you want asymmetric conversions, and pay a little performance for it.</p>
+      <p><strong>You describe the C signature wrong.</strong> Nothing checks your <code>FunctionDescriptor</code> against the real function &mdash; there is no header being read. Get <code>size_t</code> wrong and you will corrupt a return value silently. This is where <code>jextract</code> earns its keep.</p>
+      <p><strong>You use <code>ofShared()</code> because it seemed easier.</strong> Shared arenas need cross-thread coordination to close safely, which is slower, and they let a segment escape to a thread you did not think about. Confined by default.</p>
+      <p><strong>You reach for FFM at all.</strong> The most common mistake. A pure-Java library, however unfashionable, has no ABI, no platform matrix, and no way to take the process down. FFM is for when there is genuinely no Java implementation &mdash; a vendor SDK, a hardware interface, a codec nobody has ported.</p>
+    </div>
+
+    <div class="box surgery" data-anchor="ffm-surgery">
+      <span class="box-label">Code Surgery</span>
+      <p>This wrapper compiles and passes its unit test. It fails in production under load.</p>
+      <pre><code><span class="kw">private static final</span> <span class="ty">Arena</span> ARENA = <span class="ty">Arena</span>.<span class="fn">ofConfined</span>();      <span class="cm">// (1)</span>
+<span class="kw">private static final</span> <span class="ty">MethodHandle</span> HASH = <span class="fn">lookupHash</span>();
+
+<span class="kw">public</span> <span class="kw">long</span> <span class="fn">hash</span>(<span class="ty">String</span> input) <span class="kw">throws</span> <span class="ty">Throwable</span> {
+    <span class="ty">MemorySegment</span> seg = ARENA.<span class="fn">allocateFrom</span>(input);          <span class="cm">// (2)</span>
+    <span class="kw">return</span> (<span class="kw">long</span>) HASH.<span class="fn">invokeExact</span>(seg);
+}</code></pre>
+      <p><strong>(1)</strong> A confined arena is confined to <em>the thread that created it</em> &mdash; here, whichever thread first loaded the class. Every other thread calling <code>hash</code> gets <code>WrongThreadException</code>. The unit test passed because it was single-threaded.</p>
+      <p><strong>(2)</strong> Worse: the arena is never closed, so every call leaks. This is a native memory leak, so it will not appear in a heap dump and your GC graphs will look fine right up until the container is OOM-killed.</p>
+      <p><strong>The repair</strong> is to scope the arena to the call, which is what arenas are for:</p>
+      <pre><code><span class="kw">public</span> <span class="kw">long</span> <span class="fn">hash</span>(<span class="ty">String</span> input) <span class="kw">throws</span> <span class="ty">Throwable</span> {
+    <span class="kw">try</span> (<span class="ty">Arena</span> arena = <span class="ty">Arena</span>.<span class="fn">ofConfined</span>()) {
+        <span class="ty">MemorySegment</span> seg = arena.<span class="fn">allocateFrom</span>(input);
+        <span class="kw">return</span> (<span class="kw">long</span>) HASH.<span class="fn">invokeExact</span>(seg);
+    }
+}</code></pre>
+      <p>The <code>MethodHandle</code> is fine as a static &mdash; it holds no memory and is thread-safe. It is the <em>arena</em> that must be per-call. The general rule: a <code>MethodHandle</code> is a constant, an <code>Arena</code> is a resource.</p>
+    </div>
+
+    <div class="box hood" data-anchor="ffm-hood">
+      <span class="box-label">Under the Hood</span>
+      <p>For structured data there is a second layer this chapter has skipped. A <code>MemoryLayout</code> describes a C struct &mdash; <code>MemoryLayout.structLayout(JAVA_INT.withName("x"), JAVA_INT.withName("y"))</code> &mdash; and from it you derive a <code>VarHandle</code> that reads or writes one named field at the right offset, with the right alignment, on the right platform. Hand-computing offsets is exactly the sort of thing that works on your laptop and not on the ARM box.</p>
+      <p>Calls go both ways. A <em>downcall</em> is Java calling C, as above. An <em>upcall</em> goes the other way: <code>linker.upcallStub(...)</code> turns a Java <code>MethodHandle</code> into a function pointer C can invoke, which is how you supply a callback to a native library.</p>
+      <p><code>jextract</code> reads a C header and generates the whole binding layer &mdash; descriptors, layouts, var handles, the lot. It is part of Project Panama but is <strong>not shipped in the JDK</strong>; you download it separately. For anything larger than a handful of functions, use it rather than hand-writing descriptors.</p>
+      <p>Performance, roughly: a simple downcall is in the same range as a JNI call, sometimes better, because the linker can specialize the call site and there is no JNI environment marshalling. This is not a reason to switch, but it removes the last argument for staying.</p>
+    </div>
+
+    <div class="box try-now" data-anchor="ffm-try">
+      <span class="box-label">Try This Now<span class="est">15 minutes</span></span>
+      <ol>
+        <li>Run the <code>Strlen</code> example above with <code>java --enable-native-access=ALL-UNNAMED Strlen.java</code>. It should print <code>11</code> with no build step at all.</li>
+        <li>Remove the flag. Read the warning &mdash; that is what JEP 472 plans to turn into an error.</li>
+        <li>Change <code>(long)</code> to <code>(int)</code>. Observe <code>WrongMethodTypeException</code>, and note that it names both signatures.</li>
+        <li>Move <code>escaped.get(...)</code> outside the <code>try</code> block, as in the earlier snippet, and confirm you get <code>IllegalStateException</code>. Take a second to appreciate that on the old API this same mistake had no stack trace.</li>
+        <li>Try <code>getpid</code> (no arguments, returns <code>int</code>) on your own. It is a two-line change and it proves you have the pattern.</li>
+      </ol>
+    </div>
+
+    <div class="box project" data-anchor="ffm-project">
+      <span class="box-label">Chapter project &mdash; part 5 of 7</span>
+      <p>Here is an honest answer: <strong>your aggregator should not use this API.</strong> It calls three HTTP services. There is no native library in that picture, and adding one would be the mistake the last bullet of <em>What Could Go Wrong?</em> warns about.</p>
+      <p>So this chapter's contribution to the capstone is a decision rule, written into the project's notes rather than its code:</p>
+      <blockquote>
+        <p>Reach for FFM when there is no pure-Java implementation and the native one is not optional &mdash; a vendor SDK, a hardware interface, a codec. Not for speed, not for novelty. When we do, the arena is per-call, the handle is static, <code>--enable-native-access</code> is in the launch script, and any call that can block is bounded by a semaphore because it pins a carrier.</p>
+      </blockquote>
+      <p>If you want the exercise anyway, add a <code>/health/host</code> endpoint that returns the machine's hostname via a <code>gethostname</code> downcall &mdash; a genuine use of a C function with an out-parameter, and small enough to throw away. Then notice that <code>InetAddress.getLocalHost()</code> already did it, and delete your version. That is the lesson.</p>
+    </div>
+
+    <div class="box recap" data-anchor="ffm-recap">
+      <span class="box-label">Fast Recap</span>
+      <ol>
+        <li>The FFM API is final since Java 22 and lives in <code>java.lang.foreign</code> &mdash; no JNI shim, no native build.</li>
+        <li><code>Linker.nativeLinker()</code> + <code>SymbolLookup</code> + <code>FunctionDescriptor</code> gives you a <code>MethodHandle</code> for a C function.</li>
+        <li>An <code>Arena</code> owns memory lifetime; <code>ofConfined()</code> with try-with-resources is the default, and frees deterministically.</li>
+        <li>Use-after-free is <code>IllegalStateException</code>, wrong thread is <code>WrongThreadException</code>, overrun is <code>IndexOutOfBoundsException</code>. That is the point of the API.</li>
+        <li>Pass <code>--enable-native-access</code>; today it silences a warning, later it will be required.</li>
+        <li>An FFM downcall is a native frame, so it pins a virtual thread &mdash; bound slow native calls explicitly.</li>
+        <li>The handle is a constant; the arena is a resource. Never the other way round.</li>
+      </ol>
+    </div>
+
+    <p class="bridge" data-anchor="ffm-bridge"><strong>Next:</strong> five chapters of new features, and not one measurement. Chapter 6 fixes that &mdash; JFR for what your service is actually doing, AOT caches and compact object headers for what it costs to start and to hold, and JMH for when you genuinely need a number.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-structured-concurrency-and-scoped-values.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-production-performance-and-observability.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

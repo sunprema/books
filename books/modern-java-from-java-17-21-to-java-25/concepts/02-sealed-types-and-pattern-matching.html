@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sealed Types and Pattern Matching &middot; Modern Java</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="modern-java-from-java-17-21-to-java-25">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part I &mdash; The shapes you declare</span> &middot; Chapter 02</p>
+    <p class="chapter-no">02</p>
+    <h1 data-anchor="seal-h1">Sealed types and pattern matching</h1>
+
+    <p class="lede" data-anchor="seal-lede">Records let you say what a value <em>is</em>. Sealed types let you say what a value <em>can be</em> &mdash; the whole set, closed, no additions. Put the two together with pattern matching and you get something Java has never had before: a domain model where forgetting a case is a compile error.</p>
+
+    <div class="objectives" data-anchor="seal-objectives">
+      <span class="box-label">By the end of this chapter you will be able to</span>
+      <ul>
+        <li>model a closed set of outcomes with a sealed interface and record subtypes;</li>
+        <li>write an exhaustive <code>switch</code> that needs no <code>default</code> branch;</li>
+        <li>deconstruct records inside a switch with record patterns, including nested ones;</li>
+        <li>explain why adding a <code>default</code> throws away the feature's main benefit.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="seal-h2-problem">The chain that lies to you</h2>
+
+    <p data-anchor="seal-p1">Every codebase has one of these. A payment can be a card, a bank transfer, or cash, and somewhere there is a method that has to tell them apart.</p>
+
+    <div class="pre-label">The shape you have today</div>
+    <pre><code><span class="ty">String</span> <span class="fn">describe</span>(<span class="ty">Payment</span> p) {
+    <span class="kw">if</span> (p <span class="kw">instanceof</span> <span class="ty">Card</span> c)          <span class="kw">return</span> <span class="str">"card "</span> + c.<span class="fn">last4</span>();
+    <span class="kw">if</span> (p <span class="kw">instanceof</span> <span class="ty">BankTransfer</span> b)  <span class="kw">return</span> <span class="str">"transfer from "</span> + b.<span class="fn">iban</span>();
+    <span class="kw">if</span> (p <span class="kw">instanceof</span> <span class="ty">Cash</span>)           <span class="kw">return</span> <span class="str">"cash"</span>;
+    <span class="kw">throw new</span> <span class="ty">IllegalStateException</span>(<span class="str">"unknown payment: "</span> + p);   <span class="cm">// the lie</span>
+}</code></pre>
+
+    <p data-anchor="seal-p2">That last line is a lie in two directions. It claims the situation is impossible, and it defers finding out to runtime &mdash; in production, in the one code path nobody tested, six months after someone added <code>GiftCard</code>.</p>
+
+    <div class="box predict" data-anchor="seal-predict-1">
+      <span class="box-label">Make a Prediction</span>
+      <p>A colleague adds a fourth payment type, <code>GiftCard</code>, and wires it through the parser. They do not touch <code>describe</code>. The project compiles. Tests pass, because no test constructs a <code>GiftCard</code> yet.</p>
+      <p>Now suppose <code>Payment</code> had been declared <code>sealed</code> and <code>describe</code> had been a pattern <code>switch</code> with no <code>default</code>. What happens instead?</p>
+      <p class="answer"><span class="answer-label">Answer</span> The project does not compile. The compiler reports that the switch does not cover <code>GiftCard</code>, pointing at the exact method, before the code is committed. That single behavioural difference is the whole reason to seal a hierarchy.</p>
+    </div>
+
+    <h2 data-anchor="seal-h2-sealed">Closing the set</h2>
+
+    <p data-anchor="seal-p3">A <span class="term">sealed</span> type<span class="since">Final Java 17</span> names the types allowed to extend or implement it. Everything else is rejected at compile time.</p>
+
+    <div class="pre-label">Payment.java &mdash; three permitted subtypes, no more</div>
+    <pre><code><span class="kw">public sealed interface</span> <span class="ty">Payment</span>
+        <span class="kw">permits</span> <span class="ty">Card</span>, <span class="ty">BankTransfer</span>, <span class="ty">Cash</span> {}
+
+<span class="kw">public record</span> <span class="ty">Card</span>(<span class="ty">String</span> last4, <span class="kw">int</span> expiryYear) <span class="kw">implements</span> <span class="ty">Payment</span> {}
+<span class="kw">public record</span> <span class="ty">BankTransfer</span>(<span class="ty">String</span> iban)         <span class="kw">implements</span> <span class="ty">Payment</span> {}
+<span class="kw">public record</span> <span class="ty">Cash</span>()                             <span class="kw">implements</span> <span class="ty">Payment</span> {}</code></pre>
+
+    <p data-anchor="seal-p4">Three rules govern this, and they exist to keep the set genuinely closed:</p>
+
+    <ul data-anchor="seal-list-rules">
+      <li>Every permitted subtype must itself be <code>final</code>, <code>sealed</code>, or explicitly <code>non-sealed</code>. There is no silent third option &mdash; if you want to reopen a branch of the hierarchy, you must write <code>non-sealed</code> and mean it.</li>
+      <li>Permitted subtypes must live in the same module as the sealed type (or, outside a module, the same package). Nobody can extend your closed set from their jar.</li>
+      <li>The <code>permits</code> clause may be omitted when all the subtypes are in the same source file &mdash; convenient for a small result type, and it keeps the whole domain visible at once.</li>
+    </ul>
+
+    <p data-anchor="seal-p5">Records as the permitted subtypes is the common shape, and not by accident: records give you transparent components, sealing gives you a closed set, and the next section is what happens when the compiler knows both.</p>
+
+    <h2 data-anchor="seal-h2-switch">Pattern matching, and the guarantee</h2>
+
+    <p data-anchor="seal-p6">Pattern matching for <code>switch</code><span class="since">Final Java 21</span> lets a case label be a type pattern instead of a constant. <span class="term">Record patterns</span><span class="since">Final Java 21</span> go further and destructure the record in the label itself.</p>
+
+    <div class="pre-label">The same method, Java 21 and later</div>
+    <pre><code><span class="ty">String</span> <span class="fn">describe</span>(<span class="ty">Payment</span> p) {
+    <span class="kw">return switch</span> (p) {
+        <span class="kw">case</span> <span class="ty">Card</span>(<span class="ty">String</span> last4, <span class="kw">int</span> year) <span class="kw">when</span> year &lt; <span class="num">2026</span> -&gt; <span class="str">"expired card "</span> + last4;
+        <span class="kw">case</span> <span class="ty">Card</span>(<span class="ty">String</span> last4, <span class="kw">int</span> ignored)               -&gt; <span class="str">"card "</span> + last4;
+        <span class="kw">case</span> <span class="ty">BankTransfer</span>(<span class="ty">String</span> iban)                     -&gt; <span class="str">"transfer from "</span> + iban;
+        <span class="kw">case</span> <span class="ty">Cash</span> c                                        -&gt; <span class="str">"cash"</span>;
+    };
+}</code></pre>
+
+    <p data-anchor="seal-p7">Read what is <em>not</em> there. No <code>default</code>. No <code>throw new IllegalStateException</code>. No cast, and no call to <code>last4()</code> &mdash; the component is bound by the pattern. The switch is a <span class="term">switch expression</span>, so every arm produces a value and the compiler checks that every arm does.</p>
+
+    <p data-anchor="seal-p8">The guard, introduced by the contextual keyword <code>when</code>, is what lets two arms share a type and differ on a condition. Order matters: guarded arms go first, because the unguarded <code>Card</code> arm would otherwise match everything.</p>
+
+    <figure class="diagram-fig" data-anchor="seal-fig">
+      <svg class="diagram" viewBox="0 0 560 196" role="img" aria-labelledby="seal-fig-t">
+        <title id="seal-fig-t">With a default branch a new subtype is swallowed at runtime; without one the compiler stops the build</title>
+
+        <text x="16" y="18">With default &mdash; runtime</text>
+        <rect x="16"  y="28" width="104" height="32" class="stroke fill-soft"/>
+        <text x="26"  y="48" class="big">GiftCard added</text>
+        <rect x="164" y="28" width="104" height="32" class="stroke fill-soft"/>
+        <text x="174" y="48" class="big">compiles</text>
+        <rect x="312" y="28" width="104" height="32" class="stroke fill-soft"/>
+        <text x="322" y="48" class="big">ships</text>
+        <rect x="440" y="28" width="104" height="32" class="stroke-red"/>
+        <text x="450" y="48" class="big red">3am page</text>
+
+        <path d="M120 44 L164 44" class="stroke"/>
+        <path d="M156 40 L164 44 L156 48" class="stroke"/>
+        <path d="M268 44 L312 44" class="stroke"/>
+        <path d="M304 40 L312 44 L304 48" class="stroke"/>
+        <path d="M416 44 L440 44" class="stroke-red"/>
+        <path d="M432 40 L440 44 L432 48" class="stroke-red"/>
+
+        <path d="M16 92 L544 92" class="stroke-soft"/>
+
+        <text x="16" y="122">Sealed + exhaustive switch &mdash; compile time</text>
+        <rect x="16"  y="132" width="104" height="32" class="stroke fill-soft"/>
+        <text x="26"  y="152" class="big">GiftCard added</text>
+        <rect x="164" y="132" width="104" height="32" class="stroke-red"/>
+        <text x="174" y="152" class="big red">build fails</text>
+        <rect x="312" y="132" width="232" height="32" class="stroke fill-soft"/>
+        <text x="322" y="152" class="big">every switch that needs a case is named</text>
+
+        <path d="M120 148 L164 148" class="stroke"/>
+        <path d="M156 144 L164 148 L156 152" class="stroke"/>
+        <path d="M268 148 L312 148" class="stroke"/>
+        <path d="M304 144 L312 148 L304 152" class="stroke"/>
+      </svg>
+      <figcaption><b>The Big Picture.</b> Same change, same codebase. Sealing does not prevent the mistake &mdash; it moves discovering it from 3am to the build, and it hands you the complete list of places to fix.</figcaption>
+    </figure>
+
+    <h2 data-anchor="seal-h2-nested">Nesting, and why it pays off</h2>
+
+    <p data-anchor="seal-p9">Record patterns nest. This is where the syntax stops being a nicety and starts removing real code &mdash; reaching three levels into a structure and checking a condition, in one label:</p>
+
+    <div class="pre-label">One label, three levels deep</div>
+    <pre><code><span class="kw">record</span> <span class="ty">Line</span>(<span class="ty">Product</span> product, <span class="kw">int</span> qty) {}
+<span class="kw">record</span> <span class="ty">Product</span>(<span class="ty">CatalogEntry</span> catalog, <span class="ty">Price</span> price, <span class="ty">Stock</span> stock) {}
+
+<span class="kw">boolean</span> <span class="fn">isFreeGift</span>(<span class="ty">Line</span> line) {
+    <span class="kw">return switch</span> (line) {
+        <span class="kw">case</span> <span class="ty">Line</span>(<span class="ty">Product</span>(<span class="kw">var</span> catalog, <span class="ty">Price</span>(<span class="kw">var</span> sku, <span class="kw">var</span> ccy, <span class="kw">long</span> minor), <span class="kw">var</span> stock), <span class="kw">int</span> qty)
+             <span class="kw">when</span> minor == <span class="num">0</span> &amp;&amp; qty &gt; <span class="num">0</span> -&gt; <span class="kw">true</span>;
+        <span class="kw">default</span> -&gt; <span class="kw">false</span>;
+    };
+}</code></pre>
+
+    <p data-anchor="seal-p10">Note that this switch <em>does</em> have a <code>default</code>, and correctly so: <code>Line</code> is not a sealed hierarchy, it is a single record, and the question being asked is a boolean test rather than a dispatch over a closed set. The rule is not "never write <code>default</code>". It is "never write <code>default</code> over a sealed hierarchy you want the compiler to police".</p>
+
+    <p data-anchor="seal-p11"><code>var</code> is allowed in patterns, and it is worth using for components you are only passing through. The binding names are what the next reader will use to understand the label, so name the ones that matter and <code>var</code> the ones that do not.</p>
+
+    <div class="box wrong" data-anchor="seal-wrong">
+      <span class="box-label">What Could Go Wrong?</span>
+      <p><strong>You add <code>default</code> "just to be safe".</strong> This is the mistake that costs the most. A <code>default</code> over a sealed hierarchy makes every switch trivially exhaustive, so the compiler stops checking, and the feature you sealed the type for is gone. If you genuinely need a fallback, prefer a case for the type you mean.</p>
+      <p><strong>Dominance errors surprise you.</strong> Putting a broader pattern before a narrower one is a compile error, not a dead branch &mdash; the opposite of an <code>if/else</code> chain, where the same mistake silently wins. This is good news; it just reads as a strange error the first time.</p>
+      <p><strong><code>null</code> throws.</strong> A pattern switch throws <code>NullPointerException</code> on a null selector unless you write an explicit <code>case null -&gt;</code>. This is deliberate &mdash; it preserves what <code>switch</code> always did &mdash; but it means "the switch is exhaustive" does not mean "the switch handles null". Handle it in one place:</p>
+      <pre><code><span class="kw">case null</span>      -&gt; <span class="str">"no payment"</span>;
+<span class="kw">case</span> <span class="ty">Cash</span> c    -&gt; <span class="str">"cash"</span>;</code></pre>
+      <p><strong>You seal across a module boundary.</strong> Permitted subtypes must be in the same module. Discovering this after splitting a monolith is an unpleasant afternoon; plan the sealed hierarchy and the module boundary together.</p>
+    </div>
+
+    <div class="box surgery" data-anchor="seal-surgery">
+      <span class="box-label">Code Surgery</span>
+      <p>Here is a switch that compiles, runs, and is quietly broken. Find the defect before reading on.</p>
+      <pre><code><span class="ty">BigDecimal</span> <span class="fn">fee</span>(<span class="ty">Payment</span> p) {
+    <span class="kw">return switch</span> (p) {
+        <span class="kw">case</span> <span class="ty">Card</span> c         -&gt; <span class="kw">new</span> <span class="ty">BigDecimal</span>(<span class="str">"0.029"</span>);
+        <span class="kw">case</span> <span class="ty">BankTransfer</span> b -&gt; <span class="ty">BigDecimal</span>.ZERO;
+        <span class="kw">default</span>            -&gt; <span class="ty">BigDecimal</span>.ZERO;
+    };
+}</code></pre>
+      <p><strong>The defect:</strong> <code>default</code> covers <code>Cash</code> today, which is correct today. Add <code>GiftCard</code> with a 1.5% fee and this method silently charges zero &mdash; a revenue bug that no test will catch, because the test suite has no <code>GiftCard</code> case either. The compiler could have told you. You asked it not to.</p>
+      <p><strong>The repair</strong> is to spell out the last case, so the switch is exhaustive by coverage rather than by fallback:</p>
+      <pre><code>        <span class="kw">case</span> <span class="ty">Cash</span> c         -&gt; <span class="ty">BigDecimal</span>.ZERO;</code></pre>
+      <p>Now adding <code>GiftCard</code> fails the build here, and in every other switch over <code>Payment</code> in the codebase. That list of failures is a migration checklist you did not have to write.</p>
+    </div>
+
+    <div class="box hood" data-anchor="seal-hood">
+      <span class="box-label">Under the Hood</span>
+      <p>Sealing is recorded in the class file as a <code>PermittedSubclasses</code> attribute, so it is enforced by the JVM at class load, not only by <code>javac</code>. A subclass smuggled in by bytecode manipulation fails to load.</p>
+      <p>A pattern switch compiles to an <code>invokedynamic</code> call against <code>java.lang.runtime.SwitchBootstraps.typeSwitch</code>, which resolves the selector to a case index. Dispatch is therefore closer to a table lookup than to a chain of <code>instanceof</code> checks &mdash; you are not paying for the readability.</p>
+      <p>There is one runtime hole worth knowing about. If a sealed hierarchy is recompiled with a new subtype but a dependent class is <em>not</em> recompiled, the old exhaustive switch can face a value it has no case for. Rather than fall through, it throws <code>MatchException</code>. You should never see it in a clean build; seeing it means a stale artifact is on the classpath.</p>
+      <p><strong>Preview note:</strong> primitive types in patterns, <code>instanceof</code> and <code>switch</code> &mdash; matching on <code>int</code>, <code>long</code> and friends the way you match on reference types &mdash; is still a preview feature on Java 25<span class="since preview">Preview on 25</span>. It is genuinely useful and genuinely not final; do not put it in production code yet.</p>
+    </div>
+
+    <div class="box try-now" data-anchor="seal-try">
+      <span class="box-label">Try This Now<span class="est">15 minutes</span></span>
+      <ol>
+        <li>Find an <code>enum</code> in your codebase that is always used with a <code>switch</code> and always needs extra data per constant &mdash; the classic <code>type + nullable fields</code> smell.</li>
+        <li>Rewrite it as a sealed interface with one record per constant, each carrying exactly the fields that constant needs.</li>
+        <li>Convert the switches. Delete every <code>default</code> and every null check that only existed because a field was optional-per-type.</li>
+        <li>Count the fields that became non-nullable. That number is what the enum was costing you.</li>
+      </ol>
+    </div>
+
+    <div class="box project" data-anchor="seal-project">
+      <span class="box-label">Chapter project &mdash; part 2 of 7</span>
+      <p>Give the aggregator a result type. Every downstream call in Chapter 7 will return one of exactly three outcomes, and the sealed declaration is what will force the HTTP layer to handle all three:</p>
+      <pre><code><span class="kw">public sealed interface</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; <span class="kw">permits</span> <span class="ty">Ok</span>, <span class="ty">NotFound</span>, <span class="ty">Failed</span> {}
+
+<span class="kw">public record</span> <span class="ty">Ok</span>&lt;<span class="ty">T</span>&gt;(<span class="ty">T</span> value)           <span class="kw">implements</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; {}
+<span class="kw">public record</span> <span class="ty">NotFound</span>&lt;<span class="ty">T</span>&gt;(<span class="ty">String</span> sku)   <span class="kw">implements</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; {}
+<span class="kw">public record</span> <span class="ty">Failed</span>&lt;<span class="ty">T</span>&gt;(<span class="ty">String</span> reason) <span class="kw">implements</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; {}</code></pre>
+      <p>Then write the renderer, exhaustively and with no <code>default</code>:</p>
+      <pre><code><span class="ty">String</span> <span class="fn">render</span>(<span class="ty">Result</span>&lt;<span class="ty">Product</span>&gt; r) {
+    <span class="kw">return switch</span> (r) {
+        <span class="kw">case</span> <span class="ty">Ok</span>(<span class="ty">Product</span> p)        -&gt; p.<span class="fn">catalog</span>().<span class="fn">sku</span>() + <span class="str">" ok"</span>;
+        <span class="kw">case</span> <span class="ty">NotFound</span>(<span class="ty">String</span> sku) -&gt; <span class="str">"no such product: "</span> + sku;
+        <span class="kw">case</span> <span class="ty">Failed</span>(<span class="ty">String</span> why)   -&gt; <span class="str">"lookup failed: "</span> + why;
+    };
+}</code></pre>
+      <p>Now try adding a fourth outcome &mdash; <code>Degraded</code>, say &mdash; and watch the build tell you every place that has to change. That is the feature.</p>
+    </div>
+
+    <div class="box recap" data-anchor="seal-recap">
+      <span class="box-label">Fast Recap</span>
+      <ol>
+        <li><code>sealed</code> + <code>permits</code> closes a hierarchy; each permitted subtype must be <code>final</code>, <code>sealed</code>, or <code>non-sealed</code>, and must live in the same module.</li>
+        <li>A pattern <code>switch</code> over a sealed type is exhaustive without a <code>default</code>, and stops compiling when a subtype is added.</li>
+        <li>Record patterns bind components in the label and nest arbitrarily deep; <code>var</code> is allowed for the ones you do not care about.</li>
+        <li>Guards use the contextual keyword <code>when</code>, and guarded arms must precede the unguarded arm of the same type.</li>
+        <li>Adding <code>default</code> to a sealed switch silently disables exhaustiveness checking &mdash; this is the one mistake to police in review.</li>
+        <li><code>null</code> throws unless you write <code>case null</code>.</li>
+        <li>Primitive patterns are still preview on Java 25.</li>
+      </ol>
+    </div>
+
+    <p class="bridge" data-anchor="seal-bridge"><strong>Next:</strong> that is the language half of the upgrade. Chapters 3 and 4 are the runtime half, and they start with the feature that changed the economics of a blocking call &mdash; virtual threads.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-records-and-data-first-design.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-virtual-threads.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

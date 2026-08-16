@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Structured Concurrency and Scoped Values &middot; Modern Java</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="modern-java-from-java-17-21-to-java-25">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; How you spend a thread</span> &middot; Chapter 04</p>
+    <p class="chapter-no">04</p>
+    <h1 data-anchor="sc-h1">Structured concurrency and scoped values</h1>
+
+    <p class="lede" data-anchor="sc-lede">Chapter 3 ended with a fan-out that worked and two holes it could not close: a failed call did not stop its siblings, and nothing bounded the request as a whole. This chapter closes both. One of the two features doing that is final on Java 25. The other is not, and this chapter will not let you forget it.</p>
+
+    <div class="callout warn" data-anchor="sc-preview-banner">
+      <span class="callout-title">Read this before you write any of it</span>
+      <p><strong>Scoped values are final on Java 25</strong> (JEP 506). Use them freely.</p>
+      <p><strong>Structured concurrency is still preview on Java 25</strong> (JEP 505, the <em>fifth</em> preview). It needs <code>--enable-preview</code> at compile time and at run time, it is not covered by any compatibility guarantee, and its API has changed in every LTS-adjacent release it has appeared in &mdash; including once more after Java 25. Every <code>StructuredTaskScope</code> snippet in this chapter carries that label.</p>
+    </div>
+
+    <div class="objectives" data-anchor="sc-objectives">
+      <span class="box-label">By the end of this chapter you will be able to</span>
+      <ul>
+        <li>express a fan-out as a single unit of work with one deadline and one failure policy;</li>
+        <li>choose the right <code>Joiner</code> for "all must succeed" versus "first one wins";</li>
+        <li>carry request, tenant and trace context to every subtask without a parameter or a <code>ThreadLocal</code>;</li>
+        <li>state exactly what adopting the preview API costs you, and decide whether to pay it.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="sc-h2-problem">The fan-out that will not stop</h2>
+
+    <p data-anchor="sc-p1">Here is Chapter 3's aggregator again, and here is what it does when things go wrong.</p>
+
+    <div class="pre-label">Works; leaks</div>
+    <pre><code><span class="kw">try</span> (<span class="kw">var</span> exec = <span class="ty">Executors</span>.<span class="fn">newVirtualThreadPerTaskExecutor</span>()) {
+    <span class="kw">var</span> catalog = exec.<span class="fn">submit</span>(() -&gt; catalogClient.<span class="fn">find</span>(sku));
+    <span class="kw">var</span> price   = exec.<span class="fn">submit</span>(() -&gt; pricingClient.<span class="fn">find</span>(sku));
+    <span class="kw">var</span> stock   = exec.<span class="fn">submit</span>(() -&gt; inventoryClient.<span class="fn">find</span>(sku));
+
+    <span class="kw">return new</span> <span class="ty">Product</span>(catalog.<span class="fn">get</span>(), price.<span class="fn">get</span>(), stock.<span class="fn">get</span>());
+}</code></pre>
+
+    <div class="box predict" data-anchor="sc-predict-1">
+      <span class="box-label">Make a Prediction</span>
+      <p>The catalog service returns a 500 after 10 milliseconds. Pricing and inventory are healthy but slow &mdash; 30 seconds each today, because a downstream cache is cold. The user has already been shown an error.</p>
+      <p>What are pricing and inventory doing at second 25?</p>
+      <p class="answer"><span class="answer-label">Answer</span> Still running. <code>catalog.get()</code> threw, the <code>return</code> never happened, and <code>close()</code> is now <em>waiting for the other two to finish</em> before it will let the method exit. Your request thread is stuck for thirty seconds serving a response nobody will see, and the two connections are held that whole time. Under load, this is how a single sick dependency takes out a healthy service.</p>
+    </div>
+
+    <p data-anchor="sc-p2">Both defects have the same root cause: the three tasks are related in your head and unrelated to the runtime. Nothing ties their lifetimes together, so nothing can cancel them together or time them out together.</p>
+
+    <div class="box brain" data-anchor="sc-brain">
+      <span class="box-label">Your Brain on structured concurrency</span>
+      <p>You already trust this idea everywhere except concurrency. A method call cannot outlive its caller. A <code>try</code> block cannot leave a file open past its closing brace. Control flow in sequential Java is a tree, and the shape of the tree is the shape of the code.</p>
+      <p>Then you call <code>submit()</code> and the tree becomes a pile. The task's lifetime is now unrelated to the block that started it &mdash; it can outlive the method, the request, the exception handler.</p>
+      <p><strong>Structured concurrency puts the tasks back in the tree.</strong> A scope is a block; subtasks forked inside it cannot outlive it, in the same unremarkable way a local variable cannot. Once that is true, "cancel the siblings" and "one deadline for the whole thing" stop being features you implement and start being properties of the block.</p>
+    </div>
+
+    <h2 data-anchor="sc-h2-scope">A scope is a block</h2>
+
+    <p data-anchor="sc-p3">Same aggregation, as one unit of work<span class="since preview">Preview on 25</span>:</p>
+
+    <div class="pre-label">PREVIEW on Java 25 &mdash; compile and run with --enable-preview</div>
+    <pre><code><span class="kw">import</span> java.util.concurrent.<span class="ty">StructuredTaskScope</span>;
+<span class="kw">import</span> java.util.concurrent.<span class="ty">StructuredTaskScope</span>.<span class="ty">Joiner</span>;
+<span class="kw">import</span> java.util.concurrent.<span class="ty">StructuredTaskScope</span>.<span class="ty">Subtask</span>;
+
+<span class="ty">Product</span> <span class="fn">lookup</span>(<span class="ty">String</span> sku) <span class="kw">throws</span> <span class="ty">Exception</span> {
+    <span class="kw">try</span> (<span class="kw">var</span> scope = <span class="ty">StructuredTaskScope</span>.<span class="fn">open</span>(
+             <span class="ty">Joiner</span>.&lt;<span class="ty">Object</span>&gt;<span class="fn">awaitAllSuccessfulOrThrow</span>(),
+             cf -&gt; cf.<span class="fn">withName</span>(<span class="str">"product-lookup"</span>)
+                     .<span class="fn">withTimeout</span>(<span class="ty">Duration</span>.<span class="fn">ofSeconds</span>(<span class="num">2</span>)))) {
+
+        <span class="ty">Subtask</span>&lt;<span class="ty">CatalogEntry</span>&gt; catalog = scope.<span class="fn">fork</span>(() -&gt; catalogClient.<span class="fn">find</span>(sku));
+        <span class="ty">Subtask</span>&lt;<span class="ty">Price</span>&gt;        price   = scope.<span class="fn">fork</span>(() -&gt; pricingClient.<span class="fn">find</span>(sku));
+        <span class="ty">Subtask</span>&lt;<span class="ty">Stock</span>&gt;        stock   = scope.<span class="fn">fork</span>(() -&gt; inventoryClient.<span class="fn">find</span>(sku));
+
+        scope.<span class="fn">join</span>();                       <span class="cm">// one wait; throws if any subtask failed</span>
+
+        <span class="kw">return new</span> <span class="ty">Product</span>(catalog.<span class="fn">get</span>(), price.<span class="fn">get</span>(), stock.<span class="fn">get</span>());
+    }   <span class="cm">// close() cannot be reached with a subtask still running</span>
+}</code></pre>
+
+    <p data-anchor="sc-p4">Replay the failure. Catalog fails at 10ms; <code>join()</code> immediately cancels the scope, which interrupts pricing and inventory, and throws. Total elapsed: about 10 milliseconds, with nothing left running. And if all three are merely slow, the two-second timeout cancels the scope for you.</p>
+
+    <p data-anchor="sc-p5">The shape is always the same three beats: <strong>fork everything, join once, then read results.</strong> <code>Subtask.get()</code> is only legal after <code>join()</code>, and only on a subtask that succeeded &mdash; call it early and you get <code>IllegalStateException</code> rather than a race.</p>
+
+    <figure class="diagram-fig" data-anchor="sc-fig">
+      <svg class="diagram" viewBox="0 0 560 212" role="img" aria-labelledby="sc-fig-t">
+        <title id="sc-fig-t">Without a scope a failed task leaves its siblings running past the caller; within a scope the siblings are cancelled and nothing outlives the block</title>
+
+        <text x="16" y="18">Unstructured &mdash; submit()</text>
+        <rect x="16" y="28" width="72" height="26" class="stroke-red"/>
+        <text x="24" y="45" class="big red">fails</text>
+        <rect x="16" y="60" width="300" height="20" class="stroke-soft"/>
+        <text x="24" y="75">pricing &mdash; still running</text>
+        <rect x="16" y="86" width="300" height="20" class="stroke-soft"/>
+        <text x="24" y="101">inventory &mdash; still running</text>
+
+        <path d="M120 24 L120 116" class="stroke dash"/>
+        <text x="128" y="122">caller returned here</text>
+
+        <path d="M16 138 L544 138" class="stroke-soft"/>
+
+        <text x="16" y="160">Structured &mdash; StructuredTaskScope</text>
+        <rect x="16" y="168" width="72" height="26" class="stroke-red"/>
+        <text x="24" y="185" class="big red">fails</text>
+        <rect x="96" y="168" width="52" height="26" class="stroke"/>
+        <text x="104" y="185">cancel</text>
+        <rect x="156" y="168" width="120" height="26" class="stroke fill-ink"/>
+        <text x="164" y="185" class="on-ink">scope closed</text>
+        <text x="290" y="185">nothing outlives the block</text>
+      </svg>
+      <figcaption><b>The Big Picture.</b> The dashed line is where the caller moved on. Above it, two tasks are still burning connections on the wrong side of that line. Below it, there is no wrong side.</figcaption>
+    </figure>
+
+    <h2 data-anchor="sc-h2-joiner">Joiners: the policy, named</h2>
+
+    <p data-anchor="sc-p6">The first argument to <code>open</code> is a <code>Joiner</code>, and it encodes what "done" means for this scope. Picking it is the whole design decision.</p>
+
+    <div class="table-wrap" data-anchor="sc-table-joiner">
+      <table>
+        <caption>Joiners on JDK 25 (preview API)</caption>
+        <thead>
+          <tr><th>Joiner</th><th>Finishes when</th><th>Use for</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>allSuccessfulOrThrow()</code></td><td>all succeed &mdash; cancels and throws on the first failure</td><td>a fan-out where every part is required</td></tr>
+          <tr><td><code>anySuccessfulResultOrThrow()</code></td><td>the first success &mdash; throws only if all fail</td><td>racing replicas or mirrors</td></tr>
+          <tr><td><code>awaitAllSuccessfulOrThrow()</code></td><td>all succeed; <code>join()</code> returns <code>null</code>, results read per subtask</td><td>subtasks with differing result types</td></tr>
+          <tr><td><code>awaitAll()</code></td><td>all finish, success or not</td><td>best-effort work you will inspect individually</td></tr>
+          <tr><td><code>allUntil(predicate)</code></td><td>the predicate says stop</td><td>"first three of five", quorum rules</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="sc-p7">When every subtask has the <em>same</em> result type, <code>allSuccessfulOrThrow()</code> is the tidier choice, because <code>join()</code> hands you the results directly:</p>
+
+    <div class="pre-label">PREVIEW on Java 25 &mdash; racing several quote providers</div>
+    <pre><code><span class="kw">try</span> (<span class="kw">var</span> scope = <span class="ty">StructuredTaskScope</span>.<span class="fn">open</span>(<span class="ty">Joiner</span>.&lt;<span class="ty">Quote</span>&gt;<span class="fn">allSuccessfulOrThrow</span>())) {
+    <span class="kw">for</span> (<span class="ty">String</span> carrier : carriers) scope.<span class="fn">fork</span>(() -&gt; <span class="fn">quoteFrom</span>(carrier, request));
+
+    <span class="kw">return</span> scope.<span class="fn">join</span>()              <span class="cm">// Stream&lt;Subtask&lt;Quote&gt;&gt; on JDK 25</span>
+                .<span class="fn">map</span>(<span class="ty">Subtask</span>::get)
+                .<span class="fn">toList</span>();
+}</code></pre>
+
+    <div class="callout warn" data-anchor="sc-jdk26">
+      <span class="callout-title">This exact line changes in JDK 26</span>
+      <p>On JDK 25, <code>join()</code> with <code>allSuccessfulOrThrow()</code> returns a <code>Stream&lt;Subtask&lt;T&gt;&gt;</code>. JEP 525 &mdash; structured concurrency's <em>sixth</em> preview, in JDK 26 &mdash; changes it to return a materialized <code>List&lt;T&gt;</code> in fork order, so the <code>.map(Subtask::get)</code> disappears.</p>
+      <p>That is a small change and a good one. It is also the fourth API revision in a row, and the reason this book will not tell you the API has settled. If you adopt structured concurrency now, adopt it behind a thin interface of your own, so the migration is one class rather than every service.</p>
+    </div>
+
+    <h2 data-anchor="sc-h2-scoped">Scoped values: context without a parameter</h2>
+
+    <p data-anchor="sc-p8">Now the other half, and the reassuring half: <span class="term">scoped values</span> are <strong>final</strong> on Java 25<span class="since">Final Java 25</span>. No flag, no caveat.</p>
+
+    <p data-anchor="sc-p9">The problem they solve is old. A request has a trace id and a tenant. Twelve methods down the call stack, something needs the trace id. Your options used to be threading a parameter through all twelve signatures, or a <code>ThreadLocal</code> &mdash; which is mutable from anywhere, easy to leak on a pooled thread, and multiplies badly across a million virtual threads.</p>
+
+    <div class="pre-label">Final on Java 25 &mdash; no --enable-preview</div>
+    <pre><code><span class="kw">public static final</span> <span class="ty">ScopedValue</span>&lt;<span class="ty">RequestContext</span>&gt; CONTEXT = <span class="ty">ScopedValue</span>.<span class="fn">newInstance</span>();
+
+<span class="kw">void</span> <span class="fn">handle</span>(<span class="ty">HttpExchange</span> exchange) {
+    <span class="kw">var</span> ctx = <span class="kw">new</span> <span class="ty">RequestContext</span>(<span class="fn">traceIdOf</span>(exchange), <span class="fn">tenantOf</span>(exchange));
+
+    <span class="ty">ScopedValue</span>.<span class="fn">where</span>(CONTEXT, ctx).<span class="fn">run</span>(() -&gt; <span class="fn">route</span>(exchange));
+}   <span class="cm">// binding is gone the moment run() returns &mdash; guaranteed, even on exception</span>
+
+<span class="kw">void</span> <span class="fn">audit</span>(<span class="ty">String</span> action) {                     <span class="cm">// twelve frames deeper</span>
+    log.<span class="fn">info</span>(<span class="str">"[{}] {}"</span>, CONTEXT.<span class="fn">get</span>().<span class="fn">traceId</span>(), action);
+}</code></pre>
+
+    <p data-anchor="sc-p10">Three properties make this better than a <code>ThreadLocal</code>, and they all come from the same design choice &mdash; the binding is <em>one-way and bounded</em>:</p>
+
+    <div class="table-wrap" data-anchor="sc-table-sv">
+      <table>
+        <caption><code>ThreadLocal</code> versus <code>ScopedValue</code></caption>
+        <thead>
+          <tr><th></th><th><code>ThreadLocal</code></th><th><code>ScopedValue</code></th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Mutation</td><td><code>set()</code> from anywhere</td><td>none &mdash; bind at the scope, read below it</td></tr>
+          <tr><td>Lifetime</td><td>until <code>remove()</code>, or the thread dies</td><td>the dynamic extent of one call</td></tr>
+          <tr><td>Leaks on a pooled thread</td><td>yes, classically</td><td>not expressible</td></tr>
+          <tr><td>Cost per thread</td><td>a map entry per thread</td><td>shared; no per-thread copy</td></tr>
+          <tr><td>Reaches a forked subtask</td><td>only via inheritable copies</td><td>inherited by scope subtasks</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="sc-p11">That last row is the payoff of pairing the two features. A subtask forked inside a <code>StructuredTaskScope</code> inherits the scope owner's scoped-value bindings, so the trace id reaches the catalog call, the pricing call and the inventory call without appearing in a single signature.</p>
+
+    <p class="pullquote" data-anchor="sc-pull">A <code>ThreadLocal</code> is a variable that happens to be per-thread. A scoped value is a parameter that happens not to be written down.</p>
+
+    <div class="box wrong" data-anchor="sc-wrong">
+      <span class="box-label">What Could Go Wrong?</span>
+      <p><strong>You ship the preview API without deciding who owns it.</strong> <code>--enable-preview</code> is not a compiler flag you set once &mdash; it must be on for compilation <em>and</em> for every JVM that runs the artifact, and class files compiled with preview features are rejected by a different JDK version outright. That is a deployment-wide decision, not a per-module one.</p>
+      <p><strong>You call <code>Subtask.get()</code> before <code>join()</code>,</strong> or on a subtask that failed. Both throw <code>IllegalStateException</code>. Fork, join, then read &mdash; in that order, always.</p>
+      <p><strong>You read a scoped value outside its extent.</strong> <code>get()</code> throws <code>NoSuchElementException</code>. If the value is genuinely optional, use <code>isBound()</code> or <code>orElse(fallback)</code> &mdash; and note that in the finalized Java 25 API, <code>orElse</code> no longer accepts <code>null</code>.</p>
+      <p><strong>You try to mutate a scoped value.</strong> There is no <code>set()</code>. To change the value for part of the call tree, nest another <code>where(...).run(...)</code>; the inner binding shadows the outer one and unwinds at the inner block's end.</p>
+      <p><strong>You wrap a scope in a <code>catch</code> that swallows.</strong> Cancellation reaches subtasks as an interrupt. Code that catches <code>InterruptedException</code> and continues will defeat the timeout you just added.</p>
+    </div>
+
+    <div class="box surgery" data-anchor="sc-surgery">
+      <span class="box-label">Code Surgery</span>
+      <p>A team migrating off <code>ThreadLocal</code> wrote this. It compiles. It is wrong in two ways.</p>
+      <pre><code><span class="kw">static final</span> <span class="ty">ScopedValue</span>&lt;<span class="ty">String</span>&gt; TENANT = <span class="ty">ScopedValue</span>.<span class="fn">newInstance</span>();
+
+<span class="kw">void</span> <span class="fn">handle</span>(<span class="ty">Request</span> r) {
+    <span class="ty">ScopedValue</span>.<span class="fn">where</span>(TENANT, r.<span class="fn">tenant</span>()).<span class="fn">run</span>(() -&gt; {
+        executor.<span class="fn">submit</span>(() -&gt; <span class="fn">reindex</span>(r));      <span class="cm">// (1)</span>
+    });
+}
+
+<span class="kw">void</span> <span class="fn">reindex</span>(<span class="ty">Request</span> r) {
+    <span class="ty">String</span> t = TENANT.<span class="fn">orElse</span>(<span class="kw">null</span>);             <span class="cm">// (2)</span>
+    index.<span class="fn">write</span>(t, r);
+}</code></pre>
+      <p><strong>(1)</strong> The task is submitted to an unrelated executor, so it runs on a thread outside the binding's extent &mdash; and <code>run()</code> returns as soon as <code>submit()</code> does, unbinding the value while <code>reindex</code> is still queued. <code>TENANT</code> will not be bound when the task actually runs. Scoped values are inherited by subtasks forked in a <code>StructuredTaskScope</code>, not by anything handed to an arbitrary executor.</p>
+      <p><strong>(2)</strong> <code>orElse(null)</code> is not permitted in the finalized Java 25 API. It was also hiding the bug in (1): a <code>null</code> tenant silently indexed into the wrong place instead of failing loudly.</p>
+      <p><strong>The repair:</strong> fork inside a scope so the binding is inherited and the work cannot outlive the request, and let <code>get()</code> throw if the value is genuinely required:</p>
+      <pre><code><span class="cm">// PREVIEW on Java 25</span>
+<span class="ty">ScopedValue</span>.<span class="fn">where</span>(TENANT, r.<span class="fn">tenant</span>()).<span class="fn">run</span>(() -&gt; {
+    <span class="kw">try</span> (<span class="kw">var</span> scope = <span class="ty">StructuredTaskScope</span>.<span class="fn">open</span>(<span class="ty">Joiner</span>.&lt;<span class="ty">Void</span>&gt;<span class="fn">awaitAllSuccessfulOrThrow</span>())) {
+        scope.<span class="fn">fork</span>(() -&gt; { <span class="fn">reindex</span>(r); <span class="kw">return null</span>; });
+        scope.<span class="fn">join</span>();
+    } <span class="kw">catch</span> (<span class="ty">Exception</span> e) { <span class="kw">throw new</span> <span class="ty">RuntimeException</span>(e); }
+});</code></pre>
+      <p>If the reindex genuinely should outlive the request, then it is not request-scoped work and the tenant belongs in its payload &mdash; pass it as a parameter, honestly.</p>
+    </div>
+
+    <div class="box hood" data-anchor="sc-hood">
+      <span class="box-label">Under the Hood</span>
+      <p>A scope owns its subtasks: <code>fork</code> refuses from any thread other than the owner, and <code>close</code> is what enforces the structural rule. Because <code>close</code> cannot return while a subtask runs, "leaked subtask" is not a state the API can be talked into.</p>
+      <p>Cancellation is cooperative and rides on interruption. When the joiner decides the scope is finished &mdash; a required subtask failed, the timeout fired &mdash; the remaining subtasks are interrupted. A subtask blocked in a JDK blocking call notices immediately; a subtask spinning on a CPU loop that never checks its interrupt status will not. Structured concurrency gives you the mechanism, not immunity from ignoring it.</p>
+      <p>Scoped-value bindings are held on the thread as a small immutable stack of bindings rather than a mutable map, which is why binding is cheap, reads are fast, and a subtask can inherit the whole set by sharing it rather than copying. Immutability is not a style preference here &mdash; it is what makes the sharing safe.</p>
+      <p>Both features were designed alongside virtual threads and assume them. On platform threads they work, but the economics that motivate them &mdash; a thread per task, a million of them &mdash; do not apply.</p>
+    </div>
+
+    <div class="box try-now" data-anchor="sc-try">
+      <span class="box-label">Try This Now<span class="est">20 minutes</span></span>
+      <ol>
+        <li>Write a method that forks three tasks: one that throws after 50ms, two that sleep 5 seconds. Use a plain <code>newVirtualThreadPerTaskExecutor()</code>. Time how long the method takes to return. (Five seconds.)</li>
+        <li>Rewrite it with <code>StructuredTaskScope</code> and <code>awaitAllSuccessfulOrThrow()</code>. Compile and run with <code>--enable-preview --release 25</code>. Time it again. (Fifty milliseconds.)</li>
+        <li>Add <code>withTimeout(Duration.ofSeconds(1))</code> and remove the failing task. Confirm the scope gives up at one second rather than five.</li>
+        <li>Bind a <code>ScopedValue</code> outside the scope and read it inside each subtask. Confirm it is visible. Then move one task to a separate executor and confirm it is not &mdash; the failure mode from Code Surgery, reproduced deliberately.</li>
+      </ol>
+    </div>
+
+    <div class="box project" data-anchor="sc-project">
+      <span class="box-label">Chapter project &mdash; part 4 of 7</span>
+      <p>Two changes to the aggregator, and one decision.</p>
+      <p><strong>Add the context</strong> (final API, safe to ship): a <code>ScopedValue&lt;RequestContext&gt;</code> bound once in the HTTP handler, read by the logging and metrics code, never passed as a parameter.</p>
+      <p><strong>Add the scope</strong> (preview API): replace the three <code>submit</code> calls with three <code>fork</code> calls inside a <code>StructuredTaskScope</code> carrying a 2-second timeout, so a failed catalog call cancels pricing and inventory.</p>
+      <p><strong>The decision</strong> is the real exercise. Write down, in two sentences you would be willing to show a tech lead, whether your team should run <code>--enable-preview</code> in production for this. There is no correct answer &mdash; there is only a decision made deliberately or by accident. If the answer is no, keep the executor version from Chapter 3 and add a plain per-call timeout; you will lose sibling cancellation and get it back on the release that finalizes the API.</p>
+    </div>
+
+    <div class="box recap" data-anchor="sc-recap">
+      <span class="box-label">Fast Recap</span>
+      <ol>
+        <li>A <code>StructuredTaskScope</code> makes concurrent tasks a block: fork everything, <code>join()</code> once, then read results.</li>
+        <li>The <code>Joiner</code> is the failure policy &mdash; <code>allSuccessfulOrThrow</code>, <code>anySuccessfulResultOrThrow</code>, <code>awaitAll</code>, <code>allUntil</code>.</li>
+        <li><code>withTimeout</code> applies one deadline to the whole scope; failure or timeout cancels the surviving subtasks by interrupt.</li>
+        <li>Structured concurrency is <strong>preview on Java 25</strong> (JEP 505) and changes again in JDK 26 (JEP 525) &mdash; wrap it behind your own interface if you adopt it.</li>
+        <li>Scoped values are <strong>final on Java 25</strong> (JEP 506): bind with <code>where(...).run(...)</code>, read with <code>get()</code>, never mutate, and <code>orElse(null)</code> is not allowed.</li>
+        <li>Subtasks forked in a scope inherit scoped-value bindings; tasks handed to an unrelated executor do not.</li>
+      </ol>
+    </div>
+
+    <p class="bridge" data-anchor="sc-bridge"><strong>Next:</strong> Part III turns outward. Chapter 5 is about reaching code the JVM did not compile &mdash; the Foreign Function &amp; Memory API, which finally makes calling a C library something you can do safely, in ordinary Java, without writing a line of JNI.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-virtual-threads.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-foreign-function-and-memory-api.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

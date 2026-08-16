@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Virtual Threads &middot; Modern Java</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="modern-java-from-java-17-21-to-java-25">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; How you spend a thread</span> &middot; Chapter 03</p>
+    <p class="chapter-no">03</p>
+    <h1 data-anchor="vt-h1">Virtual threads</h1>
+
+    <p class="lede" data-anchor="vt-lede">For twenty years the rule was: threads are expensive, so pool them, so never block one. Every reactive framework, every <code>CompletableFuture</code> chain, every callback pyramid in your codebase is downstream of that one constraint. Virtual threads remove the constraint. What they do not remove is your habits.</p>
+
+    <div class="objectives" data-anchor="vt-objectives">
+      <span class="box-label">By the end of this chapter you will be able to</span>
+      <ul>
+        <li>run blocking I/O on a virtual thread per task, and explain why that scales;</li>
+        <li>say what happens to a carrier thread when a virtual thread blocks;</li>
+        <li>identify what still pins a virtual thread on Java 25 &mdash; and what stopped pinning in Java 24;</li>
+        <li>replace the accidental back-pressure a thread pool was giving you with something deliberate.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="vt-h2-problem">A pool of 200, and a call that takes a second</h2>
+
+    <p data-anchor="vt-p1">Your service calls a payment provider. The call takes about a second, most of which is the network being the network. You run it on a fixed pool of 200 platform threads, because 200 felt like a reasonable number in 2019 and nobody has revisited it.</p>
+
+    <div class="box predict" data-anchor="vt-predict-1">
+      <span class="box-label">Make a Prediction</span>
+      <p>Traffic spikes to 2,000 concurrent requests, each needing one of those one-second calls. Nothing is CPU-bound; the machine is idle. How long does the 2,000th request wait before its call even starts?</p>
+      <p class="answer"><span class="answer-label">Answer</span> About nine seconds. The pool runs 200 at a time, so the queue drains in ten waves of roughly a second each, and the last request sits through nine of them. Your CPU graph is flat the whole time. You were not out of capacity &mdash; you were out of <em>threads</em>, which is a different and entirely artificial thing to run out of.</p>
+    </div>
+
+    <p data-anchor="vt-p2">The classic fixes both cost you something real. Raise the pool to 2,000 and you buy 2,000 OS threads, each with a stack reservation measured in megabytes and a scheduler that now has 2,000 things to consider. Go reactive and you keep the small pool but rewrite the code into a form where a stack trace no longer tells you what happened.</p>
+
+    <div class="box brain" data-anchor="vt-brain">
+      <span class="box-label">Your Brain on virtual threads</span>
+      <p>The mental model that unlocks this: <strong>a thread is a stack, and a stack does not need an OS thread to exist &mdash; only to run.</strong></p>
+      <p>A platform thread is a thin wrapper over an OS thread: the stack lives in OS-reserved memory, and it is bound to that OS thread for its whole life, awake or asleep. A virtual thread's stack lives on the Java heap. It borrows an OS thread &mdash; its <span class="term">carrier</span> &mdash; only while it is actually executing. The instant it blocks on I/O, the JDK copies the stack out, hands the carrier to somebody else, and puts your thread aside until the bytes arrive.</p>
+      <p>So "blocking" stops meaning "occupying a scarce OS resource for a second" and starts meaning "sitting on the heap, costing a few hundred bytes". That is the entire feature. Everything else follows.</p>
+    </div>
+
+    <h2 data-anchor="vt-h2-api">The API is deliberately boring</h2>
+
+    <p data-anchor="vt-p3">Virtual threads<span class="since">Final Java 21</span> are <code>java.lang.Thread</code> instances. Not a new type, not a wrapper &mdash; the same class, with a different implementation behind it. Debuggers, thread dumps, stack traces and <code>try/catch</code> all keep working, which is the point: the feature exists so that ordinary blocking code scales, not so that you rewrite it.</p>
+
+    <div class="pre-label">One virtual thread per task</div>
+    <pre><code><span class="kw">try</span> (<span class="kw">var</span> executor = <span class="ty">Executors</span>.<span class="fn">newVirtualThreadPerTaskExecutor</span>()) {
+    <span class="ty">List</span>&lt;<span class="ty">Future</span>&lt;<span class="ty">String</span>&gt;&gt; futures = urls.<span class="fn">stream</span>()
+        .<span class="fn">map</span>(url -&gt; executor.<span class="fn">submit</span>(() -&gt; <span class="fn">fetch</span>(url)))   <span class="cm">// plain blocking call</span>
+        .<span class="fn">toList</span>();
+
+    <span class="kw">for</span> (<span class="kw">var</span> f : futures) <span class="ty">System</span>.out.<span class="fn">println</span>(f.<span class="fn">get</span>());
+}   <span class="cm">// close() waits for every task &mdash; the executor is AutoCloseable</span></code></pre>
+
+    <p data-anchor="vt-p4">Or, without an executor at all:</p>
+
+    <div class="pre-label">Thread.ofVirtual()</div>
+    <pre><code><span class="ty">Thread</span> t = <span class="ty">Thread</span>.<span class="fn">ofVirtual</span>().<span class="fn">name</span>(<span class="str">"fetch-1"</span>).<span class="fn">start</span>(() -&gt; <span class="fn">fetch</span>(url));
+t.<span class="fn">join</span>();</code></pre>
+
+    <p data-anchor="vt-p5">Run the earlier scenario on this and the 2,000th request starts immediately, alongside the other 1,999. There is no queue, because there is nothing scarce to queue for.</p>
+
+    <figure class="diagram-fig" data-anchor="vt-fig">
+      <svg class="diagram" viewBox="0 0 560 208" role="img" aria-labelledby="vt-fig-t">
+        <title id="vt-fig-t">A platform thread stays bound to its OS thread while blocked; a virtual thread unmounts from its carrier and the carrier runs another task</title>
+
+        <text x="16" y="18">Platform thread &mdash; blocked</text>
+        <rect x="16"  y="28" width="150" height="34" class="stroke fill-soft"/>
+        <text x="26"  y="49" class="big">task waits 1s</text>
+        <rect x="210" y="28" width="150" height="34" class="stroke fill-ink"/>
+        <text x="220" y="49" class="big on-ink">OS thread: held</text>
+        <rect x="404" y="28" width="140" height="34" class="stroke-red"/>
+        <text x="414" y="49" class="big red">others queue</text>
+
+        <path d="M166 45 L210 45" class="stroke"/>
+        <path d="M202 41 L210 45 L202 49" class="stroke"/>
+        <path d="M360 45 L404 45" class="stroke-red"/>
+        <path d="M396 41 L404 45 L396 49" class="stroke-red"/>
+
+        <path d="M16 88 L544 88" class="stroke-soft"/>
+
+        <text x="16" y="118">Virtual thread &mdash; blocked</text>
+        <rect x="16"  y="128" width="150" height="34" class="stroke fill-soft"/>
+        <text x="26"  y="149" class="big">task waits 1s</text>
+        <rect x="210" y="128" width="150" height="34" class="stroke"/>
+        <text x="220" y="149" class="big">stack &rarr; heap</text>
+        <rect x="404" y="128" width="140" height="34" class="stroke fill-ink"/>
+        <text x="414" y="149" class="big on-ink">carrier freed</text>
+
+        <path d="M166 145 L210 145" class="stroke"/>
+        <path d="M202 141 L210 145 L202 149" class="stroke"/>
+        <path d="M360 145 L404 145" class="stroke"/>
+        <path d="M352 141 L360 145 L352 149" class="stroke"/>
+        <text x="252" y="180">unmount</text>
+        <text x="414" y="180">runs the next virtual thread</text>
+      </svg>
+      <figcaption><b>The Big Picture.</b> Same blocking call, same one second of waiting. The difference is only what the wait costs: an OS thread above, a few hundred bytes of heap below.</figcaption>
+    </figure>
+
+    <h2 data-anchor="vt-h2-nopool">Stop pooling. Start bounding.</h2>
+
+    <p data-anchor="vt-p6">The first instinct on meeting virtual threads is to put them in a pool, because that is what you do with threads. Do not. A pool exists to amortize an expensive creation and to cap a scarce resource. Virtual threads are cheap to create, and they are not the scarce resource.</p>
+
+    <p data-anchor="vt-p7">But read that second half carefully, because it contains a trap. Your thread pool was capping <em>something</em>. Maybe deliberately, more likely by accident: a pool of 200 meant at most 200 concurrent database calls, which happened to sit nicely under a connection pool of 250. Swap in virtual threads and that ceiling evaporates. Now 5,000 requests arrive at a connection pool of 250 simultaneously, and instead of a queue you get 4,750 threads racing for connections, timing out, retrying.</p>
+
+    <p class="pullquote" data-anchor="vt-pull">Virtual threads do not remove your bottleneck. They remove the queue that was politely hiding it.</p>
+
+    <p data-anchor="vt-p8">The fix is to bound the scarce thing explicitly, where it actually is:</p>
+
+    <div class="pre-label">A semaphore says what you mean; a thread pool only implied it</div>
+    <pre><code><span class="kw">private final</span> <span class="ty">Semaphore</span> dbPermits = <span class="kw">new</span> <span class="ty">Semaphore</span>(<span class="num">20</span>);   <span class="cm">// match the connection pool</span>
+
+<span class="ty">Order</span> <span class="fn">load</span>(<span class="kw">long</span> id) <span class="kw">throws</span> <span class="ty">InterruptedException</span> {
+    dbPermits.<span class="fn">acquire</span>();
+    <span class="kw">try</span> { <span class="kw">return</span> repository.<span class="fn">find</span>(id); }
+    <span class="kw">finally</span> { dbPermits.<span class="fn">release</span>(); }
+}</code></pre>
+
+    <p data-anchor="vt-p9">Ten thousand virtual threads may call <code>load</code>. Twenty are inside the repository at any moment; the rest are parked on the semaphore, costing heap and nothing else. The limit is now written down, next to the resource it protects, in a number you can explain.</p>
+
+    <h2 data-anchor="vt-h2-pinning">Pinning: what changed, and what did not</h2>
+
+    <p data-anchor="vt-p10">A virtual thread is <span class="term">pinned</span> when it cannot unmount from its carrier. While pinned, a blocking call holds an OS thread exactly like the old model &mdash; and if enough carriers are pinned at once, the scheduler starves.</p>
+
+    <p data-anchor="vt-p11">This is where most of the advice on the internet is out of date, so be precise about versions:</p>
+
+    <div class="table-wrap" data-anchor="vt-table">
+      <table>
+        <caption>Pinning by JDK version</caption>
+        <thead>
+          <tr><th>Cause</th><th>Java 21&ndash;23</th><th>Java 24&ndash;25</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Blocking inside <code>synchronized</code></td><td>pins</td><td><strong>does not pin</strong> (JEP 491)</td></tr>
+          <tr><td>Blocking inside a native frame (JNI, FFM downcall)</td><td>pins</td><td>pins</td></tr>
+          <tr><td>Blocking in a class initializer</td><td>pins</td><td>pins</td></tr>
+          <tr><td><code>ReentrantLock</code></td><td>does not pin</td><td>does not pin</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="vt-p12">JEP 491, delivered in JDK 24, changed the JVM so that a monitor is associated with the virtual thread rather than with its carrier. A virtual thread can now block inside a <code>synchronized</code> block and still unmount. The practical consequence is large and underappreciated: <strong>you no longer need to rewrite <code>synchronized</code> as <code>ReentrantLock</code> to be virtual-thread friendly</strong> &mdash; and neither do the libraries you depend on, most of which were never going to.</p>
+
+    <p data-anchor="vt-p13">Pinning has not vanished. A virtual thread executing a native frame cannot unmount, which is why Chapter 5's foreign-function calls come with a warning attached. The way to find remaining pinning is not to reason about it but to measure it: JFR emits a <code>jdk.VirtualThreadPinned</code> event whenever a virtual thread parks while pinned. Chapter 6 shows how to read the recording.</p>
+
+    <div class="box wrong" data-anchor="vt-wrong">
+      <span class="box-label">What Could Go Wrong?</span>
+      <p><strong>You expect CPU-bound work to get faster.</strong> It will not. The carrier pool is a <code>ForkJoinPool</code> sized to the CPU count, so ten thousand virtual threads doing arithmetic contend for the same cores as ten platform threads would. Virtual threads are for tasks that <em>wait</em>.</p>
+      <p><strong>You keep the pool "just in case".</strong> <code>Executors.newFixedThreadPool(200)</code> full of virtual threads is the worst of both: you pay for the abstraction and keep the queue.</p>
+      <p><strong>ThreadLocal quietly becomes expensive.</strong> It still works, but a per-thread copy times a million threads is a real number, and thread-local state cannot be handed to a subtask in any disciplined way. Chapter 4 is the answer.</p>
+      <p><strong>You act on stale advice.</strong> "Avoid <code>synchronized</code> with virtual threads" was correct in 2023 and is obsolete from Java 24. "Avoid long native calls" was correct then and still is. Check the version stamp on any virtual-thread advice you read.</p>
+    </div>
+
+    <div class="box surgery" data-anchor="vt-surgery">
+      <span class="box-label">Code Surgery</span>
+      <p>This migration was done on a Friday. Spot the two problems.</p>
+      <pre><code><span class="cm">// was: Executors.newFixedThreadPool(64)</span>
+<span class="kw">private final</span> <span class="ty">ExecutorService</span> pool =
+        <span class="ty">Executors</span>.<span class="fn">newFixedThreadPool</span>(<span class="num">64</span>, <span class="ty">Thread</span>.<span class="fn">ofVirtual</span>().<span class="fn">factory</span>());
+
+<span class="ty">List</span>&lt;<span class="ty">Row</span>&gt; <span class="fn">loadAll</span>(<span class="ty">List</span>&lt;<span class="ty">Long</span>&gt; ids) {
+    <span class="kw">return</span> ids.<span class="fn">stream</span>()
+        .<span class="fn">map</span>(id -&gt; pool.<span class="fn">submit</span>(() -&gt; jdbc.<span class="fn">findRow</span>(id)))
+        .<span class="fn">toList</span>()
+        .<span class="fn">stream</span>().<span class="fn">map</span>(<span class="ty">Future</span>::join)
+        .<span class="fn">toList</span>();
+}</code></pre>
+      <p><strong>Problem one:</strong> a fixed pool of 64 virtual threads. The virtual-thread factory is being used to build exactly the queue virtual threads exist to remove. Replace it with <code>Executors.newVirtualThreadPerTaskExecutor()</code>.</p>
+      <p><strong>Problem two:</strong> once you do, nothing bounds the JDBC calls. Sixty-four was accidentally protecting a connection pool. Add the semaphore &mdash; sized to the connection pool, not guessed &mdash; around <code>jdbc.findRow</code>.</p>
+      <p>Fixing only the first problem is worse than fixing neither: you would remove the cap and keep no replacement. That is how a "performance improvement" becomes an incident.</p>
+    </div>
+
+    <div class="box hood" data-anchor="vt-hood">
+      <span class="box-label">Under the Hood</span>
+      <p>The default scheduler is a <code>ForkJoinPool</code> in FIFO mode, with parallelism defaulting to the number of available processors. Carriers are its worker threads. There is no fairness guarantee and no priority; a virtual thread runs until it blocks, yields, or finishes.</p>
+      <p>Mounting and unmounting are implemented with <em>continuations</em>: when a virtual thread blocks, the JVM copies its stack frames from the carrier's stack into a chunk on the Java heap, and copies them back on resume. This is why the cost of a virtual thread scales with its stack depth rather than being a fixed megabyte reservation &mdash; and why deep recursion on a virtual thread is more expensive than you might guess.</p>
+      <p>The JDK's own blocking points &mdash; sockets, files on most platforms, <code>Thread.sleep</code>, <code>BlockingQueue</code>, <code>ReentrantLock</code>, and since Java 24 monitors &mdash; were retrofitted to unmount. Anything that blocks <em>outside</em> the JDK's knowledge, notably native code, cannot be.</p>
+    </div>
+
+    <div class="box try-now" data-anchor="vt-try">
+      <span class="box-label">Try This Now<span class="est">15 minutes</span></span>
+      <ol>
+        <li>Write a task that sleeps one second and prints its thread name. Run 10,000 of them on <code>newFixedThreadPool(200)</code>. Time it.</li>
+        <li>Change one line to <code>newVirtualThreadPerTaskExecutor()</code>. Time it again.</li>
+        <li>Take a thread dump during each run (<code>jcmd &lt;pid&gt; Thread.print</code>). Note that the virtual-thread run has a handful of carriers and your tasks are elsewhere entirely &mdash; use <code>jcmd &lt;pid&gt; Thread.dump_to_file</code> to see them.</li>
+        <li>Now put a <code>synchronized</code> block around the sleep. On Java 21 the run collapses back toward the pooled timing; on Java 24+ it does not. If you have both JDKs available, this is the most convincing five minutes in the chapter.</li>
+      </ol>
+    </div>
+
+    <div class="box project" data-anchor="vt-project">
+      <span class="box-label">Chapter project &mdash; part 3 of 7</span>
+      <p>Your aggregator makes three downstream calls per request: catalog, pricing, inventory. Right now, imagine them sequential &mdash; 90ms + 40ms + 60ms = 190ms per request, all of it waiting.</p>
+      <p>Fan them out on virtual threads:</p>
+      <pre><code><span class="kw">try</span> (<span class="kw">var</span> exec = <span class="ty">Executors</span>.<span class="fn">newVirtualThreadPerTaskExecutor</span>()) {
+    <span class="kw">var</span> catalog = exec.<span class="fn">submit</span>(() -&gt; catalogClient.<span class="fn">find</span>(sku));
+    <span class="kw">var</span> price   = exec.<span class="fn">submit</span>(() -&gt; pricingClient.<span class="fn">find</span>(sku));
+    <span class="kw">var</span> stock   = exec.<span class="fn">submit</span>(() -&gt; inventoryClient.<span class="fn">find</span>(sku));
+
+    <span class="kw">return new</span> <span class="ty">Product</span>(catalog.<span class="fn">get</span>(), price.<span class="fn">get</span>(), stock.<span class="fn">get</span>());
+}</code></pre>
+      <p>190ms becomes about 90ms, and it took no reactive rewrite. Keep this version &mdash; and keep a note of what it still cannot do: if catalog fails immediately, pricing and inventory keep running to completion anyway, and there is no deadline covering the request as a whole. Chapter 4 fixes exactly those two holes.</p>
+    </div>
+
+    <div class="box recap" data-anchor="vt-recap">
+      <span class="box-label">Fast Recap</span>
+      <ol>
+        <li>A virtual thread is a real <code>Thread</code> whose stack lives on the heap and which borrows an OS carrier only while running.</li>
+        <li>Blocking is cheap now. One virtual thread per task; <code>Executors.newVirtualThreadPerTaskExecutor()</code>.</li>
+        <li>Never pool virtual threads &mdash; but do replace the cap your old pool was accidentally providing, with a <code>Semaphore</code> on the scarce resource.</li>
+        <li>From Java 24 (JEP 491), <code>synchronized</code> no longer pins. Native frames and class initializers still do.</li>
+        <li>CPU-bound work does not speed up; the carrier pool is still sized to the CPU count.</li>
+        <li>Find real pinning with JFR's <code>jdk.VirtualThreadPinned</code>, not by reasoning.</li>
+      </ol>
+    </div>
+
+    <p class="bridge" data-anchor="vt-bridge"><strong>Next:</strong> you can now start a thousand threads without thinking. Chapter 4 is about the discipline that makes that safe &mdash; giving concurrent work a lifetime, a deadline, and a context, with structured concurrency and scoped values.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="02-sealed-types-and-pattern-matching.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="04-structured-concurrency-and-scoped-values.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
