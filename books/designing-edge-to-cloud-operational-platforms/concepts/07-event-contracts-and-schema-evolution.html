@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Event Contracts and Schema Evolution &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Real-Time Event Streaming</span> &middot; Chapter 07</p>
+    <p class="chapter-no">07</p>
+    <h1 data-anchor="ece-h1">Event Contracts and<br>Schema Evolution</h1>
+
+    <p class="lede" data-anchor="ece-lede">An event that ten teams consume is an API, and it will outlive the
+    service that emits it. In a fleet with twenty-year assets it will also outlive
+    several generations of that service. This chapter is about designing events
+    that can change without a coordinated deployment &mdash; because in a fleet
+    you cannot have one.</p>
+
+    <h2 data-anchor="ece-h2-interface">An event is a published interface</h2>
+
+    <p data-anchor="ece-p-if1">The failure to avoid is the event that mirrors an internal database
+    row. It looks free &mdash; the data is right there &mdash; and it silently
+    couples every consumer to one service's storage decisions. Renaming a column
+    then becomes a fleet-wide migration.</p>
+
+    <p data-anchor="ece-p-if2">Design the event for the consumer instead. It should describe
+    something that happened in the world, be self-describing enough to interpret
+    without calling back, and carry its own identity and time.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Envelope fields, and what breaks without them</caption>
+        <thead>
+          <tr><th>Field</th><th>Purpose</th><th>Cost of omitting</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>event_id</code></td><td>Identity</td><td>No deduplication, no safe replay</td></tr>
+          <tr><td><code>event_type</code> + <code>version</code></td><td>Interpretation</td><td>Consumers guess from shape</td></tr>
+          <tr><td><code>event_time</code></td><td>When it happened</td><td>Windows compute on arrival</td></tr>
+          <tr><td><code>ingest_time</code></td><td>When we learned</td><td>Cannot measure delay</td></tr>
+          <tr><td><code>source</code></td><td>Which device/service</td><td>No provenance, no blast-radius scoping</td></tr>
+          <tr><td><code>correlation_id</code></td><td>Causal chain</td><td>No cross-boundary tracing</td></tr>
+          <tr><td><code>schema_ref</code></td><td>Exact contract</td><td>Registry lookup by guess</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="ece-h2-taxonomy">Topic taxonomy</h2>
+
+    <p data-anchor="ece-p-tax1">Name topics so that a person can infer the contents and a machine
+    can route on the prefix. The shape we use throughout: <code>family.stage.major-version</code>.</p>
+
+    <div class="pre-label">The topic set for the rail platform</div>
+    <pre><code>telemetry.raw.v1          <span class="cm"># as received: envelope + opaque payload</span>
+telemetry.normalized.v1   <span class="cm"># validated, unit-converted, typed</span>
+asset.position.v1         <span class="cm"># derived, keyed by asset, compacted</span>
+inspection.detected.v1    <span class="cm"># vision detections as events</span>
+maintenance.alert.v1      <span class="cm"># operator-facing, safety-adjacent</span>
+schedule.plan.updated.v1  <span class="cm"># optimizer output, versioned plans</span></code></pre>
+
+    <p data-anchor="ece-p-tax2">The raw/normalized split earns its keep. <code>telemetry.raw</code>
+    is the audit record and the replay source &mdash; it is never edited, and it
+    is what lets you re-derive everything downstream when you find a bug in
+    normalisation two months later. <code>telemetry.normalized</code> is what
+    almost every consumer actually reads.</p>
+
+    <h2 data-anchor="ece-h2-format">Choosing a serialisation format</h2>
+
+    <p data-anchor="ece-p-fmt1">There is no universally right answer, but there is a right answer
+    per link, and the constraints differ sharply between the metered radio link
+    and the cloud-internal one.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Format tradeoffs for telemetry workloads</caption>
+        <thead>
+          <tr><th></th><th>Protobuf</th><th>Avro</th><th>JSON Schema</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Size on wire</td><td>Smallest</td><td>Small</td><td>Large</td></tr>
+          <tr><td>Schema on read</td><td>Compiled</td><td>Writer + reader schema</td><td>Optional</td></tr>
+          <tr><td>Evolution model</td><td>Field numbers</td><td>Named fields + defaults</td><td>Loose</td></tr>
+          <tr><td>Embedded fit</td><td>Excellent</td><td>Fair</td><td>Poor</td></tr>
+          <tr><td>Debuggability</td><td>Needs tooling</td><td>Needs tooling</td><td>Human-readable</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="ece-p-fmt2">For this platform: <strong>Protobuf on the device link</strong>,
+    where every byte is metered and the schema is compiled into firmware anyway;
+    <strong>Avro or Protobuf on internal topics</strong>, where a registry is
+    available; and <strong>JSON at the edges</strong> that humans and partner
+    systems touch. Converting once at the gateway is a good trade.</p>
+
+    <h2 data-anchor="ece-h2-compat">Compatibility, and which direction you need</h2>
+
+    <p data-anchor="ece-p-compat1">This is where teams get confused, so let's be concrete about the
+    two directions and which one a fleet actually forces on you.</p>
+
+    <dl class="modes" data-anchor="ece-dl-compat">
+      <dt>Backward compatible</dt>
+      <dd>A new reader can read old data. You need this to replay history and to
+      deploy a consumer before its producers upgrade.</dd>
+      <dt>Forward compatible</dt>
+      <dd>An old reader can read new data. You need this whenever producers
+      upgrade first &mdash; which, with devices in the field, is always.</dd>
+      <dt>Full</dt>
+      <dd>Both. The only safe default for a topic consumed by systems you do not
+      deploy.</dd>
+    </dl>
+
+    <p data-anchor="ece-p-compat2">The fleet consequence is stark: you will have devices on last year's
+    firmware for a long time, and consumers that must handle both. So the rules
+    are the conservative ones &mdash; add optional fields, never reuse or
+    renumber a field, never change a field's meaning, and never make an existing
+    optional field required.</p>
+
+    <div class="callout warn" data-anchor="ece-callout-version">
+      <span class="callout-title">A new topic version is a consumer migration</span>
+      <p>Bumping <code>v1</code> to <code>v2</code> is not a schema change, it is
+      a project: dual-publish, migrate consumers one at a time, verify, then
+      retire. Reserve it for genuinely breaking changes. Everything else should
+      be a compatible evolution inside the schema, which costs nobody anything.</p>
+    </div>
+
+    <h2 data-anchor="ece-h2-registry">The schema registry as a gate</h2>
+
+    <p data-anchor="ece-p-reg1">A registry is only worth having if it can say no. Its real job is
+    to reject an incompatible schema at CI time, when the change is cheap, rather
+    than at 2 a.m. when a consumer starts throwing deserialization errors.</p>
+
+    <ol data-anchor="ece-ol-reg">
+      <li>Schemas live in version control, reviewed like code.</li>
+      <li>CI registers them against the registry's compatibility rule and fails
+      the build on violation.</li>
+      <li>Producers reference schemas by id; the id travels in the envelope.</li>
+      <li>Consumers resolve the id, cache aggressively, and treat an unknown id
+      as a quarantine case &mdash; not a crash.</li>
+    </ol>
+
+    <p data-anchor="ece-p-reg2">That last point matters more than it looks. An unknown schema id is
+    exactly the situation a fleet produces when a device runs ahead of a
+    consumer. Quarantining is graceful; crashing takes down a consumer group and
+    stops the traffic behind it.</p>
+
+    <h2 data-anchor="ece-h2-lakehouse">Contracts continue into the lake</h2>
+
+    <p data-anchor="ece-p-lake1">The contract does not stop at the stream. Lakehouse table formats
+    provide schema evolution as a first-class capability, which is what lets a
+    long-lived data contract change without rewriting history.<sup>1</sup> Apache
+    Iceberg additionally supports partition evolution &mdash; changing the
+    partitioning scheme without rewriting the underlying data &mdash; and hidden
+    partitioning, so queries need not name partition columns.<sup>1</sup></p>
+
+    <p data-anchor="ece-p-lake2">Partition evolution is not a footnote for a telemetry platform. You
+    will get the partitioning wrong at first, because you cannot know the query
+    patterns before there are queries. Being able to change it without a
+    petabyte-scale rewrite is the difference between a correction and a project.</p>
+
+    <h2 data-anchor="ece-h2-governance">Governance in the envelope</h2>
+
+    <p data-anchor="ece-p-gov1">Some fields are sensitive: crew identifiers, precise positions that
+    reveal individual movement, imagery containing people. Handle it in the
+    contract rather than in each consumer, by classifying at the field level in
+    the schema itself.</p>
+
+    <div class="pre-label">Field-level classification, carried by the schema</div>
+    <pre><code><span class="kw">message</span> <span class="ty">CrewAssignment</span> {
+  <span class="kw">string</span> assignment_id = <span class="num">1</span>;
+  <span class="kw">string</span> crew_id       = <span class="num">2</span> [(classification) = <span class="str">"pii"</span>];
+  <span class="kw">string</span> asset_id      = <span class="num">3</span>;
+  <span class="kw">int64</span>  starts_at     = <span class="num">4</span>;
+}</code></pre>
+
+    <p data-anchor="ece-p-gov2">With the classification in the schema, masking, retention, and
+    export rules can be enforced by tooling that reads the registry &mdash; one
+    implementation, applied everywhere &mdash; instead of by twelve consumers
+    each remembering to do the right thing.</p>
+
+    <div class="pullquote" data-anchor="ece-pq">
+      Design the event for the consumer you have not met yet. In a twenty-year
+      fleet, that is most of them.
+    </div>
+
+    <h2 data-anchor="ece-h2-quality">Data-quality contracts</h2>
+
+    <p data-anchor="ece-p-dq1">A schema says an event is well-formed. It does not say it is
+    plausible. Publish a quality contract alongside it &mdash; expected value
+    ranges, expected arrival rate per asset, the freshness target, and how a
+    consumer should treat a <code>suspect</code> quality flag &mdash; and monitor
+    against it. Violations are usually a sensor fault or a firmware regression,
+    both of which are fleet-health signals worth catching early.</p>
+
+    <div class="review" data-anchor="ece-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>Take your busiest event type. Could a consumer written today read an
+        event produced by firmware from three years ago? Try it against real
+        archived bytes, not against a schema diff.</li>
+        <li>Which of your topics is really a database table with a topic name in
+        front of it?</li>
+        <li>What does your consumer do with an unrecognised schema id right now?
+        If the answer is "throws", you have a fleet-wide outage waiting for a
+        firmware rollout.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="ece-src"><sup>1</sup> <em>Data Lakehouse Architecture: Iceberg, Delta &amp;
+    Medallion</em>; see also <em>The Medallion Architecture on Open Lakehouses</em>,
+    BigData Boutique.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="06-secure-fleet-and-device-management.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="08-kafka-and-the-streaming-backbone.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

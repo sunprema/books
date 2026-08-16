@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stream Processing and Operational Intelligence &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Real-Time Event Streaming</span> &middot; Chapter 10</p>
+    <p class="chapter-no">10</p>
+    <h1 data-anchor="spo-h1">Stream Processing and<br>Operational Intelligence</h1>
+
+    <p class="lede" data-anchor="spo-lede">Raw telemetry is not operational intelligence. Turning one into the
+    other means windows, joins, and state &mdash; and in a fleet with hours-long
+    disconnections, it means confronting the hardest question in the book: when
+    is a window actually finished?</p>
+
+    <h2 data-anchor="spo-h2-choose">Choosing a processor</h2>
+
+    <p data-anchor="spo-p-ch1">The choice matters less than teams expect, and the deciding factor
+    is usually operational rather than technical.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Where each option fits</caption>
+        <thead>
+          <tr><th>Option</th><th>Strength</th><th>Cost</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Kafka Streams</td><td>A library in your service; no cluster</td><td>Kafka-only; scaling tied to partitions</td></tr>
+          <tr><td>Flink</td><td>Richest event-time and state model</td><td>A cluster to operate</td></tr>
+          <tr><td>Spark Structured Streaming</td><td>Shares tooling with the batch/lake side</td><td>Micro-batch latency floor</td></tr>
+          <tr><td>Plain consumers</td><td>Total control, trivial to reason about</td><td>You implement windowing yourself</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="spo-p-ch2">A defensible split for this platform: plain consumers on the hot
+    path where the logic is per-event and latency is the whole point, and a real
+    stream processor for the warm path where windows, joins, and event-time
+    correctness are the whole point. Resist the urge to run everything through
+    one engine.</p>
+
+    <h2 data-anchor="spo-h2-time">Watermarks, and what a fleet does to them</h2>
+
+    <p data-anchor="spo-p-t1">Watermarks track the progress of event time through a stream and are
+    what let a processor decide a window is complete despite out-of-order
+    arrival.<sup>1</sup> A bounded-out-of-orderness strategy encodes the maximum
+    lateness you expect, after which an element is treated as late.<sup>1</sup></p>
+
+    <p data-anchor="spo-p-t2">Now the operational reality. Your expected lateness is not a
+    property of the network jitter &mdash; it is a property of the fleet's
+    disconnection profile. A locomotive that spent three hours in a valley will
+    deliver three-hour-old events, correctly, with good timestamps. If your
+    watermark strategy assumes seconds, every one of those events is "late".</p>
+
+    <div class="callout warn" data-anchor="spo-callout-late">
+      <span class="callout-title">Set lateness from the fleet, not the median</span>
+      <p>A vehicle out of coverage for an hour is not late data &mdash; it is a
+      replay. Sizing allowed lateness from the median delay guarantees that every
+      genuine disconnection produces a flood of side-output records that nobody
+      has designed a home for.</p>
+    </div>
+
+    <p data-anchor="spo-p-t3">Allowed lateness changes a window's termination condition: state is
+    retained past the watermark for a configured duration so late events can
+    update an already-emitted result, and anything later is routed to a side
+    output.<sup>2</sup> That gives you three tiers, and you should use all three
+    deliberately.</p>
+
+    <dl class="modes" data-anchor="spo-dl-tiers">
+      <dt>Within the watermark</dt>
+      <dd>Normal path. The window fires once, complete.</dd>
+      <dt>Within allowed lateness</dt>
+      <dd>The window re-fires with a correction. Downstream must accept a
+      restatement &mdash; design for it explicitly.</dd>
+      <dt>Beyond allowed lateness</dt>
+      <dd>Side output. Route to the reconciliation path, which reprocesses on the
+      cold path rather than trying to patch the live aggregate.</dd>
+    </dl>
+
+    <p data-anchor="spo-p-t4">That third tier is the one to design rather than discover. Send it
+    to a topic, count it, alert on its rate, and reconcile in batch. A side
+    output nobody consumes is silent data loss wearing a respectable name.</p>
+
+    <h2 data-anchor="spo-h2-state">State, checkpoints, and recovery</h2>
+
+    <p data-anchor="spo-p-st1">Stateful processing is what makes stream processing worth the
+    trouble &mdash; per-asset running aggregates, geofence membership, pattern
+    detection across a sequence of events. Checkpointing periodically persists
+    that state so a job can recover from failure while preserving exactly-once
+    application state.<sup>2</sup></p>
+
+    <p data-anchor="spo-p-st2">The failure mode to plan for is state growth. Keyed state for
+    retired assets never goes away on its own, so the backend grows
+    monotonically and every restore gets slower &mdash; until one day a recovery
+    takes longer than your RTO. Set a TTL on keyed state, size it from the
+    longest credible disconnection, and monitor state size as a first-class
+    metric alongside lag.</p>
+
+    <figure class="diagram-fig" data-anchor="spo-fig-topo">
+      <svg class="diagram" viewBox="0 0 560 172" role="img" aria-labelledby="spo-fig-topo-t">
+        <title id="spo-fig-topo-t">Normalize, enrich, window and detect, with a side output for very late data</title>
+
+        <rect class="stroke fill-soft" x="8" y="58" width="74" height="36"/>
+        <text class="big" x="45" y="80" text-anchor="middle">raw.v1</text>
+
+        <line class="stroke" x1="82" y1="76" x2="112" y2="76" marker-end="url(#spo-a)"/>
+        <rect class="stroke fill-bg" x="112" y="58" width="82" height="36"/>
+        <text class="big" x="153" y="74" text-anchor="middle">normalize</text>
+        <text class="dim" x="153" y="88" text-anchor="middle">stateless</text>
+
+        <line class="stroke" x1="194" y1="76" x2="224" y2="76" marker-end="url(#spo-a)"/>
+        <rect class="stroke fill-bg" x="224" y="58" width="82" height="36"/>
+        <text class="big" x="265" y="74" text-anchor="middle">enrich</text>
+        <text class="dim" x="265" y="88" text-anchor="middle">stream–table</text>
+
+        <line class="stroke" x1="306" y1="76" x2="336" y2="76" marker-end="url(#spo-a)"/>
+        <rect class="stroke-thick fill-bg" x="336" y="50" width="96" height="52"/>
+        <text class="big" x="384" y="70" text-anchor="middle">window</text>
+        <text class="dim" x="384" y="84" text-anchor="middle">event time</text>
+        <text class="dim" x="384" y="96" text-anchor="middle">+ state</text>
+
+        <line class="stroke" x1="432" y1="66" x2="480" y2="42" marker-end="url(#spo-a)"/>
+        <rect class="stroke fill-soft" x="480" y="24" width="72" height="34"/>
+        <text class="big" x="516" y="45" text-anchor="middle">alerts</text>
+
+        <line class="stroke-red dash" x1="432" y1="90" x2="480" y2="122" marker-end="url(#spo-r)"/>
+        <rect class="stroke-red fill-bg" x="470" y="106" width="82" height="34"/>
+        <text class="big red" x="511" y="122" text-anchor="middle">side output</text>
+        <text class="dim" x="511" y="134" text-anchor="middle">very late</text>
+
+        <text class="dim" x="200" y="150" text-anchor="middle">state TTL sized from the longest credible disconnection</text>
+
+        <defs>
+          <marker id="spo-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+          <marker id="spo-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-red"/></marker>
+        </defs>
+      </svg>
+      <figcaption>The warm-path topology. Enrichment is a stream-to-table join against
+      compacted reference state, so it survives a restart without calling a service.</figcaption>
+    </figure>
+
+    <h2 data-anchor="spo-h2-joins">Joins that do not call services</h2>
+
+    <p data-anchor="spo-p-j1">Enrichment wants reference data: which asset is this device on, which
+    route is it assigned, what is the sensor's calibration. The tempting
+    implementation is an RPC per event. Do not: it couples stream throughput to
+    a service's latency and its availability, and it makes replay impossible
+    because the service's state has moved on.</p>
+
+    <p data-anchor="spo-p-j2">Publish reference data as a compacted topic and do a stream-to-table
+    join instead. The processor holds a local materialised view, the join is a
+    local lookup, and a replay resolves against the reference state as it is
+    &mdash; or, if you version reference data, as it was.</p>
+
+    <h2 data-anchor="spo-h2-alerts">Anomaly detection and alert hygiene</h2>
+
+    <p data-anchor="spo-p-al1">Detection is the easy half. Alert hygiene is what determines
+    whether anyone acts on the output, and it is mostly about suppression.</p>
+
+    <ul data-anchor="spo-ul-alerts">
+      <li><strong>Deduplicate</strong> on a stable alert key &mdash; asset, kind,
+      and a coarse time bucket &mdash; so one condition raises one alert.</li>
+      <li><strong>Debounce</strong>: require a condition to hold for N samples or
+      T seconds. A single spike is usually a sensor, not a fault.</li>
+      <li><strong>Suppress dependents</strong>: if the whole telemetry unit is
+      offline, do not raise forty individual sensor alarms.</li>
+      <li><strong>Escalate on age</strong>, not on repetition &mdash; an
+      unacknowledged alert should get louder, not more numerous.</li>
+      <li><strong>Rate-limit per asset</strong>, with an explicit "N further
+      alerts suppressed" record so the suppression is visible.</li>
+    </ul>
+
+    <p data-anchor="spo-p-al2">The reconnect case deserves its own rule. When a fleet comes back
+    after an outage, hours of buffered telemetry arrive at once and naive
+    detection will raise thousands of alerts for conditions that have already
+    passed. Alerts derived from historical events should be raised as
+    <em>findings</em> on the warm path &mdash; recorded, reviewable, not paging
+    &mdash; while only current conditions page anyone.</p>
+
+    <div class="pullquote" data-anchor="spo-pq">
+      An alert that fires for a condition which has already ended is not an
+      alert. It is a history lesson with a siren attached.
+    </div>
+
+    <h2 data-anchor="spo-h2-serve">Serving live state</h2>
+
+    <p data-anchor="spo-p-sv1">Applications need current state &mdash; where is every asset, what
+    is each one's health. Two viable shapes: query the processor's own state
+    store directly, or materialise into a store built for the read pattern. The
+    second is usually right, because operations dashboards have query patterns
+    that a stream processor's state store was not designed for.</p>
+
+    <p data-anchor="spo-p-sv2">Whichever you choose, one requirement is non-negotiable: <strong>the
+    response carries its own freshness</strong>. Every read returns the
+    event-time watermark behind it, and the UI shows it. That single discipline
+    converts "the system was lying to me" into "the system told me it was four
+    minutes behind", which is the difference between an incident and an
+    inconvenience.</p>
+
+    <div class="review" data-anchor="spo-review">
+      <h4>Exercise</h4>
+      <ol>
+        <li>Measure your fleet's actual event-time lateness distribution over a
+        week. Set allowed lateness from the p99, then decide what happens to the
+        remaining 1%.</li>
+        <li>Replay a day of raw telemetry through your warm path. Does it produce
+        the same aggregates? If not, you have a hidden processing-time
+        dependency &mdash; find it.</li>
+        <li>Simulate 4,000 vehicles reconnecting with two hours of backlog. Count
+        the alerts. Then design the suppression that makes that number
+        sensible.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="spo-src"><sup>1</sup> <em>Understanding Apache Flink Event Time and
+    Watermarks</em>, Decodable. &nbsp; <sup>2</sup> <em>Handling Late Data and Side
+    Outputs</em>, real-time pipelines course material.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="09-rebalancing-ordering-and-correct-processing.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="11-availability-consistency-and-graceful-degradation.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

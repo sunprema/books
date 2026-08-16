@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Computer Vision at the Edge &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part V &mdash; Vision and Spatial Data</span> &middot; Chapter 14</p>
+    <p class="chapter-no">14</p>
+    <h1 data-anchor="cve-h1">Computer Vision<br>at the Edge</h1>
+
+    <p class="lede" data-anchor="cve-lede">Vision breaks the telemetry mould in three ways: the data is
+    thousands of times larger, the processing is expensive enough that where you
+    run it is an architectural decision, and the output is a
+    <em>probabilistic</em> claim about the world. That third one is the deep
+    difference, and it changes what the platform must carry.</p>
+
+    <h2 data-anchor="cve-h2-different">Why it needs its own pipeline</h2>
+
+    <p data-anchor="cve-p-d1">A telemetry event is a few hundred bytes and is either right or
+    wrong. A 4K inspection frame is megabytes, and a detection on it is "82%
+    confident there is a rail surface defect here". You cannot alert on that the
+    way you alert on a temperature threshold, and you cannot ship every frame the
+    way you ship every reading.</p>
+
+    <div class="numbers" data-anchor="cve-numbers">
+      <dl>
+        <dt>Telemetry event</dt><dd>~250 B</dd>
+        <dt>Inspection frame, 4K JPEG</dt><dd>~2 MB</dd>
+        <dt>Inspection car, 8 h at 10 fps</dt><dd>~576 GB raw</dd>
+        <dt>Detections from that run</dt><dd>~3 MB</dd>
+      </dl>
+    </div>
+
+    <p data-anchor="cve-p-d2">Look at the last two rows. The <em>findings</em> from a full
+    inspection run fit comfortably in the event stream; the imagery does not, by
+    five orders of magnitude. That ratio is the whole architecture: run inference
+    where the pixels are, ship the findings, and upload only the evidence that
+    matters.</p>
+
+    <h2 data-anchor="cve-h2-where">Edge or cloud inference</h2>
+
+    <p data-anchor="cve-p-w1">The established shape for industrial defect detection is: models
+    trained in the cloud, optimized for the edge hardware, deployed through a
+    managed rollout mechanism, and monitored for drift with results synchronized
+    back to the cloud.<sup>1</sup> Inference inputs and outputs are captured at
+    the edge and synchronized to the cloud for human review and
+    retraining.<sup>1</sup></p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>The tradeoff, honestly stated</caption>
+        <thead>
+          <tr><th></th><th>Edge inference</th><th>Cloud inference</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Bandwidth</td><td>Findings only</td><td>Every frame uploaded</td></tr>
+          <tr><td>Latency</td><td>Milliseconds</td><td>Link-bound; often hours</td></tr>
+          <tr><td>Model update</td><td>Fleet rollout, staged</td><td>Instant, central</td></tr>
+          <tr><td>Compute cost</td><td>Hardware per vehicle</td><td>Elastic, metered</td></tr>
+          <tr><td>Reprocessing</td><td>Only what was uploaded</td><td>Everything, any time</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="cve-p-w2">The last row is the one that decides most real designs. If you only
+    kept the frames the model flagged, you can never re-run an improved model
+    over what the old one missed &mdash; and "what the old model missed" is
+    precisely the population you care about. The usual resolution is a hybrid:
+    edge inference for the operational path, plus a sampled and event-triggered
+    upload that preserves enough raw material to retrain and re-evaluate.</p>
+
+    <h2 data-anchor="cve-h2-sampling">Adaptive upload</h2>
+
+    <p data-anchor="cve-p-s1">Design the upload policy explicitly, in priority order, and make it
+    configuration rather than code &mdash; you will tune it for years.</p>
+
+    <ol data-anchor="cve-ol-upload">
+      <li><strong>Every detection above the review threshold</strong>, with a
+      short clip either side for context.</li>
+      <li><strong>Everything near the decision boundary</strong> &mdash; the
+      uncertain band is where the model learns most.</li>
+      <li><strong>A random sample</strong> of confidently-negative frames, which
+      is the only way to estimate false negatives at all.</li>
+      <li><strong>Anything a human flagged</strong> from the cab.</li>
+      <li>Bulk raw, depot links only, retained briefly.</li>
+    </ol>
+
+    <p data-anchor="cve-p-s2">Item three is routinely omitted and it is the one that makes your
+    metrics honest. Without a sample of what the model said "nothing here"
+    about, you can measure precision but never recall, and a model that quietly
+    stopped detecting a defect class looks perfect.</p>
+
+    <h2 data-anchor="cve-h2-events">Detections as events</h2>
+
+    <p data-anchor="cve-p-e1">A detection joins the same stream as everything else, and carries
+    what a reviewer and a future auditor will need.</p>
+
+    <div class="pre-label">inspection.detected.v1</div>
+    <pre><code>{
+  <span class="str">"event_id"</span>:      <span class="str">"01J8ZB4M0K2R7T9V3XW6QH8N2D"</span>,
+  <span class="str">"asset_id"</span>:      <span class="str">"inspection-car-03"</span>,
+  <span class="str">"event_time"</span>:    <span class="str">"2026-08-16T11:02:44.120Z"</span>,
+  <span class="str">"defect_class"</span>:  <span class="str">"rail_surface_spalling"</span>,
+  <span class="str">"confidence"</span>:    <span class="num">0.82</span>,
+  <span class="str">"bbox"</span>:          [<span class="num">0.41</span>, <span class="num">0.55</span>, <span class="num">0.09</span>, <span class="num">0.07</span>],   <span class="cm">// normalised</span>
+  <span class="str">"position"</span>: {
+    <span class="str">"track_id"</span>:    <span class="str">"main-2"</span>,
+    <span class="str">"milepost"</span>:    <span class="num">184.372</span>,             <span class="cm">// see chapter 16</span>
+    <span class="str">"network_ver"</span>: <span class="str">"2026-Q2"</span>
+  },
+  <span class="str">"media_ref"</span>:     <span class="str">"s3://insp/2026/08/16/car03/frame-0009412.webp"</span>,
+  <span class="str">"model"</span>:         { <span class="str">"name"</span>: <span class="str">"railsurf"</span>, <span class="str">"version"</span>: <span class="str">"4.2.1"</span> },
+  <span class="str">"review"</span>:        { <span class="str">"status"</span>: <span class="str">"pending"</span> }
+}</code></pre>
+
+    <p data-anchor="cve-p-e2">Two fields carry disproportionate weight. <code>media_ref</code> is
+    a pointer, never the bytes &mdash; media lives in object storage and the
+    stream carries the reference, for the reasons Chapter 15 goes into. And
+    <code>model.version</code> is non-negotiable: without it, a regression cannot
+    be attributed or bounded, and "which findings came from the bad model" is
+    unanswerable at exactly the moment it is asked.</p>
+
+    <div class="callout warn" data-anchor="cve-callout-conf">
+      <span class="callout-title">A confidence score is not a probability</span>
+      <p>0.82 does not mean "82% of such detections are real" unless the model
+      has been calibrated to say so. Setting a review threshold on the assumption
+      that it does is how teams end up with a review queue whose true positive
+      rate is nothing like what they planned. Calibrate against reviewed
+      outcomes, and re-calibrate after every model change.</p>
+    </div>
+
+    <h2 data-anchor="cve-h2-drift">Drift, and why it is not a software fault</h2>
+
+    <p data-anchor="cve-p-dr1">Vision systems degrade in production from physical and environmental
+    causes &mdash; dirty lenses, shifting lighting, changes to the inspected
+    subject &mdash; which appear as data drift rather than as software
+    faults.<sup>2</sup> Nothing crashed; the model is simply no longer looking at
+    the world it was trained on.</p>
+
+    <p data-anchor="cve-p-dr2">Drift is detected by comparing production input distributions
+    against a training reference using statistical measures, with low-confidence
+    predictions routed to human review while precision, recall and F1 are tracked
+    operationally.<sup>2,3</sup> And mature edge-ML operations track model version
+    per device centrally and can roll back on measured degradation within
+    minutes.<sup>3</sup></p>
+
+    <figure class="diagram-fig" data-anchor="cve-fig-loop">
+      <svg class="diagram" viewBox="0 0 560 164" role="img" aria-labelledby="cve-fig-loop-t">
+        <title id="cve-fig-loop-t">Edge inference feeding review, curation and retraining, with drift monitoring closing the loop</title>
+
+        <rect class="stroke fill-bg" x="8" y="52" width="92" height="40"/>
+        <text class="big" x="54" y="70" text-anchor="middle">Camera</text>
+        <text class="dim" x="54" y="84" text-anchor="middle">sample</text>
+
+        <line class="stroke" x1="100" y1="72" x2="132" y2="72" marker-end="url(#cve-a)"/>
+        <rect class="stroke-thick fill-bg" x="132" y="52" width="96" height="40"/>
+        <text class="big" x="180" y="70" text-anchor="middle">Edge model</text>
+        <text class="dim" x="180" y="84" text-anchor="middle">v4.2.1</text>
+
+        <line class="stroke" x1="228" y1="72" x2="262" y2="72" marker-end="url(#cve-a)"/>
+        <rect class="stroke fill-soft" x="262" y="52" width="96" height="40"/>
+        <text class="big" x="310" y="70" text-anchor="middle">Detections</text>
+        <text class="dim" x="310" y="84" text-anchor="middle">as events</text>
+
+        <line class="stroke" x1="358" y1="72" x2="392" y2="72" marker-end="url(#cve-a)"/>
+        <rect class="stroke fill-bg" x="392" y="52" width="106" height="40"/>
+        <text class="big" x="445" y="70" text-anchor="middle">Human review</text>
+        <text class="dim" x="445" y="84" text-anchor="middle">adjudication</text>
+
+        <path class="stroke-red dash" d="M445,92 L445,128 L180,128 L180,92" marker-end="url(#cve-r)"/>
+        <text class="red" x="312" y="142" text-anchor="middle">labelled outcomes &rarr; retrain &rarr; staged rollout &rarr; rollback on degradation</text>
+
+        <text class="dim" x="180" y="34" text-anchor="middle">drift monitor compares input distribution to training reference</text>
+        <line class="stroke-soft dash" x1="180" y1="38" x2="180" y2="52"/>
+
+        <defs>
+          <marker id="cve-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+          <marker id="cve-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-red"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Review outcomes are the most valuable data the system produces. The
+      loop only closes if adjudications are captured as labels, not as ticket
+      comments.</figcaption>
+    </figure>
+
+    <h2 data-anchor="cve-h2-review">The review queue is a product</h2>
+
+    <p data-anchor="cve-p-rv1">Production failures &mdash; false positives corrected by operators,
+    false negatives found downstream, edge cases flagged for review &mdash; are
+    the most valuable training data the system produces.<sup>2</sup> That only
+    holds if the review tool captures them as structured labels.</p>
+
+    <p data-anchor="cve-p-rv2">So build the queue as a first-class surface: prioritised by
+    confidence band and consequence, showing the reviewer enough context to judge
+    (the frame, its neighbours, the location, the asset's history), and capturing
+    a verdict that is <em>specific</em> &mdash; confirmed, rejected, wrong class,
+    wrong location &mdash; rather than a thumbs-down. A rejected detection with a
+    reason is a label; a rejected detection without one is a lost opportunity.</p>
+
+    <p data-anchor="cve-p-rv3">Track queue depth and time-to-review as operational SLIs. A review
+    queue that grows without bound is a detector that has effectively been turned
+    off, and it will be discovered as such at the worst time.</p>
+
+    <div class="boundary" data-anchor="cve-boundary">
+      <span class="boundary-title">The safety boundary</span>
+      <p>A detection is a finding that prioritises human inspection. It is not a
+      determination that track is unsafe, and it must never be the sole basis for
+      a decision with safety consequence. Equally, the absence of detections is
+      not evidence of absence of defects &mdash; which is why the false-negative
+      sampling above is a design requirement rather than an ML nicety.</p>
+    </div>
+
+    <div class="review" data-anchor="cve-review">
+      <h4>Exercise</h4>
+      <ol>
+        <li>Compute your bandwidth budget for a full inspection run under each of
+        the five upload priorities. Where does the budget actually run out?</li>
+        <li>Design the rollback: a model ships, and six hours later its false
+        positive rate has tripled. How do you detect it, how fast can you revert
+        the fleet, and what happens to the findings it already emitted?</li>
+        <li>Estimate your recall. If you cannot, add the negative sampling that
+        would let you.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="cve-src"><sup>1</sup> <em>Detect industrial defects at low latency with
+    computer vision at the edge</em>, AWS ML Blog. &nbsp; <sup>2</sup> <em>Data
+    Quality Problems That Cause Computer Vision Systems to Degrade After
+    Deployment</em>, TechnoLynx. &nbsp; <sup>3</sup> <em>How Do I Monitor Inference
+    Health?</em>, Roboflow.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="13-observability-and-operational-forensics.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="15-media-ingestion-and-lakehouse-architecture.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

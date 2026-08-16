@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Observability and Operational Forensics &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part IV &mdash; Resilient Operational Services</span> &middot; Chapter 13</p>
+    <p class="chapter-no">13</p>
+    <h1 data-anchor="oof-h1">Observability and<br>Operational Forensics</h1>
+
+    <p class="lede" data-anchor="oof-lede">Standard observability assumes the thing you are watching is trying
+    to talk to you. Half of this system is not: it is in a valley, buffering. The
+    central adaptation is to stop measuring availability and start measuring
+    <em>freshness</em>, then to keep enough evidence to reconstruct what the
+    system knew and when.</p>
+
+    <h2 data-anchor="oof-h2-pillars">The three pillars, and where they run out</h2>
+
+    <p data-anchor="oof-p-p1">Metrics, logs, and traces are the standard toolkit, and the four
+    golden signals &mdash; latency, traffic, errors, saturation &mdash; are the
+    standard starting set for a service.<sup>1</sup> All of it applies to the
+    cloud half of this platform and none of it is sufficient for the field half.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Where each pillar stops</caption>
+        <thead>
+          <tr><th>Pillar</th><th>Limit here</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Metrics</td><td>Devices cannot report while offline &mdash; exactly when you need to know</td></tr>
+          <tr><td>Logs</td><td>Edge logs are bandwidth-expensive and arrive hours late</td></tr>
+          <tr><td>Traces</td><td>Span the cloud well; a store-and-forward hop is not a span</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="oof-p-p2">The gap they share is the same one: <strong>absence of data is
+    itself the signal</strong>, and none of the three pillars is built to alert
+    on silence. That is why the fleet needs its own instrumentation model.</p>
+
+    <h2 data-anchor="oof-h2-fresh">Freshness is the indicator that matters</h2>
+
+    <p data-anchor="oof-p-f1">Freshness is a legitimate service level indicator alongside success
+    rate, latency, and throughput, measured at the boundary the user actually
+    perceives.<sup>2</sup> For an operational platform it is frequently the only
+    one worth paging on.</p>
+
+    <p data-anchor="oof-p-f2">The reason is simple. A pipeline can be 100% available, throwing
+    zero errors, and four hours behind. Every dashboard is green, and the
+    dispatcher is looking at where the trains were at breakfast. Availability
+    monitoring cannot see this failure at all; freshness monitoring sees nothing
+    else.</p>
+
+    <div class="pullquote" data-anchor="oof-pq">
+      Available and four hours behind is an outage. If your monitoring says
+      otherwise, your monitoring is measuring the wrong thing.
+    </div>
+
+    <p data-anchor="oof-p-f3">Measure it end to end, as the difference between now and the event
+    time of the most recent event the consumer has processed &mdash; and report
+    it as a distribution across the fleet, not a mean. The mean is dominated by
+    the healthy majority; the tail is where the story is.</p>
+
+    <div class="pre-label">Fleet freshness, as a distribution</div>
+    <pre><code>freshness(asset) = now() <span class="kw">-</span> max(event_time <span class="kw">of</span> processed events <span class="kw">for</span> asset)
+
+<span class="cm">-- report percentiles, and a count beyond a hard threshold</span>
+p50   <span class="num">12</span>s        <span class="cm">-- healthy</span>
+p95   <span class="num">48</span>s
+p99   <span class="num">6</span>m<span class="num">10</span>s
+&gt;<span class="num">30</span>m  <span class="num">37</span> assets  <span class="cm">-- the number an operator actually needs</span></code></pre>
+
+    <h2 data-anchor="oof-h2-metrics">The fleet metrics worth having</h2>
+
+    <p data-anchor="oof-p-m1">These are the edge-specific signals. Each one detects a failure the
+    golden signals cannot see.</p>
+
+    <dl class="modes" data-anchor="oof-dl-metrics">
+      <dt>Last-seen distribution</dt>
+      <dd>Per asset. The primary fleet-health signal; a shifting tail is a
+      regional problem before anyone reports one.</dd>
+      <dt>Sequence gaps</dt>
+      <dd>Missing <code>seq</code> ranges. Unambiguous evidence of loss, as
+      opposed to silence.</dd>
+      <dt>Buffer depth</dt>
+      <dd>How much each agent is holding. Predicts the reconnect burst before it
+      arrives.</dd>
+      <dt>Upload lag</dt>
+      <dd>Event time to durable ack, measured at the device.</dd>
+      <dt>Clock skew and <code>clock_src</code> mix</dt>
+      <dd>A fleet drifting to <code>unsynced</code> corrupts event-time
+      processing quietly.</dd>
+      <dt>Eviction counts</dt>
+      <dd>Events dropped by retention class. Non-zero means you are losing data
+      by policy &mdash; which is fine, but must be visible.</dd>
+      <dt>Consumer lag</dt>
+      <dd>Per group and partition, alerted on trend rather than level.</dd>
+    </dl>
+
+    <h2 data-anchor="oof-h2-corr">Correlation across four boundaries</h2>
+
+    <p data-anchor="oof-p-c1">Distributed tracing with propagated correlation identifiers is the
+    practice that makes a request legible across service boundaries.<sup>1</sup>
+    Here the id has to survive four hops of very different character: device,
+    gateway, stream, and service.</p>
+
+    <p data-anchor="oof-p-c2">The gateway is where it usually breaks, and it is exactly where an
+    edge-to-cloud investigation needs it to survive. Generate the id at the
+    device, carry it in the envelope rather than in a transport header (headers
+    do not survive a store-and-forward hop), and propagate it into every derived
+    event so an alert can be traced back to the readings that produced it.</p>
+
+    <figure class="diagram-fig" data-anchor="oof-fig-corr">
+      <svg class="diagram" viewBox="0 0 560 130" role="img" aria-labelledby="oof-fig-corr-t">
+        <title id="oof-fig-corr-t">One correlation id carried in the envelope across device, gateway, stream and service</title>
+
+        <rect class="stroke fill-bg" x="8" y="44" width="94" height="38"/>
+        <text class="big" x="55" y="62" text-anchor="middle">Device</text>
+        <text class="dim" x="55" y="76" text-anchor="middle">id created</text>
+
+        <rect class="stroke fill-bg" x="146" y="44" width="94" height="38"/>
+        <text class="big" x="193" y="62" text-anchor="middle">Gateway</text>
+        <text class="dim red" x="193" y="76" text-anchor="middle">breaks here</text>
+
+        <rect class="stroke fill-soft" x="284" y="44" width="94" height="38"/>
+        <text class="big" x="331" y="68" text-anchor="middle">Stream</text>
+
+        <rect class="stroke fill-bg" x="422" y="44" width="120" height="38"/>
+        <text class="big" x="482" y="62" text-anchor="middle">Service</text>
+        <text class="dim" x="482" y="76" text-anchor="middle">alert raised</text>
+
+        <line class="stroke" x1="102" y1="63" x2="146" y2="63" marker-end="url(#oof-a)"/>
+        <line class="stroke" x1="240" y1="63" x2="284" y2="63" marker-end="url(#oof-a)"/>
+        <line class="stroke" x1="378" y1="63" x2="422" y2="63" marker-end="url(#oof-a)"/>
+
+        <line class="stroke-red" x1="20" y1="100" x2="540" y2="100"/>
+        <text class="red" x="280" y="118" text-anchor="middle">correlation_id lives in the envelope, not in a transport header</text>
+
+        <defs>
+          <marker id="oof-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Transport headers do not survive a store-and-forward hop. Put the id
+      where the data is, and it survives buffering, batching, and replay.</figcaption>
+    </figure>
+
+    <h2 data-anchor="oof-h2-alerts">Alert on symptoms</h2>
+
+    <p data-anchor="oof-p-a1">Alert on what the user experiences, not on the cause you happen to
+    have a metric for. Causes are many and change with every deployment;
+    symptoms are few and stable.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Cause-shaped versus symptom-shaped alerts</caption>
+        <thead>
+          <tr><th>Instead of</th><th>Alert on</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Broker CPU &gt; 80%</td><td>End-to-end latency p99 above the class target</td></tr>
+          <tr><td>Consumer restarted</td><td>Freshness beyond target for N assets</td></tr>
+          <tr><td>Disk 90% full</td><td>Projected time-to-full under 6 hours</td></tr>
+          <tr><td>Devices disconnected</td><td>Last-seen tail growing faster than baseline</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="oof-p-a2">Note the third row: the useful alert is a projection, not a
+    threshold. "90% full" is either an emergency or irrelevant depending on the
+    fill rate, and the alert that tells you which is the one worth waking up for.</p>
+
+    <p data-anchor="oof-p-a3">Then attach an error budget to each SLO, which converts an argument
+    about caution into arithmetic: is there budget left?<sup>2</sup> That is a
+    much better conversation to have during a change freeze.</p>
+
+    <h2 data-anchor="oof-h2-forensics">Forensics: reconstructing what was known</h2>
+
+    <p data-anchor="oof-p-fo1">In a regulated domain, "what did the system know, and when did it
+    know it?" is a question you will be asked formally. Answering it requires
+    more than logs &mdash; it requires an immutable event record and the ability
+    to replay it.</p>
+
+    <p data-anchor="oof-p-fo2">That is why <code>telemetry.raw</code> is never edited and why every
+    derived event carries its inputs' identities. Three artifacts make the
+    reconstruction possible:</p>
+
+    <ol data-anchor="oof-ol-forensics">
+      <li><strong>The immutable raw record</strong>, with both event time and
+      ingest time &mdash; so you can distinguish when it happened from when you
+      could have known.</li>
+      <li><strong>Decision provenance</strong> &mdash; every alert and plan
+      records the input snapshot, the rule or model version, and the code
+      version that produced it.</li>
+      <li><strong>Replay determinism</strong> &mdash; reprocessing the same raw
+      events with the same versions yields the same outputs. Test this
+      periodically; it decays silently.</li>
+    </ol>
+
+    <p data-anchor="oof-p-fo3">With those, an incident timeline is generated rather than
+    reconstructed from memory, and the distinction between "the system was wrong"
+    and "the system had not been told yet" &mdash; which matters enormously in a
+    review &mdash; is answerable from evidence.</p>
+
+    <div class="callout key" data-anchor="oof-callout-audit">
+      <span class="callout-title">Ingest time is an audit field</span>
+      <p>The gap between <code>event_time</code> and <code>ingest_time</code> is
+      the honest answer to "could you have acted sooner?". Keeping both is what
+      lets you say "the event occurred at 09:14 and reached us at 11:40, because
+      the asset was out of coverage" &mdash; a defensible statement rather than an
+      apology.</p>
+    </div>
+
+    <div class="review" data-anchor="oof-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>What is your fleet's freshness p99 right now? If you cannot answer in
+        one query, that is the first thing to build.</li>
+        <li>Take a recent alert and trace it back to the raw readings. How many
+        boundaries did the correlation id survive?</li>
+        <li>Replay yesterday's raw telemetry. Do you get yesterday's alerts,
+        exactly? Any difference is an undeclared dependency on wall-clock time or
+        mutable reference data.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="oof-src"><sup>1</sup> <em>SRE Metrics: The Four Golden Signals of
+    Monitoring</em>, Splunk. &nbsp; <sup>2</sup> <em>Implementing SLOs</em>, The Site
+    Reliability Workbook; <em>Service Level Objectives</em>, the SRE book.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="12-multi-az-multi-region-and-disaster-recovery.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="14-computer-vision-at-the-edge.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

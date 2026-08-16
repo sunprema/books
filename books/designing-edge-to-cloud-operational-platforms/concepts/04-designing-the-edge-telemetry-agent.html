@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Designing the Edge Telemetry Agent &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; Edge-to-Cloud Telemetry</span> &middot; Chapter 04</p>
+    <p class="chapter-no">04</p>
+    <h1 data-anchor="eta-h1">Designing the<br>Edge Telemetry Agent</h1>
+
+    <p class="lede" data-anchor="eta-lede">The agent is the piece of software that runs on the vehicle, and it
+    is the most constrained thing you will write: limited CPU, a disk that has to
+    survive vibration, a clock you cannot trust, and no operator. It is also the
+    piece that determines whether the rest of the platform ever sees the truth.
+    Let's build it a responsibility at a time.</p>
+
+    <h2 data-anchor="eta-h2-jobs">Seven jobs, in dependency order</h2>
+
+    <p data-anchor="eta-p-jobs1">An agent that tries to be clever fails in the field. An agent that
+    does these seven things well is boring and survives, and the order matters
+    because each one depends on the one before it.</p>
+
+    <ol data-anchor="eta-ol-jobs">
+      <li><strong>Protocol adaptation</strong> &mdash; speak J1939, Modbus, or whatever
+      the equipment offers, and translate it into one internal shape.</li>
+      <li><strong>Validation</strong> &mdash; range checks, unit checks, plausibility.
+      A sensor reporting &minus;400&nbsp;&deg;C is a fault report, not a reading.</li>
+      <li><strong>Local enrichment</strong> &mdash; attach identity, sequence, firmware
+      and configuration version. Only from state the agent already holds.</li>
+      <li><strong>Durable buffering</strong> &mdash; write to disk <em>before</em>
+      acknowledging anything upstream of it.</li>
+      <li><strong>Batching and compression</strong> &mdash; because the link is metered.</li>
+      <li><strong>Local rule evaluation</strong> &mdash; the small set of conditions that
+      must be detected without the cloud.</li>
+      <li><strong>Secure command receipt</strong> &mdash; verify, execute, acknowledge,
+      and be able to say which of those three it got to.</li>
+    </ol>
+
+    <p data-anchor="eta-p-jobs2">Job three has a trap in it. "Enrichment" tempts you to look up
+    something in the cloud &mdash; the asset's current assignment, say. Don't. The
+    moment enrichment needs a network round trip, the offline path depends on the
+    online path, and the agent stops being able to do its job in the exact
+    conditions it exists for.</p>
+
+    <h2 data-anchor="eta-h2-model">The edge data model</h2>
+
+    <p data-anchor="eta-p-model1">Here is the envelope we will carry for the rest of the book. Every
+    field in it exists because leaving it out costs you something downstream.</p>
+
+    <div class="pre-label">The telemetry envelope</div>
+    <pre><code>{
+  <span class="str">"event_id"</span>:   <span class="str">"01J8Z3K2QF7M9YB0H4V2N6TA5C"</span>,  <span class="cm">// ULID: unique + sortable</span>
+  <span class="str">"device_id"</span>:  <span class="str">"loco-4471-tcu"</span>,               <span class="cm">// the box</span>
+  <span class="str">"asset_id"</span>:   <span class="str">"loco-4471"</span>,                   <span class="cm">// the thing operations cares about</span>
+  <span class="str">"sensor_id"</span>:  <span class="str">"traction.motor.2.temp_c"</span>,
+  <span class="str">"seq"</span>:        <span class="num">918342</span>,                       <span class="cm">// per-device, monotonic, gap-detecting</span>
+  <span class="str">"event_time"</span>: <span class="str">"2026-08-16T09:14:22.418Z"</span>,
+  <span class="str">"ingest_time"</span>: <span class="kw">null</span>,                        <span class="cm">// stamped by the cloud, never here</span>
+  <span class="str">"value"</span>:      <span class="num">104.5</span>,
+  <span class="str">"quality"</span>:    <span class="str">"good"</span>,                      <span class="cm">// good | suspect | substituted | bad</span>
+  <span class="str">"fw"</span>:         <span class="str">"3.11.2"</span>,
+  <span class="str">"cfg"</span>:        <span class="str">"cfg-2026-07-01"</span>,
+  <span class="str">"clock_src"</span>:  <span class="str">"gps"</span>                        <span class="cm">// gps | ntp | rtc | unsynced</span>
+}</code></pre>
+
+    <p data-anchor="eta-p-model2">Three of those deserve defending. <code>seq</code> is what lets the
+    cloud detect a gap without comparing timestamps &mdash; a missing range of
+    sequence numbers is unambiguous evidence of loss, where a time gap could just
+    be a quiet sensor. <code>quality</code> means a suspect reading can flow
+    through the pipeline and be excluded by consumers, rather than being silently
+    dropped at the edge where nobody can audit the decision.</p>
+
+    <p data-anchor="eta-p-model3">And <code>clock_src</code> is the one people leave out and regret.
+    Vehicles lose GPS lock in tunnels and depots; an unqualified device timestamp
+    silently corrupts every event-time window downstream. Recording <em>how</em>
+    the time was obtained lets a stream processor treat <code>unsynced</code>
+    events differently &mdash; usually by falling back to ingest time and marking
+    the result.</p>
+
+    <div class="callout warn" data-anchor="eta-callout-clock">
+      <span class="callout-title">Never trust the device clock, but do record it</span>
+      <p>The instinct to "fix" a bad timestamp at the edge is wrong: it destroys
+      the evidence. Send what the device believed, plus how confident it was.
+      Correction is a cloud-side decision made with more context than the agent
+      has.</p>
+    </div>
+
+    <h2 data-anchor="eta-h2-buffer">Durable buffering: the write-ahead log</h2>
+
+    <p data-anchor="eta-p-buf1">The pattern the industry has converged on for intermittently
+    connected assets is local persistence plus store-and-forward at the edge,
+    with a durable cloud buffer isolating producers from slower downstream
+    consumers.<sup>1</sup> In practice, edge gateways implement this as a
+    page-based on-disk buffer: messages are queued to disk when the connection
+    fails and published once it is restored.<sup>2</sup></p>
+
+    <p data-anchor="eta-p-buf2">The detail that makes it correct is acknowledgement tracking. A
+    buffer page is recycled only after every message on it has been
+    acknowledged, which requires per-message delivery confirmation rather than a
+    fire-and-forget send.<sup>3</sup> Get this wrong and the buffer will happily
+    reuse a page whose contents never landed.</p>
+
+    <figure class="diagram-fig" data-anchor="eta-fig-wal">
+      <svg class="diagram" viewBox="0 0 560 168" role="img" aria-labelledby="eta-fig-wal-t">
+        <title id="eta-fig-wal-t">Sensor to write-ahead log to uplink, with pages freed only after durable acknowledgement</title>
+
+        <rect class="stroke fill-bg" x="8" y="52" width="76" height="38"/>
+        <text class="big" x="46" y="70" text-anchor="middle">Sensors</text>
+        <text class="dim" x="46" y="84" text-anchor="middle">validate</text>
+
+        <line class="stroke" x1="84" y1="71" x2="120" y2="71" marker-end="url(#eta-a)"/>
+
+        <rect class="stroke-thick fill-bg" x="120" y="40" width="240" height="62"/>
+        <text x="240" y="32" text-anchor="middle">Write-ahead log on disk</text>
+        <rect class="stroke fill-soft" x="130" y="52" width="52" height="38"/>
+        <text class="dim" x="156" y="75" text-anchor="middle">page n</text>
+        <rect class="stroke fill-soft" x="188" y="52" width="52" height="38"/>
+        <text class="dim" x="214" y="75" text-anchor="middle">n+1</text>
+        <rect class="stroke fill-bg" x="246" y="52" width="52" height="38"/>
+        <text class="dim" x="272" y="75" text-anchor="middle">n+2</text>
+        <rect class="stroke-red fill-bg" x="304" y="52" width="46" height="38"/>
+        <text class="red" x="327" y="75" text-anchor="middle">head</text>
+
+        <line class="stroke" x1="360" y1="71" x2="400" y2="71" marker-end="url(#eta-a)"/>
+        <rect class="stroke fill-bg" x="400" y="52" width="80" height="38"/>
+        <text class="big" x="440" y="70" text-anchor="middle">Uplink</text>
+        <text class="dim" x="440" y="84" text-anchor="middle">batch &middot; zstd</text>
+
+        <line class="stroke" x1="480" y1="71" x2="520" y2="71" marker-end="url(#eta-a)"/>
+        <text class="big" x="536" y="74" text-anchor="middle">cloud</text>
+
+        <path class="stroke-red dash" d="M520,90 L520,140 L156,140 L156,102" marker-end="url(#eta-r)"/>
+        <text class="red" x="338" y="154" text-anchor="middle">durable ack frees the page &mdash; nothing earlier does</text>
+
+        <defs>
+          <marker id="eta-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/>
+          </marker>
+          <marker id="eta-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7 z" class="fill-red"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>Events are durable on disk before anything else happens. A page is
+      released only when the cloud confirms durability &mdash; not when the socket
+      accepted the bytes.</figcaption>
+    </figure>
+
+    <h2 data-anchor="eta-h2-disk">Disk exhaustion is a policy, not an error</h2>
+
+    <p data-anchor="eta-p-disk1">Eventually the buffer fills. A locomotive out of coverage for three
+    days will exhaust any disk you can afford to fit. What happens next must be a
+    decision you made at design time, because the default &mdash; drop the oldest
+    &mdash; discards exactly the alert you needed while preserving a week of
+    routine diagnostics.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Retention classes and their eviction behaviour</caption>
+        <thead>
+          <tr><th>Class</th><th>Example</th><th>When the disk fills</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Critical</td><td>Fault alert, safety-adjacent event</td><td>Never evicted; evict others first</td></tr>
+          <tr><td>High-value</td><td>Position, traction health</td><td>Downsample in place</td></tr>
+          <tr><td>Routine</td><td>Diagnostic counters</td><td>Aggregate to min/max/mean per window</td></tr>
+          <tr><td>Bulk</td><td>Waveform captures, media</td><td>Evicted first, and a marker kept</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="eta-p-disk2">Two refinements make this humane. First, <strong>downsample rather
+    than delete</strong> where you can &mdash; a minute-resolution summary of an
+    hour costs almost nothing and preserves the shape. Second, <strong>leave a
+    marker</strong>: an explicit "N events of class X evicted between T1 and T2"
+    record, so the cloud can tell the difference between a quiet sensor and a
+    full disk. And raise a local alarm; disk exhaustion is a fleet-health signal
+    that should reach operations before it reaches the data.</p>
+
+    <h2 data-anchor="eta-h2-runtime">Choosing a runtime</h2>
+
+    <p data-anchor="eta-p-rt1">The constraints are a fixed memory ceiling, multi-year uptime, and
+    no operator to restart anything. That points at a small set of choices, and
+    the tradeoff is real rather than a matter of taste.</p>
+
+    <dl class="modes" data-anchor="eta-dl-rt">
+      <dt>Rust</dt>
+      <dd>No GC pauses, predictable footprint, strong story for the I/O and
+      framing code. The default choice for a constrained gateway.</dd>
+      <dt>Go</dt>
+      <dd>Faster to write, good concurrency, GC pauses that are acceptable
+      unless you are near a hard latency bound. A reasonable fleet default.</dd>
+      <dt>Elixir / BEAM</dt>
+      <dd>Supervision trees and hot upgrades are genuinely valuable on a box you
+      cannot reach; the cost is a heavier runtime than the smallest devices
+      allow. Strong for gateways, weak for microcontrollers.</dd>
+      <dt>C / C++</dt>
+      <dd>Sometimes the only option the hardware vendor supports. Budget for the
+      memory-safety work you are taking on.</dd>
+    </dl>
+
+    <div class="pullquote" data-anchor="eta-pq">
+      The agent's job is not to be smart. It is to never lose an event it
+      accepted, and to be honest about the ones it could not keep.
+    </div>
+
+    <div class="review" data-anchor="eta-review">
+      <h4>Exercise</h4>
+      <ol>
+        <li>Size the agent's disk for your worst credible outage at your event
+        rate. Now halve it and write the eviction policy that makes that
+        survivable.</li>
+        <li>Implement gap detection from <code>seq</code> alone. What does your
+        detector do when a device is reflashed and its sequence resets?</li>
+        <li>Trace one event from sensor to durable ack and mark every point where
+        it could be lost without anyone noticing. Each mark is a required
+        metric.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="eta-src"><sup>1</sup> <em>IoT / Edge Ingestion</em>, CodeSparring
+    system-design notes. &nbsp; <sup>2</sup> <em>Powering the Industrial Edge with
+    MQTT</em>, HiveMQ. &nbsp; <sup>3</sup> <em>MQTT QoS Levels for Industrial
+    Telemetry</em>, MachineCDN.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="03-core-concepts-and-tradeoffs.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="05-connectivity-synchronization-and-backpressure.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

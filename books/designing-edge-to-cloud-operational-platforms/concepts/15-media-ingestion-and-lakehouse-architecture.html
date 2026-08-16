@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Media Ingestion and Lakehouse Architecture &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part V &mdash; Vision and Spatial Data</span> &middot; Chapter 15</p>
+    <p class="chapter-no">15</p>
+    <h1 data-anchor="mil-h1">Media Ingestion and<br>Lakehouse Architecture</h1>
+
+    <p class="lede" data-anchor="mil-lede">Two rules organise this chapter, and everything else follows from
+    them. Objects go in object storage; the stream carries the pointer. And the
+    raw layer is immutable, because the ability to reprocess is the only thing
+    that lets you fix a mistake made two months ago.</p>
+
+    <h2 data-anchor="mil-h2-split">Separate the bytes from the metadata</h2>
+
+    <p data-anchor="mil-p-sp1">The temptation is to put an image in the event so that consumers get
+    everything at once. Resist it: a megabyte payload wrecks a broker's batching,
+    inflates retention costs by orders of magnitude, and means every consumer
+    pays to move data most of them do not want.</p>
+
+    <p data-anchor="mil-p-sp2">Instead the media object is uploaded directly to object storage, and
+    the event carries a reference plus the metadata needed to decide whether to
+    fetch it. Consumers that only need to count detections never touch a byte of
+    imagery.</p>
+
+    <div class="pre-label">The upload sequence</div>
+    <pre><code><span class="num">1.</span> agent requests an upload URL      <span class="cm">// scoped, expiring, per-object</span>
+<span class="num">2.</span> agent uploads, resumable multipart <span class="cm">// survives a link drop mid-part</span>
+<span class="num">3.</span> storage confirms; agent computes content hash
+<span class="num">4.</span> agent publishes media.stored.v1 with ref + hash + size
+<span class="num">5.</span> indexer verifies hash, records lineage, makes it searchable</code></pre>
+
+    <p data-anchor="mil-p-sp3">Step two matters more than it looks on a rail asset. A resumable
+    multipart upload survives a link that drops halfway through a 600&nbsp;MB
+    file, which on a moving vehicle is the normal case, not the exception. A
+    non-resumable upload restarts from zero and may never complete at all.</p>
+
+    <p data-anchor="mil-p-sp4">And step three gives deduplication for free. Content hashing means
+    an object uploaded twice &mdash; after an ambiguous failure, say &mdash;
+    resolves to one stored object, and it doubles as integrity verification: the
+    hash the agent computed must match what storage holds.</p>
+
+    <h2 data-anchor="mil-h2-layout">Object layout</h2>
+
+    <p data-anchor="mil-p-lo1">Layout is close to permanent, because rewriting a petabyte to change
+    a prefix is not a maintenance task. Put the coarse partition dimensions
+    first, and never use a purely random prefix &mdash; it defeats every
+    prefix-scoped lifecycle rule and access policy you will later want.</p>
+
+    <div class="pre-label">A layout that survives</div>
+    <pre><code>media/
+  raw/
+    dt=2026-08-16/           <span class="cm"># time first: lifecycle rules key on it</span>
+      asset=inspection-car-03/
+        run=0447/
+          frame-0009412.webp
+  derived/
+    thumbs/dt=2026-08-16/...
+    clips/dt=2026-08-16/...</code></pre>
+
+    <p data-anchor="mil-p-lo2">Separating <code>raw/</code> from <code>derived/</code> means a
+    lifecycle policy can expire thumbnails aggressively while raw evidence sits
+    under a seven-year retention rule &mdash; and it makes it obvious which
+    prefix is safe to regenerate.</p>
+
+    <h2 data-anchor="mil-h2-medallion">Bronze, Silver, Gold</h2>
+
+    <p data-anchor="mil-p-md1">The medallion architecture layers lakehouse data as Bronze for raw
+    ingestion, Silver for cleaned and conformed data, and Gold for business-ready
+    aggregates; the term was popularized by Databricks around
+    2019&ndash;2020.<sup>1</sup> The same layering can be implemented on Apache
+    Iceberg, Delta Lake, or Apache Hudi and queried with Trino, Spark, or Flink,
+    without a proprietary runtime.<sup>1,2</sup></p>
+
+    <figure class="diagram-fig" data-anchor="mil-fig-med">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="mil-fig-med-t">
+        <title id="mil-fig-med-t">Bronze immutable, Silver conformed, Gold aggregated, with reprocessing always from Bronze</title>
+
+        <rect class="stroke-thick fill-bg" x="14" y="42" width="150" height="52"/>
+        <text class="big" x="89" y="60" text-anchor="middle">Bronze</text>
+        <text class="dim" x="89" y="74" text-anchor="middle">raw &middot; immutable</text>
+        <text class="dim red" x="89" y="87" text-anchor="middle">never edited</text>
+
+        <line class="stroke" x1="164" y1="68" x2="204" y2="68" marker-end="url(#mil-a)"/>
+
+        <rect class="stroke fill-soft" x="204" y="42" width="150" height="52"/>
+        <text class="big" x="279" y="60" text-anchor="middle">Silver</text>
+        <text class="dim" x="279" y="74" text-anchor="middle">validated &middot; conformed</text>
+        <text class="dim" x="279" y="87" text-anchor="middle">deduplicated</text>
+
+        <line class="stroke" x1="354" y1="68" x2="394" y2="68" marker-end="url(#mil-a)"/>
+
+        <rect class="stroke fill-bg" x="394" y="42" width="152" height="52"/>
+        <text class="big" x="470" y="60" text-anchor="middle">Gold</text>
+        <text class="dim" x="470" y="74" text-anchor="middle">aggregates &middot; features</text>
+        <text class="dim" x="470" y="87" text-anchor="middle">ML-ready</text>
+
+        <path class="stroke-red dash" d="M470,94 L470,122 L89,122 L89,94" marker-end="url(#mil-r)"/>
+        <text class="red" x="280" y="138" text-anchor="middle">a bug in Silver is fixed by reprocessing Bronze &mdash; not by editing Silver</text>
+
+        <defs>
+          <marker id="mil-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+          <marker id="mil-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-red"/></marker>
+        </defs>
+      </svg>
+      <figcaption>The arrow that matters is the dashed one. Bronze is immutable so that
+      every downstream mistake is repairable by recomputation.</figcaption>
+    </figure>
+
+    <p data-anchor="mil-p-md2">Map it concretely for this platform. <strong>Bronze</strong>: raw
+    telemetry exactly as received, media object references, and the source
+    metadata &mdash; append-only, partitioned by ingest date.
+    <strong>Silver</strong>: normalised, unit-converted, deduplicated on
+    <code>event_id</code>, enriched with asset and location, and with quality
+    flags applied. <strong>Gold</strong>: per-asset daily health, defect density
+    by track segment, plan-versus-actual, and the feature tables the models
+    consume.</p>
+
+    <div class="callout warn" data-anchor="mil-callout-bronze">
+      <span class="callout-title">Never edit Bronze</span>
+      <p>The moment raw is mutable, reprocessing stops reproducing history and
+      every lineage claim becomes unverifiable &mdash; which in a regulated domain
+      is the difference between evidence and assertion. Corrections are new rows
+      in Silver, or a new Silver computed from an unchanged Bronze. If a bad batch
+      landed in Bronze, quarantine the partition; do not rewrite it.</p>
+    </div>
+
+    <h2 data-anchor="mil-h2-formats">Why a table format, not just files</h2>
+
+    <p data-anchor="mil-p-fm1">Lakehouse table formats supply ACID transactions, schema evolution,
+    and time travel, which is what makes a raw layer safely
+    reprocessable.<sup>2</sup> Without them, a concurrent write during a
+    long-running query gives you a partially-written table and no way to tell.</p>
+
+    <p data-anchor="mil-p-fm2">Iceberg's partition evolution is worth calling out for this
+    workload specifically: changing the partitioning scheme without rewriting the
+    underlying data,<sup>2</sup> plus hidden partitioning so queries need not name
+    partition columns. You <em>will</em> get partitioning wrong initially, because
+    the query patterns do not exist until there are queries.</p>
+
+    <h2 data-anchor="mil-h2-part">Partitioning for time and space</h2>
+
+    <p data-anchor="mil-p-pt1">Telemetry is queried two ways &mdash; "this asset over this period"
+    and "this stretch of track over this period" &mdash; and one partitioning
+    scheme cannot serve both well.</p>
+
+    <p data-anchor="mil-p-pt2">Partition by date first, since almost every query is time-bounded
+    and lifecycle policies key on it. Then cluster within the partition on the
+    secondary dimension: asset for telemetry tables, track segment for inspection
+    tables. Silver tables are commonly partitioned by business keys or dates,
+    with clustering techniques such as Z-ordering used to improve read
+    performance for common access patterns.<sup>1</sup></p>
+
+    <p data-anchor="mil-p-pt3">The anti-pattern to avoid: partitioning spatial data by ingest date
+    alone, so every geographic query scans the whole table. If "show me all
+    findings on main-2 between mileposts 180 and 190" is a common question &mdash;
+    and on this platform it is the most common question &mdash; the layout has to
+    anticipate it.</p>
+
+    <div class="pullquote" data-anchor="mil-pq">
+      Retention is where the money is. Storage costs are decided by policy, not by
+      ingest rate, and a policy nobody wrote is the most expensive kind.
+    </div>
+
+    <h2 data-anchor="mil-h2-lifecycle">Retention classes and tiering</h2>
+
+    <p data-anchor="mil-p-lc1">Chapter 2 estimated petabytes. Whether that is affordable is
+    entirely a question of lifecycle policy, and the policy should be written as
+    a table that an auditor and a finance team can both read.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Retention by class</caption>
+        <thead>
+          <tr><th>Data</th><th>Hot</th><th>Cool</th><th>Archive</th><th>Delete</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Raw telemetry</td><td>30 d</td><td>13 mo</td><td>&mdash;</td><td>13 mo</td></tr>
+          <tr><td>Silver telemetry</td><td>90 d</td><td>2 y</td><td>7 y</td><td>&mdash;</td></tr>
+          <tr><td>Inspection media, flagged</td><td>90 d</td><td>2 y</td><td>7 y</td><td>&mdash;</td></tr>
+          <tr><td>Inspection media, unflagged</td><td>7 d</td><td>90 d</td><td>&mdash;</td><td>90 d</td></tr>
+          <tr><td>Derived thumbnails</td><td>30 d</td><td>&mdash;</td><td>&mdash;</td><td>30 d</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="mil-p-lc2">The fourth row does most of the saving, and it is the one that needs
+    a conscious decision: unflagged imagery is the overwhelming majority of the
+    volume, and keeping it long is the difference between an affordable platform
+    and an unaffordable one. Balance that against Chapter 14's point that you
+    need <em>some</em> negatives to measure recall &mdash; hence a sampled subset
+    promoted to the longer retention class.</p>
+
+    <h2 data-anchor="mil-h2-lineage">Lineage and reproducibility</h2>
+
+    <p data-anchor="mil-p-ln1">Record, for every derived table: the source tables and the exact
+    snapshot version read, the transformation code version, the run timestamp,
+    and the row counts in and out. With that, "why does this number differ from
+    last week's report?" has an answer, and a regulator's request to reproduce a
+    figure is a job rather than an incident.</p>
+
+    <div class="review" data-anchor="mil-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>Cost your retention table for a three-year fleet plan. Which single
+        row dominates, and what would halving it cost you analytically?</li>
+        <li>Can you reproduce last quarter's defect-density report exactly? Try
+        it. Note every input you could not pin.</li>
+        <li>Take your commonest spatial query. Does your partitioning serve it, or
+        does it scan?</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="mil-src"><sup>1</sup> <em>The Medallion Architecture: Bronze, Silver, and
+    Gold on Open Lakehouses</em>, BigData Boutique. &nbsp; <sup>2</sup> <em>Data
+    Lakehouse Architecture: Iceberg, Delta &amp; Medallion</em>.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="14-computer-vision-at-the-edge.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="16-spatial-data-and-inspection-workflows.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
