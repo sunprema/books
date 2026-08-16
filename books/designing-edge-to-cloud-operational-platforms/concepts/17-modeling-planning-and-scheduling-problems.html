@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Modeling Planning and Scheduling Problems &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VI &mdash; Distributed Scheduling and Optimization</span> &middot; Chapter 17</p>
+    <p class="chapter-no">17</p>
+    <h1 data-anchor="mps-h1">Modeling Planning and<br>Scheduling Problems</h1>
+
+    <p class="lede" data-anchor="mps-lede">Everything so far has been a transactional system: an event arrives,
+    something happens, it is correct or it is not. Optimization is a different
+    animal. There is no single right answer, the answer degrades as its inputs
+    age, and the output is a <em>proposal</em> that a human may overrule. Getting
+    the modelling right matters more than the solver.</p>
+
+    <h2 data-anchor="mps-h2-differ">How optimization differs</h2>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Two very different kinds of system</caption>
+        <thead>
+          <tr><th></th><th>Transactional</th><th>Optimization</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Correct answer</td><td>Exactly one</td><td>A quality spectrum</td></tr>
+          <tr><td>Runtime</td><td>Milliseconds, bounded</td><td>Minutes to hours, open-ended</td></tr>
+          <tr><td>Input</td><td>The current request</td><td>A snapshot of the whole world</td></tr>
+          <tr><td>Failure</td><td>Error to the caller</td><td>No plan, or a worse plan</td></tr>
+          <tr><td>Value decays</td><td>No</td><td>Yes &mdash; continuously</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="mps-p-df1">The last row drives the architecture. A plan computed against a
+    30-minute-old snapshot may be worse than a cruder plan computed against
+    current data, and there is a crossover point. Finding it is an engineering
+    question, not a solver question &mdash; and it is the question that decides
+    how you decompose the problem.</p>
+
+    <h2 data-anchor="mps-h2-plans">A schedule is a plan, not truth</h2>
+
+    <p data-anchor="mps-p-pl1">This is the framing to hold. The optimizer's output is a proposal
+    about the future, which is why it is published as a versioned plan rather
+    than written as authoritative state. Reality diverges from it within minutes,
+    and the platform's job is to notice the divergence, not to pretend it away.</p>
+
+    <p data-anchor="mps-p-pl2">Concretely, that means a plan is published as an immutable versioned
+    event (<code>schedule.plan.updated.v1</code>) with an explicit validity
+    window, a provenance record, and an approval status. Consumers reference a
+    specific plan version, so "which plan were we operating under at 14:20?" is
+    always answerable. A plan that is silently overwritten in a table cannot
+    answer that.</p>
+
+    <h2 data-anchor="mps-h2-entities">Modelling the domain</h2>
+
+    <p data-anchor="mps-p-en1">Model the network as a graph, but be careful about what the nodes
+    are. The naive choice &mdash; stations as nodes, track as edges &mdash;
+    cannot express the constraint that actually binds: two trains cannot occupy
+    the same block at the same time.</p>
+
+    <p data-anchor="mps-p-en2">Use <span class="term">track blocks</span> as the resource, and model
+    the problem as allocating block-time intervals to movements. Now capacity
+    conflicts are interval overlaps, which is a representation a solver can
+    reason about directly.</p>
+
+    <div class="pre-label">The core entities</div>
+    <pre><code>Asset      : locomotive, car, inspection vehicle — availability, location, capability
+Crew       : hours-of-service limits, qualifications, home terminal
+Block      : a track segment that holds one movement at a time
+Terminal   : finite tracks, finite processing rate
+Movement   : an asset traversing an ordered block sequence in a time window
+Plan       : a set of movements + block-time allocations, versioned</code></pre>
+
+    <h2 data-anchor="mps-h2-constraints">Hard and soft constraints</h2>
+
+    <p data-anchor="mps-p-cn1">Separating these correctly is the highest-leverage modelling
+    decision in the chapter. A hard constraint must hold or the plan is invalid;
+    a soft constraint is a preference with a penalty.</p>
+
+    <dl class="modes" data-anchor="mps-dl-constraints">
+      <dt>Hard</dt>
+      <dd>Block exclusivity. Crew hours-of-service limits. Terminal track
+      capacity. Asset physical capability. Maintenance windows already
+      committed.</dd>
+      <dt>Soft</dt>
+      <dd>Preferred departure times. Crew shift preferences. Fuel-efficient
+      speed profiles. Balanced terminal utilisation. Minimising plan churn
+      against the last published plan.</dd>
+    </dl>
+
+    <div class="callout warn" data-anchor="mps-callout-hard">
+      <span class="callout-title">Encoding a preference as a hard constraint</span>
+      <p>The most common modelling failure, and the most frustrating: it turns a
+      merely expensive schedule into an infeasible one, and the solver then
+      returns nothing at all. Nothing is far worse than a plan with a penalty on
+      it. When in doubt, make it soft with a large penalty &mdash; you get an
+      answer, and the penalty tells you how badly it hurt.</p>
+    </div>
+
+    <p data-anchor="mps-p-cn2">Do design for infeasibility anyway, because it will happen. When a
+    solver cannot satisfy the hard constraints, it should return the minimal
+    conflicting set &mdash; "these three commitments cannot all hold" &mdash;
+    rather than a bare failure. That is an actionable message for a planner; a
+    timeout is not.</p>
+
+    <h2 data-anchor="mps-h2-objective">Objectives are plural</h2>
+
+    <p data-anchor="mps-p-ob1">Operations is trading on-time performance against energy,
+    utilisation, crew constraints, and delay simultaneously. A single scalar
+    objective hides that trade rather than resolving it.</p>
+
+    <p data-anchor="mps-p-ob2">Two workable approaches. <strong>Weighted sum</strong> is simple and
+    tunable, but the weights are a policy decision that belongs to operations
+    rather than to engineering &mdash; make them configuration, version them, and
+    record which weights produced a given plan. <strong>Lexicographic
+    ordering</strong> optimises in priority tiers: satisfy safety-adjacent
+    commitments first, then on-time performance, then cost. It is easier to
+    explain to a planner, which matters more than it sounds.</p>
+
+    <p data-anchor="mps-p-ob3">Whichever you choose, report the objective breakdown with the plan.
+    "On-time 94%, energy index 1.08, crew overtime 3.2 h" lets a human judge the
+    trade. A single score of 8,412 does not.</p>
+
+    <div class="pullquote" data-anchor="mps-pq">
+      A plan nobody can explain is a plan nobody will follow. The breakdown is
+      part of the output, not a debugging aid.
+    </div>
+
+    <h2 data-anchor="mps-h2-decompose">Decomposition</h2>
+
+    <p data-anchor="mps-p-dc1">A network-wide, day-long schedule is too large to solve monolithically
+    at a useful cadence. Decompose it &mdash; and the decomposition dimension is
+    itself a design choice with consequences.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Decomposition dimensions</caption>
+        <thead>
+          <tr><th>By</th><th>Natural boundary</th><th>Coupling left over</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Geography</td><td>Corridor, division</td><td>Handoffs at boundaries</td></tr>
+          <tr><td>Time horizon</td><td>Next 2 h vs next 24 h</td><td>State at the seam</td></tr>
+          <tr><td>Terminal</td><td>One yard's internal plan</td><td>Arrival/departure commitments</td></tr>
+          <tr><td>Scenario</td><td>Independent what-ifs</td><td>None &mdash; embarrassingly parallel</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="mps-p-dc2">Geographic decomposition is usually first, because corridors are
+    genuinely loosely coupled &mdash; but the handoffs are where plans go wrong.
+    Model the boundary explicitly as a commitment: corridor A promises to deliver
+    a movement to the boundary within a window, and corridor B plans against that
+    window rather than against A's internal detail. Then a change inside A that
+    still meets its commitment does not force B to replan.</p>
+
+    <h2 data-anchor="mps-h2-uncertainty">Uncertainty and stale inputs</h2>
+
+    <p data-anchor="mps-p-un1">Every input is a measurement with an age and an error bar. Chapter
+    13's freshness discipline pays off here: an optimizer should know how old its
+    snapshot is, and behave differently when it is stale.</p>
+
+    <ul data-anchor="mps-ul-uncertainty">
+      <li><strong>Buffer</strong> proportionally to input age &mdash; a plan built
+      on 20-minute-old positions needs more slack than one on current data.</li>
+      <li><strong>Prefer robust to optimal</strong> &mdash; a plan that is good
+      across likely perturbations beats one that is optimal for a single
+      forecast and brittle around it.</li>
+      <li><strong>Refuse past a staleness threshold</strong>. Better to keep the
+      previous plan than to publish one built on data too old to trust; say so,
+      loudly, rather than degrading silently.</li>
+    </ul>
+
+    <div class="boundary" data-anchor="mps-boundary">
+      <span class="boundary-title">The safety boundary</span>
+      <p>Nothing here grants movement authority. The optimizer proposes a
+      schedule; the systems and procedures responsible for safe separation of
+      movements remain wholly independent of it and are authoritative. A plan
+      that appears to conflict with them is simply a plan that will not be
+      executed &mdash; and the platform must be designed so that this outcome is
+      normal and visible rather than exceptional.</p>
+    </div>
+
+    <div class="review" data-anchor="mps-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>List your hard constraints. For each, ask what happens if it is
+        violated in the real world. If the answer is "it costs money", it is
+        soft.</li>
+        <li>How old is your optimizer's input snapshot at the moment the plan is
+        published? Is the plan still better than the one it replaces?</li>
+        <li>Can a planner explain a plan to a dispatcher without opening the
+        solver? If not, the objective breakdown is missing.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="16-spatial-data-and-inspection-workflows.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="18-building-the-distributed-optimization-engine.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

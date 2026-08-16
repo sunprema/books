@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Connectivity, Synchronization, and Backpressure &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part II &mdash; Edge-to-Cloud Telemetry</span> &middot; Chapter 05</p>
+    <p class="chapter-no">05</p>
+    <h1 data-anchor="csb-h1">Connectivity, Sync,<br>and Backpressure</h1>
+
+    <p class="lede" data-anchor="csb-lede">Connection loss is not an error condition here &mdash; it is an
+    operating mode with a duty cycle. This chapter is about the three problems
+    that follow: how a device decides when to retry, how an offline log
+    reconciles with the cloud, and how the cloud tells ten thousand vehicles to
+    slow down without falling over in the process.</p>
+
+    <h2 data-anchor="csb-h2-modes">Link modes and what each one permits</h2>
+
+    <p data-anchor="csb-p-modes1">Before retry logic, classify the link. A vehicle moves between
+    these states many times a day, and the right behaviour differs in each.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Link modes for a rail asset</caption>
+        <thead>
+          <tr><th>Mode</th><th>Typical</th><th>What the agent should do</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Depot Wi-Fi</td><td>High bandwidth, cheap</td><td>Drain bulk backlog, upload media, pull firmware</td></tr>
+          <tr><td>Cellular, good</td><td>Moderate, metered</td><td>Stream operational classes; hold bulk</td></tr>
+          <tr><td>Cellular, marginal</td><td>Lossy, high latency</td><td>Critical only; increase batching</td></tr>
+          <tr><td>Satellite</td><td>Expensive, high latency</td><td>Critical only, aggressively compressed</td></tr>
+          <tr><td>Disconnected</td><td>&mdash;</td><td>Buffer, evaluate local rules, keep time</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="csb-p-modes2">This table is a policy table, and it belongs in configuration rather
+    than in code &mdash; it changes with commercial contracts, not with
+    engineering.</p>
+
+    <h2 data-anchor="csb-h2-retry">Retry, and the storm it can cause</h2>
+
+    <p data-anchor="csb-p-retry1">Exponential backoff alone is not enough, and the reason is worth
+    being precise about. If a regional outage takes 10,000 vehicles offline at
+    once and they all back off on the same schedule, they will also all
+    <em>return</em> on the same schedule. Backoff without jitter converts an
+    outage recovery into a synchronised stampede against a cold cache.</p>
+
+    <div class="pre-label">Backoff with full jitter and a retry budget</div>
+    <pre><code><span class="kw">fn</span> <span class="fn">next_delay</span>(attempt: <span class="ty">u32</span>, rng: &<span class="kw">mut</span> <span class="ty">impl</span> Rng) -> <span class="ty">Duration</span> {
+    <span class="kw">let</span> cap  = Duration::from_secs(<span class="num">300</span>);
+    <span class="kw">let</span> base = Duration::from_millis(<span class="num">500</span>);
+    <span class="kw">let</span> exp  = base <span class="kw">*</span> <span class="num">2u32</span>.saturating_pow(attempt.min(<span class="num">10</span>));
+    <span class="cm">// full jitter: uniform over [0, exp], not exp ± noise</span>
+    rng.gen_range(Duration::ZERO..=exp.min(cap))
+}</code></pre>
+
+    <p data-anchor="csb-p-retry2">Full jitter &mdash; a uniform draw over the whole interval, not a
+    small perturbation of it &mdash; is what actually spreads the fleet. Pair it
+    with a <span class="term">retry budget</span>: a cap on the fraction of
+    requests that may be retries, so a struggling backend is not handed more load
+    than the original traffic. And a <span class="term">circuit breaker</span>
+    per endpoint, so a device stops hammering a service that is clearly down and
+    falls back to buffering.</p>
+
+    <div class="callout warn" data-anchor="csb-callout-storm">
+      <span class="callout-title">Design the recovery, not just the outage</span>
+      <p>Chapter 2 computed a reconnect burst six times peak. Jitter, a widened
+      drain window, and per-class draining are the three levers that make that
+      number survivable. Decide them before the outage: during it, you will not
+      be able to change device behaviour.</p>
+    </div>
+
+    <h2 data-anchor="csb-h2-qos">QoS classes and what they actually mean</h2>
+
+    <p data-anchor="csb-p-qos1">MQTT defines three delivery qualities: QoS&nbsp;0 at most once with
+    no delivery guarantee, QoS&nbsp;1 at least once which can produce duplicates,
+    and QoS&nbsp;2 exactly once at additional protocol overhead.<sup>1</sup> The
+    interesting fact is what industrial deployments actually choose.</p>
+
+    <p data-anchor="csb-p-qos2">They commonly pick QoS&nbsp;1 combined with a paged ring buffer and
+    per-packet confirmation tracking &mdash; accepting duplicates and
+    deduplicating downstream rather than paying QoS&nbsp;2's four-step
+    handshake.<sup>1</sup> That is the same conclusion Chapter 3 reached from the
+    other direction: if every effect is idempotent under the event's identity, at
+    least once is sufficient and much cheaper.</p>
+
+    <p data-anchor="csb-p-qos3">Separately from the protocol's QoS, your platform needs its own
+    <em>application</em> priority classes, because the protocol has no idea which
+    of your messages matters:</p>
+
+    <dl class="modes" data-anchor="csb-dl-qos">
+      <dt>Class 0 &mdash; operational alerts</dt>
+      <dd>Sent immediately, never batched, never evicted, own connection budget.</dd>
+      <dt>Class 1 &mdash; high-value telemetry</dt>
+      <dd>Position and health. Batched briefly, delivered in order per asset.</dd>
+      <dt>Class 2 &mdash; routine diagnostics</dt>
+      <dd>Batched heavily, downsampled under pressure.</dd>
+      <dt>Class 3 &mdash; bulk media</dt>
+      <dd>Depot links only by default. Resumable, and interruptible without loss.</dd>
+    </dl>
+
+    <p data-anchor="csb-p-qos4">The rule that makes classes worth having: <strong>a lower class must
+    never be able to starve a higher one</strong>. If media uploads share a
+    connection pool with alerts, a video backlog will delay the signal that
+    mattered, and it will do so precisely during the incident that produced both.</p>
+
+    <h2 data-anchor="csb-h2-acks">Three acknowledgements, not one</h2>
+
+    <p data-anchor="csb-p-ack1">This is the section to read twice. A device that receives a single
+    undifferentiated "ack" cannot know when it is safe to free buffer space, and
+    will either delete data too early or hold it forever.</p>
+
+    <figure class="diagram-fig" data-anchor="csb-fig-acks">
+      <svg class="diagram" viewBox="0 0 560 178" role="img" aria-labelledby="csb-fig-acks-t">
+        <title id="csb-fig-acks-t">Transport, durable, and business acknowledgements returning from three different points</title>
+
+        <rect class="stroke fill-bg" x="8" y="66" width="72" height="40"/>
+        <text class="big" x="44" y="90" text-anchor="middle">Agent</text>
+
+        <rect class="stroke fill-bg" x="150" y="66" width="76" height="40"/>
+        <text class="big" x="188" y="84" text-anchor="middle">Gateway</text>
+        <text class="dim" x="188" y="98" text-anchor="middle">TLS</text>
+
+        <rect class="stroke fill-soft" x="290" y="66" width="76" height="40"/>
+        <text class="big" x="328" y="84" text-anchor="middle">Log</text>
+        <text class="dim" x="328" y="98" text-anchor="middle">replicated</text>
+
+        <rect class="stroke fill-bg" x="430" y="66" width="90" height="40"/>
+        <text class="big" x="475" y="84" text-anchor="middle">Service</text>
+        <text class="dim" x="475" y="98" text-anchor="middle">effect applied</text>
+
+        <line class="stroke" x1="80" y1="80" x2="150" y2="80" marker-end="url(#csb-a)"/>
+        <line class="stroke" x1="226" y1="80" x2="290" y2="80" marker-end="url(#csb-a)"/>
+        <line class="stroke" x1="366" y1="80" x2="430" y2="80" marker-end="url(#csb-a)"/>
+
+        <path class="stroke-soft dash" d="M188,106 L188,124 L44,124 L44,106" marker-end="url(#csb-s)"/>
+        <text class="dim" x="116" y="136" text-anchor="middle">1 &middot; transport &mdash; means nothing durable</text>
+
+        <path class="stroke-red" d="M328,106 L328,150 L44,150 L44,106" marker-end="url(#csb-r)"/>
+        <text class="red" x="186" y="162" text-anchor="middle">2 &middot; durable &mdash; the only one that frees a page</text>
+
+        <path class="stroke dash" d="M475,60 L475,36 L44,36 L44,66" marker-end="url(#csb-a)"/>
+        <text x="260" y="30" text-anchor="middle">3 &middot; business &mdash; closes a command, not a buffer</text>
+
+        <defs>
+          <marker id="csb-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+          <marker id="csb-s" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-soft"/></marker>
+          <marker id="csb-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-red"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Three acknowledgements, returning from three different depths. Only
+      the durable ack may free buffer space; the transport ack means the bytes left
+      the device.</figcaption>
+    </figure>
+
+    <p data-anchor="csb-p-ack2">A useful operational signal falls out of this: acknowledgement
+    latency is a connection-health indicator. When confirmations stop arriving
+    although the TCP connection still appears active, gateways force a
+    reconnect<sup>1</sup> &mdash; a half-open connection looks perfectly healthy
+    to the socket layer and is one of the classic silent-loss modes.</p>
+
+    <h2 data-anchor="csb-h2-sync">Synchronising an offline log</h2>
+
+    <p data-anchor="csb-p-sync1">When a vehicle reconnects it has a log the cloud has never seen,
+    possibly overlapping with data the cloud already has. Reconciliation rests on
+    the two fields we put in the envelope for exactly this moment.</p>
+
+    <ol data-anchor="csb-ol-sync">
+      <li>The device reports its buffered range: <code>seq</code> low and high
+      watermarks, per class.</li>
+      <li>The cloud replies with the highest contiguous <code>seq</code> it has
+      durably stored for that device.</li>
+      <li>The device sends from there, highest class first.</li>
+      <li>The cloud deduplicates on <code>event_id</code> and detects gaps from
+      <code>seq</code> &mdash; a missing range is loss, not silence.</li>
+    </ol>
+
+    <p data-anchor="csb-p-sync2">Note that out-of-order delivery is expected here and is fine.
+    Because the events carry event time and a sequence number, ordering is
+    reconstructible after the fact; insisting on ordered transmission would only
+    make the drain slower and more fragile.</p>
+
+    <div class="pullquote" data-anchor="csb-pq">
+      Backpressure that stops at the gateway is not backpressure. It has to reach
+      the device, or the device will keep producing into a wall.
+    </div>
+
+    <h2 data-anchor="csb-h2-bp">Backpressure that reaches the field</h2>
+
+    <p data-anchor="csb-p-bp1">Backpressure has to propagate the whole way: consumer lag raises a
+    signal, the ingest tier degrades gracefully, and the gateway tells devices to
+    slow down &mdash; per class, so that alerts keep flowing while diagnostics
+    throttle. The signal is usually a small directive returned on the
+    acknowledgement path: a suggested batch interval, a class ceiling, and a
+    validity period.</p>
+
+    <p data-anchor="csb-p-bp2">Give it a validity period so a device that loses contact reverts to
+    its default rather than staying throttled forever. This is the same
+    lease-shaped thinking that keeps a device shadow honest, and it is the
+    difference between backpressure and an accidental permanent downgrade.</p>
+
+    <h2 data-anchor="csb-h2-dlq">Dead letters and quarantine</h2>
+
+    <p data-anchor="csb-p-dlq1">Some messages cannot be processed: an unknown schema version, a
+    sensor id not in the registry, a payload that fails validation. Retrying them
+    forever blocks everything behind them. Route them to a quarantine topic with
+    the original bytes, the failure reason, and the correlation id.</p>
+
+    <p data-anchor="csb-p-dlq2">Then treat the quarantine as a product surface, not a graveyard: it
+    needs an owner, an alert on rate-of-arrival, and a replay path once the cause
+    is fixed. A dead-letter queue nobody reads is just a slower way to drop data.</p>
+
+    <div class="review" data-anchor="csb-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>Simulate 10,000 vehicles reconnecting after a one-hour regional
+        outage. What is your p99 drain time, and which class finishes last?</li>
+        <li>Can your device tell a transport ack from a durable one? If not, when
+        does it free buffer space &mdash; and is that safe?</li>
+        <li>What is in your quarantine topic right now? If you do not know, that
+        is the answer.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="csb-src"><sup>1</sup> <em>MQTT QoS Levels for Industrial Telemetry:
+    Choosing the Right Delivery Guarantee</em>, MachineCDN; see also <em>Powering the
+    Industrial Edge with MQTT</em>, HiveMQ.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="04-designing-the-edge-telemetry-agent.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="06-secure-fleet-and-device-management.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

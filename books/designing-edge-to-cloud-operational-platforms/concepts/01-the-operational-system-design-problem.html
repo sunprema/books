@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Operational System Design Problem &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part I &mdash; Framing the System</span> &middot; Chapter 01</p>
+    <p class="chapter-no">01</p>
+    <h1 data-anchor="osdp-h1">The Operational<br>System Design Problem</h1>
+
+    <p class="lede" data-anchor="osdp-lede">Most of what you know about building distributed systems still
+    applies here. What changes is the ground it stands on. In a web system the
+    network is a detail that occasionally fails; in an operational system the
+    network is a moving, weather-dependent, partly-absent thing, and the assets
+    you are trying to observe are diesel-electric locomotives that will be in
+    service longer than your company will exist. This chapter is about what
+    that difference actually costs you at design time.</p>
+
+    <h2 data-anchor="osdp-h2-differ">What actually differs</h2>
+
+    <p data-anchor="osdp-p-differ1">Start with the honest version of the comparison. A typical web
+    backend has clients that reconnect within seconds, a datacentre network with
+    known characteristics, and a fleet you can redeploy in an afternoon. An
+    operational platform for a rail network has none of those. Its "clients"
+    are on vehicles moving through terrain, its links are cellular and satellite
+    with per-byte costs, and a firmware change may take a maintenance cycle to
+    reach the whole fleet.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Where the assumptions break</caption>
+        <thead>
+          <tr><th>Assumption</th><th>Web system</th><th>Operational platform</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Connectivity</td><td>Present; loss is an error</td><td>Intermittent; loss is a mode</td></tr>
+          <tr><td>Client lifetime</td><td>Months</td><td>Decades</td></tr>
+          <tr><td>Client upgrade</td><td>Push, minutes</td><td>Staged, weeks, sometimes physical</td></tr>
+          <tr><td>Bandwidth</td><td>Effectively free</td><td>Metered, sometimes per-megabyte</td></tr>
+          <tr><td>Clock</td><td>NTP-synchronised</td><td>Drifts; GPS lost in tunnels</td></tr>
+          <tr><td>Protocols</td><td>One or two you chose</td><td>Many you inherited</td></tr>
+          <tr><td>Consequence of failure</td><td>A retry</td><td>A truck roll, or a stopped train</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="osdp-p-differ2">The last row is the one that reorganises everything above it. When
+    the cost of being wrong is a physical intervention, you stop optimising for
+    average-case throughput and start optimising for <span class="term">bounded
+    behaviour under partial failure</span>. That is a different design target,
+    and it is the target this book aims at.</p>
+
+    <h2 data-anchor="osdp-h2-four">Four kinds of traffic, four sets of rules</h2>
+
+    <p data-anchor="osdp-p-four1">The single most useful early move is refusing to call everything
+    "data". An operational platform carries at least four categories, and they
+    have genuinely different requirements. Conflating them is how a platform
+    ends up applying safety-grade latency budgets to diagnostic counters, or
+    &mdash; much worse &mdash; the reverse.</p>
+
+    <figure class="diagram-fig" data-anchor="osdp-fig-flows">
+      <svg class="diagram" viewBox="0 0 560 208" role="img" aria-labelledby="osdp-fig-flows-t">
+        <title id="osdp-fig-flows-t">Four traffic classes between field and cloud, with the safety boundary drawn around local control</title>
+
+        <rect class="stroke fill-bg" x="8" y="26" width="118" height="160"/>
+        <text x="67" y="18" text-anchor="middle">Field</text>
+        <rect class="stroke fill-bg" x="434" y="26" width="118" height="160"/>
+        <text x="493" y="18" text-anchor="middle">Cloud</text>
+
+        <rect class="stroke-red fill-bg" x="18" y="128" width="98" height="48"/>
+        <text class="big red" x="67" y="148" text-anchor="middle">Local control</text>
+        <text class="dim" x="67" y="164" text-anchor="middle">safety boundary</text>
+
+        <line class="stroke" x1="126" y1="48" x2="434" y2="48" marker-end="url(#osdp-a)"/>
+        <text class="big" x="280" y="42" text-anchor="middle">Telemetry</text>
+        <text class="dim" x="280" y="60" text-anchor="middle">high volume &middot; one way &middot; replayable</text>
+
+        <line class="stroke" x1="434" y1="88" x2="126" y2="88" marker-end="url(#osdp-a)"/>
+        <text class="big" x="280" y="82" text-anchor="middle">Commands</text>
+        <text class="dim" x="280" y="100" text-anchor="middle">low volume &middot; authenticated &middot; acknowledged</text>
+
+        <line class="stroke" x1="126" y1="118" x2="434" y2="118" marker-end="url(#osdp-a)"/>
+        <text class="big" x="280" y="132" text-anchor="middle">Decisions &amp; plans</text>
+
+        <line class="stroke-red dash" x1="67" y1="128" x2="67" y2="108"/>
+        <text class="red" x="120" y="176" text-anchor="start">never crosses</text>
+
+        <defs>
+          <marker id="osdp-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>Telemetry flows out, commands flow in, decisions circulate &mdash; and
+      safety-critical control stays inside the field, on the near side of a boundary
+      the platform is not allowed to cross.</figcaption>
+    </figure>
+
+    <p data-anchor="osdp-p-four2"><span class="term">Telemetry</span> is high-volume, one-directional,
+    and tolerant of delay as long as it is not tolerant of loss. <span
+    class="term">Commands</span> are rare, must be authenticated per-message, and
+    need an acknowledgement path that distinguishes "received" from "carried
+    out". <span class="term">Decisions</span> &mdash; a schedule, a maintenance
+    priority, a routing plan &mdash; are proposals about the future, and are
+    almost always advisory. And <span class="term">safety-critical control</span>
+    is the category that does not belong in this platform at all.</p>
+
+    <div class="boundary" data-anchor="osdp-boundary">
+      <span class="boundary-title">The safety boundary</span>
+      <p>This book teaches high availability and graceful degradation, which are
+      architectural properties you can design and measure. Operational safety in
+      a rail-like domain is a different discipline: it is bounded explicitly,
+      owned by dedicated safety systems and procedures, and subject to
+      certification regimes that a general cloud platform does not participate
+      in. Every chapter states where that line falls rather than blurring it. If
+      a design in this book appears to be making a safety decision, the design is
+      wrong.</p>
+    </div>
+
+    <h2 data-anchor="osdp-h2-example">The running example</h2>
+
+    <p data-anchor="osdp-p-example1">We will build against one domain for the whole book: a connected
+    rail network. It is a good teacher because it contains every awkward case at
+    once, and a fair one because none of it depends on a particular railroad or
+    cloud vendor.</p>
+
+    <ul data-anchor="osdp-ul-example">
+      <li><strong>Locomotives</strong> &mdash; mobile, high-value, hundreds of sensors each,
+      connectivity that comes and goes with terrain.</li>
+      <li><strong>Wayside detectors</strong> &mdash; fixed, sparse, bursty: silent for hours,
+      then a train passes and they emit a dense burst.</li>
+      <li><strong>Terminals and gates</strong> &mdash; fixed, well-connected, and the place
+      where automated decisions meet physical throughput.</li>
+      <li><strong>Inspection vehicles and drones</strong> &mdash; media producers, gigabytes
+      per run, uploaded opportunistically at a depot.</li>
+      <li><strong>Dispatch, maintenance, planning</strong> &mdash; the humans and services
+      that consume all of it and act on it.</li>
+    </ul>
+
+    <p data-anchor="osdp-p-example2">Note how badly these five want different things. The wayside
+    detector's burst and the locomotive's steady trickle cannot share a capacity
+    plan. The drone's gigabytes and the maintenance alert's few hundred bytes
+    cannot share a delivery priority. A platform that treats them uniformly will
+    be sized for the wrong thing and will drop the wrong messages first.</p>
+
+    <div class="pullquote" data-anchor="osdp-pq">
+      The cloud can optimise operations. The field must remain useful when the
+      cloud, the network, or any individual service is unavailable.
+    </div>
+
+    <h2 data-anchor="osdp-h2-goals">Design goals, in the order they bite</h2>
+
+    <p data-anchor="osdp-p-goals1">We will keep returning to seven goals. They are listed here in
+    roughly the order they cause architectural pain, which is not the order they
+    usually appear on a slide.</p>
+
+    <dl class="modes" data-anchor="osdp-dl-goals">
+      <dt>Safety boundaries</dt>
+      <dd>Stated first because it constrains everything else: what may this
+      platform decide, and what must it never decide?</dd>
+      <dt>Availability and graceful degradation</dt>
+      <dd>Not "does it stay up" but "what does it do while it is partly down,
+      and does the operator know?"</dd>
+      <dt>Latency</dt>
+      <dd>Per traffic class, end to end &mdash; sensor to operator's screen, not
+      broker to consumer.</dd>
+      <dt>Correctness</dt>
+      <dd>Ordering, duplication, and reconciliation. Usually the deepest
+      rework if you get it wrong.</dd>
+      <dt>Auditability</dt>
+      <dd>Can you reconstruct what the system knew and when? Regulated domains
+      make this non-optional.</dd>
+      <dt>Cost</dt>
+      <dd>Bandwidth, retention, and replication dominate; compute rarely does.</dd>
+      <dt>Evolvability</dt>
+      <dd>Assets outlive architectures. Whatever you build will be maintained
+      by someone who has never met you.</dd>
+    </dl>
+
+    <p data-anchor="osdp-p-goals2">Notice that resilience for critical systems is consistently framed
+    in the industry literature in terms of redundancy, failure isolation,
+    automated recovery, and <em>tested</em> failover, rather than any assumption
+    that outages will not occur; geographic distribution exists specifically to
+    survive localised failure, and the dominant lever on availability is how
+    quickly failed capacity is replaced.<sup>1</sup> That framing is worth
+    internalising now, because it is the opposite of the instinct to make
+    individual components more reliable.</p>
+
+    <div class="callout key" data-anchor="osdp-callout-key">
+      <span class="callout-title">The idea to carry forward</span>
+      <p>Loosely coupled dependencies &mdash; queues, streams, workflows, load
+      balancers &mdash; are what give you room to isolate a failure.<sup>1</sup>
+      Every time this book chooses a durable log over a synchronous call, that
+      is the reason.</p>
+    </div>
+
+    <h2 data-anchor="osdp-h2-reflect">So what did we actually gain?</h2>
+
+    <p data-anchor="osdp-p-reflect">A vocabulary and a boundary. We can now say "this is warm-path
+    telemetry with a five-minute freshness target and a retention class of 90
+    days" instead of "we need to collect sensor data", and we can say what the
+    platform is not responsible for. The next chapter turns that vocabulary into
+    numbers, because a requirement you cannot measure is a preference.</p>
+
+    <div class="review" data-anchor="osdp-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>For each of the five asset types, which traffic class dominates its
+        volume, and which dominates its urgency? They are rarely the same.</li>
+        <li>Name one decision your platform makes today that is closer to the
+        safety boundary than you would defend in a review.</li>
+        <li>If the cloud were unreachable for six hours, list what the field can
+        still do. If the list is empty, the architecture has a premise problem.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="osdp-src"><sup>1</sup> <em>Architecting for Resilience in the cloud for
+    critical railway systems</em>, AWS for Industries &mdash;
+    aws.amazon.com/blogs/industries/architecting-for-resilience-in-the-cloud-for-critical-railway-systems-2/</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="../index.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="02-requirements-before-architecture.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

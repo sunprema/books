@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kafka and the Streaming Backbone &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Real-Time Event Streaming</span> &middot; Chapter 08</p>
+    <p class="chapter-no">08</p>
+    <h1 data-anchor="ksb-h1">Kafka and the<br>Streaming Backbone</h1>
+
+    <p class="lede" data-anchor="ksb-lede">Kafka is the durable buffer that isolates a fleet of producers from
+    consumers that are slower, restarting, or temporarily broken. Most of what
+    makes it work well for telemetry comes down to two decisions &mdash; the
+    partition key and the partition count &mdash; and both are much harder to
+    change later than to get right now.</p>
+
+    <h2 data-anchor="ksb-h2-model">The mental model, briefly</h2>
+
+    <p data-anchor="ksb-p-model1">A topic is split into partitions; each partition is an append-only,
+    ordered log replicated across brokers; consumers track their position with
+    offsets. Ordering is guaranteed <em>within</em> a partition and nowhere else,
+    which is the single fact from which most design consequences follow.</p>
+
+    <p data-anchor="ksb-p-model2">Within a consumer group each partition is assigned to exactly one
+    consumer at a time, and a group coordinator manages assignments as membership
+    or topic metadata changes.<sup>1</sup> Two things follow immediately: your
+    parallelism is capped by the partition count, and consumers beyond that count
+    sit idle.<sup>1</sup></p>
+
+    <figure class="diagram-fig" data-anchor="ksb-fig-part">
+      <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="ksb-fig-part-t">
+        <title id="ksb-fig-part-t">Assets keyed to partitions, each partition consumed by exactly one consumer in a group</title>
+
+        <text x="46" y="18" text-anchor="middle">Assets</text>
+        <text class="mono dim" x="46" y="42">loco-4471</text>
+        <text class="mono dim" x="46" y="62">loco-2210</text>
+        <text class="mono dim" x="46" y="82">loco-8834</text>
+        <text class="mono dim" x="46" y="102">wayside-19</text>
+
+        <text class="dim" x="140" y="18" text-anchor="middle">hash(asset_id)</text>
+        <line class="stroke-soft" x1="92" y1="38" x2="196" y2="46" marker-end="url(#ksb-s)"/>
+        <line class="stroke-soft" x1="92" y1="58" x2="196" y2="86" marker-end="url(#ksb-s)"/>
+        <line class="stroke-soft" x1="92" y1="78" x2="196" y2="50" marker-end="url(#ksb-s)"/>
+        <line class="stroke-soft" x1="92" y1="98" x2="196" y2="126" marker-end="url(#ksb-s)"/>
+
+        <rect class="stroke fill-soft" x="200" y="32" width="150" height="28"/>
+        <text class="big" x="275" y="50" text-anchor="middle">partition 0</text>
+        <rect class="stroke fill-soft" x="200" y="72" width="150" height="28"/>
+        <text class="big" x="275" y="90" text-anchor="middle">partition 1</text>
+        <rect class="stroke fill-soft" x="200" y="112" width="150" height="28"/>
+        <text class="big" x="275" y="130" text-anchor="middle">partition 2</text>
+
+        <line class="stroke" x1="350" y1="46" x2="424" y2="46" marker-end="url(#ksb-a)"/>
+        <line class="stroke" x1="350" y1="86" x2="424" y2="86" marker-end="url(#ksb-a)"/>
+        <line class="stroke" x1="350" y1="126" x2="424" y2="126" marker-end="url(#ksb-a)"/>
+
+        <rect class="stroke fill-bg" x="428" y="32" width="120" height="28"/>
+        <text class="big" x="488" y="50" text-anchor="middle">consumer A</text>
+        <rect class="stroke fill-bg" x="428" y="72" width="120" height="28"/>
+        <text class="big" x="488" y="90" text-anchor="middle">consumer B</text>
+        <rect class="stroke-red fill-bg" x="428" y="112" width="120" height="28"/>
+        <text class="big" x="488" y="130" text-anchor="middle">consumer C</text>
+
+        <text class="red" x="275" y="164" text-anchor="middle">one partition &rarr; one consumer per group &middot; a 4th consumer would idle</text>
+
+        <defs>
+          <marker id="ksb-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+          <marker id="ksb-s" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" class="fill-soft"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Keying by asset id puts every event for one locomotive on one
+      partition, which is what buys per-asset ordering while different assets are
+      processed in parallel.</figcaption>
+    </figure>
+
+    <h2 data-anchor="ksb-h2-key">Choosing the partition key</h2>
+
+    <p data-anchor="ksb-p-key1">The common mistake is choosing a key for even distribution. That is
+    the second consideration. <strong>The key is an ordering decision first.</strong>
+    Whatever shares a key shares an order; everything else is concurrent.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Candidate keys and what each one buys</caption>
+        <thead>
+          <tr><th>Key</th><th>Ordering guarantee</th><th>Risk</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>asset_id</code></td><td>Per locomotive &mdash; usually what you want</td><td>A busy asset makes a warm partition</td></tr>
+          <tr><td><code>consist_id</code></td><td>Per train, across its vehicles</td><td>Changes as consists are re-formed</td></tr>
+          <tr><td>region</td><td>Per geography</td><td>Severe skew; regions differ hugely</td></tr>
+          <tr><td><code>sensor_id</code></td><td>Per signal</td><td>Loses cross-sensor ordering on one asset</td></tr>
+          <tr><td>none (round-robin)</td><td>None</td><td>Maximum parallelism, no ordering at all</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="ksb-p-key2">For telemetry, <code>asset_id</code> is nearly always right: an
+    anomaly detector reasoning about one locomotive needs that locomotive's
+    events in order, and does not care how they interleave with another's. The
+    skew it produces is mild, because assets are broadly similar in output.
+    Region keys, by contrast, produce genuinely painful skew &mdash; one
+    corridor may carry ten times another's traffic.</p>
+
+    <h2 data-anchor="ksb-h2-count">Partition count, and why it is nearly permanent</h2>
+
+    <p data-anchor="ksb-p-cnt1">Here is the trap. Raising the partition count later changes the
+    key-to-partition mapping, so events for one asset that used to land on
+    partition 3 start landing on partition 11 &mdash; while older events sit
+    unread on partition 3. Per-key ordering breaks across the change, silently,
+    for exactly as long as the backlog lasts.</p>
+
+    <p data-anchor="ksb-p-cnt2">So provision for the fleet you expect, not the fleet you have.
+    Partitions are cheap; a broken ordering guarantee is not.</p>
+
+    <div class="pre-label">Sizing sketch</div>
+    <pre><code>target_throughput <span class="kw">/</span> per_partition_throughput  <span class="cm"># consumer-side, measured</span>
+  <span class="kw">×</span> headroom_for_growth                    <span class="cm"># 2–3× a 3-year fleet plan</span>
+  <span class="kw">×</span> headroom_for_recovery                  <span class="cm"># drain the reconnect burst</span>
+  = partition_count</code></pre>
+
+    <p data-anchor="ksb-p-cnt3">The recovery term is the one Chapter 2 warned about: you must be
+    able to drain a burst several times steady-state, and consumer parallelism is
+    capped by partition count. Sizing only for steady state guarantees a slow
+    recovery on exactly the morning you need a fast one.</p>
+
+    <h2 data-anchor="ksb-h2-durability">Durability settings that matter</h2>
+
+    <p data-anchor="ksb-p-dur1">Since Kafka 3.0 the producer defaults to the stronger delivery
+    guarantees &mdash; <code>acks=all</code> with
+    <code>enable.idempotence=true</code>.<sup>2</sup> That is the right default
+    for telemetry, and it is worth knowing it is a default rather than something
+    you must remember to turn on. <code>acks=all</code> requires acknowledgement
+    from the in-sync replica set, and works together with the broker-side
+    <code>min.insync.replicas</code> to determine durability.<sup>3</sup></p>
+
+    <div class="pre-label">Producer and topic settings for a telemetry workload</div>
+    <pre><code><span class="cm"># producer — durability first</span>
+enable.idempotence=<span class="kw">true</span>          <span class="cm"># default since 3.0</span>
+acks=all
+compression.type=zstd            <span class="cm"># the link is metered; so is retention</span>
+linger.ms=<span class="num">25</span>                     <span class="cm"># batching pays for itself at fleet scale</span>
+max.in.flight.requests.per.connection=<span class="num">5</span>
+
+<span class="cm"># topic / broker</span>
+replication.factor=<span class="num">3</span>
+min.insync.replicas=<span class="num">2</span>             <span class="cm"># tolerate one replica loss, still durable</span></code></pre>
+
+    <p data-anchor="ksb-p-dur2">The pairing of <code>replication.factor=3</code> with
+    <code>min.insync.replicas=2</code> is the standard compromise: you survive
+    losing one replica and keep accepting writes, but you refuse writes rather
+    than accept them with only a single copy. Setting
+    <code>min.insync.replicas=1</code> converts a durability guarantee into a
+    hope.</p>
+
+    <div class="callout warn" data-anchor="ksb-callout-versions">
+      <span class="callout-title">Verify defaults against your release</span>
+      <p>Kafka's defaults have moved over time and continue to. Treat the values
+      above as a starting point to confirm against the version you actually run,
+      and pin them explicitly in configuration so an upgrade cannot change your
+      durability posture without a review.</p>
+    </div>
+
+    <h2 data-anchor="ksb-h2-retention">Retention, compaction, and replay</h2>
+
+    <p data-anchor="ksb-p-ret1">Two retention models, used for different purposes:</p>
+
+    <dl class="modes" data-anchor="ksb-dl-ret">
+      <dt>Time/size retention</dt>
+      <dd>For event streams. <code>telemetry.raw</code> keeps enough history to
+      re-derive downstream state &mdash; typically days to weeks, with the lake
+      holding the long tail.</dd>
+      <dt>Log compaction</dt>
+      <dd>For state topics. <code>asset.position</code> keyed by asset retains
+      the latest value per key indefinitely, so a new consumer can rebuild
+      current state by reading from the beginning.</dd>
+    </dl>
+
+    <p data-anchor="ksb-p-ret2">Replay is the capability all of this exists to protect. When
+    normalisation has a bug, you fix the code and reprocess
+    <code>telemetry.raw</code> from an offset. That works only if every
+    downstream effect is idempotent under <code>event_id</code> &mdash; the rule
+    from Chapter 3, now cashing in.</p>
+
+    <div class="pullquote" data-anchor="ksb-pq">
+      Partition count caps your parallelism, and your parallelism caps how fast
+      you recover. Size for the recovery, not the average day.
+    </div>
+
+    <h2 data-anchor="ksb-h2-obs">What to actually monitor</h2>
+
+    <p data-anchor="ksb-p-obs1">Broker health dashboards are reassuring and mostly beside the point.
+    The metrics that tell you whether operations can see the field are these:</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>The backbone's real signals</caption>
+        <thead>
+          <tr><th>Metric</th><th>Why it matters</th><th>Alert on</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Consumer lag</td><td>How far behind the truth you are</td><td>Trend, per group and partition</td></tr>
+          <tr><td>End-to-end latency</td><td>Sensor to consumer &mdash; the real SLI</td><td>p99 against the class target</td></tr>
+          <tr><td>Under-replicated partitions</td><td>Durability is degraded now</td><td>Any, sustained</td></tr>
+          <tr><td>ISR shrink rate</td><td>Broker or network trouble brewing</td><td>Rate of change</td></tr>
+          <tr><td>Producer error rate</td><td>Gateways failing to publish</td><td>Any sustained non-zero</td></tr>
+          <tr><td>Partition skew</td><td>A hot key throttles a whole group</td><td>Max/median ratio</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="ksb-p-obs2">Lag deserves a nuance: alert on its <em>trend</em>, not its
+    absolute value. Lag spikes every time a fleet reconnects, and that is the
+    system working. Lag that is not shrinking is the system failing.</p>
+
+    <div class="review" data-anchor="ksb-review">
+      <h4>Exercise</h4>
+      <ol>
+        <li>Compute the partition count for the Chapter 2 fleet, using your own
+        measured per-partition consumer throughput. Show the recovery term
+        explicitly.</li>
+        <li>Your busiest asset produces twelve times the median. Which partition
+        is it on, and what does that do to that partition's consumer?</li>
+        <li>Write the runbook for "normalisation had a bug for six hours".
+        Which topic do you replay from, what breaks if a consumer is not
+        idempotent, and how do you avoid double-raising alerts?</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="ksb-src"><sup>1</sup> <em>Kafka Consumer Design: Consumers, Consumer
+    Groups, and Offsets</em>, Confluent documentation. &nbsp; <sup>2</sup>
+    <em>Exactly-once Semantics is Possible</em>, Confluent. &nbsp; <sup>3</sup>
+    <em>Exactly-once semantics with Kafka transactions</em>, Strimzi.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="07-event-contracts-and-schema-evolution.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="09-rebalancing-ordering-and-correct-processing.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

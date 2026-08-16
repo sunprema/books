@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Multi-AZ, Multi-Region, and Disaster Recovery &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part IV &mdash; Resilient Operational Services</span> &middot; Chapter 12</p>
+    <p class="chapter-no">12</p>
+    <h1 data-anchor="mmd-h1">Multi-AZ, Multi-Region,<br>and Disaster Recovery</h1>
+
+    <p class="lede" data-anchor="mmd-lede">Multi-AZ is close to table stakes and mostly a configuration
+    decision. Multi-region is a different animal: it is expensive, it complicates
+    every stateful component, and it is the right answer only when you can say
+    what it buys. This chapter is about making that case honestly &mdash; and
+    about the fact that untested recovery is not recovery.</p>
+
+    <h2 data-anchor="mmd-h2-az">Zones first</h2>
+
+    <p data-anchor="mmd-p-az1">Availability zones are separate failure domains close enough for
+    synchronous replication. That combination is unusually good value: you
+    survive a datacentre-level failure with no data loss and no application
+    changes, which is not true of anything at the region level.</p>
+
+    <p data-anchor="mmd-p-az2">Get the basics right before considering regions. Every stateful
+    service replicated across at least three zones; quorums that tolerate losing
+    one; Kafka's replicas spread across zones by rack awareness; and
+    &mdash; easily forgotten &mdash; capacity headroom to run at full load with a
+    zone gone. A three-zone deployment sized so that losing one zone saturates
+    the remaining two has bought nothing.</p>
+
+    <h2 data-anchor="mmd-h2-region">The multi-region decision</h2>
+
+    <p data-anchor="mmd-p-rg1">Multi-region architecture is the recommended posture for workloads
+    whose consequences of unavailability are severe enough to justify its cost
+    and complexity.<sup>1</sup> That framing puts the burden where it belongs:
+    state the consequence, then decide.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Postures, in increasing order of cost</caption>
+        <thead>
+          <tr><th>Posture</th><th>RTO / RPO</th><th>Cost</th><th>Fits</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Backup &amp; restore</td><td>Hours / hours</td><td>Lowest</td><td>Analytics, reporting</td></tr>
+          <tr><td>Pilot light</td><td>Tens of min / minutes</td><td>Low</td><td>Control plane</td></tr>
+          <tr><td>Warm standby</td><td>Minutes / seconds</td><td>Medium</td><td>Operational services</td></tr>
+          <tr><td>Active-active</td><td>Near zero / near zero</td><td>Highest</td><td>Ingest, alerting</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="mmd-p-rg2">Mix them deliberately. A defensible arrangement for this platform:
+    <strong>ingest active-active</strong> (a device must always find somewhere to
+    deliver), <strong>alerting active-active</strong>, <strong>operational
+    services warm standby</strong>, <strong>optimization pilot light</strong>
+    (planning can pause), and <strong>the lake backed up</strong> with a long
+    restore window. Uniform postures are how multi-region budgets get spent on
+    the wrong things.</p>
+
+    <h2 data-anchor="mmd-h2-state">Stateless is easy; state is the whole problem</h2>
+
+    <p data-anchor="mmd-p-st1">Stateless services fail over by moving traffic. Everything difficult
+    is about state, and the choice of replication mode is a direct trade of
+    latency for data loss.</p>
+
+    <dl class="modes" data-anchor="mmd-dl-repl">
+      <dt>Synchronous</dt>
+      <dd>No loss; every write pays the cross-region round trip. Viable across
+      zones, rarely across regions.</dd>
+      <dt>Asynchronous</dt>
+      <dd>Fast writes, a real replication lag, and therefore a real RPO. Measure
+      the lag and quote it as your RPO &mdash; do not quote zero.</dd>
+      <dt>Event-log replication</dt>
+      <dd>Mirror the durable log; consumers in each region rebuild state. Fits
+      this architecture naturally.</dd>
+      <dt>Database replication</dt>
+      <dd>Native, well understood, and usually async across regions with the
+      same caveat.</dd>
+    </dl>
+
+    <div class="callout warn" data-anchor="mmd-callout-rpo">
+      <span class="callout-title">Asynchronous replication means non-zero RPO</span>
+      <p>This is the most common false claim in DR documents. If replication is
+      asynchronous, there is a window of writes that exist in one region only, and
+      a regional failure loses them. Measure the p99 replication lag, write it in
+      the DR plan as the RPO, and design the reconciliation for what falls in that
+      window.</p>
+    </div>
+
+    <p data-anchor="mmd-p-st2">The edge buffer softens this in a way most systems do not enjoy.
+    Because agents hold events until a durable ack, a region loss that discards
+    recent writes can often be repaired by asking devices to resend from a known
+    sequence number. That is a genuine architectural advantage of store-and-forward
+    &mdash; the field is a replica of last resort. Design the resend path
+    deliberately rather than discovering it.</p>
+
+    <h2 data-anchor="mmd-h2-kafka">Cross-region streaming</h2>
+
+    <p data-anchor="mmd-p-kf1">Stretching a single Kafka cluster across regions is usually a
+    mistake: the replication protocol is latency-sensitive and inter-region
+    latency turns every produce into a slow one. The standard alternative is a
+    cluster per region with asynchronous mirroring between them.</p>
+
+    <p data-anchor="mmd-p-kf2">Mirroring brings two constraints worth stating plainly. Offsets do
+    not correspond between clusters, so a consumer failing over cannot simply
+    resume at its old offset &mdash; it needs offset translation or an
+    application-level checkpoint keyed on event identity. And mirroring is
+    asynchronous, so the mirror lag is part of your RPO. Both are manageable;
+    neither is automatic.</p>
+
+    <h2 data-anchor="mmd-h2-split">Split-brain and fencing</h2>
+
+    <p data-anchor="mmd-p-sp1">The failure that turns an outage into a data-integrity incident:
+    region B is promoted while region A is merely unreachable, not dead. Now two
+    primaries accept writes and diverge, and the merge afterwards is manual,
+    slow, and lossy.</p>
+
+    <p data-anchor="mmd-p-sp2">Prevent it structurally rather than procedurally. Failover decisions
+    come from an external arbiter with its own quorum, never from the region
+    trying to promote itself. The old primary is fenced &mdash; its credentials
+    or storage leases revoked &mdash; before the new one is promoted. Writers
+    carry a monotonically increasing epoch and storage rejects a stale one. And
+    promotion is deliberately not automatic for the components where two writers
+    would be unrecoverable.</p>
+
+    <figure class="diagram-fig" data-anchor="mmd-fig-fence">
+      <svg class="diagram" viewBox="0 0 560 158" role="img" aria-labelledby="mmd-fig-fence-t">
+        <title id="mmd-fig-fence-t">External arbiter fences the old primary before promoting the standby</title>
+
+        <rect class="stroke fill-bg" x="18" y="70" width="120" height="46"/>
+        <text class="big" x="78" y="90" text-anchor="middle">Region A</text>
+        <text class="dim red" x="78" y="105" text-anchor="middle">unreachable &mdash; not dead</text>
+
+        <rect class="stroke fill-bg" x="418" y="70" width="120" height="46"/>
+        <text class="big" x="478" y="90" text-anchor="middle">Region B</text>
+        <text class="dim" x="478" y="105" text-anchor="middle">standby</text>
+
+        <rect class="stroke-thick fill-soft" x="218" y="16" width="130" height="44"/>
+        <text class="big" x="283" y="34" text-anchor="middle">Arbiter</text>
+        <text class="dim" x="283" y="48" text-anchor="middle">own quorum &middot; 3rd site</text>
+
+        <path class="stroke-red" d="M240,60 L120,70" marker-end="url(#mmd-r)"/>
+        <text class="red" x="150" y="52" text-anchor="middle">1 &middot; fence</text>
+
+        <path class="stroke" d="M326,60 L446,70" marker-end="url(#mmd-a)"/>
+        <text x="418" y="52" text-anchor="middle">2 &middot; promote</text>
+
+        <line class="stroke-soft dash" x1="138" y1="93" x2="418" y2="93"/>
+        <text class="dim" x="278" y="88" text-anchor="middle">async replication &mdash; lag = RPO</text>
+
+        <text class="dim" x="280" y="146" text-anchor="middle">never promote before the fence completes &mdash; epoch numbers make it enforceable</text>
+
+        <defs>
+          <marker id="mmd-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+          <marker id="mmd-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-red"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Fence first, promote second. An arbiter at a third site is what stops
+      a network partition from manufacturing two primaries.</figcaption>
+    </figure>
+
+    <h2 data-anchor="mmd-h2-test">Tested failover, or it does not count</h2>
+
+    <p data-anchor="mmd-p-ts1">This is the chapter's real thesis. Disaster recovery requires
+    recovery procedures that have been designed and tested, not merely replicated
+    infrastructure.<sup>2</sup> Fault-injection experiments are used to test real
+    disruptions and demand spikes, and their reports serve as documented evidence
+    of recovery capability<sup>2</sup> &mdash; which in a regulated domain is an
+    artifact someone will ask you for.</p>
+
+    <p data-anchor="mmd-p-ts2">Managed recovery controllers exist to shift traffic across
+    availability zones and orchestrate cross-region failover without bespoke
+    manual scripting.<sup>2</sup> Prefer them: the failover script that only one
+    engineer understands is itself a single point of failure, and it is the one
+    that will be executed under the most pressure.</p>
+
+    <p data-anchor="mmd-p-ts3">Build the exercise ladder in this order, and note that the last rung
+    is the one most programmes never reach:</p>
+
+    <ol data-anchor="mmd-ol-test">
+      <li>Kill a single instance. Weekly, automated.</li>
+      <li>Remove a zone. Monthly.</li>
+      <li>Fail over one stateful service, and measure actual RPO against the
+      claimed one.</li>
+      <li>Region-level game day, quarterly, with the real on-call.</li>
+      <li><strong>Fail back.</strong> Failing over is half the procedure; a
+      programme that never rehearses failback leaves the platform stranded in its
+      DR posture after every real event.</li>
+    </ol>
+
+    <div class="pullquote" data-anchor="mmd-pq">
+      A DR plan that has never been executed is a hypothesis. The quarterly game
+      day is what turns it into a capability.
+    </div>
+
+    <h2 data-anchor="mmd-h2-class">RPO and RTO by data class</h2>
+
+    <p data-anchor="mmd-p-cl1">One platform-wide RPO is as unhelpful as one platform-wide
+    availability number. Set them per class, and let the differences drive the
+    spend.</p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Targets, and what each implies</caption>
+        <thead>
+          <tr><th>Data class</th><th>RPO</th><th>RTO</th><th>Implication</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Operational alerts</td><td>0</td><td>&lt; 1 min</td><td>Active-active; device resend as backstop</td></tr>
+          <tr><td>Raw telemetry</td><td>&lt; 1 min</td><td>&lt; 15 min</td><td>Mirrored log; edge buffers cover the gap</td></tr>
+          <tr><td>Derived state</td><td>Rebuildable</td><td>&lt; 30 min</td><td>Recompute from raw &mdash; no replication needed</td></tr>
+          <tr><td>Device registry</td><td>0</td><td>&lt; 5 min</td><td>Synchronous where possible; fenced failover</td></tr>
+          <tr><td>Media / lake</td><td>&lt; 1 h</td><td>&lt; 24 h</td><td>Cross-region object replication</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="mmd-p-cl2">Row three is the one to notice, because it is free money. Derived
+    state does not need replicating if it can be recomputed from a replicated raw
+    log within its RTO. Every piece of state you can move into that row is state
+    you do not have to replicate, and the replay discipline from Chapter 8 is
+    what makes it possible.</p>
+
+    <div class="review" data-anchor="mmd-review">
+      <h4>Exercise</h4>
+      <ol>
+        <li>Measure your actual replication lag at p99 for a week. Compare it to
+        the RPO in your DR document. Reconcile the difference.</li>
+        <li>Write the failback procedure for your most critical stateful service.
+        Time it in a rehearsal.</li>
+        <li>Which of your replicated state could be recomputed instead? Cost the
+        replication you would stop paying for.</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="mmd-src"><sup>1</sup> <em>Enhance the resilience of critical workloads by
+    architecting with multiple AWS Regions</em>, AWS Architecture Blog. &nbsp;
+    <sup>2</sup> <em>Architecting for Resilience in the cloud for critical railway
+    systems</em>, AWS for Industries.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="11-availability-consistency-and-graceful-degradation.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="13-observability-and-operational-forensics.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rebalancing, Ordering, and Correct Processing &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; Real-Time Event Streaming</span> &middot; Chapter 09</p>
+    <p class="chapter-no">09</p>
+    <h1 data-anchor="rop-h1">Rebalancing, Ordering,<br>and Correct Processing</h1>
+
+    <p class="lede" data-anchor="rop-lede">The backbone is sound; now the consumers have to be. This is where
+    most real telemetry bugs live &mdash; not in the broker, but in a consumer
+    that took too long, got evicted, restarted, and reprocessed an hour of
+    events into a database that was not ready for it.</p>
+
+    <h2 data-anchor="rop-h2-why">Why rebalances happen</h2>
+
+    <p data-anchor="rop-p-why1">A consumer group rebalances whenever its membership or its topic
+    metadata changes: a consumer joins, leaves, crashes, is judged dead for
+    missing heartbeats, or partitions are added. The first four are routine. The
+    third and fourth are the ones you cause accidentally.</p>
+
+    <p data-anchor="rop-p-why2">Under the original <em>eager</em> protocol, a rebalance revokes
+    every assignment across the group and reassigns from scratch &mdash; a
+    stop-the-world pause during which nobody consumes. The incremental
+    cooperative protocol, introduced in Kafka 2.4, avoids revoking partitions a
+    consumer will keep owning after the rebalance, which cuts that migration cost
+    sharply.<sup>1</sup> It was aimed particularly at heavy stateful consumers
+    such as Kafka Streams applications, where losing a partition means rebuilding
+    local state.<sup>1</sup></p>
+
+    <p data-anchor="rop-p-why3">Two further pieces of the puzzle are worth knowing. Static
+    membership gives a consumer a <code>group.instance.id</code> that persists
+    across restarts, so the coordinator can reapply the same assignment and skip
+    the rebalance entirely during planned restarts or brief
+    outages.<sup>2</sup> And KIP-848 defines a next-generation protocol that
+    moves assignment computation to the group coordinator on the
+    broker.<sup>3</sup></p>
+
+    <div class="table-wrap">
+      <table>
+        <caption>Which mechanism solves which problem</caption>
+        <thead>
+          <tr><th>Problem</th><th>Mechanism</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Rolling deploy pauses the whole group</td><td>Cooperative rebalancing</td></tr>
+          <tr><td>Restart triggers a needless reassignment</td><td>Static membership</td></tr>
+          <tr><td>Slow consumer evicted mid-batch</td><td>Bounded work per poll (below)</td></tr>
+          <tr><td>Stateful consumer rebuilds state on every move</td><td>Cooperative + static together</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="rop-h2-safe">Writing a rebalance-safe consumer</h2>
+
+    <p data-anchor="rop-p-safe1">The rule is short: <strong>never do long work inside the poll
+    loop</strong>. A consumer that spends ninety seconds calling an external
+    service will miss its heartbeat deadline, be evicted, and trigger exactly the
+    rebalance the work was trying to survive &mdash; and then the next consumer
+    will do the same work and be evicted the same way.</p>
+
+    <div class="pre-label">The shape that survives</div>
+    <pre><code><span class="kw">while</span> running {
+    <span class="kw">let</span> batch = consumer.poll(<span class="fn">Duration</span>::from_millis(<span class="num">500</span>));
+
+    <span class="cm">// bounded: sized so worst-case latency stays under max.poll.interval.ms</span>
+    <span class="kw">for</span> msg <span class="kw">in</span> batch.iter().take(MAX_PER_POLL) {
+        <span class="fn">handle_idempotently</span>(msg)?;   <span class="cm">// keyed on event_id</span>
+    }
+
+    <span class="cm">// commit AFTER effects are durable, never before</span>
+    consumer.<span class="fn">commit</span>(batch.offsets())?;
+}</code></pre>
+
+    <p data-anchor="rop-p-safe2">Two details carry the weight. <code>MAX_PER_POLL</code> is sized so
+    the worst-case batch finishes inside <code>max.poll.interval.ms</code> &mdash;
+    measure it, do not guess. And the commit happens strictly after the effects
+    are durable: committing first converts a crash into silent data loss, which
+    is far worse than the duplicate you get from committing last.</p>
+
+    <p data-anchor="rop-p-safe3">Also implement the partition-revoked callback. On revocation, flush
+    in-flight work and commit what is genuinely complete; on assignment, load
+    whatever per-partition state you need. Skipping this is how a cooperative
+    rebalance still loses work.</p>
+
+    <h2 data-anchor="rop-h2-poison">The poison-pill problem</h2>
+
+    <p data-anchor="rop-p-poison1">One message cannot be processed &mdash; a schema the consumer does
+    not know, a payload that fails a downstream constraint. If the consumer
+    retries it forever, every well-formed message behind it on that partition
+    waits too. One bad event has stopped a locomotive's entire telemetry stream.</p>
+
+    <p data-anchor="rop-p-poison2">The fix is a bounded retry ladder, then get it out of the way:</p>
+
+    <ol data-anchor="rop-ol-poison">
+      <li>Retry in-process a few times, with backoff, for transient faults.</li>
+      <li>Then publish to a delayed retry topic &mdash; a separate topic, so the
+      main partition advances.</li>
+      <li>After a bounded number of ladder steps, publish to a dead-letter topic
+      with the original bytes, the failure reason, and the correlation id.</li>
+      <li>Alert on dead-letter arrival rate, and provide a replay path.</li>
+    </ol>
+
+    <p data-anchor="rop-p-poison3">Note that this deliberately sacrifices ordering for the failed
+    message. That is the right trade: the alternative is sacrificing liveness for
+    every other message on the partition.</p>
+
+    <h2 data-anchor="rop-h2-outbox">The dual-write problem and the outbox</h2>
+
+    <p data-anchor="rop-p-out1">Here is a bug that looks like correct code. A service updates its
+    database and then publishes an event. There is no transaction spanning both,
+    so a failure between them leaves the two inconsistent &mdash; the database
+    says the work order exists, the stream never said so.<sup>4</sup></p>
+
+    <p data-anchor="rop-p-out2">The transactional outbox resolves it by writing the event payload
+    into an outbox table inside the same local transaction as the business data,
+    with a separate relay process reading that table and forwarding to the
+    broker.<sup>4,5</sup> One transaction, one atomic outcome.</p>
+
+    <figure class="diagram-fig" data-anchor="rop-fig-outbox">
+      <svg class="diagram" viewBox="0 0 560 152" role="img" aria-labelledby="rop-fig-outbox-t">
+        <title id="rop-fig-outbox-t">Business row and outbox row written in one transaction, then relayed to the broker</title>
+
+        <rect class="stroke fill-bg" x="8" y="52" width="82" height="40"/>
+        <text class="big" x="49" y="76" text-anchor="middle">Service</text>
+
+        <line class="stroke" x1="90" y1="72" x2="128" y2="72" marker-end="url(#rop-a)"/>
+
+        <rect class="stroke-thick fill-bg" x="128" y="28" width="188" height="90"/>
+        <text x="222" y="20" text-anchor="middle">one local transaction</text>
+        <rect class="stroke fill-soft" x="140" y="40" width="164" height="30"/>
+        <text class="big" x="222" y="59" text-anchor="middle">work_order row</text>
+        <rect class="stroke-red fill-soft" x="140" y="76" width="164" height="30"/>
+        <text class="big red" x="222" y="95" text-anchor="middle">outbox row</text>
+
+        <line class="stroke" x1="316" y1="91" x2="360" y2="91" marker-end="url(#rop-a)"/>
+        <rect class="stroke fill-bg" x="360" y="72" width="86" height="38"/>
+        <text class="big" x="403" y="90" text-anchor="middle">Relay</text>
+        <text class="dim" x="403" y="103" text-anchor="middle">at least once</text>
+
+        <line class="stroke" x1="446" y1="91" x2="486" y2="91" marker-end="url(#rop-a)"/>
+        <rect class="stroke fill-soft" x="486" y="72" width="66" height="38"/>
+        <text class="big" x="519" y="95" text-anchor="middle">Kafka</text>
+
+        <text class="red" x="300" y="140" text-anchor="middle">the relay may republish after a crash &mdash; consumers must be idempotent</text>
+
+        <defs>
+          <marker id="rop-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Either both rows commit or neither does. The relay then delivers at
+      least once, which is exactly why the consumer side needs the inbox.</figcaption>
+    </figure>
+
+    <p data-anchor="rop-p-out3">The outbox does not eliminate duplicates &mdash; it moves the
+    problem to a place you can solve. Because a relay can republish after a
+    crash, consumers must be idempotent, typically by tracking the ids of
+    messages already processed.<sup>5,4</sup> That consumer-side table is the
+    <span class="term">inbox</span>, and the two patterns are meant to be used
+    together.</p>
+
+    <div class="pre-label">The inbox: dedup and effect in one transaction</div>
+    <pre><code><span class="kw">BEGIN</span>;
+  <span class="kw">INSERT INTO</span> inbox (event_id, consumer, seen_at)
+  <span class="kw">VALUES</span> (<span class="str">:event_id</span>, <span class="str">'workorder-svc'</span>, now())
+  <span class="kw">ON CONFLICT</span> <span class="kw">DO NOTHING</span>;
+  <span class="cm">-- 0 rows means we have seen it: skip the effect, commit, move on</span>
+
+  <span class="kw">INSERT INTO</span> work_order (...) <span class="kw">VALUES</span> (...);
+<span class="kw">COMMIT</span>;</code></pre>
+
+    <p data-anchor="rop-p-out4">Bound the inbox. Retaining every id forever is neither necessary nor
+    affordable; retain for the longest replay window you actually support, and
+    say what that window is. An unbounded dedup table is a slow-motion outage.</p>
+
+    <div class="pullquote" data-anchor="rop-pq">
+      Exactly-once is not a setting you enable. It is idempotent effects keyed on
+      a stable identity, plus a dedup window you can defend.
+    </div>
+
+    <h2 data-anchor="rop-h2-ordering">Per-asset ordering with cross-asset parallelism</h2>
+
+    <p data-anchor="rop-p-ord1">Keying by <code>asset_id</code> gives per-asset ordering, and then a
+    multithreaded consumer can throw it away in a line of code &mdash; by handing
+    a partition's messages to a thread pool. If you need concurrency inside a
+    consumer, shard the work by key and keep one worker per key, never a shared
+    pool over one partition.</p>
+
+    <p data-anchor="rop-p-ord2">And be honest about what ordering you actually need. "Events for
+    one asset, in order" is usually sufficient and cheap. "All events across the
+    fleet, in order" is neither, and nobody has ever genuinely needed it.</p>
+
+    <h2 data-anchor="rop-h2-eos">Testing the claim</h2>
+
+    <p data-anchor="rop-p-test1">A correctness claim you have not tested against the failure is a
+    hope. Build these three tests before you need them:</p>
+
+    <ul data-anchor="rop-ul-test">
+      <li><strong>Duplicate injection</strong> &mdash; replay a known batch twice
+      and assert the effects are identical, not merely "no errors".</li>
+      <li><strong>Kill during processing</strong> &mdash; SIGKILL a consumer
+      between effect and commit, restart, and assert exactly one effect.</li>
+      <li><strong>Rebalance under load</strong> &mdash; add and remove consumers
+      during sustained traffic; assert no gaps in per-asset sequence.</li>
+    </ul>
+
+    <div class="review" data-anchor="rop-review">
+      <h4>Design review questions</h4>
+      <ol>
+        <li>What is your <code>max.poll.interval.ms</code>, and what is your
+        measured worst-case batch time? If you do not know the second number, you
+        are relying on luck.</li>
+        <li>Does any consumer commit before its effect is durable? Find it.</li>
+        <li>How long is your dedup window, and which replay scenario justifies
+        that length?</li>
+      </ol>
+    </div>
+
+    <p class="src" data-anchor="rop-src"><sup>1</sup> KIP-429, Kafka Consumer Incremental Rebalance
+    Protocol. &nbsp; <sup>2</sup> KIP-345, static membership. &nbsp; <sup>3</sup>
+    KIP-848, next-generation rebalance protocol. &nbsp; <sup>4</sup>
+    <em>Transactional outbox pattern</em>, AWS Prescriptive Guidance. &nbsp;
+    <sup>5</sup> <em>Pattern: Transactional outbox</em>, microservices.io.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="08-kafka-and-the-streaming-backbone.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="10-stream-processing-and-operational-intelligence.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Building the Distributed Optimization Engine &middot; Designing Edge-to-Cloud Operational Platforms</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="designing-edge-to-cloud-operational-platforms">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part VI &mdash; Distributed Scheduling and Optimization</span> &middot; Chapter 18</p>
+    <p class="chapter-no">18</p>
+    <h1 data-anchor="doe-h1">Building the Distributed<br>Optimization Engine</h1>
+
+    <p class="lede" data-anchor="doe-lede">The model is settled; now it has to run &mdash; repeatedly, under
+    deadline, on a cluster, without becoming a source of operational risk in its
+    own right. The organising principle is that an optimization run is a
+    <em>pure function of a pinned snapshot</em>. Everything in this chapter
+    follows from taking that seriously.</p>
+
+    <h2 data-anchor="doe-h2-snapshot">Pin the inputs</h2>
+
+    <p data-anchor="doe-p-sn1">The tempting design lets solver workers read live operational state
+    directly. It is wrong twice over: runs become non-reproducible because the
+    state moves underneath them, and planning latency becomes coupled to
+    operational load.</p>
+
+    <p data-anchor="doe-p-sn2">Instead, a run begins by materialising an immutable snapshot &mdash;
+    asset positions and availability, crew rosters, committed maintenance
+    windows, network model version, the current plan &mdash; written once,
+    identified, and never modified. Workers read only from it.</p>
+
+    <div class="pre-label">The job descriptor is the whole reproducibility story</div>
+    <pre><code>{
+  <span class="str">"job_id"</span>:        <span class="str">"opt-2026-08-16-1140-a3f"</span>,
+  <span class="str">"snapshot_id"</span>:   <span class="str">"snap-2026-08-16T11:38:02Z"</span>,
+  <span class="str">"snapshot_age_s"</span>: <span class="num">118</span>,
+  <span class="str">"horizon"</span>:       { <span class="str">"from"</span>: <span class="str">"2026-08-16T12:00Z"</span>, <span class="str">"to"</span>: <span class="str">"2026-08-17T00:00Z"</span> },
+  <span class="str">"scope"</span>:         { <span class="str">"division"</span>: <span class="str">"west"</span> },
+  <span class="str">"weights_ver"</span>:   <span class="str">"policy-2026-07"</span>,
+  <span class="str">"constraints_ver"</span>: <span class="str">"rules-4.1.0"</span>,
+  <span class="str">"solver"</span>:        { <span class="str">"name"</span>: <span class="str">"cbc"</span>, <span class="str">"version"</span>: <span class="str">"2.10.11"</span>, <span class="str">"seed"</span>: <span class="num">42</span> },
+  <span class="str">"deadline_s"</span>:    <span class="num">240</span>
+}</code></pre>
+
+    <p data-anchor="doe-p-sn3">Reproducibility requires pinning the input snapshot, the model and
+    constraint versions, and the solver version together, since any of them
+    changes the result. That is why all four appear in the descriptor, along with
+    the random seed &mdash; many solvers use randomised heuristics, and an
+    unpinned seed alone will make two runs disagree and cost you a day of
+    investigation.</p>
+
+    <h2 data-anchor="doe-h2-isolation">Isolation and admission</h2>
+
+    <p data-anchor="doe-p-is1">Optimization is bursty and resource-hungry, and it must not be able
+    to hurt the operational path. Run it in its own cluster or node pool, with
+    its own quota. Chapter 11's dependency rule applies with full force: the
+    operational services must not synchronously depend on the optimizer, so a
+    solver stampede degrades planning and nothing else.</p>
+
+    <p data-anchor="doe-p-is2">Admission control matters too. Jobs arrive from schedules, from
+    material events, and from planners exploring what-ifs. Give each source a
+    quota, so an enthusiastic scenario exploration cannot starve the scheduled
+    replan that operations depends on.</p>
+
+    <h2 data-anchor="doe-h2-pool">Worker pools and partitioning</h2>
+
+    <figure class="diagram-fig" data-anchor="doe-fig-engine">
+      <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="doe-fig-engine-t">
+        <title id="doe-fig-engine-t">Snapshot, coordinator, partitioned workers, boundary reconciliation, validation and publish</title>
+
+        <rect class="stroke-thick fill-soft" x="8" y="66" width="86" height="42"/>
+        <text class="big" x="51" y="84" text-anchor="middle">Snapshot</text>
+        <text class="dim" x="51" y="98" text-anchor="middle">immutable</text>
+
+        <line class="stroke" x1="94" y1="87" x2="126" y2="87" marker-end="url(#doe-a)"/>
+        <rect class="stroke fill-bg" x="126" y="66" width="88" height="42"/>
+        <text class="big" x="170" y="84" text-anchor="middle">Coordinator</text>
+        <text class="dim" x="170" y="98" text-anchor="middle">partition</text>
+
+        <line class="stroke" x1="214" y1="76" x2="252" y2="42" marker-end="url(#doe-a)"/>
+        <line class="stroke" x1="214" y1="87" x2="252" y2="87" marker-end="url(#doe-a)"/>
+        <line class="stroke" x1="214" y1="98" x2="252" y2="132" marker-end="url(#doe-a)"/>
+
+        <rect class="stroke fill-bg" x="252" y="24" width="94" height="34"/>
+        <text class="big" x="299" y="45" text-anchor="middle">west</text>
+        <rect class="stroke fill-bg" x="252" y="70" width="94" height="34"/>
+        <text class="big" x="299" y="91" text-anchor="middle">central</text>
+        <rect class="stroke fill-bg" x="252" y="116" width="94" height="34"/>
+        <text class="big" x="299" y="137" text-anchor="middle">east</text>
+
+        <line class="stroke" x1="346" y1="41" x2="384" y2="76" marker-end="url(#doe-a)"/>
+        <line class="stroke" x1="346" y1="87" x2="384" y2="87" marker-end="url(#doe-a)"/>
+        <line class="stroke" x1="346" y1="133" x2="384" y2="98" marker-end="url(#doe-a)"/>
+
+        <rect class="stroke fill-bg" x="384" y="66" width="76" height="42"/>
+        <text class="big" x="422" y="84" text-anchor="middle">Reconcile</text>
+        <text class="dim" x="422" y="98" text-anchor="middle">boundaries</text>
+
+        <line class="stroke-red" x1="460" y1="87" x2="490" y2="87" marker-end="url(#doe-r)"/>
+        <rect class="stroke-red fill-bg" x="490" y="66" width="62" height="42"/>
+        <text class="big red" x="521" y="84" text-anchor="middle">Validate</text>
+        <text class="dim" x="521" y="98" text-anchor="middle">then publish</text>
+
+        <text class="dim" x="280" y="168" text-anchor="middle">every worker reads the same pinned snapshot &middot; nothing reads live state</text>
+
+        <defs>
+          <marker id="doe-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-ink"/></marker>
+          <marker id="doe-r" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="fill-red"/></marker>
+        </defs>
+      </svg>
+      <figcaption>Partition, solve in parallel, reconcile the boundary commitments, then
+      validate before anything is published.</figcaption>
+    </figure>
+
+    <p data-anchor="doe-p-pl1">Two shapes of parallelism, and they suit different problems.
+    <strong>Map-reduce style</strong> works when partitions are genuinely
+    independent &mdash; scenario evaluation, or corridors with fixed boundary
+    commitments. <strong>Coordinated search</strong> is needed when partitions
+    must agree on shared resources, and it costs you a communication protocol
+    between workers plus a convergence criterion.</p>
+
+    <p data-anchor="doe-p-pl2">Start with the first. Fix boundary commitments from the previous
+    plan, solve corridors independently, then reconcile: if a boundary commitment
+    could not be met, either renegotiate it in a second round or accept the
+    penalty and record it. Two rounds of independent solving usually beat one
+    round of coordinated search, and it is dramatically simpler to operate.</p>
+
+    <h2 data-anchor="doe-h2-deadline">Deadlines, checkpoints, preemption</h2>
+
+    <p data-anchor="doe-p-dl1">Optimization has no natural stopping point &mdash; it has an
+    anytime quality curve. So give every job a hard deadline and require the
+    solver to surrender its best feasible solution when the deadline arrives. A
+    good plan now beats a better plan after the window it applied to has passed.</p>
+
+    <p data-anchor="doe-p-dl2">Checkpoint long runs. Checkpointing is what makes distributed work
+    restartable rather than restart-from-zero &mdash; the same property stream
+    processors get from periodic state snapshots. Persist the incumbent solution
+    and search state periodically so a lost worker resumes rather than restarts.</p>
+
+    <p data-anchor="doe-p-dl3">And if you preempt a job for a higher-priority one, checkpoint it
+    first. Preempting without checkpointing converts priority scheduling into
+    wasted compute, and it will happen precisely during a disruption when both
+    jobs mattered.</p>
+
+    <h2 data-anchor="doe-h2-validate">Validate before publishing</h2>
+
+    <p data-anchor="doe-p-vl1">Never publish a solver's output unchecked. The assumption that a
+    solver cannot violate its own hard constraints is wrong often enough to be
+    dangerous: model bugs, numerical tolerance, and a mis-encoded constraint all
+    produce confidently infeasible plans.</p>
+
+    <p data-anchor="doe-p-vl2">Run an independent validator &mdash; deliberately written separately
+    from the model, ideally by someone else &mdash; that re-checks every hard
+    constraint against the plan. If validation fails, the plan is discarded, the
+    previous plan stands, and an alert fires. This is cheap, it is fast, and it is
+    the difference between a bad plan reaching a dispatcher and not.</p>
+
+    <div class="callout key" data-anchor="doe-callout-validate">
+      <span class="callout-title">The validator is not the model</span>
+      <p>If the validator reuses the model's constraint code, it will agree with
+      the model's bugs. Write it independently, against the specification rather
+      than the implementation. The redundancy is the point.</p>
+    </div>
+
+    <h2 data-anchor="doe-h2-publish">Publishing plans as versioned events</h2>
+
+    <p data-anchor="doe-p-pb1">A validated plan is published as an immutable event carrying its
+    full provenance &mdash; the job descriptor from the start of this chapter,
+    the objective breakdown, the boundary commitments, and the diff against the
+    plan it supersedes.</p>
+
+    <p data-anchor="doe-p-pb2">The diff is what makes the plan usable by humans. A dispatcher does
+    not want to read a fresh 400-movement schedule; they want to know what changed
+    and why. "Movement 4471-E delayed 12 min to resolve a block conflict at MP
+    186" is reviewable. A new complete plan is not.</p>
+
+    <h2 data-anchor="doe-h2-human">Approval, override, rollback</h2>
+
+    <p data-anchor="doe-p-hu1">Plans above a change threshold should require human approval; below
+    it, auto-apply with notification. Set the threshold from the operational
+    consequence of the change, not from its size in rows.</p>
+
+    <p data-anchor="doe-p-hu2">Overrides are first-class, not exceptions. A dispatcher who changes
+    one movement is recording an operational constraint the model did not know
+    about &mdash; capture it as a pinned commitment that the next run must
+    respect, and capture the reason. Overrides that recur are the model's best
+    bug report.</p>
+
+    <p data-anchor="doe-p-hu3">And rollback is trivial by construction: plans are immutable and
+    versioned, so reverting is republishing the previous version. That is the
+    payoff for refusing to overwrite plans in place.</p>
+
+    <div class="pullquote" data-anchor="doe-pq">
+      Every override is a constraint the model did not know about. Treat the
+      pattern as a specification, not as user error.
+    </div>
+
+    <div class="review" data-anchor="doe-review">
+      <h4>Exercise</h4>
+      <ol>
+        <li>Run the same job descriptor twice. Do you get an identical plan? If
+        not, find the unpinned input &mdash; it is usually a seed, a clock, or a
+        live read.</li>
+        <li>Write the independent validator for your three most important hard
+        constraints. Then deliberately break the model and confirm the validator
+        catches it.</li>
+        <li>Analyse a month of dispatcher overrides. Which recur? Each recurring
+        one is a missing constraint.</li>
+      </ol>
+    </div>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a class="nav-prev" rel="prev" href="17-modeling-planning-and-scheduling-problems.html">&lsaquo; Prev</a>
+  <a class="nav-home" rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a class="nav-next" rel="next" href="19-closed-loop-operations.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
