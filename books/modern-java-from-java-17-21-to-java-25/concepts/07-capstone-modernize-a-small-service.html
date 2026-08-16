@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Capstone: Modernize a Small Service &middot; Modern Java</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="modern-java-from-java-17-21-to-java-25">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part IV &mdash; Capstone</span> &middot; Chapter 07</p>
+    <p class="chapter-no">07</p>
+    <h1 data-anchor="cap-h1">Capstone: modernize a small service</h1>
+
+    <p class="lede" data-anchor="cap-lede">One service, about a hundred lines, written the way everyone wrote them in 2021. Six changes, in an order that lets you measure each one. At the end you will have a Java 25 service and &mdash; more useful &mdash; a defensible account of which change bought what.</p>
+
+    <div class="objectives" data-anchor="cap-objectives">
+      <span class="box-label">By the end of this chapter you will be able to</span>
+      <ul>
+        <li>sequence a modernization so that each step is independently reversible;</li>
+        <li>convert an exception-and-null API surface into a sealed result type;</li>
+        <li>replace a thread pool with virtual threads without losing back-pressure;</li>
+        <li>state which parts of your Java 25 service are preview code and who owns that decision.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="cap-h2-before">The service, as it is</h2>
+
+    <p data-anchor="cap-p1"><code>GET /product/{sku}</code>. Three downstream calls &mdash; catalog, pricing, inventory &mdash; merged into one response. Roughly 90ms, 40ms and 60ms respectively, essentially all of it network wait.</p>
+
+    <div class="pre-label">ProductService.java &mdash; Java 17, and every line of it is normal</div>
+    <pre><code><span class="kw">public class</span> <span class="ty">ProductService</span> {
+
+    <span class="kw">private final</span> <span class="ty">ExecutorService</span> pool = <span class="ty">Executors</span>.<span class="fn">newFixedThreadPool</span>(<span class="num">64</span>);
+
+    <span class="cm">// returns null when not found; throws when anything else goes wrong</span>
+    <span class="kw">public</span> <span class="ty">ProductDto</span> <span class="fn">lookup</span>(<span class="ty">String</span> sku, <span class="ty">String</span> traceId) <span class="kw">throws</span> <span class="ty">Exception</span> {
+        <span class="ty">Future</span>&lt;<span class="ty">CatalogDto</span>&gt; c = pool.<span class="fn">submit</span>(() -&gt; catalog.<span class="fn">find</span>(sku, traceId));
+        <span class="ty">Future</span>&lt;<span class="ty">PriceDto</span>&gt;   p = pool.<span class="fn">submit</span>(() -&gt; pricing.<span class="fn">find</span>(sku, traceId));
+        <span class="ty">Future</span>&lt;<span class="ty">StockDto</span>&gt;   s = pool.<span class="fn">submit</span>(() -&gt; inventory.<span class="fn">find</span>(sku, traceId));
+
+        <span class="ty">CatalogDto</span> cd = c.<span class="fn">get</span>();
+        <span class="kw">if</span> (cd == <span class="kw">null</span>) <span class="kw">return null</span>;
+
+        <span class="kw">return new</span> <span class="ty">ProductDto</span>(cd, p.<span class="fn">get</span>(), s.<span class="fn">get</span>());
+    }
+}</code></pre>
+
+    <p data-anchor="cap-p2">Four things are wrong with it, and none of them are bugs today.</p>
+
+    <ul data-anchor="cap-list-wrong">
+      <li><strong>The DTOs</strong> are hand-written classes with hand-maintained <code>equals</code>, <code>hashCode</code> and <code>toString</code>.</li>
+      <li><strong>The outcomes</strong> are encoded as <code>null</code> for "not found" and an exception for everything else. Nothing in the signature says so; a comment does.</li>
+      <li><strong>The pool of 64</strong> caps concurrency at a number nobody can justify, and it is the only thing protecting the downstream connection pools.</li>
+      <li><strong><code>traceId</code></strong> is threaded through every method that might want to log.</li>
+    </ul>
+
+    <div class="box predict" data-anchor="cap-predict-1">
+      <span class="box-label">Make a Prediction</span>
+      <p>You have an afternoon. You convert the DTOs to records, swap the pool for virtual threads, introduce a sealed <code>Result</code>, and move <code>traceId</code> to a scoped value &mdash; all in one commit. Load test shows P99 up 40%.</p>
+      <p>Which change caused it?</p>
+      <p class="answer"><span class="answer-label">Answer</span> You cannot tell, and that is the entire lesson of this chapter. The likely culprit is the virtual-thread swap removing the cap of 64 in front of a connection pool &mdash; but "likely" is not "measured", and to find out you now have to unpick a commit that touched every file. Sequence the changes and each one gets its own verdict.</p>
+    </div>
+
+    <h2 data-anchor="cap-h2-order">The order, and why it is that order</h2>
+
+    <div class="table-wrap" data-anchor="cap-table-order">
+      <table>
+        <caption>Six steps, each independently reversible</caption>
+        <thead>
+          <tr><th>#</th><th>Change</th><th>Risk</th><th>What to measure</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>DTOs &rarr; records</td><td>very low</td><td>tests pass; serialization unchanged</td></tr>
+          <tr><td>2</td><td>null/exception &rarr; sealed <code>Result</code></td><td>low</td><td>every call site now handles all three outcomes</td></tr>
+          <tr><td>3</td><td>pool &rarr; virtual threads <em>+ semaphore</em></td><td><strong>high</strong></td><td>P99, downstream pool saturation, error rate</td></tr>
+          <tr><td>4</td><td><code>traceId</code> param &rarr; scoped value</td><td>low</td><td>trace ids still present in every log line</td></tr>
+          <tr><td>5</td><td>scope + timeout (preview)</td><td>medium</td><td>failure latency, orphaned downstream calls</td></tr>
+          <tr><td>6</td><td>JFR + AOT cache</td><td>very low</td><td>startup time; pinning events; CPU profile</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="cap-p3">Steps 1 and 2 are pure refactors of shape &mdash; land them first, precisely because they are boring and they make everything after them easier to read. Step 3 is the one that can take the service down, so it goes alone, behind a flag, with the semaphore in the same commit. Steps 4 and 6 are safe. Step 5 is the one requiring a policy decision, so it goes last, when everything else is already stable.</p>
+
+    <h2 data-anchor="cap-h2-steps">Steps 1 and 2: shape</h2>
+
+    <p data-anchor="cap-p4">The records are Chapter 1's project. The sealed result type is Chapter 2's. Together they change what the signature promises:</p>
+
+    <div class="pre-label">The signature now says what the comment used to</div>
+    <pre><code><span class="kw">public record</span> <span class="ty">CatalogEntry</span>(<span class="ty">String</span> sku, <span class="ty">String</span> name, <span class="ty">String</span> category) { <span class="cm">/* validates sku */</span> }
+<span class="kw">public record</span> <span class="ty">Price</span>(<span class="ty">String</span> sku, <span class="ty">String</span> currency, <span class="kw">long</span> minorUnits)  { <span class="cm">/* validates sku */</span> }
+<span class="kw">public record</span> <span class="ty">Stock</span>(<span class="ty">String</span> sku, <span class="kw">int</span> onHand, <span class="kw">boolean</span> backorderable) { <span class="cm">/* validates sku */</span> }
+<span class="kw">public record</span> <span class="ty">Product</span>(<span class="ty">CatalogEntry</span> catalog, <span class="ty">Price</span> price, <span class="ty">Stock</span> stock) {}
+
+<span class="kw">public sealed interface</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; <span class="kw">permits</span> <span class="ty">Ok</span>, <span class="ty">NotFound</span>, <span class="ty">Failed</span> {}
+<span class="kw">public record</span> <span class="ty">Ok</span>&lt;<span class="ty">T</span>&gt;(<span class="ty">T</span> value)            <span class="kw">implements</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; {}
+<span class="kw">public record</span> <span class="ty">NotFound</span>&lt;<span class="ty">T</span>&gt;(<span class="ty">String</span> sku)    <span class="kw">implements</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; {}
+<span class="kw">public record</span> <span class="ty">Failed</span>&lt;<span class="ty">T</span>&gt;(<span class="ty">String</span> reason)  <span class="kw">implements</span> <span class="ty">Result</span>&lt;<span class="ty">T</span>&gt; {}
+
+<span class="cm">// no comment needed: the type is the documentation</span>
+<span class="ty">Result</span>&lt;<span class="ty">Product</span>&gt; <span class="fn">lookup</span>(<span class="ty">String</span> sku);</code></pre>
+
+    <p data-anchor="cap-p5">And the HTTP layer becomes an exhaustive switch, with no <code>default</code> and no null check:</p>
+
+    <div class="pre-label">HTTP mapping, checked by the compiler</div>
+    <pre><code><span class="ty">HttpResponse</span> <span class="fn">toResponse</span>(<span class="ty">Result</span>&lt;<span class="ty">Product</span>&gt; result) {
+    <span class="kw">return switch</span> (result) {
+        <span class="kw">case</span> <span class="ty">Ok</span>(<span class="ty">Product</span> p)        -&gt; <span class="ty">HttpResponse</span>.<span class="fn">json</span>(<span class="num">200</span>, p);
+        <span class="kw">case</span> <span class="ty">NotFound</span>(<span class="ty">String</span> sku) -&gt; <span class="ty">HttpResponse</span>.<span class="fn">problem</span>(<span class="num">404</span>, <span class="str">"unknown sku "</span> + sku);
+        <span class="kw">case</span> <span class="ty">Failed</span>(<span class="ty">String</span> why)   -&gt; <span class="ty">HttpResponse</span>.<span class="fn">problem</span>(<span class="num">502</span>, why);
+    };
+}</code></pre>
+
+    <p data-anchor="cap-p6">Add a <code>Degraded</code> outcome next quarter and this method stops compiling, along with every other place that maps a <code>Result</code>. That failing build is a to-do list you did not have to write.</p>
+
+    <h2 data-anchor="cap-h2-step3">Step 3: the dangerous one</h2>
+
+    <p data-anchor="cap-p7">This is the change that makes the service faster and the change most likely to cause an incident, and those are the same change. Ship the semaphore in the same commit as the executor swap &mdash; not the next one.</p>
+
+    <div class="pre-label">Virtual threads with the cap made explicit</div>
+    <pre><code><span class="kw">private final</span> <span class="ty">Semaphore</span> downstream = <span class="kw">new</span> <span class="ty">Semaphore</span>(<span class="num">64</span>);   <span class="cm">// was the pool size; now it is a stated limit</span>
+
+<span class="kw">private</span> &lt;<span class="ty">T</span>&gt; <span class="ty">T</span> <span class="fn">call</span>(<span class="ty">Callable</span>&lt;<span class="ty">T</span>&gt; c) <span class="kw">throws</span> <span class="ty">Exception</span> {
+    downstream.<span class="fn">acquire</span>();
+    <span class="kw">try</span> { <span class="kw">return</span> c.<span class="fn">call</span>(); }
+    <span class="kw">finally</span> { downstream.<span class="fn">release</span>(); }
+}
+
+<span class="kw">public</span> <span class="ty">Result</span>&lt;<span class="ty">Product</span>&gt; <span class="fn">lookup</span>(<span class="ty">String</span> sku) {
+    <span class="kw">try</span> (<span class="kw">var</span> exec = <span class="ty">Executors</span>.<span class="fn">newVirtualThreadPerTaskExecutor</span>()) {
+        <span class="kw">var</span> c = exec.<span class="fn">submit</span>(() -&gt; <span class="fn">call</span>(() -&gt; catalog.<span class="fn">find</span>(sku)));
+        <span class="kw">var</span> p = exec.<span class="fn">submit</span>(() -&gt; <span class="fn">call</span>(() -&gt; pricing.<span class="fn">find</span>(sku)));
+        <span class="kw">var</span> s = exec.<span class="fn">submit</span>(() -&gt; <span class="fn">call</span>(() -&gt; inventory.<span class="fn">find</span>(sku)));
+
+        <span class="kw">return new</span> <span class="ty">Ok</span>&lt;&gt;(<span class="kw">new</span> <span class="ty">Product</span>(c.<span class="fn">get</span>(), p.<span class="fn">get</span>(), s.<span class="fn">get</span>()));
+    } <span class="kw">catch</span> (<span class="ty">Exception</span> e) {
+        <span class="kw">return new</span> <span class="ty">Failed</span>&lt;&gt;(e.<span class="fn">getMessage</span>());
+    }
+}</code></pre>
+
+    <p data-anchor="cap-p8">Note the semaphore is <em>64</em>, not "unbounded because virtual threads are cheap". You did not learn that 64 was correct &mdash; but it was the number in production yesterday, so it is the number that keeps this step a single-variable experiment. Tune it afterwards, deliberately, with the downstream pool in view.</p>
+
+    <p class="pullquote" data-anchor="cap-pull">Keeping the old limit is not timidity. It is the only way the load test tells you anything.</p>
+
+    <h2 data-anchor="cap-h2-step45">Steps 4 and 5: context, then structure</h2>
+
+    <p data-anchor="cap-p9">The <code>traceId</code> parameter goes to a scoped value &mdash; final API, no flag:</p>
+
+    <div class="pre-label">Bound once, at the edge</div>
+    <pre><code><span class="kw">public static final</span> <span class="ty">ScopedValue</span>&lt;<span class="ty">RequestContext</span>&gt; CONTEXT = <span class="ty">ScopedValue</span>.<span class="fn">newInstance</span>();
+
+<span class="kw">void</span> <span class="fn">handle</span>(<span class="ty">HttpExchange</span> x) {
+    <span class="kw">var</span> ctx = <span class="kw">new</span> <span class="ty">RequestContext</span>(<span class="fn">traceIdOf</span>(x), <span class="fn">tenantOf</span>(x));
+    <span class="ty">ScopedValue</span>.<span class="fn">where</span>(CONTEXT, ctx)
+               .<span class="fn">run</span>(() -&gt; <span class="fn">respond</span>(x, <span class="fn">toResponse</span>(products.<span class="fn">lookup</span>(<span class="fn">skuOf</span>(x)))));
+}</code></pre>
+
+    <p data-anchor="cap-p10">Then the structural step. This is the one carrying the preview label, and the one that finally closes the hole Chapter 4 opened:</p>
+
+    <div class="pre-label">PREVIEW on Java 25 (JEP 505) &mdash; --enable-preview required</div>
+    <pre><code><span class="kw">public</span> <span class="ty">Result</span>&lt;<span class="ty">Product</span>&gt; <span class="fn">lookup</span>(<span class="ty">String</span> sku) {
+    <span class="kw">try</span> (<span class="kw">var</span> scope = <span class="ty">StructuredTaskScope</span>.<span class="fn">open</span>(
+             <span class="ty">Joiner</span>.&lt;<span class="ty">Object</span>&gt;<span class="fn">awaitAllSuccessfulOrThrow</span>(),
+             cf -&gt; cf.<span class="fn">withName</span>(<span class="str">"product-lookup"</span>)
+                     .<span class="fn">withTimeout</span>(<span class="ty">Duration</span>.<span class="fn">ofMillis</span>(<span class="num">500</span>)))) {
+
+        <span class="kw">var</span> c = scope.<span class="fn">fork</span>(() -&gt; <span class="fn">call</span>(() -&gt; catalog.<span class="fn">find</span>(sku)));
+        <span class="kw">var</span> p = scope.<span class="fn">fork</span>(() -&gt; <span class="fn">call</span>(() -&gt; pricing.<span class="fn">find</span>(sku)));
+        <span class="kw">var</span> s = scope.<span class="fn">fork</span>(() -&gt; <span class="fn">call</span>(() -&gt; inventory.<span class="fn">find</span>(sku)));
+
+        scope.<span class="fn">join</span>();
+        <span class="kw">return new</span> <span class="ty">Ok</span>&lt;&gt;(<span class="kw">new</span> <span class="ty">Product</span>(c.<span class="fn">get</span>(), p.<span class="fn">get</span>(), s.<span class="fn">get</span>()));
+
+    } <span class="kw">catch</span> (<span class="ty">NoSuchElementException</span> e) {
+        <span class="kw">return new</span> <span class="ty">NotFound</span>&lt;&gt;(sku);
+    } <span class="kw">catch</span> (<span class="ty">Exception</span> e) {
+        <span class="kw">return new</span> <span class="ty">Failed</span>&lt;&gt;(e.<span class="fn">getMessage</span>());
+    }
+}</code></pre>
+
+    <p data-anchor="cap-p11">Three things changed and all three matter. A failure in any call now cancels the other two immediately, instead of leaving them to run out the clock. The 500ms timeout covers the request as a whole rather than each call separately. And the scoped context binds through to every subtask, because subtasks forked in a scope inherit it.</p>
+
+    <figure class="diagram-fig" data-anchor="cap-fig">
+      <svg class="diagram" viewBox="0 0 560 214" role="img" aria-labelledby="cap-fig-t">
+        <title id="cap-fig-t">The Java 17 service returns null or throws and leaves siblings running; the Java 25 service returns a sealed result under one deadline with nothing orphaned</title>
+
+        <text x="16" y="18">Java 17</text>
+        <rect x="16"  y="28" width="96" height="30" class="stroke fill-soft"/>
+        <text x="26"  y="47" class="big">pool(64)</text>
+        <rect x="140" y="28" width="120" height="30" class="stroke fill-soft"/>
+        <text x="150" y="47" class="big">3 DTO classes</text>
+        <rect x="288" y="28" width="120" height="30" class="stroke-red"/>
+        <text x="298" y="47" class="big red">null or throw</text>
+        <rect x="436" y="28" width="108" height="30" class="stroke-red"/>
+        <text x="446" y="47" class="big red">no deadline</text>
+
+        <path d="M112 43 L140 43" class="stroke"/>
+        <path d="M132 39 L140 43 L132 47" class="stroke"/>
+        <path d="M260 43 L288 43" class="stroke"/>
+        <path d="M280 39 L288 43 L280 47" class="stroke"/>
+        <path d="M408 43 L436 43" class="stroke-red"/>
+        <path d="M428 39 L436 43 L428 47" class="stroke-red"/>
+        <text x="26" y="76">siblings run on after a failure; traceId threaded through every method</text>
+
+        <path d="M16 104 L544 104" class="stroke-soft"/>
+
+        <text x="16" y="130">Java 25</text>
+        <rect x="16"  y="140" width="96" height="30" class="stroke fill-ink"/>
+        <text x="26"  y="159" class="big on-ink">scope</text>
+        <rect x="140" y="140" width="120" height="30" class="stroke fill-soft"/>
+        <text x="150" y="159" class="big">4 records</text>
+        <rect x="288" y="140" width="120" height="30" class="stroke fill-soft"/>
+        <text x="298" y="159" class="big">sealed Result</text>
+        <rect x="436" y="140" width="108" height="30" class="stroke fill-soft"/>
+        <text x="446" y="159" class="big">500ms</text>
+
+        <path d="M112 155 L140 155" class="stroke"/>
+        <path d="M132 151 L140 155 L132 159" class="stroke"/>
+        <path d="M260 155 L288 155" class="stroke"/>
+        <path d="M280 151 L288 155 L280 159" class="stroke"/>
+        <path d="M408 155 L436 155" class="stroke"/>
+        <path d="M428 151 L436 155 L428 159" class="stroke"/>
+        <text x="26" y="188">failure cancels siblings; context inherited; every outcome checked at compile time</text>
+      </svg>
+      <figcaption><b>The Big Picture.</b> The two red boxes above are the defects; below, both are gone. Everything else is the same three HTTP calls it always was.</figcaption>
+    </figure>
+
+    <h2 data-anchor="cap-h2-step6">Step 6: and what did it buy?</h2>
+
+    <p data-anchor="cap-p12">Write the prediction first, then take the recording. Chapter 6's launch flags, and three questions with expected answers:</p>
+
+    <div class="table-wrap" data-anchor="cap-table-verify">
+      <table>
+        <caption>Predictions, then evidence</caption>
+        <thead>
+          <tr><th>Question</th><th>Expected</th><th>Where to look</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Latency per request</td><td>~90&ndash;100ms, not 190ms</td><td>load test P50/P99</td></tr>
+          <tr><td>Any carrier pinning?</td><td>zero events</td><td><code>jfr print --events jdk.VirtualThreadPinned</code></td></tr>
+          <tr><td>CPU per request</td><td>near zero &mdash; it is all waiting</td><td><code>jdk.CPUTimeSample</code> (Linux)</td></tr>
+          <tr><td>Failure latency</td><td>fails in ~10ms, not 30s</td><td>fault-injection test</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p data-anchor="cap-p13">If pinning events appear, something in the stack is doing native work &mdash; a driver, a crypto provider &mdash; and Chapter 5's warning applies. If CPU per request is <em>not</em> near zero, you have found real work you did not know about, which is a better outcome than the one you predicted.</p>
+
+    <div class="box wrong" data-anchor="cap-wrong">
+      <span class="box-label">What Could Go Wrong?</span>
+      <p><strong>You do it in one commit.</strong> The prediction box. Six changes, one number, no attribution.</p>
+      <p><strong>You drop the semaphore in step 3</strong> because virtual threads are cheap. They are; the downstream connection pool is not.</p>
+      <p><strong>You catch <code>Exception</code> around the scope and swallow the interrupt.</strong> Cancellation arrives as an interrupt; code that catches and continues defeats the timeout you just added.</p>
+      <p><strong>You ship <code>--enable-preview</code> without telling anyone.</strong> It has to be on for compilation and for every JVM that runs the artifact, and preview class files are rejected outright by a different JDK version. That is an operational decision with your ops team's name on it, not a build tweak.</p>
+      <p><strong>You convert an entity to a record.</strong> <code>Product</code> is a value. A <code>Customer</code> row with an id is not &mdash; component-wise equality on an entity is a bug waiting for a <code>HashSet</code>.</p>
+    </div>
+
+    <div class="box surgery" data-anchor="cap-surgery">
+      <span class="box-label">Code Surgery</span>
+      <p>A team followed this chapter and produced the following. It passes review at a glance.</p>
+      <pre><code><span class="kw">try</span> (<span class="kw">var</span> scope = <span class="ty">StructuredTaskScope</span>.<span class="fn">open</span>(<span class="ty">Joiner</span>.&lt;<span class="ty">Object</span>&gt;<span class="fn">awaitAllSuccessfulOrThrow</span>())) {
+    <span class="kw">var</span> c = scope.<span class="fn">fork</span>(() -&gt; catalog.<span class="fn">find</span>(sku));
+    <span class="ty">CatalogEntry</span> entry = c.<span class="fn">get</span>();                    <span class="cm">// (1)</span>
+
+    <span class="kw">var</span> p = scope.<span class="fn">fork</span>(() -&gt; pricing.<span class="fn">find</span>(entry));
+    scope.<span class="fn">join</span>();
+    <span class="kw">return new</span> <span class="ty">Ok</span>&lt;&gt;(<span class="fn">merge</span>(entry, p.<span class="fn">get</span>()));
+} <span class="kw">catch</span> (<span class="ty">InterruptedException</span> e) {
+    <span class="kw">return new</span> <span class="ty">Failed</span>&lt;&gt;(<span class="str">"interrupted"</span>);        <span class="cm">// (2)</span>
+}</code></pre>
+      <p><strong>(1)</strong> <code>get()</code> before <code>join()</code> throws <code>IllegalStateException</code>. The intent &mdash; "fetch the catalog entry, then use it to price" &mdash; is genuinely sequential, and a scope is the wrong tool for it. Either call catalog directly and then open a scope for the parallel part, or nest a second scope. Do not try to interleave <code>fork</code> and <code>get</code>.</p>
+      <p><strong>(2)</strong> Catching <code>InterruptedException</code> without restoring the interrupt status leaves the thread's flag cleared, so an outer scope's cancellation is silently absorbed. If you catch it and do not rethrow, call <code>Thread.currentThread().interrupt()</code> before returning.</p>
+      <p><strong>The repair:</strong> separate the sequential dependency from the parallel fan-out, and re-arm the interrupt.</p>
+      <pre><code><span class="ty">CatalogEntry</span> entry = catalog.<span class="fn">find</span>(sku);          <span class="cm">// sequential: just call it</span>
+
+<span class="kw">try</span> (<span class="kw">var</span> scope = <span class="ty">StructuredTaskScope</span>.<span class="fn">open</span>(<span class="ty">Joiner</span>.&lt;<span class="ty">Object</span>&gt;<span class="fn">awaitAllSuccessfulOrThrow</span>())) {
+    <span class="kw">var</span> p = scope.<span class="fn">fork</span>(() -&gt; pricing.<span class="fn">find</span>(entry));
+    <span class="kw">var</span> s = scope.<span class="fn">fork</span>(() -&gt; inventory.<span class="fn">find</span>(entry));
+    scope.<span class="fn">join</span>();
+    <span class="kw">return new</span> <span class="ty">Ok</span>&lt;&gt;(<span class="fn">merge</span>(entry, p.<span class="fn">get</span>(), s.<span class="fn">get</span>()));
+} <span class="kw">catch</span> (<span class="ty">InterruptedException</span> e) {
+    <span class="ty">Thread</span>.<span class="fn">currentThread</span>().<span class="fn">interrupt</span>();
+    <span class="kw">return new</span> <span class="ty">Failed</span>&lt;&gt;(<span class="str">"interrupted"</span>);
+}</code></pre>
+    </div>
+
+    <div class="box hood" data-anchor="cap-hood">
+      <span class="box-label">Under the Hood</span>
+      <p>Worth noticing what this modernization did <em>not</em> require. No reactive types. No new framework. No callback rewrite. The final <code>lookup</code> reads top to bottom, throws where it fails, and produces a stack trace that names the line &mdash; the whole reason to prefer blocking code, now that blocking is cheap.</p>
+      <p>The two most durable changes are also the least glamorous. The sealed <code>Result</code> means the compiler enumerates your failure modes, forever. The records mean the model cannot drift out of sync with its own equality. Both survive the next JDK, the next framework, and the API churn in Chapter 4 &mdash; which is why they are steps 1 and 2 rather than an afterthought.</p>
+      <p>And keep this in proportion: the service went from about 190ms to about 90ms because three calls now overlap. That is Chapter 3's arithmetic, not magic, and you could have had it with a thread pool. What the rest of the chapters bought is that the fast version is also the one that cancels cleanly, times out as a unit, carries its trace context, and tells you when it is lying to you.</p>
+    </div>
+
+    <div class="box try-now" data-anchor="cap-try">
+      <span class="box-label">Try This Now<span class="est">20 minutes</span></span>
+      <ol>
+        <li>Stub the three clients with <code>Thread.sleep</code> (90ms, 40ms, 60ms) and build the Java 17 version. Measure one request.</li>
+        <li>Apply steps 1&ndash;3. Measure again. You should see roughly 190ms &rarr; 90ms.</li>
+        <li>Make the catalog stub throw after 10ms and the other two sleep for 30 seconds. Measure how long <code>lookup</code> takes to return. (Thirty seconds.)</li>
+        <li>Apply step 5. Measure the same failure. (Ten milliseconds.)</li>
+        <li>Delete the semaphore and run 5,000 concurrent requests against a stub that permits only 20 concurrent calls. Watch what "removing back-pressure" actually looks like, in a place where nobody gets paged.</li>
+      </ol>
+    </div>
+
+    <div class="box project" data-anchor="cap-project">
+      <span class="box-label">Chapter project &mdash; part 7 of 7: what you are holding</span>
+      <p>A working service, and a one-page migration note you can hand to the next team. The note should say, for each of the six steps: what changed, what you measured, and what you decided. Two entries matter more than the rest.</p>
+      <ul>
+        <li><strong>Step 3</strong> &mdash; the concurrency limit is now <code>64</code> in a semaphore rather than implied by a pool. Whoever tunes it next needs to know it was chosen to keep one experiment clean, not because it is right.</li>
+        <li><strong>Step 5</strong> &mdash; whether you shipped preview code, and who agreed. If you did, note that JDK 26 changes <code>allSuccessfulOrThrow</code> to return a <code>List</code>, and that the wrapper interface is where that change lands.</li>
+      </ul>
+      <p>That note is the actual deliverable. The code will be edited by someone who was not here; the reasoning is what they cannot reconstruct.</p>
+    </div>
+
+    <div class="box recap" data-anchor="cap-recap">
+      <span class="box-label">Fast Recap</span>
+      <ol>
+        <li>Sequence the changes. Shape first (records, sealed results), concurrency second, structure and observability last.</li>
+        <li>A sealed <code>Result</code> turns a comment about null and exceptions into something the compiler enforces at every call site.</li>
+        <li>Swap the pool and add the semaphore in the same commit, keeping the old number, so the load test measures one variable.</li>
+        <li>Scoped values remove the <code>traceId</code> parameter; a structured scope adds sibling cancellation and one deadline &mdash; the second is still preview.</li>
+        <li>Predict, then measure with JFR. A measurement without a prediction is a number.</li>
+        <li>The lasting wins are the boring ones: correct equality, and failure modes the compiler enumerates.</li>
+      </ol>
+    </div>
+
+    <p class="bridge" data-anchor="cap-bridge"><strong>That is the book.</strong> The <a href="../cheatsheet.html">cheatsheet</a> has the version table, the syntax, the flags, and the migration checklist on one page &mdash; the part worth keeping open in a tab while you do this for real.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-production-performance-and-observability.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Cheatsheet &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

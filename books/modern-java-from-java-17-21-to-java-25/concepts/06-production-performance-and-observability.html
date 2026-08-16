@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Production Performance and Observability &middot; Modern Java</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="modern-java-from-java-17-21-to-java-25">
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <hr class="page-rule">
+    <p class="kicker"><span class="part">Part III &mdash; What you can see</span> &middot; Chapter 06</p>
+    <p class="chapter-no">06</p>
+    <h1 data-anchor="perf-h1">Production performance and observability</h1>
+
+    <p class="lede" data-anchor="perf-lede">Five chapters of new features and not a single measurement. That is the normal way upgrades go wrong: a team adopts virtual threads, latency improves for unrelated reasons, everyone learns the wrong lesson. This chapter is the corrective &mdash; how to see what your service is really doing, and which Java 25 knobs are worth turning.</p>
+
+    <div class="objectives" data-anchor="perf-objectives">
+      <span class="box-label">By the end of this chapter you will be able to</span>
+      <ul>
+        <li>take a JFR recording in production and know which events answer which question;</li>
+        <li>find virtual-thread pinning with evidence rather than reasoning;</li>
+        <li>use the Java 25 AOT cache to cut startup and warm-up, in two commands;</li>
+        <li>say what compact object headers cost and whether they are on by default (they are not);</li>
+        <li>write a microbenchmark that measures the thing you meant.</li>
+      </ul>
+    </div>
+
+    <h2 data-anchor="perf-h2-problem">"It got slower after the upgrade"</h2>
+
+    <p data-anchor="perf-p1">A service moves to Java 25 and virtual threads. P99 latency goes up. Someone opens a profiler, sees a lot of time in the HTTP client, and concludes the client is the problem.</p>
+
+    <div class="box predict" data-anchor="perf-predict-1">
+      <span class="box-label">Make a Prediction</span>
+      <p>The profiler is a sampling profiler measuring <em>wall-clock</em> time. The service does three downstream HTTP calls per request, each about 90ms of waiting. Where will most of the samples land, and what does that tell you about CPU cost?</p>
+      <p class="answer"><span class="answer-label">Answer</span> Almost all of them land in the HTTP client, because that is where the threads are &mdash; parked, doing nothing. It tells you nothing at all about CPU cost. Wall-clock profiles of an I/O-bound service mostly rediscover that it is I/O-bound. To find where the CPU actually goes you need samples attributed to CPU time, which is precisely what JDK 25 added.</p>
+    </div>
+
+    <h2 data-anchor="perf-h2-jfr">JFR is already in there</h2>
+
+    <p data-anchor="perf-p2"><span class="term">JDK Flight Recorder</span> is built into the JVM and designed to be left on in production. It is not a profiler you attach during an incident; it is a flight recorder, which is a different thing and a better one.</p>
+
+    <div class="pre-label">Two ways in</div>
+    <pre><code><span class="cm"># From launch, dumping on exit</span>
+java -XX:StartFlightRecording=settings=profile,filename=app.jfr,dumponexit=true -jar app.jar
+
+<span class="cm"># Or attach to something already running and unhappy</span>
+jcmd &lt;pid&gt; JFR.start name=live settings=profile
+jcmd &lt;pid&gt; JFR.dump  name=live filename=live.jfr</code></pre>
+
+    <p data-anchor="perf-p3">Two built-in settings profiles: <code>default</code>, cheap enough to run permanently, and <code>profile</code>, more detail and still modest. Open the file in JDK Mission Control, or query it from the command line with <code>jfr summary</code> and <code>jfr print</code>.</p>
+
+    <p data-anchor="perf-p4">The events worth knowing by name, for the code in this book:</p>
+
+    <div class="table-wrap" data-anchor="perf-table-events">
+      <table>
+        <caption>JFR events that answer the questions this book raises</caption>
+        <thead>
+          <tr><th>Event</th><th>Answers</th><th>Note</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>jdk.VirtualThreadPinned</code></td><td>where am I still pinning a carrier?</td><td>Chapter 3's open question</td></tr>
+          <tr><td><code>jdk.VirtualThreadStart</code> / <code>End</code></td><td>how many virtual threads, and how long-lived?</td><td>off by default &mdash; high volume</td></tr>
+          <tr><td><code>jdk.VirtualThreadSubmitFailed</code></td><td>is the scheduler rejecting work?</td><td>rare, and always serious</td></tr>
+          <tr><td><code>jdk.ObjectAllocationSample</code></td><td>what is producing the garbage?</td><td>sampled, cheap</td></tr>
+          <tr><td><code>jdk.JavaMonitorEnter</code></td><td>what is contended?</td><td>with the blocking stack trace</td></tr>
+          <tr><td><code>jdk.CPUTimeSample</code></td><td>where does CPU time actually go?</td><td>JDK 25, <em>experimental</em>, Linux only</td></tr>
+          <tr><td><code>jdk.MethodTiming</code></td><td>how long does <em>this</em> method take?</td><td>JDK 25, no code change</td></tr>
+          <tr><td><code>SafepointLatency</code></td><td>how long to reach a safepoint?</td><td>JDK 25</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 data-anchor="perf-h2-jfr25">What Java 25 added to JFR</h2>
+
+    <p data-anchor="perf-p5">Three JEPs landed together, and they are more useful as a group than the release notes suggest.</p>
+
+    <p data-anchor="perf-p6"><strong>JEP 509 &mdash; CPU-time profiling</strong><span class="since experimental">Experimental &middot; Linux</span> is the answer to the prediction box. The new <code>jdk.CPUTimeSample</code> event uses the Linux <code>SIGPROF</code> timer, so samples are attributed to CPU time rather than wall-clock time, and native frames &mdash; including the FFM downcalls from Chapter 5 &mdash; appear in the profile instead of vanishing into a black box. Two caveats you must carry: it is <strong>experimental</strong>, and it is <strong>Linux-only</strong>. Your container is probably Linux; your laptop may not be.</p>
+
+    <p data-anchor="perf-p7"><strong>JEP 518 &mdash; cooperative sampling</strong> is the least visible and arguably the most valuable. JFR now walks thread stacks at safepoints rather than interrupting threads at arbitrary points, which makes sampling safe under ZGC and lets stack walking scale concurrently. You do not turn it on; it just stops being a source of instability. It also adds a <code>SafepointLatency</code> event, which is how you find out that a thread took 40ms to reach a safepoint &mdash; a latency source most teams have never once looked at.</p>
+
+    <p data-anchor="perf-p8"><strong>JEP 520 &mdash; method timing and tracing</strong> is the one you will reach for during an incident. Two events, <code>jdk.MethodTiming</code> (invocation counts and execution times) and <code>jdk.MethodTrace</code> (individual invocations with stack traces), implemented by bytecode instrumentation and selected by <em>configuration</em>. You can time a specific method in a running JVM without editing, rebuilding or redeploying it.</p>
+
+    <figure class="diagram-fig" data-anchor="perf-fig">
+      <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="perf-fig-t">
+        <title id="perf-fig-t">Four questions about a running service and the JFR facility that answers each</title>
+
+        <rect x="16" y="16" width="528" height="26" class="stroke fill-ink"/>
+        <text x="26" y="34" class="big on-ink">one JFR recording</text>
+
+        <path d="M148 42 L148 60" class="stroke"/>
+        <path d="M144 52 L148 60 L152 52" class="stroke"/>
+        <path d="M280 42 L280 60" class="stroke"/>
+        <path d="M276 52 L280 60 L284 52" class="stroke"/>
+        <path d="M412 42 L412 60" class="stroke"/>
+        <path d="M408 52 L412 60 L416 52" class="stroke"/>
+        <path d="M60 42 L60 60" class="stroke"/>
+        <path d="M56 52 L60 60 L64 52" class="stroke"/>
+
+        <rect x="16"  y="68" width="120" height="46" class="stroke fill-soft"/>
+        <text x="26"  y="86" class="big">am I pinning?</text>
+        <text x="26"  y="104" class="mono">VirtualThreadPinned</text>
+
+        <rect x="148" y="68" width="120" height="46" class="stroke fill-soft"/>
+        <text x="158" y="86" class="big">where is CPU?</text>
+        <text x="158" y="104" class="mono">CPUTimeSample</text>
+
+        <rect x="280" y="68" width="120" height="46" class="stroke fill-soft"/>
+        <text x="290" y="86" class="big">how slow is it?</text>
+        <text x="290" y="104" class="mono">MethodTiming</text>
+
+        <rect x="412" y="68" width="132" height="46" class="stroke fill-soft"/>
+        <text x="422" y="86" class="big">what allocates?</text>
+        <text x="422" y="104" class="mono">ObjectAllocationSample</text>
+
+        <rect x="148" y="128" width="120" height="20" class="stroke-red"/>
+        <text x="156" y="142" class="red">experimental &middot; linux</text>
+      </svg>
+      <figcaption><b>The Big Picture.</b> One recording, four questions. Only the CPU-time answer carries a caveat &mdash; and it is the one worth the caveat.</figcaption>
+    </figure>
+
+    <h2 data-anchor="perf-h2-startup">Startup and warm-up: the AOT cache</h2>
+
+    <p data-anchor="perf-p9">A JVM starts slow twice. First it loads and links thousands of classes; then it runs everything interpreted until the JIT has watched long enough to compile. On a short-lived job or a scale-to-zero service, you may pay both costs and never reach steady state.</p>
+
+    <p data-anchor="perf-p10">JDK 24 introduced the <span class="term">AOT cache</span> (JEP 483): do a training run, record the loaded-and-linked classes, reuse them on subsequent starts. JDK 25 made it usable in two commands (JEP 514) instead of three:</p>
+
+    <div class="pre-label">Java 25 &mdash; the whole workflow</div>
+    <pre><code><span class="cm"># 1. Training run: exercise a realistic path, then let it exit</span>
+java -XX:AOTCacheOutput=app.aot -jar app.jar
+
+<span class="cm"># 2. Every run after that</span>
+java -XX:AOTCache=app.aot -jar app.jar</code></pre>
+
+    <p data-anchor="perf-p11">JDK 25 also added <strong>AOT method profiling</strong> (JEP 515): the cache now carries execution profiles for hot methods, so the JIT can start emitting optimized code at startup instead of re-learning what it learned yesterday. That targets warm-up, not just startup &mdash; the second of the two slow phases.</p>
+
+    <p data-anchor="perf-p12">Two practical notes. The training run must exercise a path resembling production; training on <code>--version</code> caches nothing useful. And the cache is tied to the JDK build and the application &mdash; regenerate it in CI as a build artifact, do not hand-copy it between environments.</p>
+
+    <h2 data-anchor="perf-h2-headers">Compact object headers</h2>
+
+    <p data-anchor="perf-p13">Every object on a 64-bit JVM carries a header. Traditionally 12 bytes. <span class="term">Compact object headers</span> shrink it to 8.</p>
+
+    <p data-anchor="perf-p14">Four bytes sounds trivial until you multiply. A heap full of small objects &mdash; and a heap full of records is exactly that &mdash; can lose a meaningful fraction of its footprint to headers alone. Less footprint also means better cache behaviour and less GC work, so the effect is usually larger than the arithmetic suggests.</p>
+
+    <div class="callout warn" data-anchor="perf-coh-status">
+      <span class="callout-title">Get the status right &mdash; this is widely misreported</span>
+      <p>Compact object headers were <strong>experimental</strong> in JDK 24 (JEP 450) and became a <strong>product feature</strong> in JDK 25 (JEP 519). Product feature means the experimental-flag requirement is gone.</p>
+      <p>It does <strong>not</strong> mean on by default. On Java 25 you must still opt in:</p>
+      <pre><code>java -XX:+UseCompactObjectHeaders -jar app.jar</code></pre>
+      <p>A separate proposal, JEP 534, would enable it by default in a later release. Until then, a blog post telling you Java 25 shrinks your heap automatically is wrong, and you will not see the benefit without the flag.</p>
+    </div>
+
+    <p data-anchor="perf-p15">It is a genuinely easy win to evaluate: turn it on in a load test, compare heap-after-GC and allocation rate, keep it if the numbers move. Which brings us to the part of the chapter that matters more than any flag.</p>
+
+    <h2 data-anchor="perf-h2-measure">Measure, and measure the right thing</h2>
+
+    <p class="pullquote" data-anchor="perf-pull">Every flag in this chapter is worth exactly as much as your ability to tell whether it helped.</p>
+
+    <p data-anchor="perf-p16">Timing a loop with <code>System.nanoTime</code> does not survive contact with the JVM. The JIT will constant-fold a computation whose result you ignore, eliminate the loop entirely, and swap implementations halfway through your measurement. JMH exists to control for exactly these effects: warm-up iterations, separate forked JVMs, and a <code>Blackhole</code> to consume results the compiler would otherwise delete.</p>
+
+    <div class="pre-label">A benchmark that measures what it claims to</div>
+    <pre><code><span class="mac">@State</span>(<span class="ty">Scope</span>.Benchmark)
+<span class="mac">@BenchmarkMode</span>(<span class="ty">Mode</span>.AverageTime)
+<span class="mac">@OutputTimeUnit</span>(<span class="ty">TimeUnit</span>.NANOSECONDS)
+<span class="mac">@Warmup</span>(iterations = <span class="num">5</span>, time = <span class="num">1</span>)
+<span class="mac">@Measurement</span>(iterations = <span class="num">5</span>, time = <span class="num">1</span>)
+<span class="mac">@Fork</span>(<span class="num">2</span>)
+<span class="kw">public class</span> <span class="ty">ParseBenchmark</span> {
+
+    <span class="kw">private</span> <span class="ty">String</span> input;
+
+    <span class="mac">@Setup</span> <span class="kw">public void</span> <span class="fn">setup</span>() { input = <span class="str">"2026-08-16T12:00:00Z"</span>; }
+
+    <span class="mac">@Benchmark</span>
+    <span class="kw">public</span> <span class="ty">Instant</span> <span class="fn">parse</span>() {
+        <span class="kw">return</span> <span class="ty">Instant</span>.<span class="fn">parse</span>(input);      <span class="cm">// returned, so JMH consumes it</span>
+    }
+}</code></pre>
+
+    <p data-anchor="perf-p17">Returning the result is not a style choice &mdash; it is how JMH knows the value is used. A <code>void</code> benchmark needs a <code>Blackhole</code> parameter instead. And note what this benchmark does <em>not</em> do: it does not tell you whether your service is faster. JMH answers "which of these two implementations of one method is quicker". Service-level questions belong to a load test and a JFR recording.</p>
+
+    <div class="box wrong" data-anchor="perf-wrong">
+      <span class="box-label">What Could Go Wrong?</span>
+      <p><strong>You enable <code>jdk.VirtualThreadStart</code> and <code>End</code> in production.</strong> They are off by default for a reason. A million virtual threads means two million events, and your recording becomes a very expensive way to fill a disk.</p>
+      <p><strong>You profile with a wall-clock profiler and tune what it shows you.</strong> On an I/O-bound service it will point at the I/O. Use CPU-time sampling when the question is CPU &mdash; on Linux, with the experimental caveat understood.</p>
+      <p><strong>You benchmark on a laptop with a browser open.</strong> Thermal throttling and background load will move your numbers more than the change you are testing. Benchmark where you deploy.</p>
+      <p><strong>You turn on three flags at once.</strong> AOT cache, compact headers and a GC change together, and now you cannot attribute the result to anything. One at a time, with a measurement between.</p>
+      <p><strong>You believe compact object headers are on by default in Java 25.</strong> They are not. Check with <code>-XX:+PrintFlagsFinal -version | grep UseCompactObjectHeaders</code> rather than trusting a changelog summary.</p>
+    </div>
+
+    <div class="box surgery" data-anchor="perf-surgery">
+      <span class="box-label">Code Surgery</span>
+      <p>This benchmark "proves" that string concatenation is free.</p>
+      <pre><code><span class="kw">long</span> start = <span class="ty">System</span>.<span class="fn">nanoTime</span>();
+<span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">1</span>_000_000; i++) {
+    <span class="ty">String</span> s = <span class="str">"order-"</span> + i;         <span class="cm">// never used</span>
+}
+<span class="ty">System</span>.out.<span class="fn">println</span>((<span class="ty">System</span>.<span class="fn">nanoTime</span>() - start) / <span class="num">1</span>_000_000 + <span class="str">"ms"</span>);</code></pre>
+      <p><strong>Three defects, any one of which invalidates it.</strong> <code>s</code> is never used, so the JIT is entitled to delete the whole loop body &mdash; you may be timing an empty loop. There is no warm-up, so the early iterations run interpreted and the later ones compiled, and you are averaging two different programs. And it runs in a JVM that has already been doing other things, so the profile of every call site involved is polluted.</p>
+      <p><strong>The repair</strong> is not to patch this loop but to stop hand-rolling it:</p>
+      <pre><code><span class="mac">@Benchmark</span>
+<span class="kw">public</span> <span class="ty">String</span> <span class="fn">concat</span>(<span class="ty">Blackhole</span> bh) {
+    <span class="ty">String</span> s = <span class="str">"order-"</span> + counter++;
+    bh.<span class="fn">consume</span>(s);
+    <span class="kw">return</span> s;
+}</code></pre>
+      <p>If a JMH dependency is genuinely not worth it for the question you have, that is a fine answer &mdash; but then do not report a number. Report that you did not measure.</p>
+    </div>
+
+    <div class="box hood" data-anchor="perf-hood">
+      <span class="box-label">Under the Hood</span>
+      <p>JFR events are emitted into per-thread buffers, flushed to a global buffer, then to disk. That design is why the overhead is a few percent rather than the tenfold cost of an instrumenting profiler: the hot path is a buffer write, not a call into an agent.</p>
+      <p>The safepoint bias that JEP 518 addresses is a decades-old problem in JVM sampling. Traditional async samplers interrupt a thread wherever it happens to be, but walking a stack safely at an arbitrary instruction is genuinely hard; the classic compromise walks only at safepoints, which biases samples toward safepoint-adjacent code. JEP 518's cooperative approach keeps the safety and reduces the bias &mdash; and, incidentally, is what makes sampling trustworthy under ZGC.</p>
+      <p>Compact object headers work by folding the class pointer into the mark word, so a 96-bit header becomes 64. That interacts with locking and hashing, which is why it spent a release as experimental and why JEP 534 exists as a separate step: the JEP is finished, the confidence to default it on is a different question.</p>
+      <p>The AOT cache is Project Leyden's first shipping increment. Reading it as "Java is getting an AOT compiler" is a misreading &mdash; it caches class loading, linking and now profiles, while leaving the JIT in charge of code generation. You keep peak throughput, which is the thing native-image trades away.</p>
+    </div>
+
+    <div class="box try-now" data-anchor="perf-try">
+      <span class="box-label">Try This Now<span class="est">20 minutes</span></span>
+      <ol>
+        <li>Run any service you have with <code>-XX:StartFlightRecording=settings=profile,filename=app.jfr,dumponexit=true</code>. Put some load through it. Exit.</li>
+        <li><code>jfr summary app.jfr</code> &mdash; read the event counts. This is the cheapest orientation you will ever get on an unfamiliar service.</li>
+        <li><code>jfr print --events jdk.VirtualThreadPinned app.jfr</code>. If your service uses virtual threads and this is empty, you have evidence, not a hope.</li>
+        <li>Take a training run with <code>-XX:AOTCacheOutput=app.aot</code>, then time ten starts with and without <code>-XX:AOTCache=app.aot</code>. Report the median, not the best.</li>
+        <li>Run once with <code>-XX:+UseCompactObjectHeaders</code> under the same load and compare heap-after-GC. Change one thing at a time.</li>
+      </ol>
+    </div>
+
+    <div class="box project" data-anchor="perf-project">
+      <span class="box-label">Chapter project &mdash; part 6 of 7</span>
+      <p>Give the aggregator a way to answer questions about itself. Three things, none of which touch application code:</p>
+      <ol>
+        <li>Add <code>-XX:StartFlightRecording=settings=profile,filename=/var/log/agg.jfr,dumponexit=true</code> to the launch command.</li>
+        <li>Configure <code>jdk.MethodTiming</code> for the aggregation method, so you can see its distribution without instrumenting it by hand.</li>
+        <li>Write down, before you measure, what you expect: three concurrent 90ms calls should give roughly 90&ndash;100ms per request, near-zero CPU per request, and <em>no</em> <code>jdk.VirtualThreadPinned</code> events.</li>
+      </ol>
+      <p>Step 3 is the discipline that makes the rest worth doing. A measurement you did not predict is a number; a measurement that contradicts a written prediction is a finding.</p>
+    </div>
+
+    <div class="box recap" data-anchor="perf-recap">
+      <span class="box-label">Fast Recap</span>
+      <ol>
+        <li>JFR is in the JVM, cheap enough for production: <code>-XX:StartFlightRecording</code> or <code>jcmd &lt;pid&gt; JFR.start</code>.</li>
+        <li><code>jdk.VirtualThreadPinned</code> is how you find real pinning; the start/end events stay off in production.</li>
+        <li>JDK 25 JFR: CPU-time profiling (JEP 509, <em>experimental, Linux-only</em>), cooperative sampling (JEP 518), method timing and tracing (JEP 520, no code change).</li>
+        <li>AOT cache in two commands: <code>-XX:AOTCacheOutput=app.aot</code> once, then <code>-XX:AOTCache=app.aot</code>. JEP 515 adds method profiles, which helps warm-up.</li>
+        <li>Compact object headers are a <em>product feature</em> in Java 25 but still <strong>opt-in</strong>: <code>-XX:+UseCompactObjectHeaders</code>.</li>
+        <li>Use JMH for method-level questions and a load test plus JFR for service-level ones. Never a hand-rolled <code>nanoTime</code> loop.</li>
+        <li>Change one thing at a time, and predict before you measure.</li>
+      </ol>
+    </div>
+
+    <p class="bridge" data-anchor="perf-bridge"><strong>Next:</strong> six features, six chapter-project fragments. Chapter 7 assembles them into one service &mdash; a Java 17-style aggregator taken to Java 25, one change at a time, with a measurement between each.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-foreign-function-and-memory-api.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-capstone-modernize-a-small-service.html">Next &rsaquo;</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
