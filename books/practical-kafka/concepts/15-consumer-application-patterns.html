@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Consumer Application Patterns — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part IV · Enterprise Integration Patterns</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c15-no">Chapter 15</p>
+    <h1 data-anchor="c15-h1">Consumer Application Patterns</h1>
+
+    <p class="standfirst" data-anchor="c15-stand">A consumer's job is not to process
+    every record. It is to make progress in the presence of records it cannot
+    process — which is a different, harder job.</p>
+
+    <h2 data-anchor="c15-h2-classify">Classify the failure first</h2>
+    <p data-anchor="c15-p1">Almost every consumer pathology comes from treating all
+    exceptions the same way. Four categories, four responses:</p>
+
+    <table data-anchor="c15-tbl1">
+      <caption>Failure classification drives the retry decision</caption>
+      <thead><tr><th>Class</th><th>Example</th><th>Will it ever succeed?</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><b>Transient</b></td><td>Database timeout, 503 from a dependency</td><td class="yes">Yes, later</td><td>Retry with backoff</td></tr>
+        <tr><td><b>Permanent</b></td><td>Deserialization failure, unknown schema</td><td class="no">Never</td><td>Dead-letter immediately</td></tr>
+        <tr><td><b>Malformed</b></td><td>Required field null, impossible values</td><td class="no">Never</td><td>Dead-letter immediately</td></tr>
+        <tr><td><b>Business rule</b></td><td>Order references an unknown customer</td><td>Maybe — ordering or data issue</td><td>Bounded retry, then dead-letter</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c15-p2">The expensive mistake is retrying a permanent failure. That
+    is the poison pill from Chapter 7: an uncaught exception means the same batch
+    is re-consumed on the next poll, forever, while lag climbs and the process
+    looks healthy.</p>
+    <p data-anchor="c15-p3">The other expensive mistake is dead-lettering a transient
+    failure. A ten-minute database blip should not send ten thousand valid
+    records to a dead-letter topic that someone must now replay by hand.</p>
+
+    <div class="callout key" data-anchor="c15-call1">
+      <p class="callout-t">The default that is usually right</p>
+      <p>Retry with backoff a bounded number of times; if it still fails, route
+      the record to a dead-letter topic with the failure reason attached, commit
+      the offset, and continue. Progress is preserved, the failure is captured,
+      and no single record can stop the stream.</p>
+    </div>
+
+    <h2 data-anchor="c15-h2-retry">Where to retry</h2>
+    <p data-anchor="c15-p4">Retrying in-line on the consumer thread is the obvious
+    approach and it has a hard limit: exceed <code>max.poll.interval.ms</code>
+    and the broker evicts you, triggering a rebalance (Chapter 7). Three retries
+    with exponential backoff can easily blow through a five-minute interval
+    during a dependency outage — and then you have converted a slow dependency
+    into a rebalance storm across the whole group.</p>
+    <p data-anchor="c15-p5">So in-line retry is for <b>fast</b> retries only: a
+    handful of attempts over a few seconds. Anything longer needs to leave the
+    poll loop, and the standard mechanism is a <b>retry topic</b>.</p>
+
+    <figure class="diagram-fig" data-anchor="c15-fig1">
+      <svg class="diagram" viewBox="0 0 560 172" role="img" aria-labelledby="c15d1t">
+        <title id="c15d1t">Failed records move to retry topics with increasing delays and finally to a dead-letter topic</title>
+
+        <rect x="16" y="30" width="110" height="34" class="stroke fill-soft"/>
+        <text x="26" y="52" class="big">orders</text>
+        <path d="M126 47 L176 47" class="stroke"/>
+        <path d="M168 43 L176 47 L168 51" class="stroke"/>
+        <rect x="176" y="30" width="110" height="34" class="stroke fill-soft"/>
+        <text x="186" y="52" class="big">consumer</text>
+
+        <path d="M231 64 L231 104" class="stroke-red"/>
+        <path d="M227 96 L231 104 L235 96" class="stroke-red"/>
+        <text x="241" y="86" class="red">fails</text>
+
+        <rect x="16" y="110" width="120" height="34" class="stroke fill-soft"/>
+        <text x="26" y="132" class="big">retry-5s</text>
+        <path d="M136 127 L176 127" class="stroke"/>
+        <path d="M168 123 L176 127 L168 131" class="stroke"/>
+        <rect x="176" y="110" width="120" height="34" class="stroke fill-soft"/>
+        <text x="186" y="132" class="big">retry-5m</text>
+        <path d="M296 127 L336 127" class="stroke"/>
+        <path d="M328 123 L336 127 L328 131" class="stroke"/>
+        <rect x="336" y="110" width="120" height="34" class="stroke-red"/>
+        <text x="346" y="132" class="big red">dead-letter</text>
+
+        <text x="336" y="164" class="red">someone must look at this</text>
+      </svg>
+      <figcaption><b>Retry topics move waiting off the poll loop.</b> Each tier
+      has its own consumer with its own delay; the main stream never
+      blocks.</figcaption>
+    </figure>
+
+    <p data-anchor="c15-p6">Each retry topic has its own consumer that waits before
+    processing. Because that waiting happens on a separate consumer group with
+    its own poll budget, the main stream keeps flowing at full speed. The cost is
+    that retried records are now <b>out of order</b> relative to the main stream —
+    which is fine for independent records and unacceptable for an aggregate's
+    lifecycle. For ordered work, blocking the partition is sometimes the correct
+    behaviour, and you should choose it deliberately.</p>
+
+    <h2 data-anchor="c15-h2-dlq">Dead-letter topics</h2>
+    <p data-anchor="c15-p7">A dead-letter queue in Kafka is simply another Kafka
+    topic that failed records get routed to. There is no special broker feature —
+    which means everything about its usefulness is your design.</p>
+    <p data-anchor="c15-p8">Make it useful by attaching context in headers: the
+    original topic, partition and offset; the exception class and message; the
+    consumer group; a timestamp; and the attempt count. A dead-letter record
+    without that context is an unreadable blob that nobody can act on.</p>
+
+    <div class="callout warn" data-anchor="c15-call2">
+      <p class="callout-t">A dead-letter topic nobody monitors is data loss with extra steps</p>
+      <p>Alert on the record count. Assign an owner. Build the replay tool before
+      you need it — during an incident is the wrong moment to discover that
+      replaying from the DLQ means writing a script.</p>
+    </div>
+
+    <h2 data-anchor="c15-h2-idempotency">Idempotent processing</h2>
+    <p data-anchor="c15-p9">At-least-once is the practical default (Chapter 7), and
+    reliable publication is at-least-once too (Chapter 14). So duplicates are
+    normal traffic, not an exceptional condition, and every consumer with an
+    external side effect needs to be safe against them.</p>
+    <p data-anchor="c15-p10">In rough order of preference:</p>
+    <ul data-anchor="c15-ul1">
+      <li><b>Make the write naturally idempotent.</b> An upsert keyed by the
+      business identity, or a state transition that is a no-op when already
+      applied. Nothing to store, nothing to expire, no extra failure mode. This
+      is by far the best answer when the domain allows it.</li>
+      <li><b>Use a conditional write.</b> "Set status to SHIPPED where status is
+      PACKED" — a duplicate updates zero rows and that is the correct
+      outcome.</li>
+      <li><b>Keep a processed-event store.</b> Record each processed event id and
+      skip ones you have seen. Store the id in the <em>same transaction</em> as
+      the side effect, or you have reinvented the dual-write problem inside your
+      consumer.</li>
+      <li><b>Pass an idempotency key to the external system.</b> Payment and
+      messaging providers generally accept one, because this problem is
+      universal.</li>
+    </ul>
+
+    <p class="pen-note" data-anchor="c15-pen">A processed-event store needs a
+    retention policy of its own, and it must be longer than your maximum replay
+    window — otherwise a replay after the store has expired reprocesses
+    everything. This is the detail that gets missed.</p>
+
+    <h2 data-anchor="c15-h2-replay">Replay-safe consumers</h2>
+    <p data-anchor="c15-p11">Sooner or later you will reset a consumer group to an
+    earlier offset — to fix a bug, backfill a new field, or rebuild state. That
+    means reprocessing records the consumer has already handled, at maximum
+    speed, with no rate limiting.</p>
+    <p data-anchor="c15-p12">Which raises questions worth answering <em>before</em>
+    the day you need to: Will it re-send ten thousand emails? Will it double every
+    balance? Will it overwhelm a downstream API sized for steady-state traffic?</p>
+    <p data-anchor="c15-p13">The design responses are: idempotency (above), a
+    distinction between replayable side effects (database writes) and
+    non-replayable ones (emails, payments), and a way to run the consumer in a
+    mode where non-replayable effects are suppressed. Isolating the two kinds of
+    side effect into different consumers is the cleanest version of this — the
+    projection consumer can be replayed freely, the notification consumer
+    cannot.</p>
+
+    <h2 data-anchor="c15-h2-scaling">Concurrency, backpressure, and partition awareness</h2>
+    <p data-anchor="c15-p14">A group's parallelism is capped by the partition count
+    (Chapter 2). Adding consumers beyond that does nothing — the extras sit
+    idle.</p>
+    <p data-anchor="c15-p15">To go faster within that ceiling you can process records
+    from a partition concurrently, but doing so breaks ordering within the
+    partition, which is the guarantee you chose your key for. The compromise that
+    works: <b>parallelise by key within the partition</b>. Records for different
+    keys can be processed concurrently; records for the same key are serialised.
+    You keep per-aggregate ordering while using more than one thread.</p>
+    <p data-anchor="c15-p16">Backpressure comes for free from the poll loop if you
+    respect it: do not read ahead into an unbounded internal queue. Bound the
+    work in flight, and let <code>max.poll.records</code> and your processing rate
+    be the throttle. An internal queue that grows without limit turns a downstream
+    slowdown into an out-of-memory crash, and loses whatever was buffered.</p>
+
+    <h2 data-anchor="c15-h2-stateful">Stateless, stateful, and materialized views</h2>
+    <p data-anchor="c15-p17">Three shapes, worth naming because they have different
+    operational profiles:</p>
+    <ul data-anchor="c15-ul2">
+      <li><b>Stateless</b> — each record processed independently. Trivially
+      scalable, trivially replayable. Aim for this.</li>
+      <li><b>Stateful</b> — processing depends on prior records. Now you own
+      state: where it lives, how it is restored after a crash, whether it is
+      consistent with the committed offset. Kafka Streams exists largely to
+      handle this for you (Chapter 16).</li>
+      <li><b>Materialized view</b> — the consumer's whole purpose is to maintain
+      a queryable projection. The projection <em>is</em> the state, it can always
+      be rebuilt by replaying from the beginning, and that rebuildability is the
+      main operational advantage: a corrupted view is fixed by replaying rather
+      than by repairing.</li>
+    </ul>
+
+    <h2 data-anchor="c15-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c15-p18">A consumer that keeps making progress. Records that
+    cannot be processed leave the main path, transient failures get another
+    chance, duplicates are harmless, and a replay does not cause an incident.</p>
+    <p data-anchor="c15-p19">Everything here is hand-built. The next chapter is what
+    happens when you decide not to hand-build it.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="14-publishing-reliable-domain-events.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="16-kafka-streams.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Publishing Reliable Domain Events — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part IV · Enterprise Integration Patterns</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c14-no">Chapter 14</p>
+    <h1 data-anchor="c14-h1">Publishing Reliable Domain Events</h1>
+
+    <p class="standfirst" data-anchor="c14-stand">You need to change a row and publish
+    an event, atomically, without a distributed transaction. There is a standard
+    answer, and the naive approach fails in a way that is very hard to see in
+    testing.</p>
+
+    <h2 data-anchor="c14-h2-dualwrite">The dual-write problem</h2>
+    <p data-anchor="c14-p1">Your service accepts an order. It must write the order to
+    its database and publish <code>OrderPlaced</code> to Kafka. Two systems, two
+    writes, no shared transaction.</p>
+
+    <figure class="diagram-fig" data-anchor="c14-fig1">
+      <svg class="diagram" viewBox="0 0 560 180" role="img" aria-labelledby="c14d1t">
+        <title id="c14d1t">Writing to the database and publishing to Kafka separately leaves two windows in which the two systems disagree</title>
+
+        <text x="16" y="18">Naive: two independent writes</text>
+
+        <rect x="16" y="30" width="130" height="34" class="stroke fill-soft"/>
+        <text x="26" y="52" class="big">DB commit</text>
+        <path d="M146 47 L206 47" class="stroke"/>
+        <path d="M198 43 L206 47 L198 51" class="stroke"/>
+        <rect x="206" y="30" width="130" height="34" class="stroke fill-soft"/>
+        <text x="216" y="52" class="big">Kafka send</text>
+
+        <path d="M176 70 L176 96" class="stroke-red"/>
+        <path d="M172 88 L176 96 L180 88" class="stroke-red"/>
+        <text x="186" y="92" class="red">crash here: order exists, nobody told</text>
+
+        <path d="M16 116 L544 116" class="stroke-soft"/>
+
+        <text x="16" y="140">Reversed order</text>
+        <rect x="16" y="146" width="130" height="26" class="stroke fill-soft"/>
+        <text x="26" y="164" class="big">Kafka send</text>
+        <rect x="206" y="146" width="130" height="26" class="stroke fill-soft"/>
+        <text x="216" y="164" class="big">DB commit</text>
+        <text x="350" y="164" class="red">rollback: event is a lie</text>
+      </svg>
+      <figcaption><b>Neither order is safe.</b> Both leave a window where the
+      database and the event stream disagree, and the window is exactly where
+      crashes happen.</figcaption>
+    </figure>
+
+    <p data-anchor="c14-p2">Database first, then publish: a crash between them leaves
+    an order that exists but that no downstream system will ever hear about. No
+    error is raised anywhere. The bug surfaces days later as "some orders never
+    got fulfilled."</p>
+    <p data-anchor="c14-p3">Publish first, then commit: a rollback leaves an event
+    announcing something that did not happen. Downstream consumers act on it —
+    charge a card, reserve stock — for an order your database has no record
+    of.</p>
+    <p data-anchor="c14-p4">Wrapping the send inside the database transaction does not
+    help either: Kafka does not participate in it, so the record is published
+    the moment it is sent regardless of what the database does afterwards. It
+    also means a slow broker holds a database transaction open, which is its own
+    kind of outage.</p>
+
+    <div class="callout key" data-anchor="c14-call1">
+      <p class="callout-t">Why not two-phase commit?</p>
+      <p>Because it is not available here in any practical form, and because
+      even where XA exists it trades a rare inconsistency for a common
+      availability problem: a coordinator failure can leave locks held until a
+      human intervenes. The industry moved to the outbox pattern for good
+      reasons.</p>
+    </div>
+
+    <h2 data-anchor="c14-h2-outbox">The transactional outbox</h2>
+    <p data-anchor="c14-p5">The insight is to make it one write. Write the event to an
+    <b>outbox table in the same local database transaction</b> as the business
+    change. The transaction is atomic by construction — one database, one commit.
+    Then a separate relay reads the outbox and publishes to Kafka.</p>
+
+    <figure class="diagram-fig" data-anchor="c14-fig2">
+      <svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="c14d2t">
+        <title id="c14d2t">The outbox pattern: one local transaction writes both the business row and the outbox row, then a relay publishes the outbox to Kafka</title>
+
+        <rect x="16" y="26" width="230" height="72" class="stroke-red"/>
+        <text x="26" y="44" class="red">ONE local transaction</text>
+        <rect x="30" y="52" width="96" height="32" class="stroke fill-soft"/>
+        <text x="40" y="72" class="big">orders</text>
+        <rect x="138" y="52" width="96" height="32" class="stroke fill-soft"/>
+        <text x="148" y="72" class="big">outbox</text>
+
+        <path d="M246 62 L306 62" class="stroke"/>
+        <path d="M298 58 L306 62 L298 66" class="stroke"/>
+        <rect x="306" y="44" width="110" height="36" class="stroke fill-soft"/>
+        <text x="316" y="66" class="big">relay / CDC</text>
+
+        <path d="M416 62 L476 62" class="stroke"/>
+        <path d="M468 58 L476 62 L468 66" class="stroke"/>
+        <rect x="476" y="44" width="68" height="36" class="stroke fill-soft"/>
+        <text x="486" y="66" class="big">Kafka</text>
+
+        <text x="16" y="122" class="dim">atomic by construction</text>
+        <text x="306" y="122" class="dim">at-least-once, retryable</text>
+      </svg>
+      <figcaption><b>One atomic write, one retryable relay.</b> The relay may
+      publish a duplicate; it can never publish a lie.</figcaption>
+    </figure>
+
+    <p data-anchor="c14-p6">The relay is at-least-once, which is fine — consumers are
+    idempotent anyway (Chapter 15), and the event id from Chapter 1 is the
+    deduplication key. What the relay can never do is publish an event whose
+    business change was rolled back, because the outbox row rolled back with
+    it.</p>
+
+    <p class="pre-label">A workable outbox table</p>
+<pre data-anchor="c14-code1"><code><span class="kw">CREATE TABLE</span> outbox (
+  id             <span class="ty">uuid</span>        <span class="kw">PRIMARY KEY</span>,
+  aggregate_type <span class="ty">text</span>        <span class="kw">NOT NULL</span>,  <span class="cm">-- routes to a topic</span>
+  aggregate_id   <span class="ty">text</span>        <span class="kw">NOT NULL</span>,  <span class="cm">-- becomes the Kafka KEY</span>
+  event_type     <span class="ty">text</span>        <span class="kw">NOT NULL</span>,
+  payload        <span class="ty">jsonb</span>       <span class="kw">NOT NULL</span>,
+  occurred_at    <span class="ty">timestamptz</span> <span class="kw">NOT NULL</span>,
+  trace_context  <span class="ty">text</span>
+);</code></pre>
+
+    <p data-anchor="c14-p7"><code>aggregate_id</code> earns its place: it becomes the
+    Kafka message key, which means all events for one aggregate land in one
+    partition and stay ordered (Chapter 2). Getting this wrong — keying by the
+    event id instead — destroys per-aggregate ordering silently, and the symptom
+    is a consumer occasionally seeing <code>OrderShipped</code> before
+    <code>OrderPlaced</code>.</p>
+
+    <h2 data-anchor="c14-h2-relay">Two ways to run the relay</h2>
+    <p data-anchor="c14-p8"><b>Polling.</b> A background job selects unpublished rows,
+    publishes them, marks them done. Simple, easy to reason about, no extra
+    infrastructure. It adds polling latency and load on the database, and you own
+    the "mark as published" logic and its own dual-write problem in miniature
+    (publish, then mark — so a crash between them republishes; that is fine,
+    consumers are idempotent).</p>
+    <p data-anchor="c14-p9"><b>Change data capture.</b> A CDC connector tails the
+    database's replication log and emits a Kafka record per outbox row. No
+    polling, no query load, low latency. Debezium is the common choice: it runs
+    as a Kafka Connect connector and captures changes from PostgreSQL logical
+    replication, the MySQL binlog, and others.</p>
+    <p data-anchor="c14-p10">Debezium ships an <code>outbox.event.router</code> Single
+    Message Transform for exactly this pattern. It post-processes the raw CDC
+    events, routes them to the right topic based on the aggregate type, and uses
+    the aggregate id as the message key — which is what preserves per-aggregate
+    ordering. That is the pattern's ordering guarantee made mechanical.</p>
+
+    <h2 data-anchor="c14-h2-cdc">CDC without an outbox — and why it is different</h2>
+    <p data-anchor="c14-p11">You can also point CDC straight at your business tables
+    and skip the outbox. It is less work, and it publishes a fundamentally
+    different thing.</p>
+
+    <table data-anchor="c14-tbl1">
+      <caption>Three ways to get events out of a service</caption>
+      <thead><tr><th></th><th>App publishes</th><th>Outbox + relay</th><th>CDC on tables</th></tr></thead>
+      <tbody>
+        <tr><td>Atomic with the business change</td><td class="no">No</td><td class="yes">Yes</td><td class="yes">Yes</td></tr>
+        <tr><td>Event shape</td><td>Whatever you want</td><td>Whatever you want</td><td class="no">Your table</td></tr>
+        <tr><td>Couples the contract to your schema</td><td class="yes">No</td><td class="yes">No</td><td class="no">Yes</td></tr>
+        <tr><td>Captures intent (why it changed)</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">No</td></tr>
+        <tr><td>Extra infrastructure</td><td>None</td><td>Connector or job</td><td>Connector</td></tr>
+        <tr><td>Works for legacy apps you cannot change</td><td class="no">No</td><td class="no">No</td><td class="yes">Yes</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c14-p12">Table-level CDC publishes row changes, so
+    "status went from <code>PENDING</code> to <code>CANCELLED</code>" reaches
+    consumers without the reason. Was it cancelled by the customer, by fraud
+    review, or by a timeout? The table does not know, so neither do your
+    consumers — and this is exactly the table-shaped-event problem from
+    Chapter 10, arriving through the back door.</p>
+
+    <p class="pen-note" data-anchor="c14-pen">Use table CDC where you cannot change
+    the application — legacy systems, packaged software, a database you inherited.
+    Use the outbox everywhere you own the code. The outbox is CDC plus the
+    freedom to design your own contract.</p>
+
+    <h2 data-anchor="c14-h2-ordering">Per-aggregate sequencing</h2>
+    <p data-anchor="c14-p13">Kafka gives you ordering within a partition. Keying by
+    aggregate id gives you ordering per aggregate. That is usually enough — but
+    consumers cannot tell the difference between "these arrived in order" and
+    "these are all the events there were."</p>
+    <p data-anchor="c14-p14">For anything where a gap matters, carry an explicit
+    <b>sequence number per aggregate</b> in the event. A consumer that sees
+    sequence 7 after 5 knows something is missing and can react, rather than
+    silently applying an incomplete history. It costs one field and turns a class
+    of invisible bug into a detectable one.</p>
+
+    <h2 data-anchor="c14-h2-recon">Reconciliation</h2>
+    <p data-anchor="c14-p15">Even a correct outbox benefits from an audit. A periodic
+    job that compares business-table counts against published-event counts for a
+    window will catch a relay that has been silently stuck for six hours, a
+    connector that lost its replication slot, or a topic whose ACLs changed under
+    you.</p>
+    <p data-anchor="c14-p16">Publish that comparison as a metric. "Outbox rows
+    unpublished older than five minutes" is one of the highest-value alerts in an
+    event-driven system, because it fires before anyone downstream notices
+    anything is wrong.</p>
+
+    <h2 data-anchor="c14-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c14-p17">A publication path where the failure mode is a duplicate
+    rather than a lie, and where the event's shape is still yours to design.
+    Every downstream chapter assumes this: consumers are built for at-least-once
+    because the reliable publication patterns are at-least-once.</p>
+    <p data-anchor="c14-p18">Now the other side of the pipe.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="13-enterprise-contract-governance.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="15-consumer-application-patterns.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
