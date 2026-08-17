@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Customer 360 and Data Platform — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part VI · End-to-End Case Studies</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c24-no">Chapter 24</p>
+    <h1 data-anchor="c24-h1">Case Study: Customer 360 and Data Platform</h1>
+
+    <p class="standfirst" data-anchor="c24-stand">A different shape from Chapter 23:
+    state rather than events, sources you do not control, and a PII problem that
+    has to be solved at design time.</p>
+
+    <h2 data-anchor="c24-h2-problem">The problem</h2>
+    <p data-anchor="c24-p1">Build a unified customer view from six systems — CRM,
+    billing, support, web analytics, the loyalty programme, and a marketing
+    platform. Feed a warehouse, a search index, and back into the CRM. Three of
+    the six are packaged software nobody can modify.</p>
+    <p data-anchor="c24-p2">The distinction that shapes everything: this is a
+    <b>state</b> problem, not an event problem. Nobody wants "the customer's
+    address changed" so much as "what is the customer's address." That points at
+    compacted topics (Chapter 9) from the start.</p>
+
+    <h2 data-anchor="c24-h2-ingest">Getting data out of systems you do not own</h2>
+    <p data-anchor="c24-p3">Chapter 14 preferred the outbox pattern — but it requires
+    changing the application. For the three packaged systems that is not
+    available, so table-level CDC is the honest answer, with its costs
+    acknowledged rather than ignored.</p>
+
+    <table data-anchor="c24-tbl1">
+      <caption>Ingestion approach per source</caption>
+      <thead><tr><th>Source</th><th>Approach</th><th>Because</th></tr></thead>
+      <tbody>
+        <tr><td>CRM (packaged)</td><td>CDC on tables</td><td>Cannot modify it</td></tr>
+        <tr><td>Billing (in-house)</td><td>Outbox</td><td>We own the code — design the contract</td></tr>
+        <tr><td>Support (SaaS)</td><td>Connect source, polling API</td><td>No database access at all</td></tr>
+        <tr><td>Web analytics</td><td>Direct produce</td><td>Already event-shaped</td></tr>
+        <tr><td>Loyalty (in-house)</td><td>Outbox</td><td>As billing</td></tr>
+        <tr><td>Marketing (SaaS)</td><td>Connect source</td><td>As support</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn" data-anchor="c24-call1">
+      <p class="callout-t">Contain the CDC topics</p>
+      <p>CDC topics publish table shapes, so they are coupled to a schema the CRM
+      vendor changes at their convenience (Chapter 17). Treat them as
+      <b>internal to the data platform team</b> — an <code>internal.cdc.*</code>
+      prefix, not consumed by anyone outside. The platform team transforms them
+      into real domain contracts. Skipping that step exports the vendor's schema
+      to the whole company.</p>
+    </div>
+
+    <h2 data-anchor="c24-h2-state">Compacted state topics</h2>
+    <p data-anchor="c24-p4">The curated layer is a set of compacted topics keyed by
+    canonical entity id:</p>
+    <ul data-anchor="c24-ul1">
+      <li><code>customer.profile.state</code> — identity, contact preferences, status</li>
+      <li><code>customer.account.state</code> — billing account, plan, standing</li>
+      <li><code>customer.consent.state</code> — marketing permissions, per channel</li>
+      <li><code>customer.pii.state</code> — restricted, name and contact details</li>
+    </ul>
+    <p data-anchor="c24-p5">Chapter 9's three rules apply throughout: the key is the
+    canonical customer id exactly, never null, and <b>each value is a complete
+    snapshot rather than a delta</b>. A consumer reading only the latest record
+    for a key must have the whole current state, because compaction will remove
+    the intermediate records a delta depends on.</p>
+
+    <h2 data-anchor="c24-h2-pii">The PII split</h2>
+    <p data-anchor="c24-p6">Note that fourth topic. Because the topic is the unit of
+    authorization (Chapter 19), splitting personal data onto its own restricted
+    topic is the only isolation that actually holds.</p>
+
+    <figure class="diagram-fig" data-anchor="c24-fig1">
+      <svg class="diagram" viewBox="0 0 560 172" role="img" aria-labelledby="c24d1t">
+        <title id="c24d1t">Non-sensitive customer state is broadly readable while personal data sits on a separate restricted topic with narrow ACLs</title>
+
+        <rect x="16" y="30" width="170" height="34" class="stroke fill-soft"/>
+        <text x="26" y="52" class="big">customer.profile.state</text>
+        <text x="200" y="52" class="dim">readable by all teams</text>
+
+        <path d="M101 64 L101 88" class="stroke"/>
+        <path d="M97 80 L101 88 L105 80" class="stroke"/>
+        <rect x="16" y="88" width="80" height="28" class="stroke fill-soft"/>
+        <text x="26" y="106" class="big">warehouse</text>
+        <rect x="106" y="88" width="80" height="28" class="stroke fill-soft"/>
+        <text x="116" y="106" class="big">search</text>
+
+        <path d="M16 132 L544 132" class="stroke-soft"/>
+
+        <rect x="16" y="140" width="170" height="28" class="stroke-red"/>
+        <text x="26" y="158" class="big red">customer.pii.state</text>
+        <text x="200" y="158" class="red">3 named consumers · crypto-shredded</text>
+      </svg>
+      <figcaption><b>Same key on both topics.</b> The two consumers that need
+      both join them; everyone else never receives personal data at
+      all.</figcaption>
+    </figure>
+
+    <p data-anchor="c24-p7">Both topics are keyed by customer id, so a consumer with
+    both grants can join them. Personal fields on the restricted topic are
+    encrypted per customer (Chapter 22), which makes erasure a key destruction
+    rather than an impossible delete. The warehouse and search sinks read only
+    the non-restricted topics, so the obligation never propagates to them.</p>
+
+    <h2 data-anchor="c24-h2-identity">Identity resolution</h2>
+    <p data-anchor="c24-p8">The genuinely hard part, and it is a data problem rather
+    than a Kafka problem. Six systems have six identifiers for the same person,
+    and none is authoritative.</p>
+    <p data-anchor="c24-p9">The workable structure is a separate compacted topic,
+    <code>customer.identity.map</code>, keyed by source-system identifier with the
+    canonical id as the value. Enrichment jobs consume it as a KTable and use it
+    to translate incoming records onto the canonical key.</p>
+    <p data-anchor="c24-p10">Keep resolution logic <em>out</em> of the enrichment jobs
+    and in a dedicated service that publishes to the map. Matching rules change
+    constantly — new heuristics, manual merges, corrections — and you want those
+    changes in one place with its own history, not spread across every pipeline
+    that happens to need a customer id.</p>
+
+    <h2 data-anchor="c24-h2-enrich">Enrichment with Streams</h2>
+    <p data-anchor="c24-p11">A Kafka Streams job (Chapter 16) builds the curated
+    state from the raw sources. Two design notes that matter:</p>
+    <p data-anchor="c24-p12"><b>Re-keying costs a repartition topic.</b> Incoming CDC
+    records are keyed by the source system's primary key, and the curated topics
+    are keyed by canonical customer id. That re-key inserts a repartition topic
+    per source (Chapter 16) — six extra topics, sized like the sources
+    themselves. Count them in capacity planning (Chapter 21).</p>
+    <p data-anchor="c24-p13"><b>KTable-KTable joins for state.</b> Joining profile
+    state with account state is a non-windowed inner equi-join on the primary key,
+    producing an ever-updating KTable. That is the right operation here — no
+    windowing, because state has no notion of "recently."</p>
+
+    <h2 data-anchor="c24-h2-sinks">Sinks</h2>
+    <p data-anchor="c24-p14">All four sinks are Connect (Chapter 17), each with
+    <code>errors.tolerance=all</code> and its own dead-letter topic:</p>
+    <ul data-anchor="c24-ul2">
+      <li><b>Warehouse</b> — the analytical copy. Reads curated non-PII topics only.</li>
+      <li><b>Lakehouse</b> — raw and curated, for data science.</li>
+      <li><b>Search</b> — a subset for customer lookup in support tooling.</li>
+      <li><b>CRM</b> — enriched attributes written back. The loop-risk sink.</li>
+    </ul>
+
+    <div class="callout warn" data-anchor="c24-call2">
+      <p class="callout-t">The feedback loop</p>
+      <p>The CRM is both a source (via CDC) and a sink. Writing an enriched
+      attribute back produces a CDC event, which re-enters the pipeline, which
+      may write again. Mark platform-originated writes so the CDC source filters
+      them out — an SMT is exactly the right tool — and verify it, because this
+      loop is silent until it is a storage incident.</p>
+    </div>
+
+    <h2 data-anchor="c24-h2-limits">Where Avro compatibility stops helping</h2>
+    <p data-anchor="c24-p15">The honest limitation of this whole book's approach, and
+    it shows up most sharply here.</p>
+    <p data-anchor="c24-p16">Avro guarantees a consumer can still <em>read</em> the
+    data. It says nothing about whether the data still <em>means</em> the same
+    thing. If the CRM team redefines "active customer" from "logged in within 90
+    days" to "purchased within 12 months," every schema check passes. The field is
+    the same type with the same name. Every downstream metric changes, and nothing
+    in the tooling notices.</p>
+
+    <p class="pen-note" data-anchor="c24-pen">Structural compatibility is
+    automatable; semantic compatibility is not. The controls are human — the
+    <code>doc</code> field carrying the definition (Chapter 10), review by someone
+    who understands the domain (Chapter 13), and treating a semantic change as a
+    new field or a new event rather than a redefinition (Chapter 12).</p>
+
+    <h2 data-anchor="c24-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c24-p17">A platform where new consumers bootstrap from compacted
+    topics without touching source systems, where personal data is isolated
+    behind an enforceable boundary, and where the sources you cannot change are
+    contained rather than exported.</p>
+    <p data-anchor="c24-p18">And a clear statement of what the machinery does not
+    cover. Which is a good place to be standing when the next chapter goes
+    wrong.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="23-case-study-order-to-cash.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="25-case-study-incident-walkthrough.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

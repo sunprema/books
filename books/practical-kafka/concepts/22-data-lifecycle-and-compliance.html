@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Data Lifecycle and Compliance — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part V · Operating Kafka in an Enterprise</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c22-no">Chapter 22</p>
+    <h1 data-anchor="c22-h1">Data Lifecycle and Compliance</h1>
+
+    <p class="standfirst" data-anchor="c22-stand">An append-only log and a right to
+    erasure are in genuine tension. Pretending otherwise — usually by assuming
+    compaction is a delete button — is how teams end up with an obligation they
+    cannot meet.</p>
+
+    <h2 data-anchor="c22-h2-tension">The core problem</h2>
+    <p data-anchor="c22-p1">Kafka's value comes from immutability. Records are
+    appended, never modified; consumers replay history; the log is the record of
+    what happened. Regulations frequently require that specific data about a
+    specific person be deleted on request, within a deadline.</p>
+    <p data-anchor="c22-p2">You cannot delete one record from the middle of a Kafka
+    partition. There is no API for it, and the architecture is built around there
+    not being one. So the question is not "how do I delete a record" but "how do
+    I design so that I never need to."</p>
+
+    <h2 data-anchor="c22-h2-notdelete">Why compaction is not the answer</h2>
+    <p data-anchor="c22-p3">The intuitive move is: compacted topic, write a tombstone,
+    the record disappears. Chapter 9 explained why this does not hold up as a
+    compliance mechanism. Restated in compliance terms:</p>
+    <ul data-anchor="c22-ul1">
+      <li><b>Compaction only touches closed segments.</b> Data in the active
+      segment is not cleaned at all, and there is no bound on when the segment
+      rolls on a low-traffic topic.</li>
+      <li><b>Cleaning is threshold-driven.</b>
+      <code>min.cleanable.dirty.ratio</code> means a partition may sit
+      uncleaned indefinitely if it is not dirty enough.</li>
+      <li><b>Timing is non-deterministic.</b> Compaction does not guarantee one
+      record per key at any moment; several versions and a tombstone can coexist.</li>
+      <li><b>It only removes superseded values for the same key.</b> If personal
+      data appears in the <em>value</em> of an event keyed by order id, no
+      tombstone for that person exists to write.</li>
+    </ul>
+
+    <div class="callout warn" data-anchor="c22-call1">
+      <p class="callout-t">State this plainly to your compliance team</p>
+      <p>Compaction is a storage optimisation with no deletion deadline. It
+      cannot be relied on to remove an individual record by a specific date. If
+      you have told an auditor otherwise, correct it before it is tested.</p>
+    </div>
+
+    <h2 data-anchor="c22-h2-strategies">Four strategies that do work</h2>
+
+    <p data-anchor="c22-p4"><b>1. Do not publish it.</b> The cheapest erasure is data
+    you never wrote. Publish a customer id, and let consumers that genuinely need
+    the name look it up from a system that supports deletion. Chapter 10's data
+    minimisation, restated as a compliance control. This handles more cases than
+    teams expect once they audit what consumers actually use.</p>
+
+    <p data-anchor="c22-p5"><b>2. Tokenise at the source.</b> The event carries a
+    token; the mapping from token to personal data lives in a system that supports
+    deletion. Erasure means deleting the mapping. The events remain, intact and
+    replayable, and are now permanently meaningless with respect to that person.</p>
+
+    <p data-anchor="c22-p6"><b>3. Crypto-shredding.</b> Encrypt sensitive fields with a
+    per-subject key (Chapter 19). Erasure means destroying the key. The ciphertext
+    remains in the log and is unrecoverable. This is the strongest option when the
+    data genuinely must travel in the event, and it is more operationally
+    demanding: you now run a key management system whose availability gates
+    consumption, and whose key destruction must be as auditable as the deletion
+    it implements.</p>
+
+    <p data-anchor="c22-p7"><b>4. Short retention on sensitive topics.</b> If personal
+    data must be in the payload and encryption is impractical, bound its lifetime.
+    A 30-day retention means the erasure deadline is met by the passage of time —
+    provided your deadline is longer than your retention, which is a calculation
+    worth doing explicitly rather than assuming.</p>
+
+    <figure class="diagram-fig" data-anchor="c22-fig1">
+      <svg class="diagram" viewBox="0 0 560 160" role="img" aria-labelledby="c22d1t">
+        <title id="c22d1t">Four erasure strategies ordered by cost: do not publish, tokenise, encrypt per subject, or bound retention</title>
+
+        <rect x="16" y="26" width="250" height="30" class="stroke fill-soft"/>
+        <text x="26" y="46" class="big">1 · never publish it</text>
+        <text x="280" y="46" class="dim">nothing to erase</text>
+
+        <rect x="16" y="62" width="250" height="30" class="stroke fill-soft"/>
+        <text x="26" y="82" class="big">2 · tokenise at source</text>
+        <text x="280" y="82" class="dim">delete the mapping</text>
+
+        <rect x="16" y="98" width="250" height="30" class="stroke-red"/>
+        <text x="26" y="118" class="big red">3 · crypto-shred</text>
+        <text x="280" y="118" class="red">destroy the key</text>
+
+        <rect x="16" y="134" width="250" height="22" class="stroke fill-soft"/>
+        <text x="26" y="150" class="big">4 · short retention</text>
+        <text x="280" y="150" class="dim">time does it for you</text>
+      </svg>
+      <figcaption><b>Prefer the top of the list.</b> Crypto-shredding is the
+      most capable and the most operationally expensive.</figcaption>
+    </figure>
+
+    <h2 data-anchor="c22-h2-isolation">Topic isolation for regulated data</h2>
+    <p data-anchor="c22-p8">Because the topic is the unit of authorization
+    (Chapter 19), regulated data on its own topic is the only isolation that is
+    actually enforceable. It also makes every other control tractable: retention
+    can be set for that topic alone, ACLs are narrow enough to serve as an access
+    record, and a compliance audit has a bounded surface to examine rather than
+    "somewhere in these 400 topics."</p>
+    <p data-anchor="c22-p9">The design pattern: publish the non-sensitive event
+    broadly, and the sensitive fields to a separate restricted topic keyed the
+    same way. Consumers that need both join them; most consumers need only the
+    first, and never receive the sensitive data at all.</p>
+
+    <h2 data-anchor="c22-h2-downstream">The obligation propagates</h2>
+    <p data-anchor="c22-p10">This is the part that turns a deletion request into a
+    project. Every consumer that read the data may have copied it — into a
+    warehouse, a search index, a cache, a materialized view, a partner system.
+    Deleting from Kafka, even if you could, does not delete any of those.</p>
+    <p data-anchor="c22-p11">Which means erasure needs a propagation mechanism, and
+    it is a design decision, not an operational one:</p>
+    <ul data-anchor="c22-ul2">
+      <li><b>Publish erasure as an event.</b> A <code>SubjectErased</code> event
+      that every consumer handles, deleting its own copy. Auditable, and it puts
+      the obligation where the data actually is.</li>
+      <li><b>Maintain a consumer inventory</b> (Chapter 13) so you can answer
+      "who has this data" at all. Without it, erasure is guesswork.</li>
+      <li><b>Make erasure handling a condition of consuming</b> a regulated topic.
+      Grant the ACL to consumers that implement the handler.</li>
+    </ul>
+
+    <h2 data-anchor="c22-h2-replay">Replay, lineage, and legal hold</h2>
+    <p data-anchor="c22-p12">Three lifecycle interactions that catch people out:</p>
+    <p data-anchor="c22-p13"><b>Replay can resurrect deleted data.</b> If you erased a
+    downstream copy but the source event still carries the data, replaying it
+    restores what you deleted. This is why erasure must happen at the source —
+    key destruction, token deletion — rather than only downstream.</p>
+    <p data-anchor="c22-p14"><b>Lineage is a real requirement</b> and Kafka gives you
+    an unusually good starting point: the event log <em>is</em> lineage, provided
+    events carry causation ids (Chapter 1). "Why does this record say this?"
+    is answerable by replaying the chain.</p>
+    <p data-anchor="c22-p15"><b>Legal hold conflicts with retention.</b> A hold
+    requires preserving data that your retention policy is about to delete. Kafka
+    has no per-record hold mechanism, so in practice this means copying the
+    relevant data to a held store — which is another copy, with its own
+    obligations. Plan the mechanism before you are served with a hold.</p>
+
+    <h2 data-anchor="c22-h2-checklist">A regulated-topic checklist</h2>
+    <ul class="checklist" data-anchor="c22-ul3">
+      <li>Is the sensitive data necessary in the event, or can consumers look it up?</li>
+      <li>Is it on its own topic, with narrow ACLs?</li>
+      <li>Is the erasure mechanism decided — tokenisation, crypto-shredding, or retention?</li>
+      <li>Is retention shorter than the erasure deadline?</li>
+      <li>Is there an inventory of consumers, and does each handle erasure?</li>
+      <li>Is there an erasure event, and is handling it a condition of access?</li>
+      <li>Does replay re-expose anything that was erased?</li>
+      <li>Is the classification recorded in the schema (Chapter 10)?</li>
+      <li>Is there a legal-hold procedure that does not depend on Kafka retention?</li>
+    </ul>
+
+    <h2 data-anchor="c22-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c22-p16">An honest position. Kafka cannot delete individual
+    records, and no configuration changes that. What you can do is design so the
+    log never holds anything that must be individually deleted — through
+    minimisation, tokenisation, or encryption — and make erasure a first-class
+    event that propagates to everyone who copied the data.</p>
+    <p data-anchor="c22-p17">That closes Part V. Part VI puts the whole book to work
+    on three systems, including one that breaks.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="21-capacity-and-cost-engineering.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="23-case-study-order-to-cash.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

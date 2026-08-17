@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Schema Registry Model — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part I · The Event Contract Mindset</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c4-no">Chapter 04</p>
+    <h1 data-anchor="c4-h1">The Schema Registry Model</h1>
+
+    <p class="standfirst" data-anchor="c4-stand">Five bytes at the front of every
+    record turn Avro from a serialization library into the place where your
+    organisation's compatibility policy actually lives.</p>
+
+    <h2 data-anchor="c4-h2-wire">The wire format</h2>
+    <p data-anchor="c4-p1">A Kafka record serialized for the Confluent Schema
+    Registry is not raw Avro. It is prefixed:</p>
+
+    <figure class="diagram-fig" data-anchor="c4-fig1">
+      <svg class="diagram" viewBox="0 0 560 116" role="img" aria-labelledby="c4d1t">
+        <title id="c4d1t">The Confluent wire format: one magic byte, a four-byte schema id, then the Avro binary payload</title>
+
+        <rect x="16" y="34" width="70" height="42" class="stroke fill-soft"/>
+        <text x="26" y="60" class="mono big">0x00</text>
+        <text x="16" y="26">byte 0</text>
+        <text x="16" y="94" class="dim">magic</text>
+
+        <rect x="94" y="34" width="150" height="42" class="stroke-red"/>
+        <text x="104" y="60" class="mono big red">schema id</text>
+        <text x="94" y="26">bytes 1&ndash;4</text>
+        <text x="94" y="94" class="red">big-endian int32</text>
+
+        <rect x="252" y="34" width="292" height="42" class="stroke fill-soft"/>
+        <text x="262" y="60" class="mono big">Avro binary payload</text>
+        <text x="252" y="26">bytes 5+</text>
+        <text x="252" y="94" class="dim">positional · no field names</text>
+      </svg>
+      <figcaption><b>Five bytes of indirection.</b> The payload carries no
+      schema; the id says which one to fetch.</figcaption>
+    </figure>
+
+    <p data-anchor="c4-p2">Byte 0 is a magic byte, <code>0x00</code>. Bytes 1&ndash;4
+    are the schema id as a big-endian 32-bit integer. Everything after is the
+    Avro binary payload. When a consumer deserializes, it reads the id, fetches
+    that exact schema from the registry (usually from its local cache), and uses
+    it as the <b>writer's schema</b> for resolution against its own reader
+    schema.</p>
+
+    <div class="callout warn" data-anchor="c4-call1">
+      <p class="callout-t">Debugging note</p>
+      <p>If you ever see a deserializer complain about an "unknown magic byte,"
+      something wrote to the topic without the registry serializer — a
+      console producer, a test harness, or a service using plain Avro. The
+      record is unreadable by every registry-aware consumer on that topic, and
+      it will sit there poisoning the partition until you skip past it
+      (Chapter 25).</p>
+    </div>
+
+    <h2 data-anchor="c4-h2-subjects">Subjects: the unit of policy</h2>
+    <p data-anchor="c4-p3">Schemas are registered under a <b>subject</b>. A subject
+    accumulates versions, and — this is the important part — the compatibility
+    policy is enforced <em>per subject</em>, at registration time. When a
+    producer starts up and registers a schema, the registry checks the new
+    schema against the subject's existing versions under whatever policy that
+    subject carries. If the check fails, registration fails, and the producer
+    does not start.</p>
+    <p data-anchor="c4-p4">So the subject is the blast radius of a compatibility
+    decision, and how subjects are named determines what that blast radius
+    is.</p>
+
+    <h2 data-anchor="c4-h2-naming">Subject naming strategies</h2>
+    <p data-anchor="c4-p5">There are three, and choosing between them is a genuine
+    architectural decision that gets made by accident far too often.</p>
+
+    <table data-anchor="c4-tbl1">
+      <caption>Subject naming strategies and their operational meaning</caption>
+      <thead>
+        <tr><th>Strategy</th><th>Subject name</th><th>What it lets you do</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>TopicNameStrategy</b><br><span class="part-label">default</span></td>
+          <td><code>&lt;topic&gt;-value</code></td>
+          <td>One schema per topic. Simple, and the compatibility check is
+          scoped exactly to the topic — which is usually what you want.</td>
+        </tr>
+        <tr>
+          <td><b>RecordNameStrategy</b></td>
+          <td>Avro record fullname</td>
+          <td>Several record types in one topic. No intra-topic check at all;
+          instead the same record name is checked across every topic it
+          appears in.</td>
+        </tr>
+        <tr>
+          <td><b>TopicRecordNameStrategy</b></td>
+          <td><code>&lt;topic&gt;-&lt;fullname&gt;</code></td>
+          <td>Several record types in one topic, each evolving independently
+          per topic.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c4-p6">The default, <code>TopicNameStrategy</code>, implicitly
+    requires that all messages in a topic conform to the same schema — otherwise
+    a new record type would break the topic's compatibility checks. That
+    constraint is a feature: it is what makes "this topic means this thing"
+    enforceable.</p>
+    <p data-anchor="c4-p7">Reach for <code>RecordNameStrategy</code> when you
+    genuinely need heterogeneous events in one topic to preserve ordering across
+    types — for example, <code>OrderPlaced</code>, <code>OrderShipped</code> and
+    <code>OrderCancelled</code> on one <code>orders</code> topic keyed by order
+    id, so an order's whole lifecycle stays ordered. That is a legitimate and
+    common design. Understand what you gave up: there is now no compatibility
+    check tying the topic together, and the check that <em>does</em> run spans
+    every topic carrying that record name.</p>
+
+    <p class="pen-note" data-anchor="c4-pen"><code>TopicRecordNameStrategy</code> is
+    the middle road and the one people forget exists: heterogeneous topics,
+    but each record type's evolution scoped to one topic rather than the whole
+    cluster.</p>
+
+    <h2 data-anchor="c4-h2-references">Schema references</h2>
+    <p data-anchor="c4-p8">A schema can cite another by reference — a reference name
+    plus a subject and version. This is how you share a common envelope, a
+    <code>Money</code> type, or an <code>Address</code> across many events
+    without copy-pasting the definition into thirty schemas and watching them
+    drift.</p>
+    <p data-anchor="c4-p9">It also creates a dependency graph, which is a governance
+    obligation: evolving a widely-referenced type affects every schema that
+    references it. Shared types deserve stricter compatibility policy than
+    leaf event schemas, for the same reason a shared library deserves more
+    careful versioning than an application.</p>
+
+    <h2 data-anchor="c4-h2-caching">Lookup, caching, and what happens when it is down</h2>
+    <p data-anchor="c4-p10">Producers register (or look up) their schema once and
+    cache the id. Consumers fetch a schema by id on first sight and cache it.
+    Steady-state traffic therefore does not touch the registry at all, which is
+    why registry latency rarely shows up in benchmarks — and why registry
+    availability gets underestimated.</p>
+    <p data-anchor="c4-p11">The failure mode that matters is a <b>cold client</b>. A
+    consumer that restarts with an empty cache, or meets a schema id it has never
+    seen, must reach the registry to deserialize anything. If the registry is
+    unavailable at that moment, the consumer cannot make progress — not because
+    Kafka is down, but because it cannot interpret the bytes. Plan registry
+    availability against your deployment pattern: a rolling restart during a
+    registry outage is how a "non-critical" component takes down consumption.</p>
+
+    <div class="callout key" data-anchor="c4-call2">
+      <p class="callout-t">Design consequence</p>
+      <p>Treat the Schema Registry as tier-1 infrastructure on the same footing
+      as the brokers. Replicate it, back up its underlying storage, and rehearse
+      its disaster recovery — including the case where schema ids must be
+      preserved, because every retained record on every topic references them by
+      number.</p>
+    </div>
+
+    <h2 data-anchor="c4-h2-authz">Authorization is where policy becomes real</h2>
+    <p data-anchor="c4-p12">Two permissions matter and they are separate: who may
+    <em>read</em> a subject (needed by every consumer) and who may
+    <em>register or evolve</em> one. If every producer principal can evolve any
+    subject, your compatibility policy protects you only from accidents, not
+    from a team in a hurry.</p>
+    <p data-anchor="c4-p13">There is also a broker-side control worth knowing about:
+    schema validation can be enabled so brokers reject records whose schema id
+    is not registered for the topic. That moves the check off the client's
+    honour system — a client with a hand-rolled serializer can no longer put
+    unreadable bytes into a governed topic. Chapter 13 makes this part of a
+    governance design.</p>
+
+    <h2 data-anchor="c4-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c4-p14">The five-byte prefix is a small mechanism with a large
+    organisational consequence. Because every record points at a registered
+    schema, and because registration is gated by a per-subject policy, the
+    registry becomes the single place where "you may not break your consumers"
+    is expressed as code rather than as a meeting.</p>
+    <p data-anchor="c4-p15">That is the end of Part I. You now have the contract
+    vocabulary. Part II turns to the internals — but with a specific agenda:
+    every mechanism we look at exists in this book because it constrains a
+    contract decision.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="03-avro-as-a-contract-system.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-producer-send-path.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

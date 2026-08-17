@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Request/Reply, Work Queues, and Anti-Patterns — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part IV · Enterprise Integration Patterns</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c18-no">Chapter 18</p>
+    <h1 data-anchor="c18-h1">Request/Reply, Work Queues, and Anti-Patterns</h1>
+
+    <p class="standfirst" data-anchor="c18-stand">Kafka is very good at a specific
+    shape of problem. This chapter is about the shapes it is not good at, and how
+    to recognise one before it becomes your architecture.</p>
+
+    <h2 data-anchor="c18-h2-async">Asynchronous commands: when it works</h2>
+    <p data-anchor="c18-p1">Kafka is a reasonable transport for commands and
+    long-running workflows, despite the contract advice in Chapter 1 being written
+    for facts. It works when:</p>
+    <ul data-anchor="c18-ul1">
+      <li>The work is genuinely asynchronous — the caller does not block.</li>
+      <li>Ordering per entity matters, and the natural key gives it to you.</li>
+      <li>Durability matters: the command must survive a consumer restart.</li>
+      <li>The rate is high enough that Kafka's throughput is the point.</li>
+    </ul>
+    <p data-anchor="c18-p2">A document-processing pipeline, a batch of notifications
+    to render, a workflow moving through stages — these fit. Keep the command
+    topic separate from your event topics, keep its schema owned by the consuming
+    service (it is <em>their</em> interface, unlike a fact), and give it a
+    tighter retention: an unprocessed command from three weeks ago is usually not
+    something you want executed.</p>
+
+    <h2 data-anchor="c18-h2-reqrep">Request/reply: mostly a mistake</h2>
+    <p data-anchor="c18-p3">The pattern: send a request to a topic with a correlation
+    id and a reply-to topic, then block waiting for a response to appear. It can
+    be made to work and it is usually the wrong tool.</p>
+
+    <figure class="diagram-fig" data-anchor="c18-fig1">
+      <svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="c18d1t">
+        <title id="c18d1t">Synchronous request/reply over Kafka adds two topics, a correlation id, and rebalance latency to what an HTTP call does directly</title>
+
+        <text x="16" y="18">Over Kafka</text>
+        <rect x="16" y="28" width="90" height="30" class="stroke fill-soft"/>
+        <text x="26" y="48" class="big">caller</text>
+        <path d="M106 43 L156 43" class="stroke"/>
+        <path d="M148 39 L156 43 L148 47" class="stroke"/>
+        <rect x="156" y="28" width="90" height="30" class="stroke fill-soft"/>
+        <text x="166" y="48" class="big">requests</text>
+        <path d="M246 43 L296 43" class="stroke"/>
+        <path d="M288 39 L296 43 L288 47" class="stroke"/>
+        <rect x="296" y="28" width="90" height="30" class="stroke fill-soft"/>
+        <text x="306" y="48" class="big">service</text>
+        <path d="M386 43 L436 43" class="stroke"/>
+        <path d="M428 39 L436 43 L428 47" class="stroke"/>
+        <rect x="436" y="28" width="90" height="30" class="stroke fill-soft"/>
+        <text x="446" y="48" class="big">replies</text>
+        <path d="M481 58 L481 76 L61 76 L61 58" class="stroke-red dash"/>
+        <text x="200" y="92" class="red">caller blocks, correlating by id</text>
+
+        <path d="M16 110 L544 110" class="stroke-soft"/>
+
+        <text x="16" y="134">Over HTTP</text>
+        <rect x="16" y="140" width="90" height="26" class="stroke fill-soft"/>
+        <text x="26" y="158" class="big">caller</text>
+        <path d="M106 153 L296 153" class="stroke"/>
+        <path d="M288 149 L296 153 L288 157" class="stroke"/>
+        <rect x="296" y="140" width="90" height="26" class="stroke fill-soft"/>
+        <text x="306" y="158" class="big">service</text>
+        <text x="400" y="158" class="dim">done</text>
+      </svg>
+      <figcaption><b>Count the moving parts.</b> The Kafka version adds two
+      topics, a correlation scheme, and rebalance latency to get the same
+      answer.</figcaption>
+    </figure>
+
+    <p data-anchor="c18-p4">The costs are real and mostly non-obvious. The caller now
+    depends on consumer group health for a synchronous operation, so a rebalance
+    (Chapter 7) becomes latency on a user-facing request. Reply topics need
+    partitioning that routes back to the right caller instance, which is awkward
+    when instances scale. Timeouts are your problem entirely: nothing tells you
+    the request failed, only that no reply arrived. And a duplicate request
+    produces a duplicate reply, so both sides need idempotency.</p>
+    <p data-anchor="c18-p5">If the caller waits for the answer, use HTTP or gRPC.
+    Kafka's advantages — durability, replay, multiple independent consumers — are
+    all irrelevant to a request that one caller is blocking on and will abandon
+    in two seconds.</p>
+
+    <h2 data-anchor="c18-h2-queues">Work queues and share groups</h2>
+    <p data-anchor="c18-p6">The classic work-queue need is competing consumers on one
+    logical stream, scaling past the partition count, with per-message
+    acknowledgement. Chapter 2's model does not offer that: a partition goes to
+    one consumer in a group, so parallelism is capped by partitions.</p>
+    <p data-anchor="c18-p7">This is what <b>share groups</b> (KIP-932) address. They
+    add queue-like cooperative consumption over Kafka topics — roughly a durable
+    shared subscription — rather than adding a queue primitive to Kafka. Several
+    consumers in a share group can read from the same partition, with
+    per-record acknowledgement, so consumer count is no longer tied to partition
+    count.</p>
+    <p data-anchor="c18-p8">Know the maturity before you plan around it. Share groups
+    shipped as <b>early access in Kafka 4.0</b> — explicitly not for production
+    clusters — as a <b>preview in 4.1</b>, and reached <b>general availability
+    around the 4.2 timeframe</b>. Check what your cluster actually runs rather
+    than what the blog posts describe.</p>
+
+    <div class="callout key" data-anchor="c18-call1">
+      <p class="callout-t">What share groups change, and what they do not</p>
+      <p>They remove the partition-count ceiling on consumer parallelism for
+      queue-shaped work. They do not give you global ordering, priority queues,
+      or arbitrary message selection — and using them means giving up the
+      per-partition ordering that consumer groups provide. Pick per workload,
+      not per cluster.</p>
+    </div>
+
+    <h2 data-anchor="c18-h2-antipatterns">Four anti-patterns</h2>
+
+    <p data-anchor="c18-p9"><b>1. The giant shared event bus.</b> One
+    <code>enterprise.events</code> topic that every domain publishes to. It seems
+    like decoupling; it is the opposite. Compatibility policy becomes meaningless
+    (whose schema?), ownership dissolves, ACLs cannot express anything useful, and
+    every consumer filters through ninety percent of records it does not want.
+    Topics are cheap. Use one per event type or per closely-related family, owned
+    by one team.</p>
+
+    <p data-anchor="c18-p10"><b>2. Database-table mirror topics.</b> A topic per
+    table, with no domain meaning, published by CDC because it was easy
+    (Chapter 14). Consumers end up reimplementing your business logic from your
+    schema, and every migration you make is a breaking change for them. If you
+    must mirror tables, treat those topics as internal to the owning team and
+    publish real domain events from them.</p>
+
+    <p data-anchor="c18-p11"><b>3. Kafka as a database.</b> Infinite retention plus
+    "we can always replay" is not a query layer. There is no index, no random
+    access, no query language — reading a specific record means scanning. Build a
+    materialized view (Chapter 15) and query that. Kafka is the log of record;
+    it is not the read model.</p>
+
+    <p data-anchor="c18-p12"><b>4. Kafka as an RPC transport.</b> Covered above, but
+    it is worth naming as its own anti-pattern because it arrives with a
+    plausible justification: "everything goes through Kafka, so we have one
+    integration mechanism." A single mechanism that is wrong for half the cases
+    is not simplicity.</p>
+
+    <h2 data-anchor="c18-h2-fit">When Kafka is a poor fit, full stop</h2>
+    <table data-anchor="c18-tbl1">
+      <caption>Requirements Kafka does not serve well</caption>
+      <thead><tr><th>You need</th><th>Why Kafka struggles</th><th>Consider</th></tr></thead>
+      <tbody>
+        <tr><td>Global ordering</td><td>Ordering is per partition; one partition means no scale</td><td>Rethink the requirement, or a single-writer design</td></tr>
+        <tr><td>Arbitrary queries</td><td>No index, no random access</td><td>A database fed by Kafka</td></tr>
+        <tr><td>Low-latency RPC</td><td>Adds broker hops and rebalance risk</td><td>HTTP / gRPC</td></tr>
+        <tr><td>Per-message priority</td><td>Strictly ordered log, no reordering</td><td>Separate topics per priority</td></tr>
+        <tr><td>Selective consumption</td><td>Consumers read whole partitions</td><td>Split topics, or filter downstream</td></tr>
+        <tr><td>Individual record deletion</td><td>Immutable log; compaction is best-effort</td><td>Topic isolation, crypto-shredding (Ch 22)</td></tr>
+      </tbody>
+    </table>
+
+    <p class="pen-note" data-anchor="c18-pen">The "global ordering" row deserves a
+    second look whenever it comes up. Genuine global ordering requirements are
+    rare; usually what is needed is ordering per entity, which Kafka gives you
+    for the price of choosing the right key.</p>
+
+    <h2 data-anchor="c18-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c18-p13">A clearer boundary. Kafka is excellent at durable,
+    ordered-per-key, replayable, multi-consumer streams of facts. It is mediocre
+    at request/reply, at queues (improving), and at being a database. Knowing that
+    is what keeps an event platform from slowly absorbing every integration
+    problem in the organisation and doing several of them badly.</p>
+    <p data-anchor="c18-p14">Part V turns to operating all of this.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="17-kafka-connect.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="19-security-and-multi-tenancy.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

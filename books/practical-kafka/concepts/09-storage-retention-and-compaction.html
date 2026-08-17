@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Storage, Retention, and Compaction — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part II · Internals That Shape Design</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c9-no">Chapter 09</p>
+    <h1 data-anchor="c9-h1">Storage, Retention, and Compaction</h1>
+
+    <p class="standfirst" data-anchor="c9-stand">Compaction is not deletion, is not
+    immediate, and does not guarantee one record per key. Three facts that
+    together explain a great many production surprises.</p>
+
+    <h2 data-anchor="c9-h2-segments">Segments: how a partition is stored</h2>
+    <p data-anchor="c9-p1">A partition is not one enormous file. It is a sequence of
+    <b>segments</b>, each a log file with accompanying index files. Exactly one
+    segment is <b>active</b> — the one currently being appended to. When it
+    reaches a size or age limit, it is closed and a new active segment is
+    rolled.</p>
+    <p data-anchor="c9-p2">This structure explains almost every retention behaviour
+    that looks wrong at first. Deletion works on whole segments, not individual
+    records; compaction works only on <em>closed</em> segments. So the newest
+    data is never cleaned, and "retention is 1 hour" does not mean a record is
+    gone 60 minutes after it was written — it means the segment containing it
+    becomes eligible for deletion once its records are all older than that, and
+    the segment must have been closed first.</p>
+
+    <figure class="diagram-fig" data-anchor="c9-fig1">
+      <svg class="diagram" viewBox="0 0 560 130" role="img" aria-labelledby="c9d1t">
+        <title id="c9d1t">A partition is a series of closed segments plus one active segment; only closed segments are eligible for cleaning</title>
+
+        <rect x="16" y="34" width="110" height="40" class="stroke-soft"/>
+        <text x="26" y="58" class="mono big dim">seg 0</text>
+        <rect x="134" y="34" width="110" height="40" class="stroke fill-soft"/>
+        <text x="144" y="58" class="mono big">seg 1</text>
+        <rect x="252" y="34" width="110" height="40" class="stroke fill-soft"/>
+        <text x="262" y="58" class="mono big">seg 2</text>
+        <rect x="370" y="34" width="174" height="40" class="stroke-red"/>
+        <text x="380" y="58" class="mono big red">active segment</text>
+
+        <text x="16" y="26" class="dim">deleted</text>
+        <text x="134" y="26">closed — cleanable</text>
+        <text x="370" y="26" class="red">never cleaned</text>
+
+        <path d="M134 92 L362 92" class="stroke"/>
+        <path d="M142 88 L134 92 L142 96" class="stroke"/>
+        <path d="M354 88 L362 92 L354 96" class="stroke"/>
+        <text x="134" y="112">the cleaner only ever works in here</text>
+      </svg>
+      <figcaption><b>The active segment is untouchable.</b> Any expectation of
+      prompt cleaning has to account for segment rolling first.</figcaption>
+    </figure>
+
+    <h2 data-anchor="c9-h2-delete">Retention by deletion</h2>
+    <p data-anchor="c9-p3">The default policy. <code>retention.ms</code> and
+    <code>retention.bytes</code> set how long, or how much, to keep; whichever
+    limit is hit first triggers deletion of the oldest segments. Setting either
+    to <code>-1</code> means unlimited.</p>
+    <p data-anchor="c9-p4">The design question is not "how long do we keep data" but
+    <b>"how far back must a consumer be able to start?"</b> Retention is your
+    replay window, and it is bounded by three separate requirements that rarely
+    agree:</p>
+    <ul data-anchor="c9-ul1">
+      <li><b>Recovery</b> — a consumer that has been broken over a long weekend
+      must still be able to catch up rather than skip.</li>
+      <li><b>Bootstrap</b> — a brand-new consumer that needs history to build its
+      initial state (Chapter 24).</li>
+      <li><b>Compliance</b> — a maximum, not a minimum. Sometimes the binding
+      constraint is how long you are <em>allowed</em> to keep data (Chapter 22).</li>
+    </ul>
+
+    <h2 data-anchor="c9-h2-compact">Compaction: a changelog, not a history</h2>
+    <p data-anchor="c9-p5">With <code>cleanup.policy=compact</code>, the log cleaner
+    retains at least the latest value for each key and discards older records for
+    that key. The topic stops being "everything that happened" and becomes
+    "the current value of every key" — a changelog.</p>
+    <p data-anchor="c9-p6">This is what makes a compacted topic a bootstrap
+    mechanism. A new consumer reads from offset zero and ends up with current
+    state for every key, without needing a separate snapshot API. It is how
+    Kafka Streams state stores are backed up (Chapter 16), and it is the right
+    shape for customer profiles, account state, feature flags, and reference
+    data.</p>
+
+    <h2 data-anchor="c9-h2-tombstones">Tombstones</h2>
+    <p data-anchor="c9-p7">Deletion under compaction is expressed as a record with a
+    <b>null value</b> — a tombstone. It says "this key no longer exists." The
+    tombstone is retained for <code>delete.retention.ms</code> and is then
+    removed along with the key's older values.</p>
+    <p data-anchor="c9-p8">The retention window for tombstones exists for a specific
+    reason: a consumer must have a chance to <em>see</em> the deletion. If
+    tombstones were removed instantly, a consumer that was offline during the
+    delete would rebuild its state from the compacted log, never see the
+    tombstone, and keep the deleted key forever. The window is how long you are
+    guaranteeing a rebuild will still observe deletions.</p>
+
+    <div class="callout warn" data-anchor="c9-call1">
+      <p class="callout-t">Consequence</p>
+      <p>A consumer offline for longer than <code>delete.retention.ms</code>
+      cannot safely rebuild state incrementally — it may resurrect deleted keys.
+      Either keep the window comfortably longer than your worst realistic
+      outage, or rebuild from scratch after a long absence.</p>
+    </div>
+
+    <h2 data-anchor="c9-h2-nondeterministic">Compaction is best-effort and asynchronous</h2>
+    <p data-anchor="c9-p9">This is the part that catches people, so it is worth
+    stating flatly: <b>compaction does not guarantee there is only one record
+    with a given key at any moment.</b> There may be several, including a
+    tombstone, because cleaning timing is non-deterministic.</p>
+    <p data-anchor="c9-p10">Two mechanisms drive the timing.
+    <code>min.cleanable.dirty.ratio</code> — 0.5 by default — means a partition's
+    log must be at least half "dirty" before the cleaner bothers with it. And
+    only closed segments are eligible, so <code>segment.ms</code> governs how
+    quickly records become candidates at all. A low-traffic compacted topic may
+    go a long time with duplicates sitting in it, entirely correctly.</p>
+
+    <p class="pen-note" data-anchor="c9-pen">Practical rule: consumers of compacted
+    topics must still be idempotent and must handle seeing the same key more than
+    once. Compaction is a <em>storage</em> optimisation; it is not a uniqueness
+    guarantee, and code that assumes otherwise will work in testing and fail
+    under replay.</p>
+
+    <h2 data-anchor="c9-h2-both">compact,delete — both at once</h2>
+    <p data-anchor="c9-p11">The two policies can be combined. With
+    <code>cleanup.policy=compact,delete</code> you keep the latest value per key
+    <em>and</em> time-expire older, fully-cleaned segments. This is the answer
+    for a changelog that must not grow without bound — for example, state for
+    entities that eventually go dormant, where you want current values but not a
+    permanent record of every key that ever existed.</p>
+
+    <h2 data-anchor="c9-h2-design">Designing a compacted topic</h2>
+    <p data-anchor="c9-p12">Three rules, learned the hard way:</p>
+    <ol data-anchor="c9-ol1">
+      <li><b>The key must be the entity identity, exactly.</b> Compaction
+      deduplicates by key, so the key <em>defines</em> what "the same thing"
+      means. Getting this wrong is unrecoverable without a full republish.</li>
+      <li><b>Never use a null key.</b> A record with a null key on a compacted
+      topic has no identity to compact against and is rejected outright.</li>
+      <li><b>The value must be a complete snapshot, not a delta.</b> A consumer
+      that reads only the latest record for a key must have the whole current
+      state. Deltas break the moment compaction removes the intermediate records
+      they depend on — and it will.</li>
+    </ol>
+
+    <h2 data-anchor="c9-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c9-p13">The right mental model for two very different topic
+    shapes, and — importantly for Chapter 22 — the knowledge that neither one is
+    a deletion mechanism. Compaction removes superseded values on its own
+    schedule. If a regulation requires that a specific record be gone by a
+    specific date, compaction is not the tool, and believing it is has produced
+    some genuinely uncomfortable audit conversations.</p>
+    <p data-anchor="c9-p14">That closes Part II. We now have enough mechanism to
+    return to contracts and be precise about what "compatible" must mean.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="08-transactions-and-eos.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-schema-design-principles.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kafka Streams and Stream Processing — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part IV · Enterprise Integration Patterns</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c16-no">Chapter 16</p>
+    <h1 data-anchor="c16-h1">Kafka Streams and Stream Processing</h1>
+
+    <p class="standfirst" data-anchor="c16-stand">Kafka Streams is a library that
+    turns the hard parts of Chapter 15 — state, restoration, exactly-once — into
+    configuration. In exchange it creates topics on your behalf, and you should
+    know which ones.</p>
+
+    <h2 data-anchor="c16-h2-topology">Topologies</h2>
+    <p data-anchor="c16-p1">A Streams application is a <b>topology</b>: a graph of
+    processing nodes. <b>Source</b> nodes read from topics, <b>processor</b> nodes
+    transform, <b>sink</b> nodes write back to topics. <b>State stores</b> hang
+    off processors that need memory.</p>
+    <p data-anchor="c16-p2">It is a library, not a cluster. Your application is a
+    normal process that you deploy normally; scaling means running more
+    instances, which join a consumer group and divide the partitions between them
+    exactly as in Chapter 7. There is no separate scheduler to operate, which is
+    the main reason to prefer it over a heavier processing framework when your
+    input and output are both Kafka.</p>
+
+    <h2 data-anchor="c16-h2-duality">Streams and tables</h2>
+    <p data-anchor="c16-p3">The core abstraction. A <b>KStream</b> is a sequence of
+    independent facts: every record is a new event. A <b>KTable</b> is a changelog:
+    every record is an update to the value for its key, and only the latest
+    matters.</p>
+    <p data-anchor="c16-p4">This is Chapter 9's distinction, lifted into the
+    programming model — a KTable is what a compacted topic looks like from inside
+    an application. And the two convert: aggregating a stream produces a table;
+    reading a table's changes produces a stream.</p>
+
+    <table data-anchor="c16-tbl1">
+      <caption>Same records, two interpretations</caption>
+      <thead><tr><th>Records for key <code>A</code></th><th>As a KStream</th><th>As a KTable</th></tr></thead>
+      <tbody>
+        <tr><td><code>A→1</code>, <code>A→3</code>, <code>A→7</code></td>
+            <td>Three events</td><td>One row, value 7</td></tr>
+        <tr><td>Sum</td><td>11</td><td>7</td></tr>
+        <tr><td>Then <code>A→null</code></td><td>A fourth event</td><td>Row deleted</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c16-p5">Choosing the wrong one is a correctness bug, not a
+    performance one. Reading a compacted topic as a KStream and summing gives you
+    a number that means nothing.</p>
+
+    <h2 data-anchor="c16-h2-hidden">The topics Streams creates for you</h2>
+    <p data-anchor="c16-p6">This is the part that surprises operators, so it belongs
+    early rather than in a footnote.</p>
+
+    <figure class="diagram-fig" data-anchor="c16-fig1">
+      <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="c16d1t">
+        <title id="c16d1t">A re-keying operation inserts a repartition topic, and each state store is backed by a changelog topic</title>
+
+        <rect x="16" y="26" width="96" height="34" class="stroke fill-soft"/>
+        <text x="26" y="48" class="big">source</text>
+        <path d="M112 43 L152 43" class="stroke"/>
+        <path d="M144 39 L152 43 L144 47" class="stroke"/>
+
+        <rect x="152" y="26" width="110" height="34" class="stroke fill-soft"/>
+        <text x="162" y="48" class="big">groupBy(k2)</text>
+        <path d="M262 43 L302 43" class="stroke-red"/>
+        <path d="M294 39 L302 43 L294 47" class="stroke-red"/>
+
+        <rect x="302" y="26" width="120" height="34" class="stroke-red"/>
+        <text x="312" y="48" class="big red">repartition</text>
+        <path d="M422 43 L462 43" class="stroke"/>
+        <path d="M454 39 L462 43 L454 47" class="stroke"/>
+
+        <rect x="462" y="26" width="82" height="34" class="stroke fill-soft"/>
+        <text x="472" y="48" class="big">aggregate</text>
+
+        <path d="M503 60 L503 100" class="stroke"/>
+        <path d="M499 92 L503 100 L507 92" class="stroke"/>
+        <rect x="424" y="100" width="120" height="34" class="stroke fill-soft"/>
+        <text x="434" y="122" class="big">state store</text>
+
+        <path d="M424 117 L384 117" class="stroke-red"/>
+        <path d="M392 113 L384 117 L392 121" class="stroke-red"/>
+        <rect x="264" y="100" width="120" height="34" class="stroke-red"/>
+        <text x="274" y="122" class="big red">changelog</text>
+
+        <text x="16" y="164" class="red">both accent boxes are real Kafka topics you did not create</text>
+      </svg>
+      <figcaption><b>Two hidden topics per stateful re-keyed operation.</b> They
+      consume storage, partitions and broker resources like any other.</figcaption>
+    </figure>
+
+    <p data-anchor="c16-p7"><b>Changelog topics.</b> Every state store gets one
+    automatically, logging updates so the store can be rebuilt elsewhere. They
+    are compacted, which is exactly right: restoring only needs the latest value
+    per key. This is what makes a Streams instance's state survive the loss of
+    the machine holding it — a new instance replays the changelog and
+    continues.</p>
+    <p data-anchor="c16-p8"><b>Repartition topics.</b> Any operation that changes the
+    key — a <code>groupBy</code>, or a join on a different field — inserts one, so
+    that records sharing the new key land in the same partition. Without it,
+    aggregation would be wrong: the same key's records would be spread across
+    instances that cannot see each other.</p>
+
+    <div class="callout warn" data-anchor="c16-call1">
+      <p class="callout-t">Capacity planning</p>
+      <p>A Streams application with three re-keying steps and four state stores
+      is running seven extra topics. Count them when sizing your cluster
+      (Chapter 21) — teams are routinely surprised by where their partition count
+      and disk went.</p>
+    </div>
+
+    <h2 data-anchor="c16-h2-ops">Stateless and stateful operations</h2>
+    <p data-anchor="c16-p9"><b>Stateless</b> — <code>filter</code>, <code>map</code>,
+    <code>flatMap</code>, <code>branch</code>. One record in, zero or more out, no
+    memory. Cheap, and freely reordered by the optimiser. Note that
+    <code>map</code> may change the key and therefore trigger a repartition;
+    <code>mapValues</code> promises it will not, so prefer it when you are only
+    touching the value.</p>
+    <p data-anchor="c16-p10"><b>Stateful</b> — <code>aggregate</code>,
+    <code>count</code>, <code>reduce</code>, joins, windowing, deduplication.
+    These need a state store, and therefore a changelog, and therefore a
+    restoration time when an instance starts. A large store means a slow
+    startup — which is the practical reason to keep state stores as small as the
+    problem allows.</p>
+
+    <h2 data-anchor="c16-h2-joins">Joins</h2>
+    <p data-anchor="c16-p11">Which join you get depends on what you are joining, and
+    the semantics differ substantially:</p>
+    <ul data-anchor="c16-ul1">
+      <li><b>KStream-KStream</b> — must be windowed. Two streams of events only
+      join if they arrive close enough in time, because otherwise the state would
+      grow forever.</li>
+      <li><b>KStream-KTable</b> — an enrichment lookup. Each event is joined
+      against the table's current value for its key. Not windowed, and the
+      workhorse of most pipelines: enrich an order event with the customer's
+      current tier.</li>
+      <li><b>KTable-KTable</b> — a non-windowed inner equi-join on primary key,
+      where the join attribute is <code>thisKTable.key == otherKTable.key</code>.
+      The result is an ever-updating KTable representing the current result of
+      the join.</li>
+    </ul>
+    <p data-anchor="c16-p12">All of them require <b>co-partitioning</b>: both sides
+    must have the same number of partitions and the same keying strategy, or
+    matching records land on different instances and simply never meet. Streams
+    will insert a repartition to fix this when it can, and fail at startup when
+    it cannot.</p>
+
+    <h2 data-anchor="c16-h2-time">Event time, and the grace period</h2>
+    <p data-anchor="c16-p13">Records arrive out of order — a mobile client was
+    offline, a partition was slow, a producer retried. So Streams distinguishes
+    <b>event time</b> (when the fact happened, from the record) from
+    <b>processing time</b> (when you saw it). Windowing uses event time, which is
+    the only choice that gives reproducible results on replay.</p>
+    <p data-anchor="c16-p14">The <b>grace period</b> controls how long a window waits
+    for out-of-order records. If a record arrives after the window's end plus the
+    grace period — that is, <code>record.ts &gt; window-end + grace</code> — it is
+    discarded and not processed into that window.</p>
+
+    <div class="callout key" data-anchor="c16-call2">
+      <p class="callout-t">The trade-off, stated plainly</p>
+      <p>A longer grace period means more complete results and later results, and
+      more state held open. A shorter one means faster answers that may be wrong.
+      There is no setting that gives both — decide which failure the business
+      prefers, and monitor how many records you are dropping so the decision
+      stays informed.</p>
+    </div>
+
+    <h2 data-anchor="c16-h2-eos">Exactly-once in Streams</h2>
+    <p data-anchor="c16-p15">This is where the transactions of Chapter 8 become
+    practical. Streams implements consume-transform-produce with transactional
+    offset commits internally; you turn it on with a configuration setting rather
+    than writing the loop.</p>
+    <p data-anchor="c16-p16">The improved implementation, <b>exactly-once v2</b>,
+    arrived in the 2.6.0 release and requires broker 2.5.0 or newer. It is
+    materially more efficient than the original implementation, which used one
+    producer per input partition.</p>
+    <p data-anchor="c16-p17">The same boundary from Chapter 8 still applies, and it is
+    worth repeating because the configuration flag makes it easy to forget: this
+    guarantees exactly-once <em>within Kafka</em>. A Streams application that
+    calls an external API in a processor is back to at-least-once for that call,
+    flag or no flag.</p>
+
+    <h2 data-anchor="c16-h2-queryable">Interactive queries</h2>
+    <p data-anchor="c16-p18">State stores can be queried directly from the
+    application that owns them. That turns a Streams app into a low-latency
+    read model: the aggregate is already computed and held locally, so a lookup
+    is a local read rather than a database query.</p>
+    <p data-anchor="c16-p19">The catch is that state is partitioned across instances,
+    so a query may need routing to whichever instance owns the key. Streams tells
+    you which one that is; you still have to do the routing, and handle the
+    window during a rebalance when the answer is "nobody, briefly."</p>
+
+    <h2 data-anchor="c16-h2-when">When not to use it</h2>
+    <p data-anchor="c16-p20">Streams is the right tool when input and output are both
+    Kafka and the logic is genuinely streaming. It is the wrong tool when you are
+    really doing an ETL job into a warehouse (use Connect, Chapter 17), when the
+    transformation is a single stateless map that a plain consumer would do in
+    twenty lines, or when you need to join against a large external dataset that
+    does not belong in a state store.</p>
+
+    <h2 data-anchor="c16-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c16-p21">State management, restoration, and exactly-once as
+    library features rather than application code — at the price of hidden
+    topics, restoration times, and co-partitioning constraints that are invisible
+    until they are not.</p>
+    <p data-anchor="c16-p22">Next: moving data in and out of systems that are not
+    Kafka at all, without writing an application for each one.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="15-consumer-application-patterns.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="17-kafka-connect.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

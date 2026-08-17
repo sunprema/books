@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Capacity and Cost Engineering — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part V · Operating Kafka in an Enterprise</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c21-no">Chapter 21</p>
+    <h1 data-anchor="c21-h1">Capacity and Cost Engineering</h1>
+
+    <p class="standfirst" data-anchor="c21-stand">Partition count is four decisions
+    wearing one number's clothing. Storage is a multiplication most people get
+    wrong by a factor of three.</p>
+
+    <h2 data-anchor="c21-h2-partitions">Partition count is four decisions</h2>
+    <p data-anchor="c21-p1">Every time someone types <code>--partitions N</code> they
+    are simultaneously deciding:</p>
+    <ol data-anchor="c21-ol1">
+      <li><b>Throughput</b> — partitions are the unit of write and read
+      parallelism.</li>
+      <li><b>Consumer parallelism ceiling</b> — a group can never usefully have
+      more members than partitions (Chapter 2).</li>
+      <li><b>Ordering scope</b> — more partitions means the same key set is
+      spread more finely; and repartitioning later breaks existing keys'
+      ordering.</li>
+      <li><b>Recovery time and metadata cost</b> — every partition is files on
+      disk, memory on the broker, and work during leader election. Recovery time
+      after a broker failure scales with the partitions it led.</li>
+    </ol>
+    <p data-anchor="c21-p2">Because these pull in different directions, there is no
+    formula that answers all four. What there is, is an asymmetry worth building
+    a habit around.</p>
+
+    <div class="callout key" data-anchor="c21-call1">
+      <p class="callout-t">The asymmetry that should drive your default</p>
+      <p>Adding partitions is easy. <b>Removing them is effectively impossible</b>,
+      and adding them changes key routing — so ordering for existing keys breaks
+      at that boundary. Start modest, measure, and grow deliberately. Over-partitioning
+      "to be safe" is the expensive direction of the mistake.</p>
+    </div>
+
+    <h2 data-anchor="c21-h2-sizing">Sizing that works</h2>
+    <p data-anchor="c21-p3">The approach that survives contact with production:</p>
+    <ol data-anchor="c21-ol2">
+      <li><b>Start modest</b> — single digits to low double digits for most new
+      topics.</li>
+      <li><b>Measure per-partition throughput on your actual cluster</b>, with
+      your record sizes and your consumer's real processing cost. Published
+      benchmark numbers are not your numbers.</li>
+      <li><b>Divide</b> your target peak by that measured figure.</li>
+      <li><b>Plan for one to two years of peak</b>, using the measured
+      per-partition numbers.</li>
+      <li><b>Round up to a number with good divisor properties</b> — 12 rather
+      than 11 — so partitions distribute evenly across a varying number of
+      consumers. Avoid primes.</li>
+    </ol>
+    <p data-anchor="c21-p4">Step 5 matters more than it sounds. With 12 partitions a
+    group can scale to 2, 3, 4, 6 or 12 members with perfectly even
+    distribution. With 11, every configuration except 1 and 11 is lopsided, and
+    one consumer does twice the work of another.</p>
+    <p data-anchor="c21-p5">The consumer side has its own ceiling to check: your
+    partition count must be at least the parallelism your slowest consumer group
+    needs. If processing one record takes 50 ms and you need 2,000 records per
+    second, you need 100 concurrent processors — and therefore at least 100
+    partitions, unless you parallelise by key within a partition (Chapter 15).</p>
+
+    <h2 data-anchor="c21-h2-storage">Storage: the multiplication</h2>
+    <p data-anchor="c21-p6">The formula is simple and routinely misapplied:</p>
+
+    <figure class="diagram-fig" data-anchor="c21-fig1">
+      <svg class="diagram" viewBox="0 0 560 128" role="img" aria-labelledby="c21d1t">
+        <title id="c21d1t">Stored bytes equal message size times rate times retention times replication factor, divided by the compression ratio</title>
+
+        <rect x="16" y="40" width="86" height="34" class="stroke fill-soft"/>
+        <text x="26" y="62" class="big">msg size</text>
+        <text x="110" y="62" class="big">×</text>
+
+        <rect x="128" y="40" width="70" height="34" class="stroke fill-soft"/>
+        <text x="138" y="62" class="big">rate</text>
+        <text x="206" y="62" class="big">×</text>
+
+        <rect x="224" y="40" width="96" height="34" class="stroke fill-soft"/>
+        <text x="234" y="62" class="big">retention</text>
+        <text x="328" y="62" class="big">×</text>
+
+        <rect x="346" y="40" width="60" height="34" class="stroke-red"/>
+        <text x="356" y="62" class="big red">RF</text>
+        <text x="414" y="62" class="big">÷</text>
+
+        <rect x="432" y="40" width="112" height="34" class="stroke fill-soft"/>
+        <text x="442" y="62" class="big">compression</text>
+
+        <text x="346" y="104" class="red">the term that gets forgotten</text>
+      </svg>
+      <figcaption><b>Replication factor is a multiplier on everything.</b> RF 3
+      means three copies of every byte, on three brokers' disks.</figcaption>
+    </figure>
+
+    <p data-anchor="c21-p7">A worked example, because the numbers are more persuasive
+    than the formula. 2&nbsp;KB records, 5,000 per second, 7 days retention,
+    RF&nbsp;3:</p>
+    <ul data-anchor="c21-ul1">
+      <li>Raw per day: 2&nbsp;KB × 5,000/s × 86,400&nbsp;s ≈ <b>864&nbsp;GB/day</b></li>
+      <li>Over 7 days: ≈ <b>6.0&nbsp;TB</b></li>
+      <li>× RF&nbsp;3: ≈ <b>18.1&nbsp;TB</b> of actual disk</li>
+      <li>÷ 3 for lz4 on typical structured data: ≈ <b>6.0&nbsp;TB</b></li>
+    </ul>
+    <p data-anchor="c21-p8">Then add headroom: you cannot run disks at 100%, retention
+    is enforced lazily by segment (Chapter 9), and you want to survive a broker
+    being down while its partitions' data lives elsewhere. Sizing at 60&ndash;70%
+    of capacity is realistic.</p>
+
+    <p class="pen-note" data-anchor="c21-pen">Do not forget the topics you did not
+    create: Kafka Streams changelog and repartition topics (Chapter 16), Connect's
+    internal offset topics (Chapter 17), retry and dead-letter topics
+    (Chapter 15). On a mature platform these are routinely a quarter of total
+    storage.</p>
+
+    <h2 data-anchor="c21-h2-network">Network: replication and fan-out</h2>
+    <p data-anchor="c21-p9">Two multipliers on your produce rate, and both are easy to
+    miss in a capacity model:</p>
+    <p data-anchor="c21-p10"><b>Replication.</b> Every byte produced is transferred to
+    each follower. RF 3 means roughly 2× the produce rate in inter-broker traffic,
+    on top of the produce traffic itself.</p>
+    <p data-anchor="c21-p11"><b>Consumer fan-out.</b> Every consumer group reads every
+    record. Ten groups on a topic means 10× the produce rate in egress. This is
+    the term that surprises people on managed platforms where cross-zone egress
+    is billed — a popular topic can cost more to read than to write, by a wide
+    margin.</p>
+
+    <div class="callout warn" data-anchor="c21-call2">
+      <p class="callout-t">A cost the architecture creates</p>
+      <p>"Anyone can consume any topic" is a good architectural property and a
+      real line item. Before adding the eleventh consumer group to a high-volume
+      topic, check whether it needs the raw stream or whether a filtered or
+      aggregated downstream topic would serve — one consumer of the firehose,
+      ten of the summary.</p>
+    </div>
+
+    <h2 data-anchor="c21-h2-retention">Retention as a cost decision</h2>
+    <p data-anchor="c21-p12">Retention is usually chosen once, generously, and never
+    revisited. It is a direct multiplier on storage, so it deserves the same
+    scrutiny as partition count.</p>
+    <p data-anchor="c21-p13">Ask what the retention is actually <em>for</em>
+    (Chapter 9): consumer recovery, new-consumer bootstrap, or compliance. Those
+    want very different numbers, and the honest answer is often "7 days for
+    recovery, and the bootstrap case should be served by a compacted topic
+    instead." Long retention adopted for replay convenience also becomes a
+    compliance liability (Chapter 22) — a cost that does not show up on the
+    infrastructure bill.</p>
+
+    <h2 data-anchor="c21-h2-profiles">Two capacity profiles</h2>
+    <table data-anchor="c21-tbl1">
+      <caption>High-throughput event topic versus compacted state topic</caption>
+      <thead><tr><th></th><th>Event stream</th><th>Compacted state</th></tr></thead>
+      <tbody>
+        <tr><td>Sized by</td><td>Rate × retention</td><td>Number of keys × value size</td></tr>
+        <tr><td>Grows with</td><td>Traffic</td><td>Distinct entities</td></tr>
+        <tr><td>Retention</td><td>Days to weeks</td><td>Indefinite (compacted)</td></tr>
+        <tr><td>Partition driver</td><td>Throughput</td><td>Restore time, key distribution</td></tr>
+        <tr><td>Storage risk</td><td>A traffic spike</td><td>Unbounded key growth</td></tr>
+        <tr><td>Mitigation</td><td>Retention policy</td><td><code>compact,delete</code></td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c21-p14">The compacted-topic risk is the subtler one: it grows
+    with the number of distinct keys that have ever existed, which is unbounded if
+    your key space is unbounded. A compacted topic keyed by session id will grow
+    forever. That is what <code>compact,delete</code> (Chapter 9) is for.</p>
+
+    <h2 data-anchor="c21-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c21-p15">Numbers you can defend, and an understanding of which
+    ones are reversible. Partition count is nearly permanent, so be conservative.
+    Retention is a dial you can turn, so revisit it. Consumer fan-out is a
+    consequence of your architecture, so make it visible before it appears on an
+    invoice.</p>
+    <p data-anchor="c21-p16">One more operational chapter, and it is the one where the
+    append-only log meets the legal requirement to forget.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="20-observability-and-troubleshooting.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="22-data-lifecycle-and-compliance.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

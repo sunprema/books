@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kafka Connect and Data Integration — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part IV · Enterprise Integration Patterns</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c17-no">Chapter 17</p>
+    <h1 data-anchor="c17-h1">Kafka Connect and Data Integration</h1>
+
+    <p class="standfirst" data-anchor="c17-stand">Connect is the answer to "we need to
+    move this data and the logic is trivial." Its main risk is being used where
+    the logic is not trivial.</p>
+
+    <h2 data-anchor="c17-h2-what">Source and sink</h2>
+    <p data-anchor="c17-p1">Connect is a framework for running connectors as
+    configuration rather than code. A <b>source connector</b> pulls data into
+    Kafka; a <b>sink connector</b> pushes it out. You POST a JSON configuration to
+    the Connect REST API and the cluster runs it, restarts it, distributes it, and
+    tracks its offsets.</p>
+    <p data-anchor="c17-p2">The value is not that it is impossible to write a consumer
+    that writes to Elasticsearch. It is that you would write the same consumer
+    forty times — with forty different approaches to offset management, error
+    handling, restart behaviour and schema conversion. Connect makes that one
+    well-tested implementation with a configuration file.</p>
+
+    <h2 data-anchor="c17-h2-tasks">Tasks and parallelism</h2>
+    <p data-anchor="c17-p3">A connector is split into <b>tasks</b>, and tasks are the
+    unit of parallelism, distributed across the workers in a Connect cluster.
+    <code>tasks.max</code> caps how many.</p>
+    <p data-anchor="c17-p4">How that maps to real parallelism depends on the
+    direction:</p>
+    <ul data-anchor="c17-ul1">
+      <li><b>Sink connectors</b> are a consumer group. Tasks divide the topic's
+      partitions, so the usual ceiling applies — more tasks than partitions
+      leaves tasks idle (Chapter 2).</li>
+      <li><b>Source connectors</b> split by whatever the source offers: tables,
+      files, shards. A JDBC source with three tables cannot use more than three
+      tasks no matter what you configure.</li>
+    </ul>
+
+    <div class="callout warn" data-anchor="c17-call1">
+      <p class="callout-t">Sizing note</p>
+      <p>Setting <code>tasks.max</code> high does not create parallelism the
+      source or the topic cannot supply. Check the actual split before assuming a
+      throughput problem is a scaling problem.</p>
+    </div>
+
+    <h2 data-anchor="c17-h2-converters">Converters: where the schema lives</h2>
+    <p data-anchor="c17-p5">Connect separates the connector (which knows about
+    Postgres, or S3) from the <b>converter</b> (which knows about serialization).
+    The connector produces a Connect-internal record with a schema; the converter
+    turns it into bytes.</p>
+    <p data-anchor="c17-p6">This is where the Schema Registry enters. Configuring the
+    Avro converter means source connectors register schemas derived from the
+    source's structure — a Postgres table becomes an Avro record with fields
+    matching the columns — and sink connectors resolve schemas on the way out.</p>
+    <p data-anchor="c17-p7">Notice what that implies, and it is Chapter 10's warning
+    arriving through a configuration file: <b>a source connector's schema is your
+    source system's schema</b>. Point Connect at a table and the table's shape
+    becomes a published contract, with its column names, its nullability, and its
+    next migration.</p>
+
+    <p class="pen-note" data-anchor="c17-pen">This is exactly why Chapter 14
+    recommends the outbox: an outbox table is a schema you designed for
+    publication, so CDC over it publishes a contract rather than an
+    implementation.</p>
+
+    <h2 data-anchor="c17-h2-smt">Single Message Transforms</h2>
+    <p data-anchor="c17-p8">SMTs are small transformations applied per record inside
+    the pipeline: rename a field, mask a value, route to a topic based on
+    content, extract a field as the message key. Debezium's
+    <code>outbox.event.router</code> from Chapter 14 is one.</p>
+    <p data-anchor="c17-p9">They operate on <b>one record at a time</b>. That is what
+    makes them cheap, and it is also the hard boundary: an SMT cannot join, cannot
+    aggregate, cannot look anything up, and cannot see the record before or after.
+    No amount of chaining changes that.</p>
+
+    <table data-anchor="c17-tbl1">
+      <caption>Choosing where the transformation goes</caption>
+      <thead><tr><th>Transformation</th><th>Right tool</th></tr></thead>
+      <tbody>
+        <tr><td>Rename or drop a field</td><td>SMT</td></tr>
+        <tr><td>Mask a PII column on the way out</td><td>SMT</td></tr>
+        <tr><td>Route by a field's value</td><td>SMT</td></tr>
+        <tr><td>Set the key from a field</td><td>SMT</td></tr>
+        <tr><td>Join with another topic</td><td class="no">Kafka Streams</td></tr>
+        <tr><td>Aggregate over a window</td><td class="no">Kafka Streams</td></tr>
+        <tr><td>Look up in an external service</td><td class="no">A consumer application</td></tr>
+        <tr><td>Anything needing prior records</td><td class="no">Kafka Streams</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c17-p10">When you find yourself chaining six SMTs to reshape a
+    record, you have written a stream processor in configuration syntax, without
+    tests, in a place where a failure stops the connector. Move it.</p>
+
+    <h2 data-anchor="c17-h2-errors">Error handling — the setting that matters</h2>
+    <p data-anchor="c17-p11">By default, if Connect hits a serialization error the
+    connector task <b>stops</b>. That is deliberately safe: an invalid message
+    will not be silently processed. It is also a full pipeline halt until someone
+    intervenes.</p>
+    <p data-anchor="c17-p12">Setting <code>errors.tolerance=all</code> makes Connect
+    skip records that fail in supported stages — converters and SMTs — rather
+    than failing the task immediately. Combine it with a dead-letter queue, which
+    in Connect is a configured Kafka topic that failed records are routed to.</p>
+
+    <p class="pre-label">Sink connector — error handling that does not lose data</p>
+<pre data-anchor="c17-code1"><code><span class="at">"errors.tolerance"</span>: <span class="str">"all"</span>,
+<span class="at">"errors.deadletterqueue.topic.name"</span>: <span class="str">"dlq.orders.es-sink"</span>,
+<span class="at">"errors.deadletterqueue.context.headers.enable"</span>: <span class="kw">true</span>,
+<span class="at">"errors.deadletterqueue.topic.replication.factor"</span>: <span class="num">3</span>,
+<span class="at">"errors.log.enable"</span>: <span class="kw">true</span>,
+<span class="at">"errors.log.include.messages"</span>: <span class="kw">false</span></code></pre>
+
+    <div class="callout warn" data-anchor="c17-call2">
+      <p class="callout-t">The dangerous half-configuration</p>
+      <p><code>errors.tolerance=all</code> with no dead-letter queue configured
+      silently discards records. The pipeline looks healthy, throughput looks
+      normal, and data is quietly gone. Always set both together — and note
+      <code>context.headers.enable</code>, which is what records <em>why</em>
+      each record failed.</p>
+    </div>
+
+    <p data-anchor="c17-p13">Note also that error tolerance covers converters and
+    SMTs — the stages Connect controls. It does not turn a failing target system
+    into a success: if Elasticsearch is down, the task fails, and that is
+    correct.</p>
+
+    <h2 data-anchor="c17-h2-boundary">Where Connect stops</h2>
+    <p data-anchor="c17-p14">A reasonable decision rule:</p>
+    <ul data-anchor="c17-ul2">
+      <li><b>Use Connect</b> when the movement is the point and the transformation
+      is per-record and simple. Database to Kafka, Kafka to warehouse, Kafka to
+      search index, Kafka to object storage.</li>
+      <li><b>Write an application</b> when there is business logic, external
+      calls, non-trivial error semantics, or anything you would want to unit
+      test.</li>
+    </ul>
+    <p data-anchor="c17-p15">The line is usually clear at the start of a project and
+    gets crossed gradually, one SMT at a time. It is worth revisiting a
+    connector's configuration occasionally and asking whether it has quietly
+    become an application.</p>
+
+    <h2 data-anchor="c17-h2-ops">Operating it</h2>
+    <p data-anchor="c17-p16">Two things that matter more than they look:</p>
+    <p data-anchor="c17-p17"><b>A connector's status is not a task's status.</b> A
+    connector can report RUNNING while individual tasks have failed. Monitor task
+    state, not connector state — this is the single most common Connect
+    monitoring gap, and it presents as "the connector is running but no data is
+    moving."</p>
+    <p data-anchor="c17-p18"><b>Source offsets live in Kafka</b>, in an internal
+    topic. That is what makes a source connector resumable, and it means restoring
+    a Connect cluster without those internal topics will re-read the source from
+    the beginning. Include them in whatever you consider a backup.</p>
+
+    <h2 data-anchor="c17-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c17-p19">A way to integrate the systems around Kafka without an
+    application per integration — and a clear boundary for when that stops being
+    the right shape. Reusable integration infrastructure at the edges, custom
+    services where the logic actually lives.</p>
+    <p data-anchor="c17-p20">One chapter left in Part IV, and it is the one about
+    using Kafka for things it is not good at.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="16-kafka-streams.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="18-request-reply-and-anti-patterns.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

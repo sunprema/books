@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Observability and Troubleshooting — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part V · Operating Kafka in an Enterprise</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c20-no">Chapter 20</p>
+    <h1 data-anchor="c20-h1">Observability and Troubleshooting</h1>
+
+    <p class="standfirst" data-anchor="c20-stand">Two metrics carry most of the
+    diagnostic weight: consumer lag and under-replicated partitions. Nearly every
+    incident announces itself in one of them first.</p>
+
+    <h2 data-anchor="c20-h2-lag">Consumer lag</h2>
+    <p data-anchor="c20-p1">Lag is the difference between the latest offset produced
+    to a partition and the last offset committed by a consumer group. It is the
+    single most load-bearing consumer metric because it answers the question that
+    actually matters: is the consumer keeping up?</p>
+    <p data-anchor="c20-p2">Measure it per group <em>and per partition</em>. Aggregate
+    lag hides the case that matters most — one partition badly behind while the
+    rest are fine, which is the signature of a hot key (Chapter 5) or of a single
+    stuck consumer instance.</p>
+
+    <div class="callout key" data-anchor="c20-call1">
+      <p class="callout-t">Alert on time, not on records</p>
+      <p>"Lag is 40,000 records" means nothing without a rate. Is that four
+      seconds of work or four hours? <b>Time-behind</b> — how old the next
+      unprocessed record is — is what the business cares about and what belongs
+      in an SLO. Alert on trend and on time-behind; use record count for
+      diagnosis.</p>
+    </div>
+
+    <p data-anchor="c20-p3">Note the permissions dependency: lag monitoring requires
+    <code>Describe</code> on both consumer groups and topics (Chapter 19). A
+    monitoring tool reporting zero lag for a group it cannot see is a failure
+    mode worth explicitly testing.</p>
+
+    <h2 data-anchor="c20-h2-urp">Under-replicated partitions</h2>
+    <p data-anchor="c20-p4">A URP is a partition where some replicas are not in sync
+    with the leader. It is the primary durability health signal, and a non-zero
+    steady-state value means your replication factor is nominal rather than
+    real — you have fewer live copies than you think.</p>
+    <p data-anchor="c20-p5">Brief spikes during a rolling restart are normal.
+    Sustained URPs are not, and they matter more than they look: with RF 3 and
+    minISR 2 (Chapter 6), a partition that has been under-replicated for an hour
+    is one broker failure away from rejecting writes.</p>
+
+    <h2 data-anchor="c20-h2-metrics">The metrics worth dashboards</h2>
+    <table data-anchor="c20-tbl1">
+      <caption>What to watch, and what it tells you</caption>
+      <thead><tr><th>Layer</th><th>Metric</th><th>Reads as</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="4"><b>Producer</b></td><td>Record error rate</td><td>Rejected writes — often ISR shortfall</td></tr>
+        <tr><td>Retry rate</td><td>Broker instability or timeouts</td></tr>
+        <tr><td>Request latency</td><td>Broker or network pressure</td></tr>
+        <tr><td>Batch size average</td><td>Batching efficiency; low means wasted throughput</td></tr>
+        <tr><td rowspan="4"><b>Consumer</b></td><td>Lag (per partition)</td><td>Keeping up or not</td></tr>
+        <tr><td>Processing latency</td><td>Approaching <code>max.poll.interval.ms</code>?</td></tr>
+        <tr><td>Commit latency</td><td>Coordinator health</td></tr>
+        <tr><td>Rebalance rate</td><td>Group instability — should be near zero</td></tr>
+        <tr><td rowspan="4"><b>Broker</b></td><td>Under-replicated partitions</td><td>Durability at risk</td></tr>
+        <tr><td>ISR shrink/expand rate</td><td>Replicas flapping</td></tr>
+        <tr><td>Disk usage and growth</td><td>Retention working as expected?</td></tr>
+        <tr><td>Active controller count</td><td>Must be exactly 1</td></tr>
+        <tr><td rowspan="2"><b>Registry</b></td><td>Compatibility check failures</td><td>Someone attempting a breaking change</td></tr>
+        <tr><td>Request latency / errors</td><td>Cold clients about to be stuck (Ch 4)</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c20-p6">The one people forget is <b>rebalance rate</b>. It should
+    be essentially zero in a healthy group. A group rebalancing every few minutes
+    is burning most of its capacity on reassignment, and lag will be climbing for
+    a reason nobody has connected to it yet.</p>
+
+    <h2 data-anchor="c20-h2-tracing">Tracing through Kafka</h2>
+    <p data-anchor="c20-p7">Distributed tracing does not stop at the broker if you
+    propagate trace context in <b>record headers</b> (Chapter 2). The producer
+    injects the current context; the consumer extracts it and continues the trace.
+    The result is a trace that spans the asynchronous boundary — the request that
+    created the order, the consumer that fulfilled it, the sink that indexed
+    it.</p>
+    <p data-anchor="c20-p8">Headers rather than payload, so tracing needs no schema
+    change and consumers that do not care pay nothing.</p>
+
+    <h2 data-anchor="c20-h2-diagnose">Six incidents and how to read them</h2>
+
+    <p data-anchor="c20-p9"><b>Consumer lag is increasing.</b> First distinguish
+    "slower than production" from "not processing at all." Check throughput: if
+    it is zero while the consumer is alive, suspect a poison pill (Chapter 7). If
+    it is non-zero but insufficient, check whether all partitions are behind
+    (genuine capacity problem — add consumers up to the partition count) or just
+    one (hot key, or one sick instance). Check the rebalance rate before
+    concluding anything.</p>
+
+    <p data-anchor="c20-p10"><b>A partition becomes hot.</b> One partition's lag grows
+    while others are flat. Almost always key skew (Chapter 5): a tenant, a
+    product, a null-ish default value that dominates the distribution. Adding
+    partitions does not help — that key still hashes to one of them. The fixes are
+    a composite key, or special-casing the hot key, and both are contract changes
+    to think through rather than emergency actions.</p>
+
+    <p data-anchor="c20-p11"><b>A producer times out.</b> Look at whether the ISR has
+    shrunk below <code>min.insync.replicas</code> — with <code>acks=all</code> the
+    write is rejected, and the producer surfaces it as a timeout rather than as
+    "your durability requirement cannot currently be met." Also check broker disk
+    and request latency. This is the failure mode most often misread as a network
+    problem.</p>
+
+    <p data-anchor="c20-p12"><b>Consumers repeatedly fail on one record.</b> The
+    poison pill signature: lag climbs, throughput is zero, error rate is constant,
+    nothing crashes. Confirm by comparing the group's committed offset over time —
+    it will be perfectly static. Route the record to a dead-letter topic
+    (Chapter 15); Chapter 25 walks through the whole incident.</p>
+
+    <p data-anchor="c20-p13"><b>Schema registration or deserialization fails.</b>
+    Registration failures mean someone attempted an incompatible change — the
+    system working correctly, and a CI gap (Chapter 13). Deserialization failures
+    on the consumer side mean incompatible data is already in the topic, which is
+    considerably worse: the bytes are written and every consumer will hit them.</p>
+
+    <p data-anchor="c20-p14"><b>Replication is degraded.</b> Sustained URPs. Check
+    which brokers host the lagging replicas — if it is always the same one,
+    suspect that broker's disk or network rather than the cluster. Watch ISR
+    shrink/expand rate: replicas flapping in and out is a different problem from
+    a replica that is simply down, and it is usually resource pressure.</p>
+
+    <p class="pen-note" data-anchor="c20-pen">Diagnostic habit worth building: before
+    changing anything, write down which metric you expect to move and by how
+    much. It converts "we restarted it and it got better" into knowledge.</p>
+
+    <h2 data-anchor="c20-h2-slo">What to actually alert on</h2>
+    <p data-anchor="c20-p15">Alert fatigue kills observability faster than missing
+    metrics do. A defensible starting set:</p>
+    <ul data-anchor="c20-ul1">
+      <li><b>Page:</b> under-replicated partitions sustained beyond a few
+      minutes; active controller count not equal to 1; a critical consumer
+      group's time-behind exceeding its SLO; producer error rate above zero on a
+      critical topic.</li>
+      <li><b>Ticket:</b> rebalance rate elevated; dead-letter topic receiving
+      records; registry compatibility failures; disk growth trending toward
+      capacity.</li>
+      <li><b>Dashboard only:</b> everything else, including absolute lag
+      numbers.</li>
+    </ul>
+
+    <h2 data-anchor="c20-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c20-p16">Two numbers that tell you whether the system is healthy,
+    and a mapping from symptom to cause for the incidents that actually recur.
+    The recurring theme is that Kafka's failures are usually quiet — a stuck
+    consumer looks healthy, a degraded replica set serves traffic normally — so
+    the metrics are not a nicety. They are the only way you find out.</p>
+    <p data-anchor="c20-p17">Next: sizing all this before it becomes an incident.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="19-security-and-multi-tenancy.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="21-capacity-and-cost-engineering.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

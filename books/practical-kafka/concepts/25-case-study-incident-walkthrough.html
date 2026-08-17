@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Production Incident Walkthrough — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part VI · End-to-End Case Studies</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c25-no">Chapter 25</p>
+    <h1 data-anchor="c25-h1">Case Study: Production Incident Walkthrough</h1>
+
+    <p class="standfirst" data-anchor="c25-stand">A Tuesday afternoon, a schema
+    change, and four hours. Every decision in this chapter is one the book has
+    already argued about in the abstract.</p>
+
+    <h2 data-anchor="c25-h2-1400">14:02 — the deploy</h2>
+    <p data-anchor="c25-p1">The orders team ships a change to
+    <code>OrderPlaced</code>. A field that was
+    <code>["null","string"]</code> becomes a required <code>string</code>: the
+    value is always populated now, so making it required "documents reality
+    better."</p>
+    <p data-anchor="c25-p2">The subject runs <code>FORWARD</code> compatibility, set
+    two years ago when this topic's consumers were external and upgraded after the
+    producer. The check asks: can a consumer on the latest registered schema read
+    data written with the new one? A consumer whose schema has the field as
+    nullable can read a value that is always present. <b>The check passes.</b>
+    Registration succeeds, the producer starts, records flow.</p>
+
+    <div class="callout key" data-anchor="c25-call1">
+      <p class="callout-t">Nothing malfunctioned</p>
+      <p>The registry did exactly what it was configured to do. The
+      <em>configuration</em> was wrong for how this topic is now used —
+      consumers here are internal and are not upgraded first. The policy was
+      never revisited when the consumer population changed (Chapter 13).</p>
+    </div>
+
+    <h2 data-anchor="c25-h2-1417">14:17 — the first symptom</h2>
+    <p data-anchor="c25-p3">Fulfillment's consumer lag alert fires. Time-behind is
+    climbing steadily. The on-call engineer looks at the dashboard and finds the
+    combination from Chapter 20:</p>
+    <ul data-anchor="c25-ul1">
+      <li>Lag: climbing linearly, all partitions</li>
+      <li>Throughput: <b>zero</b></li>
+      <li>Error rate: constant, non-zero</li>
+      <li>Rebalance rate: zero</li>
+      <li>Process health: fine. No restarts, no OOM, CPU normal</li>
+    </ul>
+    <p data-anchor="c25-p4">That is the poison pill signature (Chapter 7). Confirmed
+    in ten seconds by checking the group's committed offset over time: perfectly
+    static. The consumer is polling the same batch, failing, and re-polling
+    it.</p>
+
+    <h2 data-anchor="c25-h2-1421">14:21 — the actual error</h2>
+    <p data-anchor="c25-p5">The consumer logs show an Avro resolution error: a field
+    present in the reader's schema, absent from the writer's, with no default.</p>
+    <p data-anchor="c25-p6">Which is Chapter 3's rule, in production. Fulfillment's
+    consumer was deployed <em>before</em> the change with the field as required in
+    its own reader schema — and now, reading with resolution against the new
+    writer schema, it hits a field it must supply and cannot.</p>
+
+    <figure class="diagram-fig" data-anchor="c25-fig1">
+      <svg class="diagram" viewBox="0 0 560 166" role="img" aria-labelledby="c25d1t">
+        <title id="c25d1t">Three consumers of the same topic: two survive because their schemas tolerate the change, one is stuck and cannot make progress</title>
+
+        <rect x="16" y="26" width="140" height="34" class="stroke fill-soft"/>
+        <text x="26" y="48" class="big">order.events</text>
+
+        <path d="M156 43 L216 43" class="stroke"/>
+        <path d="M208 39 L216 43 L208 47" class="stroke"/>
+        <rect x="216" y="26" width="150" height="34" class="stroke fill-soft"/>
+        <text x="226" y="48" class="big">analytics — ok</text>
+
+        <path d="M156 43 L186 43 L186 89 L216 89" class="stroke-red"/>
+        <path d="M208 85 L216 89 L208 93" class="stroke-red"/>
+        <rect x="216" y="72" width="150" height="34" class="stroke-red"/>
+        <text x="226" y="94" class="big red">fulfillment — STUCK</text>
+
+        <path d="M186 43 L186 135 L216 135" class="stroke"/>
+        <path d="M208 131 L216 135 L208 139" class="stroke"/>
+        <rect x="216" y="118" width="150" height="34" class="stroke fill-soft"/>
+        <text x="226" y="140" class="big">search — ok</text>
+
+        <text x="384" y="94" class="red">lag climbing</text>
+        <text x="384" y="110" class="dim">throughput zero</text>
+      </svg>
+      <figcaption><b>One consumer's reader schema decided the blast radius.</b>
+      Same records, same topic, three different outcomes.</figcaption>
+    </figure>
+
+    <p data-anchor="c25-p7">Two other consumers are unaffected — their reader schemas
+    happen to tolerate it. This is why the alert came from one team and why the
+    first fifteen minutes were spent looking at fulfillment's own code.</p>
+
+    <h2 data-anchor="c25-h2-1428">14:28 — the decision</h2>
+    <p data-anchor="c25-p8">Three options on the table.</p>
+
+    <table data-anchor="c25-tbl1">
+      <caption>Options at 14:28</caption>
+      <thead><tr><th>Option</th><th>Time to relief</th><th>Problem</th></tr></thead>
+      <tbody>
+        <tr><td><b>Roll back the producer</b></td><td>~10 min</td><td class="no">Does not fix it — the bad records are already in the topic</td></tr>
+        <tr><td><b>Skip past the poison records</b></td><td>~5 min</td><td class="no">Silently drops real orders</td></tr>
+        <tr><td><b>Fix forward: update the consumer schema</b></td><td>~35 min</td><td>Longest, and it is correct</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c25-p9">The first option is the instinctive one and it is a
+    trap worth naming, because it is chosen under pressure surprisingly often.
+    Rolling back the producer stops <em>new</em> unreadable records, but the
+    records written between 14:02 and now are in the log and immutable. The
+    consumer is stuck on those. Rollback alone changes nothing about the
+    outage.</p>
+    <p data-anchor="c25-p10">The second restores throughput in minutes by advancing
+    the group past the failing offsets — and discards real customer orders that
+    nothing else will ever process. It converts a visible outage into invisible
+    data loss, which is worse.</p>
+    <p data-anchor="c25-p11">They choose to fix forward, and they roll back the
+    producer as well — not to fix the outage, but to stop adding to the affected
+    range while the fix is prepared.</p>
+
+    <h2 data-anchor="c25-h2-1455">14:55 — recovery</h2>
+    <p data-anchor="c25-p12">Fulfillment ships a consumer with the field nullable and
+    a default. It restarts, resolution succeeds on the stuck records, and it
+    begins catching up. Lag peaks around 14:58 and drains over the next forty
+    minutes. No records were lost, because nothing was ever skipped — the log kept
+    them safe the entire time, which is the property the whole architecture is
+    built on.</p>
+    <p data-anchor="c25-p13">By 15:40 lag is normal. The orders team re-deploys their
+    change, this time as an additive one.</p>
+
+    <h2 data-anchor="c25-h2-recon">16:10 — reconciliation</h2>
+    <p data-anchor="c25-p14">Before closing, they verify nothing was lost: count
+    orders created in the window against orders that reached a fulfilled state
+    (Chapter 14's reconciliation job, run on demand). The numbers match. That
+    check is what turns "we think it recovered" into "it recovered," and it takes
+    minutes when the job already exists.</p>
+
+    <h2 data-anchor="c25-h2-post">The post-incident controls</h2>
+    <p data-anchor="c25-p15">Five actions, each pointing at a chapter:</p>
+    <ol data-anchor="c25-ol1">
+      <li><b>CI compatibility checks</b> on every schema change, with the
+      registry's own explanation printed into the pull request. The change would
+      have been discussed at review rather than discovered at 14:17
+      (Chapter 13).</li>
+      <li><b>Review the compatibility policy per subject.</b> This topic's
+      consumers are internal and are not upgraded first, so
+      <code>FORWARD</code> is wrong for it. Move to
+      <code>FULL_TRANSITIVE</code> — replay must work and the deployment order is
+      not guaranteed (Chapter 11).</li>
+      <li><b>Dead-letter routing on every consumer.</b> A record that cannot be
+      deserialized should leave the main path rather than block it. Lag would
+      have stayed flat and this would have been a ticket, not an incident
+      (Chapter 15).</li>
+      <li><b>Alert on the signature, not just on lag.</b> "Lag climbing while
+      throughput is zero" is a specific, high-confidence poison-pill alert that
+      fires within a minute (Chapter 20).</li>
+      <li><b>Record schema ownership and the consumer inventory</b>, so a
+      producer team can see who consumes their topic before changing it
+      (Chapter 13).</li>
+    </ol>
+
+    <div class="callout key" data-anchor="c25-call2">
+      <p class="callout-t">The one-sentence lesson</p>
+      <p>Every control that would have prevented this is cheap, and every one of
+      them looks like unnecessary process until the afternoon it does not. The
+      compatibility policy in particular is not set-and-forget: it encodes an
+      assumption about deployment order that quietly expires when your consumer
+      population changes.</p>
+    </div>
+
+    <h2 data-anchor="c25-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c25-p16">A worked example of the book's central claim. The
+    incident was not caused by Kafka, or by Avro, or by a bug in anyone's code.
+    It was caused by a <b>contract decision</b> — a compatibility policy — that
+    was correct when it was made and had not been revisited when the facts
+    changed.</p>
+    <p data-anchor="c25-p17">That is what event contracts are: decisions with a long
+    half-life, made by people who will not be in the room when they are tested.
+    Partitions determine ordering scope. Keys determine hot spots. Defaults
+    determine whether a field can ever be added. Compatibility policy determines
+    who can break whom.</p>
+    <p data-anchor="c25-p18">None of it is exotic. All of it is permanent. Design
+    accordingly — and see the <a href="../cheatsheet.html">cheatsheet</a> for the
+    checklists worth keeping close.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="24-case-study-customer-360.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="../cheatsheet.html">Cheatsheet ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

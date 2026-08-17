@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Security and Multi-Tenant Boundaries — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part V · Operating Kafka in an Enterprise</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c19-no">Chapter 19</p>
+    <h1 data-anchor="c19-h1">Security and Multi-Tenant Boundaries</h1>
+
+    <p class="standfirst" data-anchor="c19-stand">The topic is the unit of
+    authorization. That single fact determines how you isolate tenants, protect
+    sensitive data, and separate environments — and it has to be designed in, not
+    added later.</p>
+
+    <h2 data-anchor="c19-h2-flow">Authentication, then authorization</h2>
+    <p data-anchor="c19-p1">Two separate steps that get conflated constantly. The
+    flow is: the client authenticates (via SASL, mTLS, or another mechanism), the
+    principal identity is extracted, the client attempts an operation on a
+    resource, the authorizer queries stored ACLs for a matching rule, and if an
+    Allow rule exists the operation proceeds — otherwise it is denied.</p>
+    <p data-anchor="c19-p2">Deny-by-default is the important property. An operation
+    with no matching rule fails, which means every permission your applications
+    need must be explicitly granted. That is more work at setup and it is what
+    makes the model worth anything.</p>
+
+    <h2 data-anchor="c19-h2-tls">TLS, SASL, and the naming confusion</h2>
+    <p data-anchor="c19-p3">This trips up nearly everyone once, so it is worth being
+    explicit. <b>SASL/PLAIN is an authentication mechanism</b> — username and
+    password. <b>SASL_PLAINTEXT and SASL_SSL are security protocols</b> —
+    indicating whether the connection is encrypted with TLS.</p>
+    <p data-anchor="c19-p4">The trap is <code>SASL_PLAINTEXT</code> with
+    <code>SASL/PLAIN</code>: it looks internally consistent and it sends your
+    credentials over the network in clear text. Always pair SASL with TLS
+    (<code>SASL_SSL</code>), and prefer SASL/SCRAM or SASL/GSSAPI over SASL/PLAIN
+    in production.</p>
+
+    <table data-anchor="c19-tbl1">
+      <caption>What the combinations actually mean</caption>
+      <thead><tr><th>Protocol</th><th>Encrypted?</th><th>Authenticated?</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td><code>PLAINTEXT</code></td><td class="no">No</td><td class="no">No</td><td>Local development only</td></tr>
+        <tr><td><code>SSL</code></td><td class="yes">Yes</td><td>Optional (mTLS)</td><td>mTLS deployments</td></tr>
+        <tr><td><code>SASL_PLAINTEXT</code></td><td class="no">No</td><td class="yes">Yes</td><td class="no">Credentials in clear — avoid</td></tr>
+        <tr><td><code>SASL_SSL</code></td><td class="yes">Yes</td><td class="yes">Yes</td><td>The production default</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="c19-h2-acls">ACLs: the resources that matter</h2>
+    <p data-anchor="c19-p5">An ACL binds a principal to an operation on a resource.
+    The resources are topics, consumer groups, the cluster itself, and
+    transactional ids. Getting the set right the first time saves a genuinely
+    tedious debugging session:</p>
+
+    <table data-anchor="c19-tbl2">
+      <caption>Minimum ACLs by role</caption>
+      <thead><tr><th>Role</th><th>Resource</th><th>Operations</th></tr></thead>
+      <tbody>
+        <tr><td>Producer</td><td>Topic</td><td><code>Write</code>, <code>Describe</code></td></tr>
+        <tr><td>Idempotent producer</td><td>Cluster</td><td><code>IdempotentWrite</code> (older versions)</td></tr>
+        <tr><td>Transactional producer</td><td>TransactionalId</td><td><code>Write</code>, <code>Describe</code></td></tr>
+        <tr><td rowspan="2">Consumer</td><td>Topic</td><td><code>Read</code>, <code>Describe</code></td></tr>
+        <tr><td>Group</td><td><code>Read</code></td></tr>
+        <tr><td>Lag monitoring</td><td>Group + Topic</td><td><code>Describe</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn" data-anchor="c19-call1">
+      <p class="callout-t">The classic first-deploy failure</p>
+      <p>Consumers need permissions on <b>both</b> the topic and the consumer
+      group. Granting topic <code>Read</code> and stopping there produces an
+      authorization error that names the group, not the topic, and teams spend an
+      afternoon re-checking topic ACLs.</p>
+    </div>
+
+    <p data-anchor="c19-p6">Prefixed ACLs are what make this manageable at scale:
+    grant a team's principal rights on <code>orders.*</code> rather than on
+    forty individual topics. It pairs directly with the naming convention from
+    Chapter 13 — a naming scheme that maps prefixes to teams is also an
+    authorization scheme.</p>
+
+    <h2 data-anchor="c19-h2-registry">Registry authorization is separate</h2>
+    <p data-anchor="c19-p7">Worth repeating from Chapter 13 because it is so easy to
+    miss: broker ACLs and Schema Registry permissions are different systems. A
+    principal denied <code>Write</code> on a topic can still, if the registry is
+    open, register an incompatible schema version on that topic's subject and
+    break every consumer.</p>
+    <p data-anchor="c19-p8">Secure both, with the same ownership model, and keep the
+    ability to <em>lower</em> a compatibility level restricted to the platform
+    team. Lowering the policy is the privileged operation.</p>
+
+    <h2 data-anchor="c19-h2-tenancy">Multi-tenancy: three models</h2>
+    <p data-anchor="c19-p9">Because the topic is the unit of authorization, tenant
+    isolation is a topic-layout question.</p>
+
+    <figure class="diagram-fig" data-anchor="c19-fig1">
+      <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="c19d1t">
+        <title id="c19d1t">Three tenancy models: shared topic with a tenant field, topic per tenant, and cluster per tenant, with increasing isolation and cost</title>
+
+        <rect x="16" y="26" width="150" height="52" class="stroke fill-soft"/>
+        <text x="26" y="46" class="big">shared topic</text>
+        <text x="26" y="62" class="dim">tenant field</text>
+
+        <rect x="200" y="26" width="150" height="52" class="stroke fill-soft"/>
+        <text x="210" y="46" class="big">topic per tenant</text>
+        <text x="210" y="62" class="dim">ACL per topic</text>
+
+        <rect x="384" y="26" width="160" height="52" class="stroke-red"/>
+        <text x="394" y="46" class="big red">cluster per tenant</text>
+        <text x="394" y="62" class="red">full isolation</text>
+
+        <path d="M16 104 L544 104" class="stroke-soft"/>
+        <path d="M536 100 L544 104 L536 108" class="stroke-soft"/>
+        <text x="16" y="124">isolation, and cost, increase this way</text>
+
+        <text x="16" y="152" class="dim">app enforces</text>
+        <text x="200" y="152" class="dim">broker enforces</text>
+        <text x="384" y="152" class="red">infrastructure enforces</text>
+      </svg>
+      <figcaption><b>Who enforces the boundary?</b> That is the real question —
+      and only the middle and right options survive an application bug.</figcaption>
+    </figure>
+
+    <p data-anchor="c19-p10"><b>Shared topic with a tenant field</b> is cheapest and
+    scales to many tenants, but the boundary is enforced by application code. One
+    filtering bug leaks tenant data, and no broker-level control can prevent it.
+    Acceptable for internal tenancy; rarely acceptable for external customers.</p>
+    <p data-anchor="c19-p11"><b>Topic per tenant</b> makes the boundary real: an ACL
+    per topic, enforced by the broker. It multiplies your topic and partition
+    count, which is a genuine constraint at hundreds of tenants (Chapter 21). This
+    is the right default for external multi-tenancy at moderate scale.</p>
+    <p data-anchor="c19-p12"><b>Cluster per tenant</b> is complete isolation including
+    the blast radius of an operational mistake. Expensive; reserved for
+    regulatory requirements or a small number of very large tenants.</p>
+
+    <h2 data-anchor="c19-h2-pii">Sensitive data</h2>
+    <p data-anchor="c19-p13">Chapter 10 covered the schema-design moves. The
+    operational layer adds:</p>
+    <ul data-anchor="c19-ul1">
+      <li><b>Topic isolation for sensitive fields.</b> Since the topic is the
+      authorization unit, sensitive data on its own topic is the only isolation
+      that is actually enforceable. A "restricted" field on a widely-readable
+      topic is readable by everyone with topic access.</li>
+      <li><b>Encryption at rest</b> protects the disks, not your consumers — every
+      authorized consumer still reads plaintext. It addresses a different threat
+      model than access control, and neither substitutes for the other.</li>
+      <li><b>Field-level encryption</b> does address consumer-level access: the
+      value is encrypted in the payload, and only key-holding consumers can read
+      it. It also makes <b>crypto-shredding</b> possible — destroy the key and
+      the data is unrecoverable, which is the closest thing to per-record
+      deletion an immutable log offers (Chapter 22).</li>
+      <li><b>Tokenisation at the source</b>, so the event never carries the
+      sensitive value at all. The cheapest option when consumers only need to
+      correlate, not to read.</li>
+    </ul>
+
+    <h2 data-anchor="c19-h2-audit">Audit logging</h2>
+    <p data-anchor="c19-p14">Authorization decisions — especially denials — should be
+    logged and monitored. A spike in denials usually means a misconfigured
+    deployment, and occasionally means something worse. Either way it is
+    information you want before someone opens a ticket.</p>
+    <p data-anchor="c19-p15">Note the asymmetry that makes Kafka auditing hard:
+    <b>consumption is not individually logged</b> the way a database query is. You
+    can see which groups have committed offsets, but not every read. If your
+    compliance regime requires proof of who accessed what, that has to be
+    designed in — typically by restricting access narrowly enough that the ACL
+    set <em>is</em> the audit record.</p>
+
+    <h2 data-anchor="c19-h2-envs">Environment isolation</h2>
+    <p data-anchor="c19-p16">Separate clusters per environment. Not separate topic
+    prefixes on one cluster — separate clusters.</p>
+    <p data-anchor="c19-p17">The reasoning is failure isolation rather than access
+    control: a load test in staging should not be able to starve production of
+    broker resources, and a misconfigured consumer group name should not be able
+    to read production data at all. Prefix separation makes both of those
+    one typo away.</p>
+
+    <h2 data-anchor="c19-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c19-p18">A security model that follows from one structural fact:
+    the topic is the unit of authorization. Tenancy, sensitive data isolation and
+    environment separation are all consequences of that, which is why they are
+    topic-layout decisions made at design time rather than security controls
+    bolted on afterwards.</p>
+    <p data-anchor="c19-p19">Next: knowing what your cluster is doing.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="18-request-reply-and-anti-patterns.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="20-observability-and-troubleshooting.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

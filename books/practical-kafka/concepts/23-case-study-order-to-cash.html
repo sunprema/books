@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Case Study: Order-to-Cash Platform — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part VI · End-to-End Case Studies</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c23-no">Chapter 23</p>
+    <h1 data-anchor="c23-h1">Case Study: Order-to-Cash Platform</h1>
+
+    <p class="standfirst" data-anchor="c23-stand">One system, built with everything in
+    this book. We will make the decisions in order and name the chapter each one
+    comes from.</p>
+
+    <h2 data-anchor="c23-h2-domains">Step 1 — Draw the domain boundaries</h2>
+    <p data-anchor="c23-p1">Six domains, each owning its data and its events:
+    <b>ordering</b>, <b>payment</b>, <b>inventory</b>, <b>fulfillment</b>,
+    <b>notifications</b>, <b>analytics</b>.</p>
+    <p data-anchor="c23-p2">The first four publish facts. Notifications and analytics
+    are pure consumers — they publish nothing anyone else depends on, which makes
+    them safe places to iterate quickly. That asymmetry is worth noticing early:
+    the teams that publish contracts carry a governance burden the consuming teams
+    do not.</p>
+
+    <h2 data-anchor="c23-h2-topics">Step 2 — Topics, keys, and ordering scope</h2>
+    <p data-anchor="c23-p3">Naming follows Chapter 13's convention; keys follow
+    Chapter 2's rule that the key <em>is</em> the ordering promise.</p>
+
+    <table data-anchor="c23-tbl1">
+      <caption>The topic layout, and what each key promises</caption>
+      <thead><tr><th>Topic</th><th>Key</th><th>Policy</th><th>Ordering promise</th></tr></thead>
+      <tbody>
+        <tr><td><code>orders.order.events</code></td><td><code>orderId</code></td><td>delete, 30d</td><td>One order's lifecycle is ordered</td></tr>
+        <tr><td><code>payments.payment.events</code></td><td><code>orderId</code></td><td>delete, 90d</td><td>One order's payments are ordered</td></tr>
+        <tr><td><code>inventory.reservation.events</code></td><td><code>sku</code></td><td>delete, 30d</td><td>One SKU's movements are ordered</td></tr>
+        <tr><td><code>fulfillment.shipment.events</code></td><td><code>orderId</code></td><td>delete, 90d</td><td>One order's shipments are ordered</td></tr>
+        <tr><td><code>orders.order.state</code></td><td><code>orderId</code></td><td>compact</td><td>Current state of every order</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c23-p4">Two decisions in that table deserve their reasoning
+    stated.</p>
+    <p data-anchor="c23-p5"><b>Payments are keyed by <code>orderId</code>, not
+    <code>paymentId</code>.</b> We want authorization, capture and refund for one
+    order to arrive in order, and <code>paymentId</code> would scatter them across
+    partitions. This is Chapter 5's point about ordering scope beating
+    distribution: it is a slightly worse key for load balancing and the right key
+    for correctness.</p>
+    <p data-anchor="c23-p6"><b>Inventory is keyed by <code>sku</code>.</b> Stock
+    movements for one SKU must be ordered against each other — an order's events
+    are not the relevant sequence here. Different aggregate, different key, and
+    that is fine: not every topic in a system shares an ordering scope.</p>
+    <p data-anchor="c23-p7">Because one order's lifecycle spans several event types
+    on <code>orders.order.events</code>, this topic uses
+    <code>TopicRecordNameStrategy</code> (Chapter 4) — heterogeneous events, each
+    evolving independently, ordering preserved by the shared key.</p>
+
+    <h2 data-anchor="c23-h2-schemas">Step 3 — The schemas</h2>
+    <p data-anchor="c23-p8">A shared envelope (Chapter 10), referenced by every event
+    schema via a schema reference (Chapter 4):</p>
+
+    <p class="pre-label">com.acme.common.EventEnvelope</p>
+<pre data-anchor="c23-code1"><code>{ <span class="at">"eventId"</span>:       <span class="ty">uuid</span>,
+  <span class="at">"occurredAt"</span>:    <span class="ty">timestamp-micros</span>,
+  <span class="at">"correlationId"</span>: <span class="ty">uuid</span>,
+  <span class="at">"causationId"</span>:   [<span class="str">"null"</span>, <span class="ty">uuid</span>],
+  <span class="at">"actor"</span>:         <span class="ty">string</span>,
+  <span class="at">"tenantId"</span>:      <span class="ty">string</span>,
+  <span class="at">"sequence"</span>:      <span class="ty">long</span> }   <span class="cm">// per-aggregate, for gap detection (Ch 14)</span></code></pre>
+
+    <p class="pre-label">com.acme.orders.v1.OrderPlaced</p>
+<pre data-anchor="c23-code2"><code>{ <span class="at">"envelope"</span>:  <span class="ty">EventEnvelope</span>,
+  <span class="at">"orderId"</span>:   <span class="ty">uuid</span>,
+  <span class="at">"customerId"</span>:<span class="ty">uuid</span>,          <span class="cm">// an id, not a name — Ch 10, Ch 22</span>
+  <span class="at">"currency"</span>:  <span class="ty">string</span>,
+  <span class="at">"total"</span>:     <span class="ty">decimal(12,4)</span>,  <span class="cm">// scale 4: permanent, so be generous</span>
+  <span class="at">"lines"</span>:     <span class="ty">array</span>&lt;OrderLine&gt;,
+  <span class="at">"channel"</span>:   <span class="ty">enum</span>{WEB,MOBILE,STORE,<span class="kw">UNKNOWN</span>} <span class="at">default</span> UNKNOWN }</code></pre>
+
+    <div class="callout key" data-anchor="c23-call1">
+      <p class="callout-t">Three deliberate choices in ten lines</p>
+      <p><b>decimal(12,4)</b> — scale is permanent (Chapter 3), so we take four
+      now rather than discover we needed it. <b>customerId, not customer name</b>
+      — minimisation makes Chapter 22's erasure problem largely disappear.
+      <b>An enum default of UNKNOWN</b> — so adding a channel later is additive
+      rather than an outage (Chapter 11).</p>
+    </div>
+
+    <p data-anchor="c23-p9">Compatibility tiers per Chapter 13: payments run
+    <code>FULL_TRANSITIVE</code> (money, and external auditors), orders and
+    inventory run <code>BACKWARD_TRANSITIVE</code>, analytics topics run
+    <code>BACKWARD</code>.</p>
+
+    <h2 data-anchor="c23-h2-publish">Step 4 — Publishing reliably</h2>
+    <p data-anchor="c23-p10">The ordering service writes the order row and an outbox
+    row in one local transaction; Debezium's <code>outbox.event.router</code>
+    relays it, keyed by <code>aggregate_id</code> so per-order ordering survives
+    (Chapter 14). Producers run the durability profile from Chapters 5 and 6:
+    <code>acks=all</code>, idempotence on, RF 3, minISR 2, unclean leader election
+    disabled.</p>
+    <p data-anchor="c23-p11">Payment is the interesting case, because the side effect
+    is a card authorization at an external provider — outside any Kafka
+    transaction (Chapter 8). So the payment service passes the
+    <code>orderId</code> as the provider's idempotency key, and publishes
+    <code>PaymentAuthorized</code> from its own outbox after the provider
+    confirms. A duplicate consumption of the command re-sends the same
+    idempotency key and the provider deduplicates. Exactly-once where it counts,
+    built from at-least-once parts.</p>
+
+    <figure class="diagram-fig" data-anchor="c23-fig1">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="c23d1t">
+        <title id="c23d1t">Order flows from ordering through payment, inventory and fulfillment, with a streams job deriving order state and analytics sinking to a warehouse</title>
+
+        <rect x="16" y="26" width="100" height="32" class="stroke fill-soft"/>
+        <text x="26" y="46" class="big">ordering</text>
+        <path d="M116 42 L156 42" class="stroke"/>
+        <path d="M148 38 L156 42 L148 46" class="stroke"/>
+        <rect x="156" y="26" width="130" height="32" class="stroke-red"/>
+        <text x="166" y="46" class="big red">order.events</text>
+
+        <path d="M221 58 L221 82" class="stroke"/>
+        <path d="M217 74 L221 82 L225 74" class="stroke"/>
+        <path d="M286 42 L326 42" class="stroke"/>
+        <path d="M318 38 L326 42 L318 46" class="stroke"/>
+        <rect x="326" y="26" width="100" height="32" class="stroke fill-soft"/>
+        <text x="336" y="46" class="big">payment</text>
+        <path d="M426 42 L466 42" class="stroke"/>
+        <path d="M458 38 L466 42 L458 46" class="stroke"/>
+        <rect x="466" y="26" width="78" height="32" class="stroke fill-soft"/>
+        <text x="476" y="46" class="big">fulfil</text>
+
+        <rect x="156" y="82" width="130" height="32" class="stroke fill-soft"/>
+        <text x="166" y="102" class="big">inventory</text>
+
+        <rect x="16" y="130" width="130" height="32" class="stroke fill-soft"/>
+        <text x="26" y="150" class="big">streams job</text>
+        <path d="M146 146 L186 146" class="stroke"/>
+        <path d="M178 142 L186 146 L178 150" class="stroke"/>
+        <rect x="186" y="130" width="130" height="32" class="stroke fill-soft"/>
+        <text x="196" y="150" class="big">order.state</text>
+        <path d="M316 146 L356 146" class="stroke"/>
+        <path d="M348 142 L356 146 L348 150" class="stroke"/>
+        <rect x="356" y="130" width="188" height="32" class="stroke fill-soft"/>
+        <text x="366" y="150" class="big">sink → warehouse</text>
+
+        <text x="16" y="182" class="dim">compacted state topic doubles as the dashboard read model</text>
+      </svg>
+      <figcaption><b>Facts flow left to right; state is derived, not
+      published by hand.</b></figcaption>
+    </figure>
+
+    <h2 data-anchor="c23-h2-consume">Step 5 — Consumers</h2>
+    <p data-anchor="c23-p12">Every consumer follows Chapter 15: bounded in-line
+    retries for transient failures, retry topics for anything slower,
+    dead-letter with full context headers for the permanent cases, and an
+    idempotency strategy chosen per consumer.</p>
+    <ul data-anchor="c23-ul1">
+      <li><b>Fulfillment</b> — conditional writes. "Set status to PACKED where
+      status is PAID." A duplicate updates zero rows, which is correct.</li>
+      <li><b>Notifications</b> — a processed-event store keyed by
+      <code>eventId</code>, written in the same transaction as the send record.
+      This is the consumer that must never be replayed carelessly, so it is
+      deliberately separate from the projection consumers.</li>
+      <li><b>Analytics</b> — a Connect sink to the warehouse
+      (Chapter 17), with <code>errors.tolerance=all</code> <em>and</em> a
+      configured dead-letter topic.</li>
+    </ul>
+
+    <h2 data-anchor="c23-h2-streams">Step 6 — Deriving order state</h2>
+    <p data-anchor="c23-p13">A Kafka Streams job (Chapter 16) aggregates the order
+    lifecycle into <code>orders.order.state</code>, a compacted topic holding the
+    current status of every order. Because both inputs are keyed by
+    <code>orderId</code> they are co-partitioned, so no repartition topic is
+    needed — a design choice, not luck.</p>
+    <p data-anchor="c23-p14">The compacted state topic serves the operational
+    dashboard directly: a new dashboard instance reads from offset zero and has
+    every order's current status without a database query. This is Chapter 9's
+    bootstrap property doing real work.</p>
+
+    <h2 data-anchor="c23-h2-evolve">Step 7 — Evolving the schema, six months in</h2>
+    <p data-anchor="c23-p15">Marketing wants promotion details on
+    <code>OrderPlaced</code>. Walk the ladder from Chapter 12:</p>
+    <p data-anchor="c23-p16">It is additive, it changes no existing field's meaning,
+    and it can carry a default. Rung 1 — evolve the schema. Add
+    <code>promotion</code> as <code>["null", "Promotion"]</code> with
+    <code>"default": null</code>. Under <code>BACKWARD_TRANSITIVE</code> the CI
+    check (Chapter 13) passes, the producer deploys, and <b>no consumer does
+    anything at all</b>. Consumers that do not know the field ignore it;
+    consumers that want it upgrade when convenient.</p>
+    <p data-anchor="c23-p17">Compare with the change that is <em>not</em> rung 1:
+    splitting <code>total</code> into <code>subtotal</code> and <code>tax</code>
+    and removing <code>total</code>. That deletes a required field. Under our
+    policy it is rejected — correctly. The honest options are to add the new
+    fields while keeping <code>total</code> populated, deprecate it, and remove it
+    only when the consumer inventory shows nobody reads it.</p>
+
+    <h2 data-anchor="c23-h2-replay">Step 8 — A new consumer, two years later</h2>
+    <p data-anchor="c23-p18">A fraud team wants to build a model on historical order
+    behaviour. They create a new consumer group, set
+    <code>auto.offset.reset=earliest</code>, and replay everything retained.</p>
+    <p data-anchor="c23-p19">Nothing else notices. Offsets are per group (Chapter 2),
+    so no existing consumer is affected. <code>BACKWARD_TRANSITIVE</code>
+    guarantees their new schema reads every historical version. They get 90 days
+    from <code>payments</code> and 30 from <code>orders</code> — and the fact that
+    those numbers are lower than they hoped is a retention decision (Chapter 21)
+    that someone made deliberately, not an accident.</p>
+
+    <p class="pen-note" data-anchor="c23-pen">This is the payoff for everything in
+    Parts I&ndash;III. A team you had never met built on a two-year-old contract
+    with no coordination, no migration, and no meeting. That is what the
+    discipline buys.</p>
+
+    <h2 data-anchor="c23-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c23-p20">A system where the common changes are free and the
+    expensive ones are visible. Adding a field, adding a consumer, replaying
+    history: routine. Changing an ordering scope or deleting a required field:
+    a project, correctly, because that is what those things are.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="22-data-lifecycle-and-compliance.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="24-case-study-customer-360.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
