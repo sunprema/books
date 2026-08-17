@@ -1,0 +1,88 @@
+<meta charset="utf-8">
+<title>A Basic Implementation Guide — Kafka/Avro</title>
+<link rel="stylesheet" href="../assets/book.css">
+<body data-book="kafka-avro">
+<div class="book-topbar">
+  <span class="title">Kafka / Avro</span>
+  <a rel="home" href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <h1>6. A Basic Implementation Guide</h1>
+
+    <p data-anchor="impl-p1">Theory's done. Let's wire an actual producer and consumer through Avro and a Schema Registry, in pseudo-code close enough to a real client library that translating it is mechanical. Two pieces of infrastructure need to be running first: a Kafka broker, and a Schema Registry, both reachable at addresses your code will point at.</p>
+
+    <h2>The schema</h2>
+    <p data-anchor="impl-p2">We'll reuse the <code>UserRegistered</code> event from chapter 3, trimmed to three fields:</p>
+
+    <pre><code><span class="mac">{</span>
+  <span class="str">"type"</span>: <span class="str">"record"</span>,
+  <span class="str">"name"</span>: <span class="str">"UserRegistered"</span>,
+  <span class="str">"namespace"</span>: <span class="str">"com.example.events"</span>,
+  <span class="str">"fields"</span>: [
+    <span class="mac">{</span> <span class="str">"name"</span>: <span class="str">"userId"</span>, <span class="str">"type"</span>: <span class="str">"string"</span> <span class="mac">}</span>,
+    <span class="mac">{</span> <span class="str">"name"</span>: <span class="str">"email"</span>,  <span class="str">"type"</span>: <span class="str">"string"</span> <span class="mac">}</span>,
+    <span class="mac">{</span> <span class="str">"name"</span>: <span class="str">"plan"</span>,   <span class="str">"type"</span>: <span class="str">"string"</span>, <span class="str">"default"</span>: <span class="str">"free"</span> <span class="mac">}</span>
+  ]
+<span class="mac">}</span></code></pre>
+
+    <h2>The producer</h2>
+    <p data-anchor="impl-p3">The only thing that changes from a plain Kafka producer is the value serializer: instead of a raw string or byte-array serializer, you configure the Avro serializer, pointed at the registry's URL. It handles registering-or-looking-up the schema and prefixing the payload with the schema ID for you.</p>
+
+    <pre><code><span class="cm"># Producer (pseudo-code, Confluent-style Avro serializer)</span>
+value_serializer = AvroSerializer(schema_registry_client, user_registered_schema)
+producer = Producer(<span class="mac">{</span><span class="str">"bootstrap.servers"</span>: <span class="str">"localhost:9092"</span><span class="mac">}</span>)
+
+event = <span class="mac">{</span><span class="str">"userId"</span>: <span class="str">"u-42"</span>, <span class="str">"email"</span>: <span class="str">"ada@example.com"</span>, <span class="str">"plan"</span>: <span class="str">"pro"</span><span class="mac">}</span>
+producer.produce(
+    topic=<span class="str">"user-registered"</span>,
+    key=event[<span class="str">"userId"</span>],
+    value=value_serializer(event, SerializationContext(<span class="str">"user-registered"</span>, MessageField.VALUE)),
+)
+producer.flush()</code></pre>
+
+    <p data-anchor="impl-p4">Notice the key: <code>event["userId"]</code>. Per chapter 2, that's what keeps every event for a given user in the same partition, in order — worth doing even in a first prototype, because retrofitting a partition key later means every consumer's ordering assumptions can silently shift.</p>
+
+    <h2>The consumer</h2>
+    <pre><code><span class="cm"># Consumer (pseudo-code, Confluent-style Avro deserializer)</span>
+value_deserializer = AvroDeserializer(schema_registry_client)
+consumer = Consumer(<span class="mac">{</span>
+    <span class="str">"bootstrap.servers"</span>: <span class="str">"localhost:9092"</span>,
+    <span class="str">"group.id"</span>: <span class="str">"user-registered-watchers"</span>,
+    <span class="str">"auto.offset.reset"</span>: <span class="str">"earliest"</span>,
+<span class="mac">}</span>)
+consumer.subscribe([<span class="str">"user-registered"</span>])
+
+<span class="kw">while</span> <span class="kw">True</span>:
+    msg = consumer.poll(1.0)
+    <span class="kw">if</span> msg <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">continue</span>
+    event = value_deserializer(msg.value(), SerializationContext(<span class="str">"user-registered"</span>, MessageField.VALUE))
+    handle(event)</code></pre>
+
+    <p data-anchor="impl-p5">The deserializer never sees <code>user_registered_schema</code> as a hardcoded value — it pulls the schema ID off the front of the message and asks the registry for the matching schema. Change the producer's schema next month, in a backward-compatible way, and this consumer keeps working unmodified.</p>
+
+    <div class="callout pitfall">
+      <strong>Pitfall</strong>
+      Pointing the producer and consumer at <em>different</em> Schema Registry instances (easy to do by accident across environments). Schema IDs are only meaningful within the registry that issued them — a consumer looking up "schema 7" in the wrong registry gets the wrong schema, or none at all.
+    </div>
+
+    <div class="callout pitfall">
+      <strong>Pitfall</strong>
+      Starting the consumer <em>after</em> the producer and being confused when nothing shows up. By default a fresh consumer group only sees records produced after it starts; <code>auto.offset.reset: "earliest"</code> (as above) is what lets a new group read from the beginning of the topic instead.
+    </div>
+
+    <p data-anchor="impl-p6">That's the whole loop: a schema, a producer that registers it once and reuses the ID, and a consumer that resolves any ID it sees back to the exact schema it needs. Everything from chapters 2 through 5 is in these two snippets — you just can't see the registry calls, because the serializer and deserializer are making them for you.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="05-the-schema-registry.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-summary-and-best-practices.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
