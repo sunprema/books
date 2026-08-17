@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kafka's Data Model — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part I · The Event Contract Mindset</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c2-no">Chapter 02</p>
+    <h1 data-anchor="c2-h1">Kafka's Data Model</h1>
+
+    <p class="standfirst" data-anchor="c2-stand">A topic is an append-only log, not a
+    queue. Almost every design mistake in this book traces back to forgetting
+    that sentence.</p>
+
+    <h2 data-anchor="c2-h2-log">A log, not a queue</h2>
+    <p data-anchor="c2-p1">In a traditional queue, reading is destructive: a consumer
+    takes a message and it is gone. The broker tracks what has been delivered,
+    delivery is the point, and the data's lifetime is "until someone consumed
+    it."</p>
+    <p data-anchor="c2-p2">Kafka inverts this. Records are appended to a partition and
+    stay there for as long as the retention policy says, regardless of who has
+    read them. Consumers track their own position — an <b>offset</b> — and
+    reading does not remove anything. Two independent consumer groups read the
+    same records without knowing about each other.</p>
+    <p data-anchor="c2-p3">This single difference gives you replay, multiple
+    independent consumers, and the ability to add a consumer years later. It also
+    means the broker will not help you with per-message acknowledgement,
+    priority, or selective redelivery, because those are queue features and this
+    is not a queue.</p>
+
+    <div class="callout key" data-anchor="c2-call1">
+      <p class="callout-t">Key idea</p>
+      <p>A consumer's offset is independent of whether the data still exists.
+      Retention governs the data; the committed offset only records progress.
+      A consumer can be at offset 400 on a partition whose oldest surviving
+      record is 900 — that consumer has silently lost data and will be reset.</p>
+    </div>
+
+    <h2 data-anchor="c2-h2-anatomy">Anatomy of a record</h2>
+    <p data-anchor="c2-p4">A record has more moving parts than "a message body,"
+    and each part is a design decision:</p>
+
+    <table data-anchor="c2-tbl1">
+      <caption>The parts of a Kafka record and what they decide</caption>
+      <thead><tr><th>Part</th><th>What it is</th><th>What it decides</th></tr></thead>
+      <tbody>
+        <tr><td><b>Key</b></td><td>Optional bytes</td><td>Partition, therefore ordering scope and compaction identity</td></tr>
+        <tr><td><b>Value</b></td><td>The payload</td><td>The contract (Chapters 3, 10&ndash;12)</td></tr>
+        <tr><td><b>Headers</b></td><td>Key/value metadata</td><td>Trace context, schema hints, routing — things consumers read without deserializing the value</td></tr>
+        <tr><td><b>Timestamp</b></td><td>Creation or log-append time</td><td>Retention, stream-time, windowing</td></tr>
+        <tr><td><b>Offset</b></td><td>Assigned by the broker</td><td>Position; monotonic within a partition only</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c2-p5">Headers deserve a note. Putting trace context in headers
+    rather than the payload means you can propagate it without a schema change,
+    and consumers that do not care never pay to parse it. Putting business data
+    in headers is the opposite of this — it escapes the contract entirely and no
+    compatibility check will ever look at it. Headers are for plumbing.</p>
+
+    <h2 data-anchor="c2-h2-partitions">Partitions: the decision that keeps costing you</h2>
+    <p data-anchor="c2-p6">A topic is split into partitions, and this is where the
+    design questions concentrate. Kafka provides ordering guarantees within a
+    partition, not across a topic. A record's key is hashed to select a
+    partition, so <b>the key you choose is the ordering scope you promise</b>.</p>
+
+    <figure class="diagram-fig" data-anchor="c2-fig1">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="c2d1t">
+        <title id="c2d1t">Records keyed by order id land in one partition and stay ordered; ordering across partitions is not defined</title>
+
+        <text x="16" y="18">Topic: orders (3 partitions)</text>
+
+        <rect x="16" y="30" width="440" height="34" class="stroke fill-soft"/>
+        <text x="24" y="52" class="mono big">P0</text>
+        <text x="70" y="52" class="mono">A1</text>
+        <text x="130" y="52" class="mono">A2</text>
+        <text x="190" y="52" class="mono">A3</text>
+        <text x="470" y="52">ordered</text>
+
+        <rect x="16" y="76" width="440" height="34" class="stroke fill-soft"/>
+        <text x="24" y="98" class="mono big">P1</text>
+        <text x="70" y="98" class="mono">B1</text>
+        <text x="130" y="98" class="mono">B2</text>
+        <text x="470" y="98">ordered</text>
+
+        <rect x="16" y="122" width="440" height="34" class="stroke fill-soft"/>
+        <text x="24" y="144" class="mono big">P2</text>
+        <text x="70" y="144" class="mono">C1</text>
+        <text x="470" y="144">ordered</text>
+
+        <path d="M16 172 L456 172" class="stroke-red dash"/>
+        <text x="16" y="186" class="red">across partitions: no ordering guarantee at all</text>
+      </svg>
+      <figcaption><b>Order is a per-partition property.</b> A1&nbsp;→&nbsp;A2&nbsp;→&nbsp;A3
+      is guaranteed. A1 before B1 is not, and never will be.</figcaption>
+    </figure>
+
+    <p data-anchor="c2-p7">Three consequences follow immediately, and they are the
+    reason this chapter sits in Part I rather than Part II:</p>
+    <ul data-anchor="c2-ul1">
+      <li><b>Ordering scope is a contract term.</b> If you key by
+      <code>orderId</code>, you have promised consumers that one order's events
+      arrive in order — and promised nothing about two different orders. Write
+      that down; consumers will assume more than you meant.</li>
+      <li><b>Partition count caps consumer parallelism.</b> A partition is
+      assigned to at most one consumer within a group, so a group can never have
+      more usefully-working members than the topic has partitions. Your
+      throughput ceiling was set when someone typed
+      <code>--partitions 3</code>.</li>
+      <li><b>Repartitioning breaks the promise.</b> Adding partitions changes the
+      key-to-partition mapping, so a key that used to land in P1 may now land in
+      P4 — while its history sits in P1. Ordering for existing keys is broken at
+      that boundary. There is no clean fix, only planning.</li>
+    </ul>
+
+    <div class="callout warn" data-anchor="c2-call2">
+      <p class="callout-t">Trap</p>
+      <p>A null key round-robins across partitions. That is fine for
+      genuinely independent records and catastrophic for anything with a
+      lifecycle — you have opted out of ordering without saying so anywhere.</p>
+    </div>
+
+    <h2 data-anchor="c2-h2-groups">Consumer groups</h2>
+    <p data-anchor="c2-p8">A consumer group is Kafka's unit of work distribution.
+    Members of a group divide the partitions between them; each partition goes to
+    exactly one member. Add a member and partitions redistribute; lose a member
+    and its partitions move elsewhere. Different groups are entirely independent
+    — that is what lets a new team start consuming your topic without asking
+    permission or affecting anyone.</p>
+    <p data-anchor="c2-p9">Group membership is also where most operational pain
+    lives, which is Chapter 7's subject. For now the contract-level fact is the
+    important one: <b>the group is the unit of "a consumer," and the partition
+    count is the ceiling on its parallelism</b>.</p>
+
+    <h2 data-anchor="c2-h2-retention">Retention versus compaction</h2>
+    <p data-anchor="c2-p10">Kafka offers two cleanup policies, and they answer
+    different questions.</p>
+    <p data-anchor="c2-p11"><b>Delete</b> (time- or size-based) says: keep records for
+    a while, then drop the oldest. This suits a stream of facts. "We keep 30 days
+    of <code>OrderPlaced</code>" is a retention statement, and it is also a
+    replay-window statement — you can only rebuild a consumer from data that
+    still exists.</p>
+    <p data-anchor="c2-p12"><b>Compact</b> says: keep at least the latest value for
+    each key, forever. This turns the topic into a changelog of keyed state
+    rather than a stream of events. A compacted <code>customer-profiles</code>
+    topic lets a brand-new consumer read from the beginning and end up with the
+    current profile of every customer — a bootstrap mechanism, not a history.</p>
+
+    <p class="pen-note" data-anchor="c2-pen">Rule of thumb: if replaying the topic
+    from the start should give you <em>everything that happened</em>, use delete
+    retention. If it should give you <em>how things are now</em>, use compaction.
+    If you want both, you want two topics.</p>
+
+    <p data-anchor="c2-p13">Compaction's details are genuinely surprising — it is
+    asynchronous, best-effort, and does not guarantee a single record per key at
+    any given moment. Chapter 9 covers that properly, because several compliance
+    and correctness mistakes depend on believing otherwise.</p>
+
+    <h2 data-anchor="c2-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c2-p14">A vocabulary where each term is a decision rather than a
+    fact. Key means ordering scope. Partition count means parallelism ceiling and
+    future repartitioning pain. Retention means replay window. Cleanup policy
+    means "history" or "current state."</p>
+    <p data-anchor="c2-p15">Next we look at how the payload itself is encoded — and
+    why Avro's central idea is that the reader and the writer are allowed to
+    disagree about the schema, within rules.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="01-why-event-contracts-matter.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="03-avro-as-a-contract-system.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
