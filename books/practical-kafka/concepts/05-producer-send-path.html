@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>What Happens When a Producer Sends a Record — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part II · Internals That Shape Design</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c5-no">Chapter 05</p>
+    <h1 data-anchor="c5-h1">What Happens When a Producer Sends a Record</h1>
+
+    <p class="standfirst" data-anchor="c5-stand"><code>send()</code> returns almost
+    immediately and almost nothing has happened yet. Understanding the gap
+    between "returned" and "durable" is where producer correctness lives.</p>
+
+    <h2 data-anchor="c5-h2-path">The path a record takes</h2>
+    <p data-anchor="c5-p1">Calling <code>send()</code> does not write to a broker. It
+    runs a short client-side pipeline and then hands the record to a background
+    thread. Six stages:</p>
+
+    <figure class="diagram-fig" data-anchor="c5-fig1">
+      <svg class="diagram" viewBox="0 0 560 176" role="img" aria-labelledby="c5d1t">
+        <title id="c5d1t">Producer send path: serialize, partition, accumulate into a batch, compress, then the sender thread issues the produce request and the leader appends</title>
+
+        <rect x="16" y="26" width="100" height="36" class="stroke fill-soft"/>
+        <text x="26" y="48" class="big">serialize</text>
+        <rect x="140" y="26" width="100" height="36" class="stroke fill-soft"/>
+        <text x="150" y="48" class="big">partition</text>
+        <rect x="264" y="26" width="100" height="36" class="stroke fill-soft"/>
+        <text x="274" y="48" class="big">accumulate</text>
+        <rect x="388" y="26" width="100" height="36" class="stroke fill-soft"/>
+        <text x="398" y="48" class="big">compress</text>
+
+        <path d="M116 44 L140 44" class="stroke"/>
+        <path d="M132 40 L140 44 L132 48" class="stroke"/>
+        <path d="M240 44 L264 44" class="stroke"/>
+        <path d="M256 40 L264 44 L256 48" class="stroke"/>
+        <path d="M364 44 L388 44" class="stroke"/>
+        <path d="M380 40 L388 44 L380 48" class="stroke"/>
+
+        <text x="16" y="84" class="dim">— caller's thread returns here (a Future) —</text>
+        <path d="M16 92 L544 92" class="stroke-soft dash"/>
+
+        <rect x="16" y="110" width="140" height="36" class="stroke-red"/>
+        <text x="26" y="132" class="big red">sender thread</text>
+        <path d="M156 128 L236 128" class="stroke-red"/>
+        <path d="M228 124 L236 128 L228 132" class="stroke-red"/>
+        <rect x="236" y="110" width="140" height="36" class="stroke fill-soft"/>
+        <text x="246" y="132" class="big">leader append</text>
+        <path d="M376 128 L456 128" class="stroke"/>
+        <path d="M448 124 L456 128 L448 132" class="stroke"/>
+        <rect x="456" y="110" width="88" height="36" class="stroke fill-soft"/>
+        <text x="466" y="132" class="big">replicas</text>
+
+        <text x="16" y="168" class="red">everything below the line happens after send() returned</text>
+      </svg>
+      <figcaption><b>The gap is the point.</b> Durability is decided below the
+      dashed line, long after your code moved on.</figcaption>
+    </figure>
+
+    <p data-anchor="c5-p2"><b>Serialize</b> turns key and value into bytes — for us,
+    the Avro serializer that registers the schema and writes the five-byte prefix
+    from Chapter 4. <b>Partition</b> selects the target: hash of the key if there
+    is one, otherwise a sticky round-robin. <b>Accumulate</b> puts the record into
+    a per-partition batch in the producer's memory buffer. <b>Compress</b>
+    applies to the whole batch, not per record — which is why batching and
+    compression multiply each other.</p>
+    <p data-anchor="c5-p3">Then the sender thread issues a produce request, the
+    partition leader appends to its log, and followers replicate. Only at that
+    point is anything durable, and only then does your <code>Future</code>
+    complete.</p>
+
+    <h2 data-anchor="c5-h2-acks">acks: what you are waiting for</h2>
+    <p data-anchor="c5-p4">The <code>acks</code> setting decides what counts as
+    "written."</p>
+    <ul data-anchor="c5-ul1">
+      <li><code>acks=0</code> — fire and forget. The producer does not wait at all.
+      Records are lost silently on any failure. Use for telemetry you would not
+      pay to recover.</li>
+      <li><code>acks=1</code> — the leader has written to its log. If the leader
+      fails before followers replicate, the record is gone. This is the setting
+      that produces "we lost a few hundred events during the failover."</li>
+      <li><code>acks=all</code> — the leader waits for the full set of in-sync
+      replicas to acknowledge the record. This guarantees the record will not be
+      lost as long as at least one in-sync replica remains alive.</li>
+    </ul>
+    <p data-anchor="c5-p5">Read that last guarantee carefully: it is conditional on
+    the in-sync replica set, which is itself configurable. <code>acks=all</code>
+    on a topic where the ISR has shrunk to one replica guarantees very little.
+    That interaction is Chapter 6, and it is the single most misunderstood thing
+    about Kafka durability.</p>
+
+    <h2 data-anchor="c5-h2-idem">Idempotence: retries without duplicates</h2>
+    <p data-anchor="c5-p6">Without idempotence, a retry after a broker failure may
+    write a duplicate — the classic case being an append that succeeded but whose
+    acknowledgement was lost, so the producer retries a record the broker already
+    has.</p>
+    <p data-anchor="c5-p7">The idempotent producer solves this by assigning each
+    producer a session id and each record a sequence number per partition. The
+    broker tracks the last sequence it accepted and discards a duplicate. It is
+    enabled by default when no conflicting configuration is set, and it requires
+    a specific combination:</p>
+
+    <p class="pre-label">producer.properties — the durability-first profile</p>
+<pre data-anchor="c5-code1"><code><span class="cm"># required together for idempotence</span>
+acks=<span class="str">all</span>
+enable.idempotence=<span class="kw">true</span>
+max.in.flight.requests.per.connection=<span class="num">5</span>   <span class="cm"># must be &lt;= 5</span>
+retries=<span class="num">2147483647</span>                          <span class="cm"># bounded by the timeout below</span>
+
+<span class="cm"># throughput, without giving up the above</span>
+batch.size=<span class="num">65536</span>
+linger.ms=<span class="num">5</span>
+compression.type=<span class="str">lz4</span>
+
+<span class="cm"># the real bound on "how long may a send take"</span>
+delivery.timeout.ms=<span class="num">120000</span></code></pre>
+
+    <p data-anchor="c5-p8">Idempotence requires <code>acks=all</code>, retries greater
+    than zero, and <code>max.in.flight.requests.per.connection</code> of five or
+    fewer — and ordering is preserved for any allowable value. That last clause
+    is worth internalising: before idempotence, keeping order under retries meant
+    limiting yourself to one in-flight request, at real throughput cost. With
+    idempotence you keep ordering <em>and</em> pipelining.</p>
+
+    <div class="callout warn" data-anchor="c5-call1">
+      <p class="callout-t">Trap</p>
+      <p>Setting <code>retries</code> very high without thinking about
+      <code>delivery.timeout.ms</code>. Retries are bounded by the delivery
+      timeout, not by the retry count — so the real question is "how long may a
+      record sit in the accumulator before I am told it failed?" Answer that,
+      set the timeout, and let retries be effectively infinite within it.</p>
+    </div>
+
+    <h2 data-anchor="c5-h2-batching">Batching: linger and batch size</h2>
+    <p data-anchor="c5-p9">The producer sends a batch when either
+    <code>batch.size</code> bytes have accumulated or <code>linger.ms</code> has
+    elapsed — whichever comes first. Both defaults are tuned for latency;
+    a durability-and-throughput profile typically raises the batch size well
+    above the 16&nbsp;KB default and sets a small non-zero linger.</p>
+    <p data-anchor="c5-p10">The counter-intuitive part: adding a few milliseconds of
+    linger often <em>reduces</em> end-to-end latency under load, because larger
+    batches mean fewer requests, less per-request overhead, and better
+    compression ratios. Latency-versus-throughput is a real trade-off at low
+    volume and frequently a false one at high volume.</p>
+
+    <h2 data-anchor="c5-h2-keys">Keys, hashing, and hot partitions</h2>
+    <p data-anchor="c5-p11">The key does two jobs at once, and they can conflict.
+    It defines ordering scope (Chapter 2) and it determines load distribution.
+    A key with good semantics can have terrible distribution.</p>
+    <p data-anchor="c5-p12">The canonical failure: keying by <code>tenantId</code> in
+    a system where one tenant is forty percent of your volume. Ordering per
+    tenant is exactly right; the distribution is a permanent hot partition that
+    no amount of extra partitions will relieve, because that tenant's records all
+    hash to one of them. The consumer owning that partition is the bottleneck for
+    the whole topic.</p>
+
+    <p class="pen-note" data-anchor="c5-pen">When ordering scope and load
+    distribution disagree, ordering usually wins — you can add capacity, but you
+    cannot retrofit a guarantee. If the hot key is genuinely intolerable,
+    composite keys (<code>tenantId:orderId</code>) narrow the ordering scope
+    deliberately rather than accidentally.</p>
+
+    <h2 data-anchor="c5-h2-perf">What actually moves the needle</h2>
+    <table data-anchor="c5-tbl1">
+      <caption>Producer knobs by intent</caption>
+      <thead><tr><th>You want</th><th>Turn</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Durability</td><td><code>acks=all</code>, idempotence, RF 3 / minISR 2</td><td>Latency, and write availability on broker loss</td></tr>
+        <tr><td>Throughput</td><td>Larger <code>batch.size</code>, <code>linger.ms</code> 5&ndash;50, lz4/zstd</td><td>A few ms of latency, CPU</td></tr>
+        <tr><td>Low latency</td><td><code>linger.ms=0</code>, smaller batches</td><td>More requests, worse compression</td></tr>
+        <tr><td>Even load</td><td>Higher-cardinality key</td><td>Narrower ordering scope</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="c5-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c5-p13">A precise answer to "is my event safely published?" —
+    which is a contract question, not a tuning question. A producer configured
+    <code>acks=1</code> is telling consumers, without saying so, that the event
+    stream may quietly lose records during a failover. If your contract says
+    "every accepted order appears exactly once on this topic," the producer
+    configuration is part of that contract.</p>
+    <p data-anchor="c5-p14">And since <code>acks=all</code>'s guarantee is stated in
+    terms of in-sync replicas, we need to know precisely what that set is and
+    when it shrinks. Next chapter.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="04-the-schema-registry-model.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="06-replication-durability-and-failure.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

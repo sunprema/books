@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Transactions and Exactly-Once Semantics — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part II · Internals That Shape Design</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c8-no">Chapter 08</p>
+    <h1 data-anchor="c8-h1">Transactions and Exactly-Once Semantics</h1>
+
+    <p class="standfirst" data-anchor="c8-stand">Kafka's exactly-once is real,
+    precise, and much narrower than the phrase suggests. It covers Kafka. It does
+    not cover your database, and it never will.</p>
+
+    <h2 data-anchor="c8-h2-what">What EOS actually is</h2>
+    <p data-anchor="c8-p1">Exactly-once semantics in Kafka is three mechanisms
+    working together:</p>
+    <ul data-anchor="c8-ul1">
+      <li><b>The idempotent producer</b> — sequence-number deduplication, so a
+      retry does not create a duplicate (Chapter 5).</li>
+      <li><b>The transactional producer</b> — atomic writes spanning multiple
+      partitions, via a two-phase commit coordinated by the broker.</li>
+      <li><b>read_committed consumers</b> — consumers that refuse to see records
+      belonging to transactions that have not committed.</li>
+    </ul>
+    <p data-anchor="c8-p2">Idempotence alone gets you "no duplicates from retries on
+    one partition." Transactions get you "these writes across these partitions
+    all happen, or none do." The isolation level is what makes the second one
+    observable.</p>
+
+    <h2 data-anchor="c8-h2-lso">read_committed and the last stable offset</h2>
+    <p data-anchor="c8-p3">Here is the mechanism people miss. A
+    <code>read_committed</code> consumer receives records in offset order as
+    usual, but only those with an offset below the <b>last stable offset</b>
+    (LSO) — the lowest offset of any open pending transaction. So it only ever
+    sees records from transactions that have already been committed or
+    aborted.</p>
+
+    <figure class="diagram-fig" data-anchor="c8-fig1">
+      <svg class="diagram" viewBox="0 0 560 156" role="img" aria-labelledby="c8d1t">
+        <title id="c8d1t">A read_committed consumer can only read up to the last stable offset, which is held back by the oldest open transaction</title>
+
+        <text x="16" y="18">Partition log</text>
+        <rect x="16" y="28" width="180" height="34" class="stroke fill-soft"/>
+        <text x="26" y="50" class="mono big">committed</text>
+
+        <rect x="204" y="28" width="150" height="34" class="stroke-red"/>
+        <text x="214" y="50" class="mono big red">txn OPEN</text>
+
+        <rect x="362" y="28" width="182" height="34" class="stroke fill-soft"/>
+        <text x="372" y="50" class="mono big">committed</text>
+
+        <path d="M204 22 L204 96" class="stroke-red dash"/>
+        <text x="212" y="88" class="red">LSO — reading stops here</text>
+
+        <path d="M16 116 L196 116" class="stroke"/>
+        <path d="M188 112 L196 116 L188 120" class="stroke"/>
+        <text x="16" y="136">visible to read_committed</text>
+
+        <text x="362" y="88" class="dim">committed, but blocked</text>
+        <text x="362" y="104" class="dim">behind the open txn</text>
+      </svg>
+      <figcaption><b>One slow transaction stalls readers.</b> Records after it
+      may be fully committed and still invisible until the older transaction
+      resolves.</figcaption>
+    </figure>
+
+    <p data-anchor="c8-p4">This has a direct operational consequence:
+    <b>long-running transactions block <code>read_committed</code> consumers</b>
+    at the LSO and increase the chance of hitting the transaction timeout. A
+    transaction that stays open for thirty seconds adds thirty seconds of latency
+    for every downstream consumer on that partition, no matter how fast they
+    are.</p>
+    <p data-anchor="c8-p5">Keep transactions short. If your transaction spans an
+    external call, you have designed a system where a slow third party stalls
+    your consumers.</p>
+
+    <h2 data-anchor="c8-h2-ctp">Consume-transform-produce</h2>
+    <p data-anchor="c8-p6">The pattern transactions were built for: read from input
+    topics, compute, write to output topics, and commit the input offsets — all
+    atomically. The crucial detail is that <b>the offset commit is part of the
+    transaction</b>. The producer sends the offsets to the transaction, not the
+    consumer.</p>
+
+    <p class="pre-label">The shape of the loop</p>
+<pre data-anchor="c8-code1"><code>producer.<span class="fn">initTransactions</span>();
+
+<span class="kw">while</span> (running) {
+  records = consumer.<span class="fn">poll</span>(timeout);
+  <span class="kw">if</span> (records.isEmpty()) <span class="kw">continue</span>;
+
+  producer.<span class="fn">beginTransaction</span>();
+  <span class="kw">try</span> {
+    <span class="kw">for</span> (record : records)
+      producer.<span class="fn">send</span>(<span class="fn">transform</span>(record));
+
+    <span class="cm">// offsets committed inside the transaction, by the PRODUCER</span>
+    producer.<span class="fn">sendOffsetsToTransaction</span>(offsetsOf(records), consumer.groupMetadata());
+    producer.<span class="fn">commitTransaction</span>();
+  } <span class="kw">catch</span> (Exception e) {
+    producer.<span class="fn">abortTransaction</span>();   <span class="cm">// outputs never become visible</span>
+  }
+}</code></pre>
+
+    <div class="callout warn" data-anchor="c8-call1">
+      <p class="callout-t">Required</p>
+      <p>Set <code>enable.auto.commit=false</code> on the consumer. With
+      transactional offset commits, auto-commit double-commits and destroys the
+      atomicity you just paid for.</p>
+    </div>
+
+    <h2 data-anchor="c8-h2-limits">Where it stops</h2>
+    <p data-anchor="c8-p7">Two boundaries, and both are absolute:</p>
+    <p data-anchor="c8-p8"><b>Transactions are supported only within a single Kafka
+    cluster.</b> A transaction cannot span two clusters. Cross-cluster
+    replication is at-least-once, so mirrored topics carry duplicates.</p>
+    <p data-anchor="c8-p9"><b>Side effects outside Kafka are not covered.</b> If your
+    processing writes to a database, sends an email, or calls a payment API,
+    those are not in the transaction and cannot be rolled back by
+    <code>abortTransaction()</code>. Kafka commits atomically; your database does
+    not know the transaction exists.</p>
+
+    <div class="callout key" data-anchor="c8-call2">
+      <p class="callout-t">The sentence to remember</p>
+      <p>Kafka's exactly-once means <b>exactly-once processing of Kafka records
+      into Kafka records</b>. The moment a side effect leaves Kafka, you are back
+      to at-least-once and you need idempotency — a deduplication key, an upsert,
+      or a processed-event store.</p>
+    </div>
+
+    <h2 data-anchor="c8-h2-outbox">What to use instead, when the side effect is real</h2>
+    <p data-anchor="c8-p10">Three patterns cover essentially every case where EOS
+    does not reach:</p>
+    <ul data-anchor="c8-ul2">
+      <li><b>The outbox pattern</b> — for writing to a database <em>and</em>
+      publishing. Write the event to an outbox table in the same local database
+      transaction as the business change, then relay it to Kafka. One atomic
+      write, one asynchronous relay. Chapter 14.</li>
+      <li><b>Idempotent consumers</b> — for consuming into a database. Make the
+      write itself repeatable: upsert by a natural key, or record processed
+      event ids and skip ones you have seen. Chapter 15.</li>
+      <li><b>Deduplication keys on external calls</b> — for third-party APIs.
+      Most payment and messaging providers accept an idempotency key precisely
+      because this problem is universal.</li>
+    </ul>
+
+    <h2 data-anchor="c8-h2-cost">Should you turn it on?</h2>
+    <p data-anchor="c8-p11">Transactions cost throughput and latency, and they add a
+    failure mode (the stalled LSO) that is genuinely awkward to debug. They are
+    clearly worth it for Kafka-to-Kafka stream processing where correctness of
+    aggregates matters — Kafka Streams makes this a single configuration setting
+    (Chapter 16), which is where most teams should meet transactions.</p>
+    <p data-anchor="c8-p12">Hand-rolling transactions in an application that ends up
+    calling a database anyway is usually the wrong trade: you pay the cost and
+    still need idempotency for the part that mattered. Ask first where the side
+    effects are. If any of them leave Kafka, design for idempotency and consider
+    whether transactions are buying you anything at all.</p>
+
+    <h2 data-anchor="c8-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c8-p13">A sharp boundary. Inside Kafka, atomicity is available
+    and cheap to describe. Outside it, you own the problem — and knowing which
+    side of that line each of your side effects sits on is what stops a team from
+    enabling EOS and assuming the duplicate-payment bug is now impossible.</p>
+    <p data-anchor="c8-p14">One more internals chapter: how the log physically
+    stores data, and why compaction is the mechanism most often mistaken for a
+    delete button.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="07-consumers-offsets-and-rebalances.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-storage-retention-and-compaction.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

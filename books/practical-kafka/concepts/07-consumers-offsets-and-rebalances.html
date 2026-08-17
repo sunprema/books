@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Consumers, Offsets, and Rebalances — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part II · Internals That Shape Design</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c7-no">Chapter 07</p>
+    <h1 data-anchor="c7-h1">Consumers, Offsets, and Rebalances</h1>
+
+    <p class="standfirst" data-anchor="c7-stand">Where you commit the offset relative
+    to where you do the work is the entire difference between at-most-once and
+    at-least-once. Everything else is tuning.</p>
+
+    <h2 data-anchor="c7-h2-poll">The poll loop is a liveness contract</h2>
+    <p data-anchor="c7-p1">A consumer calls <code>poll()</code> in a loop. Each call
+    fetches records and, invisibly, tells the group coordinator that this
+    consumer is alive and making progress. Those two jobs share one method, and
+    that is the source of most consumer trouble.</p>
+    <p data-anchor="c7-p2">If your processing takes longer than
+    <code>max.poll.interval.ms</code>, the broker assumes the consumer has
+    crashed and evicts it from the group, triggering a rebalance. The consumer is
+    not crashed. It is doing exactly what you told it to. But it did not come
+    back to <code>poll()</code> in time, so from the coordinator's point of view
+    it is indistinguishable from a dead process.</p>
+    <p data-anchor="c7-p3">The result is a loop that is very hard to diagnose from
+    the outside: process slowly → get evicted → partitions reassigned → new owner
+    starts from the last commit → processes the same records slowly → gets
+    evicted. Lag climbs steadily while every consumer looks busy and healthy.</p>
+
+    <div class="callout warn" data-anchor="c7-call1">
+      <p class="callout-t">The number one cause of "random rebalances"</p>
+      <p>It is almost never a network problem. It is processing time exceeding
+      <code>max.poll.interval.ms</code>. Either reduce <code>max.poll.records</code>
+      so a batch takes less time, move slow work off the poll thread, or raise the
+      interval to match reality — in that order of preference.</p>
+    </div>
+
+    <h2 data-anchor="c7-h2-commit">Committing offsets</h2>
+    <p data-anchor="c7-p4">A committed offset says "this group has processed
+    everything before this point on this partition." When a partition moves to
+    another consumer, the new owner starts from that offset. So the commit is a
+    durability decision about <em>work</em>, and its placement decides your
+    delivery semantics.</p>
+
+    <figure class="diagram-fig" data-anchor="c7-fig1">
+      <svg class="diagram" viewBox="0 0 560 168" role="img" aria-labelledby="c7d1t">
+        <title id="c7d1t">Committing before processing risks losing records; committing after processing risks reprocessing them</title>
+
+        <text x="16" y="18">Commit first — at-most-once</text>
+        <rect x="16" y="28" width="110" height="32" class="stroke fill-soft"/>
+        <text x="26" y="49" class="big">poll</text>
+        <rect x="150" y="28" width="110" height="32" class="stroke fill-soft"/>
+        <text x="160" y="49" class="big">commit</text>
+        <rect x="284" y="28" width="110" height="32" class="stroke-red"/>
+        <text x="294" y="49" class="big red">process</text>
+        <path d="M126 44 L150 44" class="stroke"/>
+        <path d="M142 40 L150 44 L142 48" class="stroke"/>
+        <path d="M260 44 L284 44" class="stroke"/>
+        <path d="M276 40 L284 44 L276 48" class="stroke"/>
+        <text x="404" y="49" class="red">crash here = lost</text>
+
+        <path d="M16 80 L544 80" class="stroke-soft"/>
+
+        <text x="16" y="106">Process first — at-least-once</text>
+        <rect x="16" y="116" width="110" height="32" class="stroke fill-soft"/>
+        <text x="26" y="137" class="big">poll</text>
+        <rect x="150" y="116" width="110" height="32" class="stroke-red"/>
+        <text x="160" y="137" class="big red">process</text>
+        <rect x="284" y="116" width="110" height="32" class="stroke fill-soft"/>
+        <text x="294" y="137" class="big">commit</text>
+        <path d="M126 132 L150 132" class="stroke"/>
+        <path d="M142 128 L150 132 L142 136" class="stroke"/>
+        <path d="M260 132 L284 132" class="stroke"/>
+        <path d="M276 128 L284 132 L276 136" class="stroke"/>
+        <text x="404" y="137" class="red">crash here = redone</text>
+      </svg>
+      <figcaption><b>There is no third option.</b> You choose which failure you
+      would rather handle, then design for it.</figcaption>
+    </figure>
+
+    <p data-anchor="c7-p5"><b>Auto-commit</b> periodically commits in the background,
+    on a timer, whether or not you finished processing what you polled. It is
+    convenient and it quietly gives you neither semantic reliably — offsets can
+    advance past records that failed. It is fine for a consumer where losing a
+    record is genuinely acceptable, and wrong almost everywhere else.</p>
+    <p data-anchor="c7-p6"><b>Manual synchronous commit</b> after processing gives you
+    clean at-least-once: you commit only what you have completed, and you find
+    out if the commit failed. It costs a round trip per commit, so commit per
+    batch rather than per record.</p>
+    <p data-anchor="c7-p7"><b>Manual asynchronous commit</b> avoids that round-trip
+    stall at the cost of not knowing immediately whether the commit landed. The
+    standard pattern is async commits during steady state and one synchronous
+    commit on shutdown and on partition revocation.</p>
+
+    <div class="callout key" data-anchor="c7-call2">
+      <p class="callout-t">Design consequence</p>
+      <p>At-least-once is the practical default, which means <b>duplicate
+      delivery is not an edge case — it is the normal operating mode</b>. Every
+      consumer with an external side effect needs an idempotency key. This is
+      Chapter 15, and it is not optional.</p>
+    </div>
+
+    <h2 data-anchor="c7-h2-rebalance">Rebalancing, and how it got better</h2>
+    <p data-anchor="c7-p8">When membership changes, partitions must be redistributed.
+    Historically this was a stop-the-world event: every consumer revoked
+    everything it held, then everyone rejoined and received a fresh assignment.
+    A group of forty consumers paused entirely because one instance restarted.</p>
+    <p data-anchor="c7-p9">Three improvements arrived, and knowing which one you are
+    running matters:</p>
+    <ul data-anchor="c7-ul1">
+      <li><b>Incremental cooperative rebalancing</b> (Kafka 2.4). The
+      <code>CooperativeStickyAssignor</code> splits the rebalance into smaller
+      steps and lets consumers keep processing partitions that are not being
+      reassigned. Most partitions never move at all.</li>
+      <li><b>Static membership</b> (KIP-345). Giving each consumer a stable
+      <code>group.instance.id</code> lets Kafka preserve its partition
+      assignments across a restart within the session timeout. A rolling deploy
+      stops reshuffling the group entirely — the instance leaves and comes back
+      to the same partitions.</li>
+      <li><b>The next-generation protocol</b> (KIP-848), generally available in
+      Kafka 4.0. The broker computes assignments instead of delegating to a group
+      leader, and a joining consumer receives partitions incrementally rather
+      than waiting for everyone to revoke and rejoin. It is enabled by default on
+      the broker side, but <b>consumers must opt in</b> with
+      <code>group.protocol=consumer</code>.</li>
+    </ul>
+
+    <p class="pen-note" data-anchor="c7-pen">If you run Kafka 4.x and have not set
+    <code>group.protocol=consumer</code>, you are still on the old protocol.
+    The broker default does not migrate your clients for you.</p>
+
+    <p data-anchor="c7-p10">Static membership and cooperative rebalancing address
+    different problems and compose well: static membership stops rebalances from
+    <em>happening</em> on planned restarts; cooperative rebalancing makes the ones
+    that do happen cheaper.</p>
+
+    <h2 data-anchor="c7-h2-poison">Poison messages</h2>
+    <p data-anchor="c7-p11">A poison pill is a record that will never process
+    successfully — a malformed payload, a schema the consumer cannot resolve, a
+    business invariant that can never be satisfied. If processing throws an
+    uncaught exception on the consumer thread, the consumer re-consumes the same
+    batch on the next poll. Forever.</p>
+    <p data-anchor="c7-p12">The symptom is distinctive and worth recognising on
+    sight: <b>lag grows steadily, throughput is zero, error rate is constant, and
+    the consumer never crashes</b>. It is perfectly healthy and perfectly
+    stuck.</p>
+    <p data-anchor="c7-p13">The fix is to classify failures rather than retry them
+    uniformly. A transient dependency error deserves a retry; a deserialization
+    failure never will succeed and must be routed out of the main path to a
+    dead-letter topic. Chapter 15 builds this properly, and Chapter 25 walks
+    through it happening in production.</p>
+
+    <h2 data-anchor="c7-h2-reset">A note on auto.offset.reset</h2>
+    <p data-anchor="c7-p14">When a group has no committed offset — a brand-new
+    consumer, or one whose offsets aged out — <code>auto.offset.reset</code>
+    decides where it starts: <code>earliest</code> (replay everything retained)
+    or <code>latest</code> (only new records). The default is
+    <code>latest</code>.</p>
+    <p data-anchor="c7-p15">This setting is a loaded weapon in both directions. A new
+    consumer that silently starts at <code>latest</code> misses the backlog
+    someone assumed it would process. A consumer that falls behind retention and
+    resets to <code>earliest</code> suddenly reprocesses months of history at
+    full speed, usually into a downstream system that is not expecting it. Set it
+    deliberately per consumer, and alert when a reset actually occurs.</p>
+
+    <h2 data-anchor="c7-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c7-p16">The knowledge that duplicates are the default, that
+    rebalances are usually self-inflicted through processing time, and that a
+    stuck consumer looks healthy. All three shape how you write consumers in Part
+    IV.</p>
+    <p data-anchor="c7-p17">Which raises the obvious question: Kafka advertises
+    exactly-once semantics. What exactly does that buy, and where does it stop?
+    Next chapter — and the answer is narrower than the marketing suggests.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="06-replication-durability-and-failure.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="08-transactions-and-eos.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

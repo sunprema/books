@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Replication, Durability, and Failure — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part II · Internals That Shape Design</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c6-no">Chapter 06</p>
+    <h1 data-anchor="c6-h1">Replication, Durability, and Failure</h1>
+
+    <p class="standfirst" data-anchor="c6-stand">Durability is not a setting. It is the
+    interaction of three settings, and getting two right while getting the third
+    wrong gives you the confidence of the first two with the safety of the
+    third.</p>
+
+    <h2 data-anchor="c6-h2-isr">Leaders, followers, and the in-sync set</h2>
+    <p data-anchor="c6-p1">Each partition has one leader and some followers. All
+    reads and writes for a partition go through its leader; followers fetch from
+    the leader and try to keep up.</p>
+    <p data-anchor="c6-p2">A follower that is keeping up is <b>in sync</b>, and the
+    set of such replicas is the <b>ISR</b> (in-sync replicas). A follower that
+    falls too far behind — because its broker is slow, garbage collecting, or
+    partitioned from the network — is removed from the ISR. It can rejoin once it
+    catches up. The ISR is therefore dynamic, and its size is the thing your
+    durability guarantee is actually stated over.</p>
+    <p data-anchor="c6-p3">The <b>high water mark</b> is the offset up to which all
+    in-sync replicas have replicated. Consumers can only read up to it. This is
+    what prevents a consumer from reading a record that would vanish if the
+    leader failed right now — you cannot observe data that is not yet
+    replicated.</p>
+
+    <figure class="diagram-fig" data-anchor="c6-fig1">
+      <svg class="diagram" viewBox="0 0 560 190" role="img" aria-labelledby="c6d1t">
+        <title id="c6d1t">The leader has records beyond the high water mark; consumers may only read up to the offset all in-sync replicas have</title>
+
+        <text x="16" y="18">Leader log</text>
+        <rect x="16" y="26" width="380" height="30" class="stroke fill-soft"/>
+        <rect x="316" y="26" width="80" height="30" class="stroke dash"/>
+        <text x="26" y="46" class="mono big">0 … 97</text>
+        <text x="326" y="46" class="mono big">98 99</text>
+
+        <text x="16" y="80">Follower A (in sync)</text>
+        <rect x="16" y="88" width="300" height="30" class="stroke fill-soft"/>
+        <text x="26" y="108" class="mono big">0 … 97</text>
+
+        <text x="16" y="142">Follower B (lagging, out of ISR)</text>
+        <rect x="16" y="150" width="200" height="30" class="stroke-soft"/>
+        <text x="26" y="170" class="mono big dim">0 … 62</text>
+
+        <path d="M316 20 L316 186" class="stroke-red dash"/>
+        <text x="404" y="46" class="red">high water mark</text>
+        <text x="404" y="62" class="dim">consumers read to here</text>
+        <text x="404" y="108" class="dim">replicated</text>
+      </svg>
+      <figcaption><b>Records exist before they are readable.</b> Offsets 98&ndash;99
+      are on the leader but not yet acknowledged by the ISR, so no consumer sees
+      them.</figcaption>
+    </figure>
+
+    <h2 data-anchor="c6-h2-three">The three settings that must agree</h2>
+    <p data-anchor="c6-p4">Durability comes from the interaction of three
+    settings. None is sufficient alone:</p>
+    <ul data-anchor="c6-ul1">
+      <li><b>Replication factor</b> (topic) — how many copies exist at all. This
+      is the ceiling on everything else.</li>
+      <li><b>min.insync.replicas</b> (topic or broker) — how many replicas must
+      be in sync for a write with <code>acks=all</code> to be accepted. If the
+      ISR drops below this, writes are rejected rather than silently accepted
+      into a fragile state.</li>
+      <li><b>acks</b> (producer) — whether the producer waits for the ISR at all.
+      A producer with <code>acks=1</code> ignores <code>min.insync.replicas</code>
+      entirely.</li>
+    </ul>
+
+    <div class="callout key" data-anchor="c6-call1">
+      <p class="callout-t">The combination to remember</p>
+      <p><b>Replication factor 3, min.insync.replicas 2, acks=all.</b> This is
+      the common production default and the right starting point for anything
+      you care about. With RF 3 and minISR 2, the producer can continue
+      unaffected while a single broker is unavailable, provided another replica
+      remains in sync — you tolerate one failure without losing writes, and you
+      refuse to accept writes that only one replica holds.</p>
+    </div>
+
+    <p data-anchor="c6-p5">The arithmetic is worth stating plainly: you tolerate
+    <code>RF &minus; minISR</code> broker failures while still accepting writes,
+    and you tolerate <code>minISR &minus; 1</code> failures without losing
+    acknowledged data. RF 3 / minISR 2 gives one of each. That symmetry is why it
+    is the default answer.</p>
+
+    <div class="callout warn" data-anchor="c6-call2">
+      <p class="callout-t">Trap</p>
+      <p>Setting <code>min.insync.replicas</code> equal to the replication
+      factor. It looks maximally safe and is operationally brittle: any single
+      broker going down — including for a routine rolling restart — stops writes
+      to that topic entirely. You have configured an outage into your deployment
+      process.</p>
+    </div>
+
+    <h2 data-anchor="c6-h2-failures">The failure modes, and who handles them</h2>
+    <table data-anchor="c6-tbl1">
+      <caption>What actually happens when things break</caption>
+      <thead><tr><th>Failure</th><th>What Kafka does</th><th>What you must do</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Follower falls behind</td>
+          <td>Drops it from the ISR; writes continue if ISR ≥ minISR</td>
+          <td>Alert on under-replicated partitions</td>
+        </tr>
+        <tr>
+          <td>Leader fails</td>
+          <td>Elects a new leader from the ISR; no acknowledged data lost</td>
+          <td>Nothing — but expect a brief produce/consume stall</td>
+        </tr>
+        <tr>
+          <td>ISR shrinks below minISR</td>
+          <td>Rejects <code>acks=all</code> writes</td>
+          <td>Handle the exception; do not silently drop the event</td>
+        </tr>
+        <tr>
+          <td>Producer retry after lost ack</td>
+          <td>Idempotence discards the duplicate</td>
+          <td>Enable idempotence (Chapter 5)</td>
+        </tr>
+        <tr>
+          <td>Consumer crashes</td>
+          <td>Rebalances its partitions to other members</td>
+          <td>Commit offsets deliberately (Chapter 7)</td>
+        </tr>
+        <tr>
+          <td>Network partition</td>
+          <td>ISR shrinks; possibly two views of the world briefly</td>
+          <td>Understand unclean leader election, below</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="c6-h2-unclean">Unclean leader election</h2>
+    <p data-anchor="c6-p6">Suppose every in-sync replica for a partition is
+    unavailable, and the only surviving replica is one that had fallen out of the
+    ISR — it is missing the most recent records. You have two choices, and Kafka
+    makes you pick in advance.</p>
+    <p data-anchor="c6-p7">With unclean leader election <b>disabled</b> (the safe
+    default), the partition stays offline until an in-sync replica returns.
+    Availability suffers; no acknowledged data is lost.</p>
+    <p data-anchor="c6-p8">With it <b>enabled</b>, that out-of-sync replica becomes
+    leader. The partition comes back immediately — and the records it never
+    received are gone, permanently, including records that were acknowledged to
+    producers. Consumers that had read past that point will see offsets go
+    backwards.</p>
+
+    <p class="pen-note" data-anchor="c6-pen">This is the clearest availability-versus-durability
+    dial in Kafka. For an <code>OrderPlaced</code> topic the answer is obviously
+    "stay offline." For a clickstream feeding a dashboard it is arguably "come
+    back up." The mistake is having one cluster-wide answer for both.</p>
+
+    <h2 data-anchor="c6-h2-profiles">Durability profiles by topic criticality</h2>
+    <p data-anchor="c6-p9">Rather than tuning per topic from scratch, define two or
+    three profiles and assign topics to them. This is the practice that scales
+    across a platform team:</p>
+
+    <table data-anchor="c6-tbl2">
+      <caption>Two profiles that cover most topics</caption>
+      <thead><tr><th></th><th>Critical</th><th>Best-effort</th></tr></thead>
+      <tbody>
+        <tr><td>Replication factor</td><td>3</td><td>3</td></tr>
+        <tr><td>min.insync.replicas</td><td>2</td><td>1</td></tr>
+        <tr><td>Producer acks</td><td><code>all</code></td><td><code>1</code></td></tr>
+        <tr><td>Idempotence</td><td>on</td><td>on</td></tr>
+        <tr><td>Unclean leader election</td><td>off</td><td>allowed</td></tr>
+        <tr><td>On ISR shortfall</td><td>Reject the write, surface the error</td><td>Continue</td></tr>
+        <tr><td>Example</td><td>Financial events, order lifecycle</td><td>Telemetry, click events</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c6-p10">Notice that replication factor stays at 3 in both. Replicas
+    are cheap relative to the cost of being wrong about which topics were
+    important, and the profile difference is in the write-time behaviour, not in
+    how many copies exist.</p>
+
+    <h2 data-anchor="c6-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c6-p11">A concrete meaning for the phrase "this event is
+    durable." It means: replicated to at least <code>minISR</code> replicas
+    before the producer was told it succeeded, on a topic where an out-of-sync
+    replica will never be promoted. Anything less is a weaker promise, and the
+    consumers of your contract deserve to know which one they have.</p>
+    <p data-anchor="c6-p12">We have covered getting data in safely. Next: getting it
+    out exactly as many times as you meant to, which turns out to be harder.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="05-producer-send-path.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-consumers-offsets-and-rebalances.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
