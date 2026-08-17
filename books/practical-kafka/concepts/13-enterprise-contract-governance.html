@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Enterprise Contract Governance — Practical Kafka</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="practical-kafka">
+
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <div class="run-head">
+      <span class="rh-book">Practical Kafka</span>
+      <span class="part-label">Part III · Schemas That Survive Change</span>
+    </div>
+
+    <p class="chapter-no" data-anchor="c13-no">Chapter 13</p>
+    <h1 data-anchor="c13-h1">Enterprise Contract Governance</h1>
+
+    <p class="standfirst" data-anchor="c13-stand">Governance that lives in a document
+    is a suggestion. Governance that lives in CI and in registry permissions is a
+    system. The difference shows up during the incident.</p>
+
+    <h2 data-anchor="c13-h2-ci">Move the check left</h2>
+    <p data-anchor="c13-p1">A compatibility violation can be discovered at three
+    moments, and the cost differs by orders of magnitude.</p>
+
+    <table data-anchor="c13-tbl1">
+      <caption>Where you find out</caption>
+      <thead><tr><th>Discovered at</th><th>Blast radius</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Pull request (CI check)</td><td>One branch</td><td>Minutes</td></tr>
+        <tr><td>Deploy (registration fails)</td><td>One service, failing to start</td><td>Hours, plus a rollback</td></tr>
+        <tr><td>Runtime (consumer cannot deserialize)</td><td>Every consumer of the topic</td><td>An incident (Chapter 25)</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c13-p2">Compatibility can be checked in CI before registration,
+    which turns a runtime failure into a pull-request failure. This is the single
+    highest-value governance control, and it is roughly a day of work: on every
+    change to a schema file, check the proposed schema against the registered
+    versions for its subject under that subject's policy, and fail the build if
+    it is incompatible.</p>
+
+    <p class="pre-label">The shape of the CI gate</p>
+<pre data-anchor="c13-code1"><code><span class="cm"># for each changed .avsc, ask the registry whether it would be accepted</span>
+<span class="cm"># under the subject's configured compatibility level — before merging</span>
+POST /compatibility/subjects/<span class="ty">{subject}</span>/versions/latest
+     ?verbose=<span class="kw">true</span>
+Body: { <span class="at">"schema"</span>: <span class="str">"&lt;the proposed schema&gt;"</span> }
+
+<span class="cm"># non-compatible =&gt; fail the build, print the reason in the PR</span></code></pre>
+
+    <p data-anchor="c13-p3">Print the registry's own explanation into the pull request.
+    A reviewer who sees "adding a required field is incompatible with BACKWARD"
+    learns the rule; a reviewer who sees "build failed" learns to rerun the
+    build.</p>
+
+    <h2 data-anchor="c13-h2-broker">Do not rely on clients behaving</h2>
+    <p data-anchor="c13-p4">CI covers changes that go through CI. It does nothing
+    about a service with a hand-rolled serializer, a console producer used during
+    an incident, or a well-meaning integration written by another department.</p>
+    <p data-anchor="c13-p5">Broker-side schema validation closes that gap: brokers can
+    reject records whose schema id is not registered for the topic. This moves
+    the check off the client's honour system entirely — a producer cannot put
+    bytes into a governed topic that registry-aware consumers will be unable to
+    read. Enable it on topics that matter.</p>
+
+    <div class="callout key" data-anchor="c13-call1">
+      <p class="callout-t">Two controls, two threat models</p>
+      <p>CI checks stop <b>well-intentioned breaking changes</b>. Broker-side
+      validation stops <b>bypasses</b>. You need both, because they fail
+      independently and the second one is what saves you at 2am when someone
+      reaches for a console producer.</p>
+    </div>
+
+    <h2 data-anchor="c13-h2-authz">Ownership needs permissions behind it</h2>
+    <p data-anchor="c13-p6">Chapter 1 separated three questions: who may write to
+    the topic, who may evolve the schema, who sets the policy. Registry
+    authorization is what makes the second one real — restricting who may
+    register or evolve a subject is what turns an ownership model from a wiki
+    table into something the system enforces.</p>
+    <p data-anchor="c13-p7">A workable arrangement:</p>
+    <ul data-anchor="c13-ul1">
+      <li><b>The owning team</b> may register new versions of its own subjects.</li>
+      <li><b>Everyone</b> may read every subject. Discoverability is a feature;
+      hiding schemas produces reimplementation, not security.</li>
+      <li><b>Only the platform team</b> may change a subject's compatibility
+      level, or set it to <code>NONE</code>. Lowering the policy is the
+      dangerous operation, not the schema change itself.</li>
+      <li><b>Shared referenced types</b> (Chapter 4) are owned centrally and run
+      at a stricter level than leaf schemas, because their blast radius is the
+      dependency graph.</li>
+    </ul>
+
+    <h2 data-anchor="c13-h2-tiers">Compatibility by criticality</h2>
+    <p data-anchor="c13-p8">Because compatibility is configured per subject, you can
+    tier it — and you should, because uniform policy either strangles low-stakes
+    topics or under-protects critical ones.</p>
+
+    <table data-anchor="c13-tbl2">
+      <caption>A three-tier policy that scales</caption>
+      <thead><tr><th>Tier</th><th>Level</th><th>Review</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><b>Regulated / external</b></td><td><code>FULL_TRANSITIVE</code></td><td>Owner + platform + data governance</td><td>Payment events, partner feeds</td></tr>
+        <tr><td><b>Core domain</b></td><td><code>BACKWARD_TRANSITIVE</code></td><td>Owner + one reviewer outside the team</td><td>Order lifecycle, customer state</td></tr>
+        <tr><td><b>Internal / analytics</b></td><td><code>BACKWARD</code></td><td>Owner</td><td>Telemetry, internal metrics</td></tr>
+      </tbody>
+    </table>
+
+    <p data-anchor="c13-p9">The transitive levels are the meaningful upgrade for
+    anything you expect to replay from the beginning. Non-transitive checks only
+    against the latest version, and a chain of individually-legal changes can
+    still leave your oldest data unreadable (Chapter 11).</p>
+
+    <h2 data-anchor="c13-h2-naming">Topic naming and domain ownership</h2>
+    <p data-anchor="c13-p10">A naming convention's job is to make ownership obvious
+    from the name alone. Something like
+    <code>&lt;domain&gt;.&lt;entity&gt;.&lt;event&gt;</code> —
+    <code>orders.order.placed</code>, <code>payments.payment.authorized</code>.</p>
+    <p data-anchor="c13-p11">Two properties matter more than the exact format.
+    First, the <b>domain prefix must map to a team</b>, so an unfamiliar topic can
+    be routed to an owner without asking around. Second, the convention should be
+    <b>enforced at creation</b> — a topic-creation pipeline that rejects
+    non-conforming names, rather than a document nobody reads. Conventions that
+    are not enforced decay within two quarters.</p>
+
+    <h2 data-anchor="c13-h2-discovery">Documentation and discoverability</h2>
+    <p data-anchor="c13-p12">Consumers you do not know about are the recurring theme
+    of this book. A catalogue reduces the problem: for each topic, its owner, its
+    purpose, its key and ordering scope, its retention and cleanup policy, its
+    classification, its compatibility tier, and its schema with
+    <code>doc</code> strings.</p>
+    <p data-anchor="c13-p13">Most of that can be generated. The registry holds the
+    schemas and the docs; the broker holds the topic configuration; ACLs list the
+    principals. A generated catalogue stays true, and a hand-maintained one does
+    not — which is the whole argument for putting semantics in
+    <code>doc</code> (Chapter 10) rather than in a separate document.</p>
+
+    <h2 data-anchor="c13-h2-deprecation">Deprecation and consumer impact</h2>
+    <p data-anchor="c13-p14">To deprecate anything you must know who consumes it.
+    Kafka will tell you: consumer group listings show which groups have committed
+    offsets on a topic. That is not a complete picture — a group that reads
+    without committing, or an occasional replay job, will not appear — but it is
+    the factual starting point, and it beats an email asking who is using
+    something.</p>
+    <p data-anchor="c13-p15">A deprecation that works has four parts: an announced
+    date, a named replacement, monitoring showing remaining consumers, and an
+    owner accountable for the number reaching zero. Drop any one and you get
+    "v1 forever" from Chapter 12.</p>
+
+    <div class="callout warn" data-anchor="c13-call2">
+      <p class="callout-t">Governance failure mode</p>
+      <p>Governance that only adds friction — reviews, approvals, checklists —
+      with no corresponding tooling gets routed around. Every control in this
+      chapter is automated: CI checks, broker validation, permissions, generated
+      catalogues. If your governance is mostly meetings, teams will find the path
+      that avoids the meeting, and you will discover the schema change in
+      production.</p>
+    </div>
+
+    <h2 data-anchor="c13-h2-platform">The registry as an internal platform</h2>
+    <p data-anchor="c13-p16">The framing worth adopting: your schema registry is an
+    internal developer platform, not a piece of infrastructure. It has users
+    (every producing and consuming team), an API (registration and lookup),
+    a policy surface (compatibility levels and permissions), and an availability
+    obligation (Chapter 4's cold-client problem).</p>
+    <p data-anchor="c13-p17">Teams that treat it that way — with an owner, a
+    roadmap, documentation, and an on-call rotation — end up with contracts that
+    hold. Teams that treat it as "the thing the Avro library talks to" end up
+    with forty schema versions and no idea which consumers still work.</p>
+
+    <h2 data-anchor="c13-h2-reflect">So what did we actually gain?</h2>
+    <p data-anchor="c13-p18">The end of Part III, and the end of the theory. You now
+    have contracts, the mechanics that constrain them, the rules for evolving
+    them, and the controls that keep the rules real.</p>
+    <p data-anchor="c13-p19">Part IV is what you build on top: how to publish events
+    reliably when a database is involved, how to consume them without losing or
+    duplicating work, and how to process streams of them.</p>
+
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+
+<nav class="book-nav">
+  <a rel="prev" href="12-versioning-strategies.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="14-publishing-reliable-domain-events.html">Next ›</a>
+</nav>
+
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
