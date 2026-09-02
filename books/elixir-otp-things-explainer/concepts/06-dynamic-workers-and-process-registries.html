@@ -1,0 +1,103 @@
+<meta charset="utf-8">
+<title>Workers You Hire on the Spot — Elixir OTP, Plainly</title>
+<link rel="stylesheet" href="../assets/book.css">
+<body data-book="elixir-otp-things-explainer">
+<div class="topbar">
+  <span>Elixir OTP, Plainly</span>
+  <span><a rel="home" href="../index.html">Contents</a> · <a href="../cheatsheet.html">Cheatsheet</a></span>
+</div>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <div class="leaf-inner">
+      <span class="chapter-tech">Elixir calls this: <b>DynamicSupervisor, Registry</b></span>
+      <h1 data-anchor="ch6-title">Workers You Hire on the Spot</h1>
+
+      <div class="scene" data-anchor="ch6-scene">
+        <span class="kicker">Here's the problem</span>
+        <p>Every supervisor list we've written so far names its workers up front: "watch the lobby room." But real rooms get created whenever someone types a new room name — "acme", "widgets-co", a thousand others we can't possibly list in advance. We need a supervisor that can be told, while the app is already running, "hire one more, right now, for this new id."</p>
+      </div>
+
+      <div class="key-idea" data-anchor="ch6-key1">
+        <span class="kicker">The rule</span>
+        <p>A <span class="term">DynamicSupervisor</span> is a supervisor with an empty starting list — you tell it what to watch as you go, calling <code>DynamicSupervisor.start_child/2</code> whenever a new one needs hiring. Same watch-and-restart behavior as before, just with hires happening on the fly instead of all at boot.</p>
+      </div>
+
+      <p>Hiring on the spot creates a second problem: how does anyone else <em>find</em> the worker for "room acme" later, without keeping a claim ticket (a PID) passed around by hand everywhere it's needed? A claim ticket also goes stale the moment a worker crashes and gets replaced — the new worker gets a brand new one.</p>
+
+      <div class="key-idea" data-anchor="ch6-key2">
+        <span class="kicker">The rule</span>
+        <p>A <span class="term">Registry</span> is a lookup desk: it maps a plain name you choose ("room acme") to whichever worker currently holds that name — automatically forgetting a crashed worker and picking up its replacement the moment one re-registers under the same name. A worker can register itself the instant it's hired by starting with a special kind of name — <code class="mono">{:via, Registry, {registry_name, key}}</code> — instead of a fixed atom name.</p>
+      </div>
+
+      <pre><code><span class="cm"># started once, at boot, under the top supervisor</span>
+children = [
+  {<span class="ty">Registry</span>, keys: <span class="at">:unique</span>, name: <span class="ty">MyApp</span>.<span class="ty">RoomRegistry</span>},
+  {<span class="ty">DynamicSupervisor</span>, strategy: <span class="at">:one_for_one</span>, name: <span class="ty">MyApp</span>.<span class="ty">RoomSupervisor</span>}
+]</code></pre>
+      <p><code class="mono">keys: :unique</code> means each name can point to exactly one worker at a time — the right choice for room ids, where "room acme" should never mean two different workers at once.</p>
+
+      <div class="scene" data-anchor="ch6-scene2">
+        <span class="kicker">Putting it together: "find it, or hire it"</span>
+        <p>Now we can write the exact operation the capstone project needs — look a room up, and only hire a new one if it doesn't exist yet:</p>
+      </div>
+      <pre><code><span class="kw">def</span> <span class="fn">get_or_start</span>(room_id) <span class="kw">do</span>
+  <span class="kw">case</span> <span class="ty">Registry</span>.<span class="fn">lookup</span>(<span class="ty">MyApp</span>.<span class="ty">RoomRegistry</span>, room_id) <span class="kw">do</span>
+    [{pid, _}] ->
+      {<span class="at">:ok</span>, pid}
+
+    [] ->
+      spec = {<span class="ty">RoomServer</span>, name: {<span class="at">:via</span>, <span class="ty">Registry</span>, {<span class="ty">MyApp</span>.<span class="ty">RoomRegistry</span>, room_id}}}
+      <span class="ty">DynamicSupervisor</span>.<span class="fn">start_child</span>(<span class="ty">MyApp</span>.<span class="ty">RoomSupervisor</span>, spec)
+  <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+      <p style="font-size:.85rem;color:var(--ink-soft)">If the lookup finds someone already at that desk, we're done. If not, we hire a fresh <code>RoomServer</code>, telling it to register itself under that same room id the moment it starts — so the very next lookup for "room acme" finds it.</p>
+
+      <figure class="figure" data-anchor="ch6-diagram">
+        <svg class="diagram" viewBox="0 0 560 240" role="img" aria-labelledby="ch6-diagram-title">
+          <title id="ch6-diagram-title">Rooms.get_or_start checking the Registry, then asking the DynamicSupervisor to hire on demand</title>
+          <rect x="20" y="90" width="110" height="46" rx="8" class="stroke fill-soft"/>
+          <text x="75" y="118" text-anchor="middle" class="mono" font-size="12">Rooms.get_or_start</text>
+
+          <rect x="200" y="30" width="150" height="46" rx="8" class="stroke fill-soft"/>
+          <text x="275" y="58" text-anchor="middle" class="mono">Registry</text>
+          <line x1="130" y1="105" x2="200" y2="60" class="stroke" marker-end="url(#a1)"/>
+          <text x="165" y="70" class="dim" font-size="11">1. lookup "acme"</text>
+
+          <rect x="200" y="150" width="150" height="46" rx="8" class="stroke fill-soft"/>
+          <text x="275" y="170" text-anchor="middle" class="mono" font-size="12">DynamicSupervisor</text>
+          <text x="275" y="186" text-anchor="middle" class="dim" font-size="10">(only if not found)</text>
+          <line x1="130" y1="125" x2="200" y2="170" class="stroke-red" marker-end="url(#a2)"/>
+          <text x="165" y="150" class="red" font-size="11">2. start_child</text>
+
+          <rect x="420" y="90" width="120" height="46" rx="8" class="stroke fill-soft"/>
+          <text x="480" y="118" text-anchor="middle" class="mono" font-size="12">room: acme</text>
+          <line x1="350" y1="173" x2="420" y2="120" class="stroke-red" marker-end="url(#a2)"/>
+          <text x="400" y="100" class="red" font-size="10">registers via Registry</text>
+
+          <defs>
+            <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" class="fill-ink"/></marker>
+            <marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" class="fill-red"/></marker>
+          </defs>
+        </svg>
+        <figcaption>Registry answers "does it exist"; DynamicSupervisor answers "hire it if not."</figcaption>
+      </figure>
+
+      <div class="warning" data-anchor="ch6-warning">
+        <span class="kicker">Worth knowing — the race hiding in "get or start"</span>
+        <p>Two requests for a brand-new room id, arriving at almost the same moment, can both see an empty lookup and both try to hire a worker. Because the Registry key is unique, only the first hire actually succeeds — the second gets told <code class="mono">{:error, {:already_started, pid}}</code> instead of quietly creating a second worker for the same room. A caller that expects this and falls back to using that pid handles the race correctly; a caller that ignores it and crashes on the unexpected error does not.</p>
+      </div>
+
+      <div class="closer" data-anchor="ch6-closer">A DynamicSupervisor hires whatever wasn't known in advance; a Registry is how anyone finds what got hired, by name, without ever passing a claim ticket around by hand.</div>
+    </div>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="05-designing-a-supervision-tree.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="07-time-async-work-and-common-traps.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>

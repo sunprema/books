@@ -1,0 +1,94 @@
+<meta charset="utf-8">
+<title>Letting a Worker Fall Down Safely — Elixir OTP, Plainly</title>
+<link rel="stylesheet" href="../assets/book.css">
+<body data-book="elixir-otp-things-explainer">
+<div class="topbar">
+  <span>Elixir OTP, Plainly</span>
+  <span><a rel="home" href="../index.html">Contents</a> · <a href="../cheatsheet.html">Cheatsheet</a></span>
+</div>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <div class="leaf-inner">
+      <span class="chapter-tech">Elixir calls this: <b>Supervisor</b></span>
+      <h1 data-anchor="ch4-title">Letting a Worker Fall Down Safely</h1>
+
+      <div class="scene" data-anchor="ch4-scene">
+        <span class="kicker">Here's the problem</span>
+        <p>Our <code>RoomServer</code> is going to see bad notes eventually — a message shaped wrong, a bug we haven't found yet. When that happens the worker hits code it can't make sense of and simply stops. Its desk sits there empty. Do we really want to write a wall of "what if this is nonsense" checks in front of every single note, forever, just in case?</p>
+      </div>
+
+      <div class="key-idea" data-anchor="ch4-key1">
+        <span class="kicker">The rule</span>
+        <p>OTP's answer is almost the opposite of "check everything defensively": mostly <em>don't</em> catch every possible error. Let a worker that's truly confused just stop — this is nicknamed "let it crash." A stopped worker leaves behind a clean, empty desk, not a half-corrupted one still limping along with bad memory. Somebody else's whole job is to notice the empty desk and deal with it.</p>
+      </div>
+
+      <p>That "somebody else" is a <span class="term">supervisor</span> — a special worker that doesn't do room-hosting work itself. It just watches a list of other workers, and the moment one of them stops, it decides what happens next. The connection that lets a supervisor find out the instant a worker stops is called a <span class="term">link</span>: two linked workers are told about each other's exits.</p>
+
+      <div class="scene" data-anchor="ch4-scene2">
+        <span class="kicker">Watching it happen</span>
+        <p>Say we deliberately send our own room a note it can't handle:</p>
+      </div>
+      <pre><code><span class="ty">GenServer</span>.<span class="fn">cast</span>(room, <span class="at">:crash</span>)</code></pre>
+      <p>If nothing handles <code>:crash</code>, the worker stops right there. Four things happen, in order:</p>
+      <ol>
+        <li>The worker's desk disappears — the process is gone.</li>
+        <li>The supervisor watching it is told immediately (that's what the link is for).</li>
+        <li>The supervisor starts a brand new worker to take its place.</li>
+        <li>The new worker's memory starts fresh from <code>init/1</code> — whatever the old one was holding is simply gone, unless it lived somewhere durable, not just in that worker's own memory.</li>
+      </ol>
+
+      <div class="warning" data-anchor="ch4-warning">
+        <span class="kicker">The one thing to really remember from this whole book</span>
+        <p>A supervisor brings back <em>a worker</em>. It does not bring back <em>the room's chat history</em>. Supervision restarts the process, not whatever business facts were only ever living in that process's own memory. If a room's messages need to survive a crash, they need to live somewhere sturdier than one worker's state — a database, or a file — and this book will keep coming back to that line, because it's the single most common wrong assumption people bring to OTP.</p>
+      </div>
+
+      <figure class="figure" data-anchor="ch4-diagram">
+        <svg class="diagram" viewBox="0 0 560 220" role="img" aria-labelledby="ch4-diagram-title">
+          <title id="ch4-diagram-title">A room worker crashing and a fresh one taking its place</title>
+          <rect x="230" y="16" width="100" height="40" rx="8" class="stroke fill-soft"/>
+          <text x="280" y="41" text-anchor="middle" class="mono">Supervisor</text>
+          <line x1="280" y1="56" x2="280" y2="90" class="stroke-soft"/>
+
+          <rect x="190" y="90" width="180" height="46" rx="8" class="stroke-red fill-soft"/>
+          <text x="280" y="118" text-anchor="middle" class="mono red">room: widgets — crashed ✕</text>
+
+          <line x1="280" y1="136" x2="280" y2="164" class="stroke-red"/>
+          <text x="360" y="152" class="dim" font-size="12">told instantly (link)</text>
+
+          <rect x="190" y="164" width="180" height="46" rx="8" class="stroke fill-soft"/>
+          <text x="280" y="192" text-anchor="middle" class="mono">room: widgets (fresh, empty)</text>
+        </svg>
+        <figcaption>Same desk, same name — but the new worker's memory starts from nothing, same as the very first time it was hired.</figcaption>
+      </figure>
+
+      <div class="scene" data-anchor="ch4-scene3">
+        <span class="kicker">Hiring the watcher itself</span>
+        <p>A supervisor is hired almost like any other worker, except instead of one job description, you hand it a list of workers to watch and a rule for how to react:</p>
+      </div>
+      <pre><code>children = [
+  {<span class="ty">RoomServer</span>, <span class="at">:lobby</span>}
+]
+
+<span class="ty">Supervisor</span>.<span class="fn">start_link</span>(children, strategy: <span class="at">:one_for_one</span>, name: <span class="ty">MyApp</span>.<span class="ty">Supervisor</span>)</code></pre>
+      <p><code class="mono">:one_for_one</code> is the plainest rule there is: when one watched worker stops, restart <em>only that one</em> — its deskmates are left alone. (There are rules for restarting a whole group of deskmates together too, but this book only ever needs the plain one.)</p>
+
+      <div class="key-idea" data-anchor="ch4-key2">
+        <span class="kicker">Worth knowing — not every stop deserves a restart</span>
+        <p>Each watched worker also carries a label for <em>why</em> it stopped matters: <code class="mono">:permanent</code> ("always bring it back, no matter how it stopped" — the default, and what a room worker should be), <code class="mono">:temporary</code> ("never bring it back — a one-off job that's done when it's done"), and <code class="mono">:transient</code> ("bring it back only if it stopped messily, not if it finished cleanly on purpose").</p>
+        <p>And a supervisor won't restart forever, no matter what: it counts how many restarts happen in a short window, and if a worker is truly stuck in a crash-restart-crash loop, the supervisor gives up and stops itself too, rather than burning the whole machine restarting something broken over and over. That's the safety valve underneath the safety feature.</p>
+      </div>
+
+      <div class="closer" data-anchor="ch4-closer">Letting a confused worker simply stop, instead of limping on half-broken, is what makes a clean restart possible — the crash is the safety feature, not the failure.</div>
+    </div>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="03-genserver-building-a-stateful-worker.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-designing-a-supervision-tree.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
