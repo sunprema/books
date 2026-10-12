@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading the Signs When Things Feel Slow — Oracle DBA</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="oracle-dba">
+<header class="book-top"><span class="t">Oracle DBA</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="c10-head">
+      <span class="chapter-num" aria-hidden="true">10</span>
+      <p class="kicker">Part IV &mdash; Observe, Diagnose, and Improve</p>
+      <h1>Reading the Signs When Things Feel Slow</h1>
+      <p class="real-name">Real name: <b>Observability and Troubleshooting</b></p>
+    </header>
+
+    <p class="lede" data-anchor="c10-lede">At ten past nine the phone rings. &ldquo;The order shop is slow.&rdquo; That is a feeling, not a fact. This chapter is about turning the feeling into facts, one sign at a time, before you touch a single dial.</p>
+
+    <h2 data-anchor="c10-h-problem">The problem</h2>
+    <p data-anchor="c10-p1">Picture a toy shop where the line at the counter is long. You could guess: more workers, a bigger counter, shut the doors and start over. Each guess feels busy. Most are wrong, and some make it worse. A restart is the worst: it wipes the very signs that would have told you what happened.</p>
+    <p data-anchor="c10-p2">A good keeper does the plain thing. Look at who is in the line, what each person is waiting for, and who is holding things up. Then write it down. Lots of people find this slow and dull when the phone is ringing, and that is fair. It is still faster than being wrong twice.</p>
+
+    <h2 data-anchor="c10-h-two">Two kinds of books to read</h2>
+    <p data-anchor="c10-p3">The house keeps two kinds of notes. The first is a catalog of <i>what exists</i>: every table, user and file. These are the &ldquo;data dictionary&rdquo; views, with names that start <code>DBA_</code>. The second is a live board of <i>what is happening right now</i>: who is connected, what they run, what they wait for. These are the &ldquo;dynamic performance views&rdquo;, with names that start <code>V$</code>.</p>
+    <p data-anchor="c10-p4">Remember one thing about the live board: it is a photo of now. It lives in memory and starts fresh when the house restarts. For the story of the last hour, you need the sampled history (below) or the logs on disk. In a house with many homes (Chapter 3), check which home you stand in before you read: a view can show one home or all of them.</p>
+
+    <h2 data-anchor="c10-h-wait">The idea that explains most slow days: waiting</h2>
+    <p data-anchor="c10-p5">At any moment, each worker is either doing work or waiting for something. The house keeps a note of what each one waits for, called a &ldquo;wait event&rdquo;, and sorts the notes into groups called &ldquo;wait classes&rdquo;. Time a customer spends in the house is the sum of working time and waiting time. So the useful question is never &ldquo;what is busy?&rdquo; but <b>&ldquo;where does the time go?&rdquo;</b></p>
+    <table class="cmp" data-anchor="c10-t-waits">
+      <thead><tr><th>What you see</th><th>Plain meaning</th><th>Where to look next</th></tr></thead>
+      <tbody>
+        <tr><td>Row lock waits (Application group)</td><td>Someone holds a page others need</td><td>Find the root blocker; ask the app owner</td></tr>
+        <tr><td>Disk read waits (User I/O group)</td><td>Workers fetch from the shelf, not from the desk</td><td>Which statements read the most?</td></tr>
+        <tr><td>Commit waits (&ldquo;log file sync&rdquo;)</td><td>Waiting for the diary to be written</td><td>Too many tiny commits, or a slow diary disk</td></tr>
+        <tr><td>Mostly on CPU</td><td>The workers are truly busy</td><td>Top statements; machine load</td></tr>
+        <tr><td>Nothing waiting, still slow</td><td>The delay is outside the house</td><td>Network, app server, client</td></tr>
+      </tbody>
+    </table>
+
+    <h2 data-anchor="c10-h-order">Read the signs in this order</h2>
+    <ol data-anchor="c10-l-order">
+      <li><b>Write down the time and the clock number</b> (<code>SELECT current_scn FROM v$database;</code>). Everything else is compared to this.</li>
+      <li><b>Is the house even healthy?</b> Check it is open, the machine is not out of room, and the recovery area is not full. A full one can stop work cold.</li>
+      <li><b>What does the alert log say?</b> It is the house&rsquo;s own diary of troubles.</li>
+      <li><b>Who is active, and what do they wait for?</b></li>
+      <li><b>Is anyone holding others up?</b></li>
+      <li><b>Which statements use the most time?</b> (Chapter 11 goes deeper.)</li>
+      <li><b>Compared to a good day, what changed?</b></li>
+    </ol>
+
+    <h2 data-anchor="c10-h-log">Step 3: the house diary of troubles</h2>
+    <p data-anchor="c10-p6">Every house writes troubles to a place on disk called the &ldquo;ADR&rdquo;. The plain text file inside it is the &ldquo;alert log&rdquo;. You can also read it with a question, from inside the house:</p>
+<pre data-anchor="c10-code-alert"><code><span class="kw">SELECT</span> originating_timestamp, message_text
+  <span class="kw">FROM</span> v$diag_alert_ext
+ <span class="kw">WHERE</span> originating_timestamp &gt; <span class="fn">SYSTIMESTAMP</span> - <span class="kw">INTERVAL</span> <span class="str">'1'</span> <span class="kw">HOUR</span>
+ <span class="kw">ORDER BY</span> originating_timestamp;</code></pre>
+    <p data-anchor="c10-p7">Line by line: pick the time and the message; from the alert view; only the last hour; oldest first. Look for lines that start with <code>ORA-</code>, notes about files that could not grow, and diary files that could not be written.</p>
+
+    <h2 data-anchor="c10-h-who">Steps 4 and 5: who is waiting, and who holds them up</h2>
+<pre data-anchor="c10-code-who"><code><span class="cm">-- 4. what the busy workers wait for, grouped</span>
+<span class="kw">SELECT</span> wait_class, event, <span class="fn">COUNT</span>(*) n
+  <span class="kw">FROM</span> v$session
+ <span class="kw">WHERE</span> status = <span class="str">'ACTIVE'</span> <span class="kw">AND</span> type = <span class="str">'USER'</span>
+ <span class="kw">GROUP BY</span> wait_class, event <span class="kw">ORDER BY</span> n <span class="kw">DESC</span>;
+
+<span class="cm">-- 5. who is stuck behind whom</span>
+<span class="kw">SELECT</span> sid, serial#, blocking_session, final_blocking_session,
+       event, sql_id, seconds_in_wait
+  <span class="kw">FROM</span> v$session
+ <span class="kw">WHERE</span> blocking_session <span class="kw">IS NOT NULL</span>;</code></pre>
+    <p data-anchor="c10-p8">The first asks, &ldquo;of the people working now, what are they waiting for, and how many for each thing?&rdquo; The second lists each stuck worker and the one in front. The <code>final_blocking_session</code> column follows the chain to the very first holder. That is the one to ask about. Do not end the stuck ones: they are the victims, and the one at the front may be a person who simply forgot to finish.</p>
+    <p data-anchor="c10-p9">For work that takes long on purpose, such as a big scan or a copy job, ask <code>v$session_longops</code>. It shows how much is done and how much is left, so &ldquo;is it stuck?&rdquo; becomes &ldquo;it is two thirds through&rdquo;.</p>
+
+    <h2 data-anchor="c10-h-hist">Looking back: the sampled history</h2>
+    <p data-anchor="c10-p10">The live board forgets. So the house also takes a small photo of every active worker once each second, called &ldquo;ASH&rdquo; (<code>v$active_session_history</code>). Ask it about ten minutes ago and it can answer. Older photos are kept in the &ldquo;AWR&rdquo; snapshots, which are also how you compare a good day to a bad one.</p>
+    <div class="callout warn" data-anchor="c10-warn-lic"><b>A rule about money.</b> On Enterprise Edition, ASH, AWR and their reports need the paid Diagnostics Pack. Reading them without it can be a licence breach. If you do not have it, use the free live views above, the alert log, and Statspack. Check before you run.</div>
+
+    <h2 data-anchor="c10-h-case">The shop&rsquo;s slow morning</h2>
+    <p data-anchor="c10-p11">Back to the 09:10 call. You write down time and clock number. The house is open; the machine has room. The alert log is quiet. Step 4 shows 31 active workers, 28 of them waiting on a row lock. It is not a slow machine. It is a line behind one person.</p>
+    <p data-anchor="c10-p12">Step 5 shows all 28 point to one worker, SID 212, which waits on nothing: it has sat in the middle of a change since 08:52, an operator&rsquo;s tool that never finished. Its <code>sql_id</code> and the user and machine columns tell you who to call. The call: &ldquo;is it safe to finish or undo your change?&rdquo; Ending the session is a last step, and only with the owner&rsquo;s word, because the house must then undo what that worker did (Chapter 2).</p>
+    <p data-anchor="c10-p13">A twist: an hour later someone says &ldquo;still slow!&rdquo; The line is gone. Now step 4 shows few waits and sessions mostly on CPU, and the sampled history shows one statement taking most of the time since a new release. That is not a lock problem at all. It is a different story for Chapter 11. One complaint, two causes: this is why you read the signs again instead of repeating the old answer.</p>
+
+    <h2 data-anchor="c10-h-space">Signs that room is running out</h2>
+    <ul data-anchor="c10-l-space">
+      <li>The recovery area is nearly full: <code>SELECT * FROM v$recovery_area_usage;</code> If it fills, old diary files cannot be saved, and work can stop.</li>
+      <li>A shelf cannot grow: messages such as ORA-01653 in the alert log (Chapter 6).</li>
+      <li>The scratch area is used up: ORA-01652, found with <code>v$tempseg_usage</code>.</li>
+      <li>The machine itself: check the load, memory and disk of the host with its own tools. The house cannot see all of that.</li>
+    </ul>
+
+    <h2 data-anchor="c10-h-evidence">Evidence before you change anything</h2>
+    <p data-anchor="c10-p14">Before you turn any dial, save the facts: the time, the clock number, the top waits, the top statements, the alert log lines, and the machine load. Then change <b>one</b> thing. Look again. If you change three at once, you will never know which one helped, or which one hurt, and you cannot put them back with confidence.</p>
+    <p data-anchor="c10-p15">When the problem is bigger than you, the house can gather the proof for you. Each serious trouble becomes an &ldquo;incident&rdquo; in the ADR. The command-line tool &ldquo;ADRCI&rdquo; can list them and wrap the files up into one package for Oracle Support:</p>
+<pre data-anchor="c10-code-adrci"><code>adrci&gt; show alert -tail 50
+adrci&gt; show incident
+adrci&gt; ips create package incident 12345
+adrci&gt; ips generate package 1 in /tmp</code></pre>
+    <p data-anchor="c10-p16">Line by line: the last 50 lines of the alert log; the list of incidents; start a package for one incident (12345 is only an example number); write the package as a file. Look inside before you send it, as it can hold names and data.</p>
+
+    <h2 data-anchor="c10-h-time">Keep a timeline</h2>
+    <p data-anchor="c10-p17">Write the story as it happens, in short lines: &ldquo;08:52 operator tool starts a change. 09:10 call. 09:14 28 waiting on SID 212. 09:20 owner finishes. 09:21 line gone.&rdquo; It is cheap, and later it is the only honest answer to &ldquo;what happened?&rdquo;</p>
+
+    <h2 data-anchor="c10-h-lab">Lab: the slow morning</h2>
+    <ol data-anchor="c10-l-lab">
+      <li>In session A, run an <code>UPDATE</code> on one row of a test table and do not commit.</li>
+      <li>In sessions B and C, update the same row. They hang.</li>
+      <li>From a fourth session, run steps 1 to 5. Name the root blocker and the event.</li>
+      <li>Write a three-line diagnosis: the fact, the evidence (view and values), and the action you would ask for.</li>
+      <li>Commit in A. Confirm B and C finish, and that the blocking query returns no rows.</li>
+    </ol>
+
+    <h2 data-anchor="c10-h-check">Checklist for production</h2>
+    <ul data-anchor="c10-l-check">
+      <li>Write time and SCN first; do not restart the house to see if it helps.</li>
+      <li>Read in order: health, alert log, active waits, blockers, top statements, change since a good day.</li>
+      <li>Find the root blocker with <code>final_blocking_session</code>, and ask its owner before ending anything.</li>
+      <li>Know whether you hold the Diagnostics Pack before using ASH, AWR or their reports.</li>
+      <li>Keep a good-day baseline (AWR snapshots or saved numbers) to compare against.</li>
+      <li>Watch the recovery area, shelves, scratch area and host load, and alert before they are full.</li>
+      <li>Save evidence before each change; change one thing at a time; write the timeline.</li>
+      <li>Check which home (PDB) you are connected to before reading a view.</li>
+    </ul>
+    <p class="payoff" data-anchor="c10-payoff">When you read the signs before you guess, a slow day turns from a fog into a short list of facts.</p>
+    <div class="sources" data-anchor="c10-sources">Sources: Oracle Database Reference (V$ACTIVE_SESSION_HISTORY, V$DIAG_ALERT_EXT), Utilities guide (ADRCI), 19c Concepts, Backup and Recovery and SQL Tuning guides (see research.json). Examples use Oracle Database 19c. View and column details beyond those pages come from standard 19c Reference content; check them there. ASH, AWR and ADDM need the Diagnostics Pack on Enterprise Edition.</div>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="09-recovery-flashback.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="11-performance-sql.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
