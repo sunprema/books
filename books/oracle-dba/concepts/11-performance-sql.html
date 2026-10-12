@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why One Question Takes So Long — Oracle DBA</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="oracle-dba">
+<header class="book-top"><span class="t">Oracle DBA</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="c11-head">
+      <span class="chapter-num" aria-hidden="true">11</span>
+      <p class="kicker">Part IV &mdash; Observe, Diagnose, and Improve</p>
+      <h1>Why One Question Takes So Long</h1>
+      <p class="real-name">Real name: <b>Performance Diagnosis and SQL Execution</b></p>
+    </header>
+
+    <p class="lede" data-anchor="c11-lede">Chapter 10 ended with one statement eating most of the time since the new release. Now you stand in front of it. Which part of its work costs the time, and what is the smallest change that fixes the cause?</p>
+
+    <h2 data-anchor="c11-h-problem">The problem</h2>
+    <p data-anchor="c11-p1">The shop&rsquo;s order screen asks one thing: &ldquo;show me this buyer&rsquo;s open orders.&rdquo; Last month it took a blink. Now it takes eleven seconds. Someone says &ldquo;add an index.&rdquo; Someone else says &ldquo;give it more memory.&rdquo; Each guess is a change, and each change has a price. Lots of people find it hard to stay calm and measure while the screen is slow, and that is fair. It is still the only way to fix the cause and not just the feeling.</p>
+
+    <h2 data-anchor="c11-h-plan">The route the house picks</h2>
+    <p data-anchor="c11-p2">Before the house answers a question, a part called the &ldquo;optimizer&rdquo; picks a route: which shelves to visit, in what order, and how to put the results together. The written route is the &ldquo;execution plan&rdquo;. The picking is done with guesses about how many rows each step will find. Good guesses, good route. Bad guesses, a long walk.</p>
+    <p data-anchor="c11-p3">There are two very different papers. One is the route the house <i>would</i> take (<code>EXPLAIN PLAN</code>): an estimate, made without running anything. The other is the route the house <i>did</i> take, with real counts written beside the guesses. Only the second can catch a wrong guess. Never settle an argument with the first.</p>
+
+    <figure class="diagram-fig" data-anchor="c11-fig-guess">
+      <svg class="diagram" viewBox="0 0 560 240" role="img" aria-labelledby="c11f1">
+        <title id="c11f1">A route with three steps. Step one reads open orders for one buyer: guessed 5 rows, found 48,000. Step two looks up each buyer's details by key. Step three joins them. Because the guess was wrong at step one, the house picked a repeat-lookup join that runs 48,000 times.</title>
+        <rect x="20" y="30" width="150" height="70" class="stroke fill-soft"/><text x="30" y="52" class="big">1. Find open orders</text><text x="30" y="72">guessed: 5 rows</text><text x="30" y="90" class="red">found: 48,000 rows</text>
+        <rect x="205" y="30" width="150" height="70" class="stroke fill-soft"/><text x="215" y="52" class="big">2. Look up item</text><text x="215" y="72">once per order row</text><text x="215" y="90">done 48,000 times</text>
+        <rect x="390" y="30" width="150" height="70" class="stroke fill-soft"/><text x="400" y="52" class="big">3. Put together</text><text x="400" y="72">&ldquo;one at a time&rdquo; way</text><text x="400" y="90">fine for 5, slow for 48,000</text>
+        <path d="M170 65 L205 65" class="stroke"/><path d="M355 65 L390 65" class="stroke"/>
+        <rect x="20" y="130" width="520" height="86" class="stroke-red fill-soft"/>
+        <text x="32" y="154" class="big red">Read the plan like this</text>
+        <text x="32" y="176">Put the guessed count next to the real count, step by step.</text>
+        <text x="32" y="194">The first step where they are far apart is where the house went wrong.</text>
+        <text x="32" y="210">Fix <tspan class="red">that</tspan> (usually the notes it guesses from), not the last step.</text>
+      </svg>
+      <figcaption><b>A wrong guess early makes a wrong route later.</b> The slow step is often not the step that caused the trouble.</figcaption>
+    </figure>
+
+    <h2 data-anchor="c11-h-see">See what really happened</h2>
+<pre data-anchor="c11-code-plan"><code><span class="kw">SELECT</span> <span class="cm">/*+ gather_plan_statistics */</span> <span class="fn">COUNT</span>(*)
+  <span class="kw">FROM</span> orders
+ <span class="kw">WHERE</span> status = <span class="str">'OPEN'</span> <span class="kw">AND</span> customer_id = :cid;
+
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> <span class="kw">TABLE</span>(DBMS_XPLAN.DISPLAY_CURSOR(<span class="kw">NULL</span>, <span class="kw">NULL</span>, <span class="str">'ALLSTATS LAST'</span>));</code></pre>
+    <p data-anchor="c11-p4">Line by line: run the question with a small note asking the house to count real rows as it goes; then, straight after, in the same session, ask for the route of the last run. The paper has columns <code>E-Rows</code> (the guess), <code>A-Rows</code> (what was found), <code>Starts</code> (how many times the step ran) and <code>A-Time</code> (time spent). Look for the first step where guess and found are far apart.</p>
+
+    <h2 data-anchor="c11-h-notes">Why guesses go wrong: the notes</h2>
+    <p data-anchor="c11-p5">The house guesses from notes it keeps about each table and column: how many rows, how many different values, which are common. These are the &ldquo;optimizer statistics&rdquo;. If the notes are old (the table grew from 5 thousand to 5 million rows), or if one value is far more common than the rest, the guess is wrong. Fresh notes come from <code>EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'ORDERS', cascade=&gt;TRUE);</code>, not the old <code>ANALYZE</code>. The house also refreshes notes by itself in a nightly job (Chapter 12), but a big load in the afternoon can beat it.</p>
+    <div class="callout warn" data-anchor="c11-warn-stats"><span class="label">Careful</span><p>New notes change routes for many questions at once, not just yours. On a busy day, try it on a copy first, or keep the old notes so you can put them back (<code>DBMS_STATS.RESTORE_TABLE_STATS</code>).</p></div>
+
+    <h2 data-anchor="c11-h-paths">Ways to reach rows, ways to put them together</h2>
+    <table class="cmp" data-anchor="c11-t-paths">
+      <thead><tr><th>Choice</th><th>Plain picture</th><th>Good when</th></tr></thead>
+      <tbody>
+        <tr><td>Read the whole shelf (&ldquo;full scan&rdquo;)</td><td>Walk every page</td><td>You need a big share of the rows. Not always bad.</td></tr>
+        <tr><td>Use an index (&ldquo;range scan&rdquo;)</td><td>Use the back-of-book list, then jump</td><td>You need a small share of the rows.</td></tr>
+        <tr><td>One at a time (&ldquo;nested loops&rdquo;)</td><td>For each row here, look up one there</td><td>Few rows on one side, fast lookup on the other.</td></tr>
+        <tr><td>Pile and match (&ldquo;hash join&rdquo;)</td><td>Sort both piles by buyer, then match</td><td>Large piles; needs memory.</td></tr>
+      </tbody>
+    </table>
+    <p data-anchor="c11-p6">No choice is the winner every time. Whether a shelf walk or a list jump is cheaper depends on how many rows you need. That is why the guess matters so much.</p>
+
+    <h2 data-anchor="c11-h-bind">Asking the same question a thousand ways</h2>
+    <p data-anchor="c11-p7">Each time the house sees a new question it has not seen, it picks a route from scratch. This is a &ldquo;hard parse&rdquo;, and it is costly and takes a shared lock on common memory (Chapter 1). If the shop writes <code>... WHERE customer_id = 7001</code>, then <code>... = 7002</code>, then <code>... = 7003</code>, each looks like a new question. If the shop writes <code>... = :cid</code> and passes the number separately (a &ldquo;bind variable&rdquo;), the house reuses the route: a &ldquo;soft parse&rdquo;. Symptoms of the first way: many nearly equal lines in <code>v$sql</code>, a busy shared memory area, and CPU spent on routes, not rows.</p>
+    <p data-anchor="c11-p8">If the shop code cannot be fixed, a setting (<code>CURSOR_SHARING=FORCE</code>) makes the house swap the numbers for binds itself. It is a patch: Oracle&rsquo;s own advice is to test it, because one route may then be used for values that need different routes. The house has a partial cure for that too, called &ldquo;adaptive cursor sharing&rdquo;, which keeps more than one route for a bind question when the values call for it (see <code>is_bind_aware</code> in <code>v$sql</code>).</p>
+
+    <h2 data-anchor="c11-h-index">Indexes cost on the way in</h2>
+    <p data-anchor="c11-p9">An index is a second list that must be kept up to date. Every new order, every change to an indexed value, every removal updates each index too. So each extra index makes reading some questions quicker and writing every row slower, and adds diary (redo) and old-page (undo) work. For a shop that takes thousands of orders a minute, six indexes on the orders shelf is a real cost. Add one when a measured, important question needs it, and check that the writes did not get worse.</p>
+
+    <h2 data-anchor="c11-h-mem">Not enough working room</h2>
+    <p data-anchor="c11-p10">Sorting and matching need a table to work on, and the house gives each job a slice of private memory (the PGA, Chapter 1). If the piles do not fit, the job spills to scratch space on disk (temp, Chapter 6) and runs several times slower. In the plan this shows as a <code>TempSpc</code> column, and ORA-01652 if scratch runs out. The cure is often a smaller pile (a better filter or join order), not simply more memory.</p>
+
+    <h2 data-anchor="c11-h-trace">Trace: one session&rsquo;s whole day, written down</h2>
+<pre data-anchor="c11-code-trace"><code><span class="kw">EXEC</span> DBMS_MONITOR.SESSION_TRACE_ENABLE(
+       session_id =&gt; :sid, serial_num =&gt; :serial,
+       waits =&gt; <span class="kw">TRUE</span>, binds =&gt; <span class="kw">FALSE</span>);
+<span class="cm">-- let the slow screen run, then:</span>
+<span class="kw">EXEC</span> DBMS_MONITOR.SESSION_TRACE_DISABLE(:sid, :serial);
+<span class="cm"># on the server:  tkprof orcl_ora_4242.trc out.txt sys=no sort=exeela</span></code></pre>
+    <p data-anchor="c11-p11">Line by line: start writing down everything that one session does, including what it waits for; stop; then turn the trace file (found in the ADR trace folder, Chapter 10) into a readable report, longest statements first. The report shows, per statement, how many parses, runs and fetches, the CPU and elapsed time, the rows, and the waits. When 90% of elapsed time is one wait, you have your answer.</p>
+
+    <h2 data-anchor="c11-h-awr">Photos of a whole hour: AWR, ASH and the helpers</h2>
+    <p data-anchor="c11-p12">For a problem across the whole house, not one session, the house keeps hourly snapshots (&ldquo;AWR&rdquo;) and per-second samples (&ldquo;ASH&rdquo;, Chapter 10). From these you can print a report for a bad hour, or compare it to a good one. Advisors read them and make suggestions. Treat suggestions as ideas to check against the plan, not orders.</p>
+    <div class="callout warn" data-anchor="c11-warn-lic"><span class="label">A rule about money, again</span><p>AWR, ASH and ADDM need the paid Diagnostics Pack on Enterprise Edition. The SQL Tuning Advisor and SQL Access Advisor need the Tuning Pack. A setting, <code>CONTROL_MANAGEMENT_PACK_ACCESS</code>, switches them off, but it does not erase past use. Without the packs, use the free views, SQL trace and TKPROF, and Statspack. Check your licence before you run a report.</p></div>
+
+    <h2 data-anchor="c11-h-case">The shop&rsquo;s eleven seconds</h2>
+    <p data-anchor="c11-p13">You find the statement from Chapter 10 in <code>v$sql</code>: the same <code>sql_id</code> with a huge number of reads per run. You run it with real counts. Step one guessed 5 rows and found 48,000. The notes on the orders shelf say 5 thousand rows; the table has grown by a load last week. The house chose &ldquo;one at a time&rdquo; matching, so step two ran 48,000 times.</p>
+    <p data-anchor="c11-p14">Fix, one thing: new notes on the orders shelf (kept old ones for rollback). The route changes to pile-and-match. It now takes 0.4 seconds. Nobody added an index; nobody bought memory.</p>
+
+    <h2 data-anchor="c11-h-trap">The trap: the second run is always faster</h2>
+    <p data-anchor="c11-p15">After the fix you run it again and it takes 0.1 seconds, and a colleague says &ldquo;wow.&rdquo; But the first run also warmed the desk: pages are now in memory, so the second run needs no walk to the shelf. A fair test compares like with like: same amount of data, run several times, and look at numbers that do not depend on luck, such as the count of pages read (<code>buffer_gets</code>, the <code>Buffers</code> column of the plan) beside the time. Write down before and after. If the only change you can show is a faster second run, you have shown nothing yet.</p>
+
+    <h2 data-anchor="c11-h-lab">Lab: slow, find, fix, measure</h2>
+    <ol data-anchor="c11-l-lab">
+      <li>Make an orders table with 50 thousand rows where 95% have <code>status='CLOSED'</code>, and an index on <code>status</code>. Gather stats.</li>
+      <li>Run a question for <code>status='OPEN'</code> with the plan note. Save the plan, A-Rows, Buffers and time.</li>
+      <li>Load 500 thousand more rows <i>without</i> gathering stats. Run again. Find the first step where E-Rows and A-Rows differ most.</li>
+      <li>Gather stats on the table. Run again. Save the new plan and numbers.</li>
+      <li>Run each version three times. Report buffer gets and elapsed time as before and after, and say what you changed (one thing).</li>
+      <li>Bonus: run the same question with literals 200 times, then with a bind 200 times; compare <code>parse_calls</code> and the number of lines in <code>v$sql</code>.</li>
+    </ol>
+
+    <h2 data-anchor="c11-h-check">Checklist for production</h2>
+    <ul data-anchor="c11-l-check">
+      <li>Judge by the plan of what really ran, with guessed and found counts side by side; not by <code>EXPLAIN PLAN</code> alone.</li>
+      <li>Find the first step where the guess is far off; look at stats, skew and filters there.</li>
+      <li>Keep the old stats before gathering new ones, and test on a copy when the table is important.</li>
+      <li>Use bind variables in the application; treat <code>CURSOR_SHARING=FORCE</code> as a tested patch.</li>
+      <li>Add an index only for a measured need, and check the cost to writes.</li>
+      <li>Watch for spills to scratch space before buying memory.</li>
+      <li>Use trace and TKPROF for one session, AWR/ASH reports for the whole house, only if licensed.</li>
+      <li>Change one thing; measure before and after with repeatable numbers; beware the warm second run.</li>
+    </ul>
+    <p class="payoff" data-anchor="c11-payoff">When you find where the time goes before you pick a fix, a slow question stops being a mystery and becomes one small, checkable change.</p>
+    <div class="sources" data-anchor="c11-sources">Sources: Oracle Database 19c SQL Tuning Guide; Oracle Optimizer blog on adaptive cursor sharing; jOOQ blog on ALLSTATS plan output; licensing guidance from a consultancy source (see research.json) &mdash; confirm pack licensing in Oracle&rsquo;s Licensing Information manual. Examples use Oracle Database 19c.</div>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="10-observability-troubleshooting.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="12-workload-automation.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
