@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Composing and Customizing Packages</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="nix">
+<header class="topbar"><span class="t">Nix</span><a href="../index.html" rel="home">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></header>
+<div class="book-viewport">
+<article class="book-leaf">
+<header class="chap-open" data-anchor="open">
+<div class="chap-num" aria-hidden="true">11</div>
+<h1 data-anchor="title">Changing Someone Else's Recipe Without Ruining It</h1>
+<div class="chap-real">Real name: <b>"Composing and Customizing Packages"</b></div>
+</header>
+
+<h2 data-anchor="h-problem">You like the recipe, but not one line</h2>
+<p data-anchor="p1">The big shared box has a recipe for almost everything. Now and then it is nearly right. Maybe you want one extra patch, or the same program built without one of its parts. You must not copy the whole recipe and own it forever. And you must not scribble on the shared card, because it is not yours.</p>
+<p data-anchor="p2">The good news is that recipe cards in this box are not fixed. Each is a thing you can ask for a changed copy of. The harder part is this: when you change one card, what happens to every other card that uses it? This chapter is about that.</p>
+
+<h2 data-anchor="h-inject">Cards that ask for what they need</h2>
+<p data-anchor="p3">Look at how a card in the box begins. It does not reach out and grab things. It is a function with a list of names at the front, one for each thing it needs:</p>
+<pre data-anchor="code-pkg">{ stdenv, zlib, pkg-config }:
+stdenv.mkDerivation {
+  pname = "zver"; version = "0.1"; src = ./.;
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ zlib ];
+}</pre>
+<p data-anchor="p4">The card says "I need a build helper, zlib and pkg-config" and does not say where they come from. Somebody has to hand them over. That job belongs to <code>callPackage</code>, and the idea is called <span class="term">"dependency injection"</span>: the card asks by name, and the caller fills the slots.</p>
+<pre data-anchor="code-call">zver = pkgs.callPackage ./zver.nix { };</pre>
+<p data-anchor="p5"><code>callPackage</code> opens the card, reads the names in its front list, and looks for each name in the big set of all packages. The empty braces at the end are for anything you want to hand over yourself instead. I ran a tiny version of this by hand to be sure I understood it. It is only three lines: read the wanted names with <code>builtins.functionArgs</code>, keep those that exist in the set, add yours on top.</p>
+<pre data-anchor="code-mini">callWith = autoArgs: fn: args:
+  let wanted = builtins.functionArgs fn;
+  in fn (builtins.intersectAttrs wanted autoArgs // args);</pre>
+<p data-anchor="p6">That is the whole trick. A name with a default value, like <code>flag ? false</code>, is fine if the set has none. A name with no default that the set lacks is an error, which is what you want: a missing thing is loud, not quiet.</p>
+
+<h2 data-anchor="h-two">Two kinds of change: the slots and the card</h2>
+<p data-anchor="p7">There are two places you can change a finished package, and the names are easy to mix up. Use the picture: the front list of slots, and the body of the card.</p>
+
+<figure class="diagram-fig" data-anchor="fig-two">
+<svg class="diagram" viewBox="0 0 560 170" role="img" aria-labelledby="t11a">
+<title id="t11a">override changes what is passed into the card; overrideAttrs changes the card's own settings</title>
+<rect class="fill-soft stroke" x="20" y="20" width="150" height="130"/>
+<text class="big" x="32" y="46">the slots</text><text class="dim" x="32" y="70">zlib, pkg-config,</text><text class="dim" x="32" y="88">a yes/no switch</text>
+<line class="stroke" x1="170" y1="85" x2="230" y2="85"/>
+<rect class="stroke-thick fill-soft" x="230" y="20" width="160" height="130"/>
+<text class="big" x="242" y="46">the card</text><text class="dim" x="242" y="70">patches, version,</text><text class="dim" x="242" y="88">source, extra steps</text>
+<text class="red" x="40" y="132">override</text>
+<text class="red" x="262" y="132">overrideAttrs</text>
+<line class="stroke" x1="390" y1="85" x2="440" y2="85"/>
+<rect class="fill-soft stroke" x="440" y="55" width="100" height="60"/><text class="big" x="456" y="90">result</text>
+</svg>
+<figcaption>Change what goes in, or change the card. Different tools, different jobs.</figcaption>
+</figure>
+
+<p data-anchor="p8"><code>override</code> gives you the same card with different things handed to the slots. It is the right tool to swap one library for another, or turn a switch the card already offers:</p>
+<pre data-anchor="code-override">zver-small = pkgs.zver.override { zlib = pkgs.zlib-ng; };</pre>
+<p data-anchor="p9"><code>overrideAttrs</code> gives you the same card with different settings inside the body. You write a function that gets the old settings and returns what changes. It is the right tool for a patch, a new version, or a few extra steps:</p>
+<pre data-anchor="code-attrs">zver-patched = pkgs.zver.overrideAttrs (old: {
+  patches = (old.patches or []) ++ [ ./fix-greeting.patch ];
+});</pre>
+<p data-anchor="p10">Look at <code>old.patches or []</code>. The old card may have no patches at all, and the <code>++</code> keeps any it did have instead of throwing them away. Beginners forget this and delete the patches that were already there. If you mix the two tools up, one of two things happens: you get an error that the name is not known, or the change does nothing at all.</p>
+<p data-anchor="p11">Either way you get a new card, and a new card means a new address on the shelf. The old package is untouched. Both can live side by side.</p>
+
+<h2 data-anchor="h-fix">A set that looks at itself</h2>
+<p data-anchor="p12">Now the hard question. Say <code>zver</code> is used by a second card, <code>zver-tools</code>. You made a changed <code>zver</code>. Does <code>zver-tools</code> use yours? With the tools above, no. You made one new card on the side; the set did not notice.</p>
+<p data-anchor="p13">To change the thing <em>everybody</em> uses, we need to understand how the set is built. Here is a small set, written by hand, that has the same shape as the big one:</p>
+<pre data-anchor="code-set">base = self: {
+  callPackage = callWith self;
+  greeting = "hello";
+  shout = self.callPackage ({ greeting }: { text = greeting + "!"; }) {};
+  hi = self.callPackage ({ greeting, shout }: "${greeting} / ${shout.text}") {};
+};</pre>
+<p data-anchor="p14">The whole set is a function of one thing, <code>self</code>, which is the finished set. The cards inside get their needs <em>from that finished set</em>. It sounds like a snake eating its tail, but Nix is lazy (chapter 7), so each name is only worked out when someone asks. We close the loop with a tiny helper, called a <span class="term">"fixed point"</span>: a value that, handed to the function, comes back as itself.</p>
+<pre data-anchor="code-fix">fix = f: let x = f x; in x;
+set0 = fix base;
+# set0.hi  =&gt;  "hello / hello!"</pre>
+<p data-anchor="p15">I ran this on Nix 2.34.6 and got exactly that. Now the interesting part. Make a changed copy of <code>base</code> in which <code>greeting</code> is "howdy", but still tie the loop at the end:</p>
+<pre data-anchor="code-ov">ov = final: prev: { greeting = "howdy"; };
+extends = overlay: base: self:
+  let prev = base self; in prev // overlay self prev;
+set1 = fix (extends ov base);
+# set1.hi  =&gt;  "howdy / howdy!"</pre>
+<p data-anchor="p16">Only <code>greeting</code> was named in the change. Yet <code>shout</code> and <code>hi</code> both came out "howdy". That is what the loop buys you: cards reach each other through the <em>finished</em> set, so one change flows to all who use it. A package set is exactly this, only huge.</p>
+
+<figure class="diagram-fig" data-anchor="fig-flow">
+<svg class="diagram" viewBox="0 0 560 160" role="img" aria-labelledby="t11b">
+<title id="t11b">Changing greeting changes shout and hi, because both read it from the final set</title>
+<rect class="stroke-thick fill-soft" x="20" y="55" width="120" height="50"/><text class="big" x="34" y="86">greeting</text>
+<rect class="fill-soft stroke" x="230" y="15" width="120" height="50"/><text class="big" x="262" y="46">shout</text>
+<rect class="fill-soft stroke" x="430" y="95" width="110" height="50"/><text class="big" x="474" y="126">hi</text>
+<line class="stroke" x1="140" y1="72" x2="230" y2="40"/>
+<line class="stroke" x1="140" y1="90" x2="430" y2="120"/>
+<line class="stroke" x1="350" y1="45" x2="430" y2="105"/>
+<text class="red" x="20" y="130">change here</text>
+<text class="dim" x="250" y="150">both are rebuilt</text>
+</svg>
+<figcaption>A change at the root reaches everything that reads it through the set.</figcaption>
+</figure>
+
+<h2 data-anchor="h-overlay">The two names in an overlay</h2>
+<p data-anchor="p17">A change like <code>ov</code> above is called an <span class="term">"overlay"</span>: a transparent sheet you lay on top of the whole set. It is a function with two inputs, and the names matter:</p>
+<ul>
+<li data-anchor="li-final"><code>final</code> is the set <em>after</em> every sheet has been laid on. Ask it for any package and you get the version everybody will see.</li>
+<li data-anchor="li-prev"><code>prev</code> is the set as it was <em>just before</em> your sheet. Ask it for a name and you get the old one.</li>
+</ul>
+<p data-anchor="p18">When do you use which? To build on the old version of the thing you are changing, use <code>prev</code>. I made a second sheet that does this, adding two more marks to the old <code>shout</code>:</p>
+<pre data-anchor="code-ov2">ov2 = final: prev: {
+  shout = { text = prev.shout.text + "!!"; };
+};
+set2 = fix (extends ov2 (extends ov base));
+# set2.hi  =&gt;  "howdy / howdy!!!"</pre>
+<p data-anchor="p19">It worked: "howdy!" from the first sheet, plus two more. Had I written <code>final.shout.text</code> there, the new <code>shout</code> would ask for itself and never finish. That is the famous <code>infinite recursion</code> error, and it is the most common mistake with overlays. Rule of thumb: for the same name, read <code>prev</code>; for other names, read <code>final</code> so you pick up their changes.</p>
+<p data-anchor="p20">Lots of people find <code>final</code> and <code>prev</code> maddening, and that is fair. Two names for nearly the same set is a lot to hold. The little experiment above is the best cure I know: run it, swap one name, and watch what comes out.</p>
+<p data-anchor="p21">In the real box you hand sheets over when you load it:</p>
+<pre data-anchor="code-real">pkgs = import &lt;nixpkgs&gt; {
+  overlays = [
+    (final: prev: {
+      zver = prev.zver.overrideAttrs (old: {
+        patches = (old.patches or []) ++ [ ./fix-greeting.patch ];
+      });
+    })
+  ];
+};</pre>
+<p data-anchor="p22">Now <code>pkgs.zver</code> is the patched one, and so is the <code>zver</code> that <code>zver-tools</code> receives from <code>callPackage</code>. The order of the list counts: a later sheet sees the earlier ones as its <code>prev</code>.</p>
+
+<div class="callout note" data-anchor="co-notrun"><span class="lbl">What I ran and what I did not</span>
+<p>The small set, <code>callWith</code>, and the sheets above were run on Nix 2.34.6. The <code>override</code> and <code>overrideAttrs</code> lines on real Nixpkgs packages come from the Nixpkgs manual; the network on my test machine would not let me fetch Nixpkgs, so I did not run them. Names like <code>zlib-ng</code> may differ on your version.</p></div>
+
+<h2 data-anchor="h-cost">The price of a change at the root</h2>
+<p data-anchor="p23">You saw that a change flows to everything that uses it. Think about what the shelf has to do. Every card downstream now has a different ingredient, so each has a different address, so each must be built again. Change a library at the bottom and a great many things get made again, and the ready-made copies other people built will not match yours. A small change in the wrong place can mean a very long wait.</p>
+
+<h2 data-anchor="h-skip">When a sheet is too much</h2>
+<p data-anchor="p24">A sheet over the whole set is strong, and strong things have costs: it changes the set for every reader, it is harder to follow, and it can spread far. So ask first: does anything else need to see my change?</p>
+<ul>
+<li data-anchor="li-one">Only <em>you</em> need the changed copy, in one place? Use <code>override</code> or <code>overrideAttrs</code> in a plain <code>let</code> and be done.</li>
+<li data-anchor="li-own">It is your own program? Put it in a file and use <code>callPackage</code>. No sheet.</li>
+<li data-anchor="li-many">Other cards must use your changed version, or you want the change to hold everywhere in one project? Now a sheet is the right tool.</li>
+</ul>
+
+<div class="try" data-anchor="ex-1"><span class="lbl">Try it yourself</span>
+<ol>
+<li>Write the <code>zver</code> card with the front list from this chapter. Build it with <code>callPackage</code>.</li>
+<li>Make a patched copy with <code>overrideAttrs</code>. Keep the old patches with <code>old.patches or []</code>. Build both and compare their addresses.</li>
+<li>Now do the same change as an overlay and load it through <code>overlays = [ ... ]</code>.</li>
+<li>Add a second card, <code>zver-tools</code>, that needs <code>zver</code>. Which version does it get with step 2? With step 3? Why?</li>
+<li>In the overlay, replace <code>prev.zver</code> with <code>final.zver</code>. Predict the error, then run it.</li>
+<li>In the small hand-made set, change <code>greeting</code> in a sheet and predict <code>hi</code> before you run it.</li>
+</ol></div>
+
+<div class="callout note" data-anchor="co-limits"><span class="lbl">What this does not do</span>
+<p>A changed copy does not check that your change makes sense. A patch can fail to apply, or an old version of a library can break a card that wanted a new one; you learn it when you build. And overlays hide where a thing came from: when two sheets touch the same name, you must read the order to know which wins.</p></div>
+
+<p class="pull" data-anchor="pull1">Change the slots with override, the card with overrideAttrs, the whole set with a sheet.</p>
+
+<p data-anchor="p25" class="closer">You can now change any card in the shared box without copying it, and you know when the change will reach everyone else.</p>
+
+<div class="sources" data-anchor="src"><b>Sources:</b> the hand-made package set, <code>callWith</code>, <code>extends</code> and the overlay results were run on Nix 2.34.6 (<code>src-local-nix-2.34-fixpoint</code> in <code>research.json</code>). The <code>override</code>/<code>overrideAttrs</code>/<code>overlays</code> idioms follow the Nixpkgs manual's overriding chapter and were not run against live Nixpkgs.</div>
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+<a rel="prev" href="10-packaging-software-with-nixpkgs.html">‹ Prev</a>
+<a rel="home" href="../index.html">Contents</a>
+<span class="book-pageno"></span>
+<a rel="next" href="12-reproducible-development-environments.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body></html>
