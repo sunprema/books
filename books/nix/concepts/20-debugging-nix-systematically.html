@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Debugging Nix Systematically</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="nix">
+<header class="topbar"><span class="t">Nix</span><a href="../index.html" rel="home">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></header>
+<div class="book-viewport">
+<article class="book-leaf">
+<header class="chap-open" data-anchor="open">
+<div class="chap-num" aria-hidden="true">20</div>
+<h1 data-anchor="title">Finding What Went Wrong, Step by Step</h1>
+<div class="chap-real">Real name: <b>"Debugging Nix Systematically"</b></div>
+</header>
+
+<h2 data-anchor="h-problem">Five red lights and one guess</h2>
+<div class="scene" data-anchor="scene"><span class="lbl">Here's the problem</span>
+<p>Your friend runs one command and a wall of red words comes back. They do what most of us do: change a line, run it again, change another line, run it again. After an hour the page is full of half-fixes, and the red words are different, but nobody can say if that is better.</p></div>
+<p data-anchor="p1">Look at it from the side of a person who fixes bikes. They do not start by swapping parts. First they ask one question: <em>is the problem in the chain, the tyre or the brakes?</em> Only then do they pick up a tool. This chapter gives you that first question for Nix, plus a short list of tools for each answer.</p>
+
+<h2 data-anchor="h-rule">The fix: ask "which step broke?"</h2>
+<p data-anchor="p2">Every Nix job walks through the same steps you met in chapters 7 to 9. A failure belongs to exactly one of them, and each step has its own look and its own cure.</p>
+
+<figure class="diagram-fig" data-anchor="fig-stages">
+<svg class="diagram" viewBox="0 0 560 150" role="img" aria-labelledby="t20a">
+<title id="t20a">Five steps in a row: reading the page, working out the page, fetching, building, switching on. A failure is in the first step that did not finish.</title>
+<rect class="fill-soft stroke" x="8" y="40" width="94" height="56"/><text class="big" x="18" y="64">1 Read</text><text class="dim" x="18" y="84">syntax</text>
+<rect class="fill-soft stroke" x="120" y="40" width="94" height="56"/><text class="big" x="130" y="64">2 Work out</text><text class="dim" x="130" y="84">evaluation</text>
+<rect class="fill-soft stroke" x="232" y="40" width="94" height="56"/><text class="big" x="242" y="64">3 Fetch</text><text class="dim" x="242" y="84">downloads</text>
+<rect class="fill-soft stroke" x="344" y="40" width="94" height="56"/><text class="big" x="354" y="64">4 Build</text><text class="dim" x="354" y="84">the builder</text>
+<rect class="stroke-thick fill-soft" x="456" y="40" width="94" height="56"/><text class="big" x="466" y="64">5 Switch on</text><text class="red" x="466" y="84">activation</text>
+<line class="stroke" x1="102" y1="68" x2="120" y2="68"/><line class="stroke" x1="214" y1="68" x2="232" y2="68"/><line class="stroke" x1="326" y1="68" x2="344" y2="68"/><line class="stroke" x1="438" y1="68" x2="456" y2="68"/>
+<text class="dim" x="8" y="124">No "building" line yet? It broke in step 1, 2 or 3.</text>
+<text class="dim" x="8" y="142">A "building" line, then the program's own words? Step 4.</text>
+</svg>
+<figcaption>Find the first step that did not finish. That is where to look.</figcaption>
+</figure>
+
+<p data-anchor="p3">The cheap test is to look for the line that says <code>building '...drv'...</code>. If it never appeared, Nix never ran any builder, so the trouble is in reading, working out, or fetching. If it appeared, the trouble is in the builder, or later.</p>
+
+<h2 data-anchor="h-read">Steps 1 and 2: the page itself</h2>
+<p data-anchor="p4">I ran every example in this chapter on Nix 2.34.6 and copied the words it gave. Start with step 1, <span class="term">"syntax"</span>, which just means "could Nix even read the page?" Here a semicolon is missing:</p>
+<pre data-anchor="code-syn">{ a = 1 b = 2; }
+
+error: syntax error, unexpected '=', expecting ';'
+       at «string»:1:11:
+            1| { a = 1 b = 2; }
+             |           ^</pre>
+<p data-anchor="p5">It gives a line, a column and a little arrow. The arrow often points a bit <em>after</em> the real mistake, because Nix only noticed when it got confused. Look at the thing just before the arrow. An unclosed list gives <code>unexpected end of file</code> at the very end, which means "something above was never closed."</p>
+
+<p data-anchor="p6">Step 2 is <span class="term">"evaluation"</span>: Nix works out the page's answer. No program has run yet. These errors say what is wrong in plain words:</p>
+<table data-anchor="tbl-eval">
+<tr><th>You wrote</th><th>Nix said</th></tr>
+<tr><td><code>{ name = "x"; }.nme</code></td><td><code>attribute 'nme' missing</code> … <code>Did you mean name?</code></td></tr>
+<tr><td><code>x + y</code> with no <code>y</code></td><td><code>undefined variable 'y'</code></td></tr>
+<tr><td><code>"a" + 1</code></td><td><code>cannot coerce an integer to a string: 1</code></td></tr>
+<tr><td>a function wanting <code>{ a, b }</code> given only <code>a</code></td><td><code>called without required argument 'b'</code></td></tr>
+<tr><td>a function wanting <code>{ a }</code> given <code>a</code> and <code>c</code></td><td><code>called with unexpected argument 'c'</code></td></tr>
+<tr><td><code>rec { a = b + 1; b = a + 1; }.a</code></td><td><code>infinite recursion encountered</code></td></tr>
+<tr><td><code>assert 1 == 2; 3</code></td><td><code>…the condition of the assertion '(1 == 2)'</code></td></tr>
+</table>
+
+<h3 data-anchor="h-trace">Reading the long trace</h3>
+<p data-anchor="p7">Bigger pages give a long error with lines that start with <code>…</code>. Think of them as a trail of footprints. Each line says "while I was doing this, I was asked to do that." The footprints lead <em>inwards</em>. The real reason is the <code>error:</code> line at the very bottom. So read the bottom line first to learn <em>what</em> went wrong, then climb the footprints to learn <em>how you got there</em>. If Nix has hidden part of the trail, add <code>--show-trace</code> and run it again to see all of it.</p>
+<div class="callout key" data-anchor="co-lazy"><span class="lbl">Laziness moves the red light</span>
+<p>From chapter 7: Nix only works out what is asked for. A bad value in a set can sit there quietly until something reads it. So the line that <em>fails</em> may be far from the line that <em>made the mistake</em>. The footprints are how you walk back.</p></div>
+
+<h2 data-anchor="h-fetch">Step 3: fetching</h2>
+<p data-anchor="p8">Some pages ask for things from outside: a web address, a code repository. If that fails, the error names the fetching tool and says it could not reach the place. It also retries several times first, with longer and longer waits, which looks like a hang. Here Nix tried five times and then said:</p>
+<pre data-anchor="code-fetch">error: … while calling the 'fetchurl' builtin
+       error: unable to download 'http://localhost:1/x':
+       Could not connect to server (7) …</pre>
+<p data-anchor="p9">For this step ask the plain questions. Is the network up? Is the address right? Do you need a proxy? Did the place move? Nothing in your Nix code is wrong, usually. The one fetch surprise worth knowing is a <em>wrong stamp</em>. A download pinned with a <span class="term">"hash"</span> (a short fingerprint of the content) fails if the content differs:</p>
+<pre data-anchor="code-hash">error: hash mismatch in fixed-output derivation '…fixed-note.drv':
+         specified: sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+            got:    sha256-DDBxQY5jVuYUiYyE7QZMqV6IVRvAgRtTS98ZUuza5TQ=</pre>
+<p data-anchor="p10">This is also how you <em>learn</em> a hash: put a fake one, run, and copy the <code>got</code> line. But stop and ask before you copy. Is this the file you meant? If a file you trusted last week now has a different fingerprint, that is a question about the file, not about Nix.</p>
+
+<h2 data-anchor="h-build">Step 4: the builder complained</h2>
+<p data-anchor="p11">Now the "building" line has appeared, and the words that follow come from the little program doing the work, not from Nix. Here is one on purpose:</p>
+<pre data-anchor="code-build">building '/nix/store/…-oops.drv'...
+sh: /bin/cat: not found
+error: Cannot build '/nix/store/…-oops.drv'.
+       Reason: builder failed with exit code 127.
+       Output paths:
+         /nix/store/…-oops</pre>
+<p data-anchor="p12">Read it in three bites. The line with <code>sh:</code> is the builder talking: it wanted a tool and the room had none. The <code>Reason</code> line carries a number. <b>127</b> means "command not found", which is the classic sign of a tool the page forgot to list (chapter 9's locked room). Most other numbers just pass on whatever the failing program said, so the log must explain them. The <code>Output paths</code> are only where the result <em>would</em> have gone. Nothing is there.</p>
+<p data-anchor="p13">Three tools help here:</p>
+<ul data-anchor="l1">
+<li><code>nix log &lt;drv&gt;</code> shows the saved log of a build, even after the screen has scrolled away.</li>
+<li><code>nix-build -K</code> keeps the failed work folder and prints <code>keeping build directory …</code>, so you can walk in and look at what the builder saw.</li>
+<li><code>nix derivation show &lt;drv&gt;</code> prints the builder, its arguments and its environment, so you see exactly what it was given instead of what you remember giving it.</li>
+</ul>
+<div class="callout warn" data-anchor="co-silent"><span class="lbl">The quiet failure</span>
+<p>A builder that does not stop on the first bad command can finish happily with a wrong result, as chapter 9 showed. If the build "worked" but the output is empty or odd, the log is still where to look. Real package helpers stop on the first error; hand-written scripts need <code>set -e</code>.</p></div>
+
+<h2 data-anchor="h-switch">Step 5: switching on</h2>
+<p data-anchor="p14">For a whole computer (chapters 18 and 19) there is a last step. The new system built fine, but turning it on can still fail: a service will not start, or a file it wants is missing. That is not a Nix evaluation error and not a build error. It is the ordinary world of the computer. So ask the ordinary questions with the ordinary tools: look at the service's status and its log (for a systemd service, <code>systemctl status</code> and <code>journalctl -u</code>), check that a secret file really exists at the path the page names, check that a door number is not already used. And remember rollback from chapter 18: the old generation is still there, so you can go back first and investigate after. I did not boot a computer for this chapter, so these commands come from the earlier chapters, not from a run here.</p>
+
+<h2 data-anchor="h-cut">Make the problem small</h2>
+<p data-anchor="p15">When the cause is not clear, cut. Copy the failing part into its own small file, or into <code>nix repl</code>, and remove things until the red words stop. The last thing you removed is the suspect. A few handy moves:</p>
+<ul data-anchor="l2">
+<li><code>:t name</code> in the repl tells you what <em>kind</em> of thing a value is. Many errors are "I thought this was a list."</li>
+<li><code>builtins.trace "here" value</code> prints <code>trace: here</code> on the way past and gives back the value untouched. It only prints if that spot is really reached, which is itself useful information.</li>
+<li><code>--strict</code> forces everything inside the answer, so a hidden bad value shows itself.</li>
+<li><code>builtins.tryEval</code> asks "does this work?" without crashing.</li>
+</ul>
+<p data-anchor="p16">Take out the traces when you are done. They are scaffolding, not part of the house.</p>
+
+<h2 data-anchor="h-pick">"Why did I get <em>that</em> package?"</h2>
+<p data-anchor="p17">Sometimes nothing fails; the wrong thing just shows up: an old version, or a package with a surprise change. Two questions settle most of these.</p>
+<p data-anchor="p18"><b>Where did the package come from?</b> Ask Nix to point at the file. This printed the exact file and line for <code>hello</code>:</p>
+<pre data-anchor="code-pos">nix eval nixpkgs#hello.meta.position
+"/nix/store/…-source/pkgs/by-name/he/hello/package.nix:58"</pre>
+<p data-anchor="p19">If someone changed the package with an override (chapter 11), <code>builtins.unsafeGetAttrPos "name" pkg</code> points at where the attribute was last set, which for my test pointed into Nixpkgs' general build helper, not <code>hello</code>'s own file. That tells you a change happened there.</p>
+<p data-anchor="p20"><b>Which Nixpkgs is this?</b> Two ways of asking can reach two different copies. <code>import &lt;nixpkgs&gt; {}</code> uses whatever your search path says; <code>nixpkgs#hello</code> uses the flake registry; a project's flake uses the revision in its lock file. When I looked, the first two gave version strings that were not the same. So print the version (<code>pkgs.lib.version</code>) and the store path of the copy you are really using, before you decide the package is wrong.</p>
+<p data-anchor="p21">A mistyped name also fails differently in each place: through a flake you get a long list of places it looked, plus a <code>Did you mean</code>; through <code>import</code> you get a short <code>attribute 'nosuchpkg' missing</code>.</p>
+
+<h2 data-anchor="h-simple">Is it too clever?</h2>
+<p data-anchor="p22">A last habit. When a page needs three overlays, two overrides and a function that builds functions just to change one setting, stop. Ask whether the thing already has an option for it, whether one pinned input would do, or whether the plain version is shorter. Each layer you add is one more place for a footprint trail to wander through. Layers are sometimes worth it, as chapter 11 said, but the debugging cost is real, and the layer you can delete is the one you do not have to debug.</p>
+
+<h2 data-anchor="h-why">Why it is worth it</h2>
+<p data-anchor="p23">Yes, Nix errors can feel like a flood, and the longest ones have a reputation for good reason. Reading them from the bottom, one step at a time, takes some patience at first. But the method does not change from one problem to the next: find the step, read the bottom line, climb the trail, cut it small. Guessing gets slower as the page grows; the method does not.</p>
+
+<div class="try" data-anchor="ex-1"><span class="lbl">Try it yourself</span>
+<p>For each example, say which of the five steps it broke in before you run it. Then run it with <code>nix-instantiate --eval -E '…'</code> (or <code>nix-build</code> for the last two) and check yourself.</p>
+<ol>
+<li><code>let a = 1; in [ a b</code></li>
+<li><code>let x = 1; in x + y</code></li>
+<li><code>({ a, b }: a) { a = 1; }</code></li>
+<li><code>let xs = [1 2 3] ++ xs; in builtins.length xs</code></li>
+<li><code>builtins.fetchurl "http://localhost:1/x"</code></li>
+<li>The "oops" derivation from the building step.</li>
+<li>The fixed-note derivation with an all-<code>A</code> hash.</li>
+</ol>
+<details data-anchor="ex-answers"><summary>Show the answers</summary>
+<p>1: step 1, reading (unexpected end of file). 2: step 2, working out (undefined variable). 3: step 2 (missing required argument). 4: step 2 (infinite recursion). 5: step 3, fetching (cannot connect). 6: step 4, building (exit code 127). 7: step 3 or 4 in spirit: the hash check happens when the fixed-output job finishes, and it is a "wrong stamp" problem, fixed by checking the file and then copying <code>got</code>. Notice that only 6 and 7 print a <code>building</code> line.</p></details>
+<p>Then break something in your own project on purpose, name the step, and fix it with only the tool that step calls for.</p></div>
+
+<p class="pull" data-anchor="pull1">Name the step first. The tool follows.</p>
+
+<p data-anchor="p24" class="closer">When the red words come, you stop guessing and start with one question, and the question already points at the next thing to try. Next: the whole book's pieces, working together.</p>
+
+<div class="sources" data-anchor="src"><b>Sources:</b> every error message, exit code and command in this chapter was produced by running Nix 2.34.6 and a current Nixpkgs pre-release in my own test session (<code>src-local-nix-2.34-debug</code>, <code>src-local-nixpkgs-26.11-debug</code>), plus the findings of chapters 7 and 9 (<code>src-local-nix-2.34</code>, <code>src-local-nix-2.34-lifecycle</code>). Exact wording and layout of errors changes between Nix versions, so expect small differences. The activation step was not run here.</div>
+</article>
+<div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+<a rel="prev" href="19-reusable-services-and-multiple-machines.html">‹ Prev</a>
+<a rel="home" href="../index.html">Contents</a>
+<span class="book-pageno"></span>
+<a rel="next" href="21-capstone-from-repository-to-running-service.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body></html>
