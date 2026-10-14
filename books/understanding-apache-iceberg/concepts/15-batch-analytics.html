@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Nightly Numbers You Can Trust — Understanding Apache Iceberg</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-apache-iceberg">
+<header class="book-top"><span class="t">Understanding Apache Iceberg</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="batch-analytics-head">
+      <span class="chapter-num">15</span>
+      <p class="kicker">Part IV &middot; Use Cases and Patterns</p>
+      <h1>The Nightly Numbers You Can Trust</h1>
+      <p class="real-name">The data world calls this: <b>batch analytics and reporting</b></p>
+    </header>
+
+    <section class="scene" data-anchor="batch-analytics-scene">
+      <p class="kicker">Here&rsquo;s the problem</p>
+      <p class="lede" data-anchor="batch-analytics-p1">It is the last day of the month, and a finance team is closing the books. The month&rsquo;s numbers are poured into a side copy of the table, where nobody else can see them. Checks run against that copy: do the totals match the bank? Are any orders missing? Only when every check passes does the team flip one switch and make the new numbers the official ones.</p>
+      <p data-anchor="batch-analytics-p2">Then they stick a label on that exact version, say &ldquo;EOY-2023&rdquo;, and keep it forever. Daily loads carry on as usual, but the audited numbers never move. Without this, the same team would be copying files, crossing fingers and hoping nobody opened the report halfway through.</p>
+    </section>
+
+    <h2 data-anchor="batch-analytics-h-concept">The idea: a loading dock with an inspector</h2>
+    <p data-anchor="batch-analytics-p3">A typical report is built like a kitchen. Raw ingredients arrive at the back door: <b>raw tables</b> that hold data just as it came in. A cook cleans and combines them into <b>curated tables</b>, the tidy ones with the answers. Finally the dining room, the dashboards and spreadsheets, <b>consumes</b> them. Data engineers call the whole thing a <span class="term">batch pipeline</span> (a job that runs on a schedule, such as every night, and handles a big chunk of data at once).</p>
+    <p data-anchor="batch-analytics-p4">Iceberg helps with one big worry: the person eating must never get a half-cooked dish. Every write to an Iceberg table is a single <span class="term">snapshot commit</span> (one all-or-nothing step that swaps in the new version). So a dashboard open during a long job sees the old complete table, then the new complete table, and nothing in between.</p>
+
+    <h2 data-anchor="batch-analytics-h-how">How it works: three safe habits</h2>
+    <figure class="diagram-fig" data-anchor="batch-analytics-fig">
+      <svg class="diagram" viewBox="0 0 560 230" role="img" aria-labelledby="ba-t">
+        <title id="ba-t">A flow from raw tables to a transform step to a hidden audit branch, then a check, then publish to the main curated table that dashboards read. The audit branch step is drawn in red.</title>
+        <rect class="fill-soft stroke" x="15" y="40" width="95" height="44"/>
+        <text class="dim" x="32" y="66">RAW TABLES</text>
+        <rect class="fill-soft stroke" x="140" y="40" width="95" height="44"/>
+        <text class="dim" x="153" y="66">TRANSFORM</text>
+        <rect class="fill-ink stroke-red" x="265" y="40" width="130" height="44"/>
+        <text class="on-ink" x="278" y="66">HIDDEN AUDIT COPY</text>
+        <rect class="fill-soft stroke" x="425" y="40" width="120" height="44"/>
+        <text class="dim" x="437" y="66">MAIN: CURATED</text>
+        <line class="stroke-soft" x1="110" y1="62" x2="140" y2="62"/>
+        <line class="stroke-soft" x1="235" y1="62" x2="265" y2="62"/>
+        <line class="stroke-soft" x1="395" y1="62" x2="425" y2="62"/>
+        <text class="red" x="268" y="108">1. WRITE HERE FIRST</text>
+        <rect class="fill-soft stroke" x="265" y="135" width="130" height="40"/>
+        <text class="dim" x="291" y="160">2. RUN CHECKS</text>
+        <line class="stroke-soft" x1="330" y1="84" x2="330" y2="135"/>
+        <line class="stroke-soft" x1="395" y1="155" x2="485" y2="155"/>
+        <line class="stroke-soft" x1="485" y1="155" x2="485" y2="84"/>
+        <text class="dim" x="405" y="200">3. PASS? PUBLISH IN ONE STEP</text>
+      </svg>
+      <figcaption>New data waits in a copy that readers cannot see. Only after the checks pass does it become the main table. The red box is the key idea: nobody sees data that has not been checked.</figcaption>
+    </figure>
+    <p data-anchor="batch-analytics-p5"><b>Habit one: reruns that do no harm.</b> Nightly jobs fail and get retried. If the retry adds the same rows again, your revenue doubles. The fix is a <span class="term">dynamic partition overwrite</span> (a write that replaces exactly the slices of the table, such as days, that the job produced and leaves every other slice alone). Run it twice and you get the same answer twice. This is a choice you make in the job; Iceberg does not do it for you.</p>
+    <p data-anchor="batch-analytics-p6"><b>Habit two: fold in the late news.</b> A refund shows up three days late. A wrong price is corrected. For this, use <span class="term">MERGE INTO</span> (one command that says: where a row matches, update it; where it is new, add it). Iceberg rewrites only the data files the change touches, and the official docs prefer it over overwrite for row-level fixes.</p>
+    <pre data-anchor="batch-analytics-code"><code><span class="cm">-- Late-arriving corrections folded into a curated sales table</span>
+<span class="kw">MERGE INTO</span> prod.sales.daily_revenue t
+<span class="kw">USING</span> updates_batch s
+<span class="kw">ON</span> t.order_id = s.order_id
+<span class="kw">WHEN MATCHED THEN UPDATE SET</span> t.amount = s.amount, t.updated_at = s.updated_at
+<span class="kw">WHEN NOT MATCHED THEN INSERT</span> *;</code></pre>
+    <p data-anchor="batch-analytics-p7"><b>Habit three: write, audit, publish.</b> Netflix made this pattern famous in 2017, and calls it <span class="term">write-audit-publish</span> (write new data where readers cannot see it, check it, then reveal it all at once). Iceberg supports it with <span class="term">branches</span> (named side copies of a table that cost almost nothing, because no data is copied):</p>
+    <pre data-anchor="batch-analytics-code2"><code><span class="kw">ALTER TABLE</span> db.table <span class="kw">SET</span> TBLPROPERTIES (<span class="str">'write.wap.enabled'</span>=<span class="str">'true'</span>);
+<span class="kw">ALTER TABLE</span> db.table <span class="kw">CREATE BRANCH</span> <span class="fn">`audit-branch`</span> <span class="kw">RETAIN</span> <span class="num">7</span> <span class="kw">DAYS</span>;
+<span class="cm">-- jobs write with spark.wap.branch = audit-branch; checks run on the branch</span>
+<span class="kw">CALL</span> catalog.system.fast_forward(<span class="str">'db.table'</span>, <span class="str">'main'</span>, <span class="str">'audit-branch'</span>);</code></pre>
+    <p data-anchor="batch-analytics-p8">Netflix runs this across thousands of tables. An auditing tool checks the hidden version, and only a passing grade exposes it. Nothing is copied during the check.</p>
+
+    <h3 data-anchor="batch-analytics-h-oops">When a bad run slips through</h3>
+    <p data-anchor="batch-analytics-p9">Suppose it happens anyway. You do not need a backup. The <span class="term">rollback_to_snapshot</span> command points the table back at an earlier saved version. And when someone asks, &ldquo;Why did the numbers change overnight?&rdquo;, the <b>history</b> and <b>snapshots</b> tables list every version, what kind of change made it, and which job wrote it. That is a small query, not a hunt through log files.</p>
+
+    <div class="callout key" data-anchor="batch-analytics-key">
+      <span class="label">Design principle</span>
+      <p>Make publishing a single step, separate from loading. When loading is slow and messy but publishing is instant and whole, readers only ever see finished, checked work.</p>
+    </div>
+
+    <h2 data-anchor="batch-analytics-h-usecase">Use case: the monthly sales report</h2>
+    <p data-anchor="batch-analytics-p10">A shop loads orders every night into raw tables. A job tidies them into a curated daily revenue table. Each night it overwrites just that night&rsquo;s slice, so a retry is harmless. Refunds that arrive late are merged in. Before the new slice goes live, the checks compare order counts and totals. Managers open the same dashboard every morning and the number matches the one from yesterday&rsquo;s meeting, unless a documented correction changed it.</p>
+
+    <h2 data-anchor="batch-analytics-h-decide">Deciding: how to load</h2>
+    <table data-anchor="batch-analytics-table">
+      <thead><tr><th>Situation</th><th>Use</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Reload whole days or months on a schedule</td><td>Dynamic partition overwrite</td><td>Simple and safe to retry; replaces whole slices</td></tr>
+        <tr><td>Late or corrected individual rows</td><td>MERGE INTO</td><td>Precise, but costs more work per run</td></tr>
+        <tr><td>Reports others rely on, such as finance close</td><td>Write-audit-publish with a branch</td><td>An extra step and a retention period to manage</td></tr>
+        <tr><td>Answers needed within seconds of an event</td><td>Not this pattern</td><td>Batch means waiting for the next scheduled run</td></tr>
+      </tbody>
+    </table>
+    <h3 data-anchor="batch-analytics-h-watch">Watch out for</h3>
+    <ul data-anchor="batch-analytics-list-watch">
+      <li>Overwriting with no slice named. Spark&rsquo;s default mode can replace the <em>whole table</em>; the docs recommend the dynamic mode for Iceberg.</li>
+      <li>Merging a batch that has two rows for the same key. The merge stops with an error, so remove duplicates first.</li>
+      <li>Retrying a job that only adds rows. It silently doubles your data. Safe reruns are a design choice, not a default.</li>
+      <li>Forgetting the chores. Frequent loads pile up small files and old snapshots, so merging files and expiring snapshots belong in the pipeline&rsquo;s routine.</li>
+    </ul>
+
+    <p class="sources" data-anchor="batch-analytics-sources">Sources: Apache Iceberg docs on Spark Writes, Spark Procedures, Spark Queries, and Branching and Tagging; lakeFS, &ldquo;Data Engineering Patterns: Write-Audit-Publish&rdquo;; Netflix write-audit-publish write-up (vutr.substack.com); Dremio on streaming into Iceberg.</p>
+    <p class="closer payoff" data-anchor="batch-analytics-closer">Because every load is checked before anyone sees it, and every mistake can be undone in one step, you can trust the number on tomorrow&rsquo;s dashboard and sleep through tonight&rsquo;s retry.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="14-when-iceberg-fits.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="16-streaming-real-time.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
