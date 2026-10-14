@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Data That Never Stops Arriving — Understanding Apache Iceberg</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-apache-iceberg">
+<header class="book-top"><span class="t">Understanding Apache Iceberg</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="streaming-real-time-head">
+      <span class="chapter-num">16</span>
+      <p class="kicker">Part IV &middot; Use Cases and Patterns</p>
+      <h1>Data That Never Stops Arriving</h1>
+      <p class="real-name">The data world calls this: <b>streaming and real-time data</b></p>
+    </header>
+
+    <section class="scene" data-anchor="streaming-real-time-scene">
+      <p class="kicker">Here&rsquo;s the problem</p>
+      <p class="lede" data-anchor="streaming-real-time-p1">A shop&rsquo;s website records every click: who looked at which shoe, who added what to a cart. The clicks never stop, day or night. The team wants the table of clicks to stay fresh, so they save a new version of it every minute. That is 1,440 versions a day.</p>
+      <p data-anchor="streaming-real-time-p2">Think of a flipbook. Each page is one complete, consistent picture of the business at that minute. Anyone can open the table and land on a whole page, never on a half-drawn one. The catch: a flipbook with 1,440 new pages a day gets heavy fast. Teams that run this at big scale, Netflix among them, pair it with automatic tidying and with alarms that shout when a page is late.</p>
+    </section>
+
+    <h2 data-anchor="streaming-real-time-h-concept">The idea: a conveyor belt that saves in small steps</h2>
+    <p data-anchor="streaming-real-time-p3">Events flow in from apps, sensors, or databases. A streaming job collects them for a short while and then saves them to the table in one commit, a single all-or-nothing save. People call this <span class="term">micro-batch commits</span> (a steady stream chopped into small, regular saves). Each save becomes one snapshot of the table.</p>
+    <p data-anchor="streaming-real-time-p4">So &ldquo;real time&rdquo; here means <b>minutes fresh</b>, not instant. The official guidance suggests saving no more often than once a minute. Iceberg is great for dashboards, monitoring, and analysis. It is not the tool for answers within a split second.</p>
+
+    <h2 data-anchor="streaming-real-time-h-how">How it works: save only when it is safe</h2>
+    <figure class="diagram-fig" data-anchor="streaming-real-time-fig">
+      <svg class="diagram" viewBox="0 0 560 220" role="img" aria-labelledby="sr-t">
+        <title id="sr-t">Events flow into a streaming job, which writes files, then a checkpoint, then one snapshot commit to the table, and repeats every minute. The commit interval is drawn in red as the knob that sets freshness.</title>
+        <rect class="fill-soft stroke" x="15" y="40" width="100" height="44"/>
+        <text class="dim" x="33" y="66">EVENTS IN</text>
+        <rect class="fill-soft stroke" x="155" y="40" width="110" height="44"/>
+        <text class="dim" x="170" y="66">STREAMING JOB</text>
+        <rect class="fill-ink stroke-red" x="305" y="40" width="110" height="44"/>
+        <text class="on-ink" x="318" y="66">ONE COMMIT</text>
+        <rect class="fill-soft stroke" x="445" y="40" width="100" height="44"/>
+        <text class="dim" x="462" y="66">NEW SNAPSHOT</text>
+        <line class="stroke-soft" x1="115" y1="62" x2="155" y2="62"/>
+        <line class="stroke-soft" x1="265" y1="62" x2="305" y2="62"/>
+        <line class="stroke-soft" x1="415" y1="62" x2="445" y2="62"/>
+        <text class="red" x="285" y="112">EVERY MINUTE OR SO: THE FRESHNESS KNOB</text>
+        <line class="stroke-soft" x1="360" y1="84" x2="360" y2="96"/>
+        <text class="dim" x="15" y="160">SHORTER GAP = FRESHER DATA, BUT MORE SNAPSHOTS AND MORE SMALL FILES</text>
+        <text class="dim" x="15" y="185">LONGER GAP = FEWER FILES, BUT STALER DATA</text>
+      </svg>
+      <figcaption>The red box is the key idea: one commit per interval. How often you commit is the single dial that trades freshness against mess.</figcaption>
+    </figure>
+    <p data-anchor="streaming-real-time-p5"><b>No double counting on a crash.</b> Flink, a popular streaming engine, saves to Iceberg only after its own safety checkpoint succeeds. If the job dies and restarts, it picks up from the last saved version, which remembers its checkpoint number. The result is <span class="term">exactly-once delivery</span> (every event lands one time, even when machines fail). If you would rather not write code, the Iceberg Kafka Connect sink does the same job with settings alone, with a default save every 5 minutes, and can fan one topic out into several tables.</p>
+    <p data-anchor="streaming-real-time-p6"><b>Copying a live database.</b> A shop&rsquo;s orders database changes all day. <span class="term">CDC</span> (change data capture: a feed of every insert, update, and delete from the source database) lets Iceberg mirror it. Flink&rsquo;s upsert mode applies those changes. It needs a format-v2 table with key columns named, and partitioned tables must include their partition columns in that key.</p>
+    <pre data-anchor="streaming-real-time-code"><code><span class="cm">-- Flink SQL: continuous CDC upsert into an Iceberg v2 table</span>
+<span class="kw">INSERT INTO</span> iceberg_catalog.db.customers <span class="cm">/*+ OPTIONS('upsert-enabled'='true') */</span>
+<span class="kw">SELECT</span> id, name, email, updated_at <span class="kw">FROM</span> kafka_cdc_source;</code></pre>
+    <p data-anchor="streaming-real-time-p7"><b>A hidden bill.</b> To keep writing fast, streaming jobs record deletes as notes (<span class="term">equality deletes</span>: a note saying &ldquo;any row with this key is gone&rdquo;) rather than hunting down the old row. The work of applying those notes moves to whoever reads the table. Until compaction rewrites the files, reading gets slower. Format v3 can turn such notes into the cheaper deletion vectors.</p>
+    <p data-anchor="streaming-real-time-p8"><b>Late, repeated, and out-of-order events.</b> The exactly-once promise covers duplicates your own crashes cause. It does not cover duplicates sent by the source, such as a producer that sends twice or a replayed change feed. Those need a key: upsert in the sink, or a de-duplicating MERGE afterwards.</p>
+    <p data-anchor="streaming-real-time-p9"><b>The table can be a stream too.</b> Spark can read an Iceberg table as a stream starting from a chosen time, taking only appended snapshots, with limits on files or rows per batch. The <span class="term">changelog view</span> (a listing of what changed between versions, including before and after pictures of updated rows) lets downstream jobs follow along without rereading everything.</p>
+
+    <h3 data-anchor="streaming-real-time-h-chores">The chores that come with it</h3>
+    <p data-anchor="streaming-real-time-p10">A one-minute rhythm is 1,440 commits a day, each leaving small files and metadata behind. Streaming writes are quick appends that skip tidying the metadata, so the table needs regular chores: <b>rewrite_data_files</b> to merge small files, <b>rewrite_manifests</b> to tidy the file lists, and <b>expire_snapshots</b> to retire old versions.</p>
+
+    <div class="callout key" data-anchor="streaming-real-time-key">
+      <span class="label">Design principle</span>
+      <p>Freshness is bought with commits, and every commit leaves clutter. Pick the slowest rhythm your users can live with, and budget for the cleaning that rhythm creates.</p>
+    </div>
+
+    <h2 data-anchor="streaming-real-time-h-usecase">Use case: clickstream, sensors, and mirrors</h2>
+    <p data-anchor="streaming-real-time-p11">Web clicks, device telemetry, and sensor readings all land through a one-minute stream, so analysts can ask what is happening this hour. Operations teams watch the same tables for trouble. A customers table mirrored from the live database through CDC stays a few minutes behind, and any past minute can be revisited through its snapshot. One caution for jobs that never rest: watch the time since the last <em>successful</em> commit. Commits can fail even while the job&rsquo;s checkpoints look healthy.</p>
+
+    <h2 data-anchor="streaming-real-time-h-decide">Deciding: should this be a stream?</h2>
+    <table data-anchor="streaming-real-time-table">
+      <thead><tr><th>Situation</th><th>Choice</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Dashboards fine with data a few minutes old</td><td>Stream into Iceberg</td><td>More chores: compaction and expiry</td></tr>
+        <tr><td>Mirror an operational database</td><td>CDC with upsert mode</td><td>Reads slow down until compaction runs</td></tr>
+        <tr><td>Move a topic into tables with no code</td><td>Kafka Connect sink</td><td>Fewer knobs than writing your own job</td></tr>
+        <tr><td>Source may send duplicates</td><td>Key-based upsert or MERGE</td><td>Needs a trustworthy key</td></tr>
+        <tr><td>Answers needed in milliseconds</td><td>Not Iceberg</td><td>Commit interval sets the floor on latency</td></tr>
+      </tbody>
+    </table>
+    <h3 data-anchor="streaming-real-time-h-watch">Watch out for</h3>
+    <ul data-anchor="streaming-real-time-list-watch">
+      <li>Chasing freshness by committing faster. Snapshots and small files multiply, and the cleaning bill grows faster than the speed gain.</li>
+      <li>Expiring snapshots or deleting stray files too eagerly. A running Flink job needs the last snapshot it committed, found through its job id in the snapshot summary, to recover.</li>
+      <li>Watching only checkpoints. Monitor commit lag on its own.</li>
+      <li>Skipping scheduled compaction on an upsert table. It gets slower every day, quietly.</li>
+    </ul>
+
+    <p class="sources" data-anchor="streaming-real-time-sources">Sources: Apache Iceberg docs on Flink Writes, Spark Structured Streaming, Spark Procedures, and the Kafka Connect sink; Dremio, &ldquo;Approaches to Streaming Data into Apache Iceberg Tables&rdquo;; RisingWave on CDC upsert and delete semantics; Data Engineer Things, &ldquo;How Netflix operates Apache Iceberg at scale&rdquo;.</p>
+    <p class="closer payoff" data-anchor="streaming-real-time-closer">Because every minute&rsquo;s save is a whole, checked page of the flipbook, you get fresh numbers without ever reading half-written data, and you pick for yourself how fresh is fresh enough.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="15-batch-analytics.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="17-ml-and-ai-workloads.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

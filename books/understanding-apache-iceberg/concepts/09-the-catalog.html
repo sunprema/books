@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Address Book Every Table Starts From — Understanding Apache Iceberg</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-apache-iceberg">
+<header class="book-top"><span class="t">Understanding Apache Iceberg</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="the-catalog-head">
+      <span class="chapter-num">09</span>
+      <p class="kicker">Part III &middot; Architecture and Design Principles</p>
+      <h1>The Address Book Every Table Starts From</h1>
+      <p class="real-name">The data world calls this: <b>the catalog</b></p>
+    </header>
+
+    <section class="scene" data-anchor="the-catalog-scene">
+      <p class="kicker">Here&rsquo;s the problem</p>
+      <p class="lede" data-anchor="the-catalog-p1">Picture a huge library. Nobody walks the shelves hunting for a book. You go to the front desk and ask the card index, &ldquo;Where is the latest edition of this one?&rdquo; The index gives you a shelf. When a new edition arrives or an old one is returned, that is written down at the same desk, one at a time.</p>
+      <p data-anchor="the-catalog-p2">Now take the desk away. Everyone wanders the stacks. Two people each put a &ldquo;newest edition&rdquo; on the shelf at the same moment, and nobody can say which one is newest. A table made of files in cheap storage is that library. Something has to be the desk.</p>
+    </section>
+
+    <h2 data-anchor="the-catalog-h-concept">The idea: one desk that knows the current page</h2>
+    <p data-anchor="the-catalog-p3">The <span class="term">catalog</span> (a service that keeps a list of table names and, for each one, the place of its current description file) is that desk. You ask for a table by name, such as <i>sales.orders</i>, and it hands back a pointer to the table&rsquo;s newest metadata file. Every program that wants the table starts there. So the pointer, not a folder in storage, decides what the table is right now.</p>
+    <p data-anchor="the-catalog-p4">This is a break from the old habit of treating a folder as the table. Drop files into the table&rsquo;s folder without a proper commit and they add nothing to the table. Delete files from it by hand and you may break the table. The folder holds the pages; the desk says which ones count.</p>
+
+    <h2 data-anchor="the-catalog-h-how">How it works: swap the pointer, but only if nobody beat you</h2>
+    <p data-anchor="the-catalog-p5">A writer never edits the table in place. It writes a complete new metadata file, then asks the catalog to move the pointer from the old file to the new one. The move is a <span class="term">compare-and-swap</span> (an update that works only if the pointer still holds the value you started from). If another writer got in first, the swap is refused, and the second writer must look at the new state and try again. Nobody silently overwrites anybody.</p>
+    <p data-anchor="the-catalog-p6">Different catalogs do this in different ways. Hive Metastore makes a conditional update to a location property. AWS Glue checks a version number. Nessie checks a commit hash. The engine sees the same promise every time: one winner per swap.</p>
+
+    <figure class="diagram-fig" data-anchor="the-catalog-fig">
+      <svg class="diagram" viewBox="0 0 560 270" role="img" aria-labelledby="cat-t">
+        <title id="cat-t">Two writers, a catalog and storage. Both writers start from metadata version 4. Writer A asks the catalog to swap the pointer from 4 to 5 and wins. Writer B asks to swap from 4 to 5 as well, and is refused in red because the pointer no longer holds 4.</title>
+        <text class="dim" x="30" y="24">WRITERS</text>
+        <rect class="fill-soft stroke" x="30" y="38" width="120" height="44"/>
+        <text class="dim" x="44" y="65">WRITER A</text>
+        <rect class="fill-soft stroke" x="30" y="150" width="120" height="44"/>
+        <text class="dim" x="44" y="177">WRITER B</text>
+
+        <text class="dim" x="230" y="24">THE CATALOG</text>
+        <rect class="fill-ink" x="230" y="38" width="150" height="156"/>
+        <text class="on-ink" x="244" y="68">SALES.ORDERS</text>
+        <text class="on-ink" x="244" y="96">POINTER:</text>
+        <text class="on-ink big" x="244" y="130">v4 &rarr; v5</text>
+        <text class="on-ink" x="244" y="170">ONE SWAP AT A TIME</text>
+
+        <line class="stroke" x1="150" y1="60" x2="230" y2="60"/>
+        <text class="dim" x="154" y="52">4 &rarr; 5</text>
+        <line class="stroke-red" x1="150" y1="172" x2="230" y2="172"/>
+        <text class="red" x="154" y="164">4 &rarr; 5 ?</text>
+        <text class="red" x="154" y="190">REFUSED</text>
+
+        <text class="dim" x="430" y="24">STORAGE</text>
+        <rect class="fill-soft stroke" x="430" y="38" width="100" height="44"/>
+        <text class="dim" x="444" y="65">META v5</text>
+        <line class="stroke-soft" x1="380" y1="60" x2="430" y2="60"/>
+
+        <text class="dim" x="30" y="234">A wins and the pointer moves. B must re-read v5 and retry.</text>
+        <text class="dim" x="30" y="254">Files can be written anywhere; only the swap decides.</text>
+      </svg>
+      <figcaption>Two writers race for the same swap. The refused one, in red, is the whole reason the desk exists.</figcaption>
+    </figure>
+
+    <p data-anchor="the-catalog-p7">Since every engine has to pass the desk to find a table or save a change, the desk is also the natural place to ask the other hard questions: who is allowed in, who changed what, and who gets a short-lived key to the storage. That is why the catalog became the place to compete, more than the file format ever was.</p>
+    <p data-anchor="the-catalog-p8">The <span class="term">REST catalog</span> (an open, shared description of how to talk to a catalog over the web) is the common language. It covers table and folder management, a commit that needs no locks, views, and handing out storage keys. By now the major engines and managed catalogs speak it. Note that it names a protocol, not a product. Two catalogs can both speak it and still differ in sign-in, rules, upkeep and price.</p>
+
+    <h2 data-anchor="the-catalog-h-options">The choices, in plain words</h2>
+    <ul data-anchor="the-catalog-list-options">
+      <li><b>Cloud-run catalogs.</b> AWS Glue, Amazon S3 Tables (a storage type with a built-in catalog that also tidies files for you), Databricks Unity Catalog (a REST doorway to its Iceberg tables, still in public preview) and Snowflake Open Catalog. Quickest to start; they tie you to one cloud&rsquo;s way of doing rules.</li>
+      <li><b>Apache Polaris.</b> An open-source REST catalog that began at Snowflake, was given to the Apache foundation in 2024, and reached version 1.0 in 2025. It adds role-based access and short-lived storage keys. Snowflake Open Catalog is a run-for-you version.</li>
+      <li><b>Project Nessie.</b> A catalog with Git-like habits: branches, tags and commits that can cover many tables. Try a set of changes on a branch, then merge them all at once, which comes close to the multi-table transactions Iceberg itself lacks.</li>
+    </ul>
+
+    <div class="callout key" data-anchor="the-catalog-key">
+      <span class="label">Design principle</span>
+      <p>The catalog is strategic infrastructure, not a setting. Your data files can move, but your grants, folders, audit history and upkeep rules live in the catalog and do not move on their own. Choosing one means choosing where rules live, who hands out storage keys, and how hard it is to leave.</p>
+    </div>
+
+    <h2 data-anchor="the-catalog-h-usecase">Use case: three engines, one table</h2>
+    <p data-anchor="the-catalog-p9">A company streams orders in with one engine, runs reports with a second, and lets data scientists explore with a third. All three ask the same catalog for <i>sales.orders</i>, so all three see the same current table, and the catalog&rsquo;s sign-in and rules apply to every one of them. If a team wants to rehearse a risky fix first, a branch-style catalog lets them try it apart from the main table and merge when happy.</p>
+
+    <h2 data-anchor="the-catalog-h-decide">Deciding: how to think about the choice</h2>
+    <table data-anchor="the-catalog-table">
+      <thead><tr><th>Situation</th><th>Reach for</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>One cloud, small team, want to start fast</td><td>The cloud&rsquo;s own catalog</td><td>Easy now; rules and state are tied to that cloud</td></tr>
+        <tr><td>Many engines, and you want to stay free to move</td><td>An open REST catalog such as Polaris</td><td>More portable protocol; you pick sign-in and upkeep yourself, or buy a run-for-you version</td></tr>
+        <tr><td>Changes spanning many tables must land together</td><td>A branching catalog such as Nessie</td><td>Strong team workflow; one more thing to learn and run</td></tr>
+        <tr><td>Already deep in one vendor&rsquo;s platform</td><td>That vendor&rsquo;s catalog, with REST access</td><td>Fewer moving parts; check how much rule state you could take with you</td></tr>
+      </tbody>
+    </table>
+    <h3 data-anchor="the-catalog-h-watch">Watch out for</h3>
+    <ul data-anchor="the-catalog-list-watch">
+      <li>Treating the catalog as a setting. Swapping it later is a real migration, because grants, folders and audit history do not travel by themselves.</li>
+      <li>Assuming &ldquo;REST catalog&rdquo; is a product. It is a protocol, and the products behind it differ a lot.</li>
+      <li>Registering one table location in two catalogs. Only one desk can own the pointer, so two of them split the table&rsquo;s history or damage it.</li>
+      <li>Carrying the old folder habit forward. The folder no longer defines the table; the pointer does.</li>
+    </ul>
+
+    <p class="sources" data-anchor="the-catalog-sources">Sources: Apache Iceberg Table Spec; Iceberg REST Catalog specification; Dremio on the life of a write; Apache Polaris docs; Project Nessie and Iceberg Nessie docs; AWS, Databricks and Snowflake catalog docs; the 2026 state-of-catalogs survey.</p>
+    <p class="closer payoff" data-anchor="the-catalog-closer">Because one desk decides what the table is right now, every engine you use sees the same table, and no two writers can quietly undo each other.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="08-updates-and-deletes.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="10-storage-files-metadata.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>

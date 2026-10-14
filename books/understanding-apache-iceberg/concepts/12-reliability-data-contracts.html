@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proofread Before You Print — Understanding Apache Iceberg</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-apache-iceberg">
+<header class="book-top"><span class="t">Understanding Apache Iceberg</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="reliability-data-contracts-head">
+      <span class="chapter-num">12</span>
+      <p class="kicker">Part III &middot; Architecture and Design Principles</p>
+      <h1>Proofread Before You Print</h1>
+      <p class="real-name">The data world calls this: <b>reliability, write-audit-publish and data contracts</b></p>
+    </header>
+
+    <section class="scene" data-anchor="reliability-data-contracts-scene">
+      <p class="kicker">Here&rsquo;s the problem</p>
+      <p class="lede" data-anchor="reliability-data-contracts-p1">Picture a newspaper. Reporters file their stories onto the proof pages. Editors read those proofs and check the facts, while yesterday&rsquo;s paper is still on the newsstand for anyone to buy. Only when the editors say &ldquo;good&rdquo; does the new edition get printed, all at once.</p>
+      <p data-anchor="reliability-data-contracts-p2">Now imagine a paper with no proof stage. Stories go straight onto the newsstand page by page, and readers pick up a front page with half its words missing. That is how old-style data tables behaved. This chapter is about how to run your tables like the good newspaper.</p>
+    </section>
+
+    <h2 data-anchor="reliability-data-contracts-h-concept">The idea: a change is all in, or not there at all</h2>
+    <p data-anchor="reliability-data-contracts-p3">In older folder-style tables, what the table &ldquo;was&rdquo; depended on which files you saw when you listed a folder. So a reader could see a half-finished load, renaming folders on cloud storage was not one single step, and nothing could change several partitions as one act. Iceberg removes that whole kind of &ldquo;half-loaded table&rdquo; accident by design.</p>
+    <p data-anchor="reliability-data-contracts-p4">Here is why. The only way an Iceberg table changes is one swap: the catalog&rsquo;s pointer moves from the old metadata note to the new one. That is the <span class="term">atomic commit</span> (a change that either lands in full or is not there at all). There is no in-between state for a reader to bump into. The guarantees apply to one table at a time, the same family of promises databases call <span class="term">ACID</span> (safe, all-or-nothing changes).</p>
+    <p data-anchor="reliability-data-contracts-p5">Readers get a calm view too. A query picks one frozen <span class="term">snapshot</span> (the table as it stood at one moment) and sticks with it until it finishes, however many writers commit meanwhile. This is called snapshot isolation.</p>
+
+    <h2 data-anchor="reliability-data-contracts-h-how">How it works: two writers, no locks, and a proof stage</h2>
+    <p data-anchor="reliability-data-contracts-p6">Writers do not queue up behind a lock. Each one prepares its new files, assuming nothing has changed, then tries the swap. This is <span class="term">optimistic concurrency</span> (go ahead, and check at the end). If another writer got there first, the loser looks at the fresh table, checks its work still makes sense, and tries again.</p>
+    <p data-anchor="reliability-data-contracts-p7">Two kinds of failure hide here. Losing the race for the pointer is harmless, and retries fix it automatically. But if two writers changed the same rows or files, the check fails, and no number of retries helps. The cure is to design writers that touch different partitions or rows. Plain appends never clash this way. For row changes, you pick how strict to be: the strict level fails if any concurrent commit added files that might hold matching rows, and the looser level is more forgiving.</p>
+    <p data-anchor="reliability-data-contracts-p8">Atomic commits stop <em>broken</em> tables. They do not stop <em>wrong</em> data. For that there is <span class="term">write-audit-publish</span> (stage the data, check it, then show it to readers). The pipeline writes to a named <span class="term">branch</span> (a side copy of the table&rsquo;s history). Checks run on the branch while the main table is untouched. When the checks pass, main is moved up to the branch in one step, called a <span class="term">fast-forward</span>. Branch-based write-audit-publish has been the recommended pattern since Iceberg 1.2.</p>
+
+    <figure class="diagram-fig" data-anchor="reliability-data-contracts-fig">
+      <svg class="diagram" viewBox="0 0 560 260" role="img" aria-labelledby="rdc-t">
+        <title id="rdc-t">A new load is written to a side branch, checked there while the main table stays as it was, and then published to main in one step. The one-step publish is drawn in red.</title>
+        <text class="dim" x="20" y="22">MAIN TABLE (WHAT READERS SEE)</text>
+        <rect class="fill-soft stroke" x="20" y="34" width="110" height="40"/>
+        <text class="dim" x="32" y="58">YESTERDAY</text>
+        <line class="stroke" x1="130" y1="54" x2="440" y2="54"/>
+        <rect class="fill-ink" x="440" y="34" width="110" height="40"/>
+        <text class="on-ink" x="456" y="58">TODAY</text>
+
+        <text class="dim" x="20" y="150">SIDE BRANCH (READERS SEE NOTHING)</text>
+        <rect class="fill-soft stroke" x="20" y="162" width="110" height="40"/>
+        <text class="dim" x="40" y="186">1 WRITE</text>
+        <line class="stroke-soft" x1="130" y1="182" x2="220" y2="182"/>
+        <rect class="fill-soft stroke" x="220" y="162" width="110" height="40"/>
+        <text class="dim" x="244" y="186">2 AUDIT</text>
+        <line class="stroke-soft" x1="330" y1="182" x2="440" y2="182"/>
+        <rect class="fill-soft stroke" x="440" y="162" width="110" height="40"/>
+        <text class="dim" x="454" y="186">PASSED</text>
+
+        <line class="stroke-soft" x1="75" y1="74" x2="75" y2="162"/>
+        <line class="stroke-red" x1="495" y1="162" x2="495" y2="76"/>
+        <text class="red" x="370" y="124">3 PUBLISH IN ONE STEP</text>
+        <text class="dim" x="20" y="244">Bad data stops at step 2. Main never changed.</text>
+      </svg>
+      <figcaption>Write on the side, check on the side, then publish in one step. The red line is the only moment readers see anything change.</figcaption>
+    </figure>
+
+<pre data-anchor="reliability-data-contracts-code"><code><span class="kw">ALTER TABLE</span> lake.db.events <span class="kw">SET</span> TBLPROPERTIES (<span class="str">'write.wap.enabled'</span>=<span class="str">'true'</span>);
+<span class="cm">-- each run writes to its own branch (Spark session: SET spark.wap.branch = etl_run_42)</span>
+<span class="kw">INSERT INTO</span> lake.db.events <span class="kw">SELECT</span> ...;            <span class="cm">-- lands on branch, invisible on main</span>
+<span class="kw">SELECT</span> <span class="fn">count</span>(*) <span class="kw">FROM</span> lake.db.events.branch_etl_run_42
+<span class="kw">WHERE</span> event_time <span class="kw">IS NULL</span>;                          <span class="cm">-- audit the staged data</span>
+<span class="kw">CALL</span> lake.system.<span class="fn">fast_forward</span>(<span class="str">'db.events'</span>, <span class="str">'main'</span>, <span class="str">'etl_run_42'</span>);  <span class="cm">-- publish atomically</span></code></pre>
+    <p data-anchor="reliability-data-contracts-p9">Those are the three steps in Spark SQL: write to the branch, audit the branch, fast-forward main. And if a bad batch slips through anyway, old snapshots are still kept until you expire them. So you can roll the table back to an earlier snapshot in seconds, instead of re-running pipelines or digging up backups.</p>
+
+    <h2 data-anchor="reliability-data-contracts-h-contract">The table&rsquo;s promise to its readers</h2>
+    <p data-anchor="reliability-data-contracts-p10">An Iceberg schema works like a <span class="term">data contract</span> (a written promise about what a table looks like). The schema is versioned in the table&rsquo;s metadata, each column has a stable ID, and engines check every write against it. The shape changes only through deliberate schema changes, never because of whatever files happened to land in the folder.</p>
+
+    <div class="callout key" data-anchor="reliability-data-contracts-key">
+      <span class="label">Design principle</span>
+      <p>Make bad data visible before it reaches consumers. Stage every change where nobody is reading, check it there, and publish it in one step. Then a mistake is a failed check on a side branch, not a wrong number in someone&rsquo;s report.</p>
+    </div>
+
+    <h2 data-anchor="reliability-data-contracts-h-usecase">Use case: the nightly orders load</h2>
+    <p data-anchor="reliability-data-contracts-p11">A team loads orders every night. Each run writes to its own branch and counts rows with missing timestamps. If the count is zero, the run fast-forwards main, and the morning dashboards show the new day all at once. If not, the run stops, the branch is thrown away, and yesterday&rsquo;s numbers stay in place while someone looks into it.</p>
+
+    <h2 data-anchor="reliability-data-contracts-h-decide">Deciding: how much checking do you need?</h2>
+    <table data-anchor="reliability-data-contracts-table">
+      <thead><tr><th>Situation</th><th>Approach</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Reports or models depend on the table</td><td>Write-audit-publish with a branch per run</td><td>An extra step and extra storage per run</td></tr>
+        <tr><td>Many writers on one table</td><td>Keep writers on different partitions or rows; batch the commits</td><td>Very frequent commits cause retry storms that burn compute</td></tr>
+        <tr><td>Several tables must change together</td><td>Orchestrate carefully, or use catalog-level branching</td><td>Core Iceberg promises are per table, not across tables</td></tr>
+        <tr><td>Scratch data, low stakes</td><td>Plain atomic commits are enough</td><td>No staging, so bad data is only caught after the fact</td></tr>
+      </tbody>
+    </table>
+    <h3 data-anchor="reliability-data-contracts-h-watch">Watch out for</h3>
+    <ul data-anchor="reliability-data-contracts-list-watch">
+      <li>Believing the guarantee covers more than one table. It does not.</li>
+      <li>Fast-forward fails if main moved on after the branch began. Several pipelines publishing to one table need a rebase or cherry-pick plan, not just this pattern.</li>
+      <li>Forgotten branches. A stale branch quietly keeps every file it points to, which blocks cleanup and grows your bill. Give audit branches an expiry.</li>
+    </ul>
+
+    <p class="sources" data-anchor="reliability-data-contracts-sources">Sources: Apache Iceberg Table Spec; Apache Iceberg docs on reliability and branching; Dremio and lakeFS write-audit-publish guides; AWS Glue Iceberg commit-conflict documentation; Cloudera snapshot-expiry documentation.</p>
+    <p class="closer payoff" data-anchor="reliability-data-contracts-closer">Because changes land whole and get checked before anyone sees them, you can trust the number on the screen and fix a bad night by simply not publishing it.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="11-interoperability.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="13-governance-security-trust.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
