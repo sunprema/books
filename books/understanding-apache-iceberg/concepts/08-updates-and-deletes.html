@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fixing One Row Without Redoing the Table — Understanding Apache Iceberg</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-apache-iceberg">
+<header class="book-top"><span class="t">Understanding Apache Iceberg</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="updates-and-deletes-head">
+      <span class="chapter-num">08</span>
+      <p class="kicker">Part II &middot; Core Concepts</p>
+      <h1>Fixing One Row Without Redoing the Whole Table</h1>
+      <p class="real-name">The data world calls this: <b>updates, deletes, copy-on-write and merge-on-read</b></p>
+    </header>
+
+    <section class="scene" data-anchor="updates-and-deletes-scene">
+      <p class="kicker">Here&rsquo;s the problem</p>
+      <p class="lede" data-anchor="updates-and-deletes-p1">A printer finds one wrong word on page 212 of a thick book. There are two ways to fix it. He can reprint the page, so every future reader gets a clean book. Or he can ship the book as it is, with a slip of paper that says &ldquo;page 212, line 4: read this instead.&rdquo; Every reader must then check the slip as they go.</p>
+      <p data-anchor="updates-and-deletes-p2">Either way the word gets fixed. The only question is who pays: the printer, once, at the press, or every reader, every time they read. Later, when enough slips pile up, the printer makes a new printing that folds them all in.</p>
+      <p data-anchor="updates-and-deletes-p3">Tables full of data face the same choice every time someone says, &ldquo;change this row&rdquo; or &ldquo;forget this person.&rdquo;</p>
+    </section>
+
+    <h2 data-anchor="updates-and-deletes-h-concept">The idea: rows must be able to change</h2>
+    <p data-anchor="updates-and-deletes-p4">It is tempting to believe that data for reports only ever grows. In real life it does not. People ask you to erase their data to follow privacy laws such as GDPR and CCPA. A source system sends bad numbers that must be corrected. A customer moves, and the old address must be replaced while the history is kept (the data world calls these <span class="term">slowly changing dimensions</span>, tables where a few facts about a thing change now and then). And a live shop database sends a stream of its changes to the report tables, a trick called <span class="term">CDC</span> (change data capture, copying every insert, edit and delete from one database to another).</p>
+    <p data-anchor="updates-and-deletes-p5">Before Iceberg, lakes of files handled all of this the blunt way: find the groups of files that held the row and rewrite those whole groups. Iceberg&rsquo;s version 2 format made row-level <span class="term">delete, update and merge</span> a normal part of the table. Each one is a single all-or-nothing step, so a reader sees the table before the change or after it, never half.</p>
+
+    <h2 data-anchor="updates-and-deletes-h-how">How it works: pay at press time or at reading time</h2>
+    <p data-anchor="updates-and-deletes-p6">Iceberg offers two ways to carry out a change. In <span class="term">copy-on-write</span> (rewrite every file that holds an affected row, and write it out clean), reading stays simple and fast, because the files are always clean. But the cost follows the number of files touched, not the number of rows changed. Fix one row in a gigabyte file and you write a gigabyte.</p>
+    <p data-anchor="updates-and-deletes-p7">In <span class="term">merge-on-read</span> (leave the data files alone and write a small side file listing the rows that no longer count), the change is quick and cheap to write. The bill moves to the reader, who must lay the slip over the page on every scan. The more unmerged slips there are, the more each read costs.</p>
+
+    <figure class="diagram-fig" data-anchor="updates-and-deletes-fig">
+      <svg class="diagram" viewBox="0 0 560 280" role="img" aria-labelledby="ud-t">
+        <title id="ud-t">Two rows. Top: copy-on-write takes an old data file and writes a whole new clean file, so reads are simple. Bottom: merge-on-read keeps the old data file and adds a small delete file, drawn in red, which every read must merge with the data.</title>
+        <text class="dim" x="30" y="26">COPY-ON-WRITE: PAY WHEN YOU WRITE</text>
+        <rect class="fill-soft stroke" x="30" y="40" width="140" height="48"/>
+        <text class="dim" x="42" y="68">OLD FILE</text>
+        <line class="stroke" x1="170" y1="64" x2="250" y2="64"/>
+        <text class="dim" x="182" y="56">REWRITE</text>
+        <rect class="fill-ink" x="250" y="40" width="140" height="48"/>
+        <text class="on-ink" x="262" y="68">NEW CLEAN FILE</text>
+        <text class="dim" x="410" y="68">READS: SIMPLE</text>
+
+        <text class="dim" x="30" y="136">MERGE-ON-READ: PAY WHEN YOU READ</text>
+        <rect class="fill-soft stroke" x="30" y="150" width="140" height="48"/>
+        <text class="dim" x="42" y="178">OLD FILE, KEPT</text>
+        <rect class="stroke-red" x="30" y="206" width="140" height="28"/>
+        <text class="red" x="42" y="225">DELETE FILE (SLIP)</text>
+        <line class="stroke" x1="170" y1="174" x2="250" y2="174"/>
+        <line class="stroke" x1="170" y1="220" x2="210" y2="220"/>
+        <line class="stroke" x1="210" y1="220" x2="210" y2="174"/>
+        <rect class="fill-ink" x="250" y="150" width="140" height="48"/>
+        <text class="on-ink" x="262" y="178">READ = MERGE</text>
+        <text class="dim" x="410" y="178">WRITES: CHEAP</text>
+
+        <text class="dim" x="30" y="264">Compaction later folds the slip into a clean file.</text>
+      </svg>
+      <figcaption>The same fix, paid for in two different places. The red slip is the only new thing merge-on-read adds.</figcaption>
+    </figure>
+
+    <p data-anchor="updates-and-deletes-p8">The slips come in two kinds. A <span class="term">position delete</span> (a note naming the exact file and row number) is precise and easy for readers, but the writer must first find the rows. An <span class="term">equality delete</span> (a note saying &ldquo;any row with this value is gone&rdquo;) needs no looking up before writing, which streaming writers like, but it is the costliest for readers, who must compare values on every scan.</p>
+    <p data-anchor="updates-and-deletes-p9">Version 3 of the format swaps position slips for <span class="term">deletion vectors</span> (one compact tick-list per data file, kept in a Puffin file), which cuts the extra reading work. Streaming jobs that write equality deletes usually convert them to vectors during upkeep. Version 3 is real today: Iceberg 1.10.0 made it generally available, 1.11.0 (May 2026) is current, and AWS, Snowflake and Google support it. Version 3 readers can read version 2 tables, but upgrading a table is one-way.</p>
+    <p data-anchor="updates-and-deletes-p10">The choice is not for the whole table. Table properties set it for each kind of action (<i>write.delete.mode</i>, <i>write.update.mode</i>, <i>write.merge.mode</i>), and each defaults to copy-on-write. One table can use merge-on-read for streaming deletes and copy-on-write for nightly merges.</p>
+
+<pre data-anchor="updates-and-deletes-code-merge"><code><span class="kw">MERGE INTO</span> prod.db.customers t
+<span class="kw">USING</span> staged_changes s <span class="kw">ON</span> t.customer_id = s.customer_id
+<span class="kw">WHEN MATCHED AND</span> s.op = <span class="str">'D'</span> <span class="kw">THEN DELETE</span>
+<span class="kw">WHEN MATCHED THEN UPDATE SET</span> *
+<span class="kw">WHEN NOT MATCHED THEN INSERT</span> *;</code></pre>
+
+<pre data-anchor="updates-and-deletes-code-props"><code><span class="kw">ALTER TABLE</span> prod.db.customers <span class="kw">SET TBLPROPERTIES</span> (
+  <span class="str">'write.delete.mode'</span> = <span class="str">'merge-on-read'</span>,
+  <span class="str">'write.update.mode'</span> = <span class="str">'copy-on-write'</span>);</code></pre>
+
+    <div class="callout key" data-anchor="updates-and-deletes-key">
+      <span class="label">Design principle</span>
+      <p>Choose the update strategy from your workload, not from fashion. Count how often you read and how often you change, then pay at the place that happens less. Merge-on-read is only half a plan: it needs compaction (regularly rewriting files with their slips folded in) to pay down the reading debt.</p>
+    </div>
+
+    <h2 data-anchor="updates-and-deletes-h-usecase">Use case: a customer table fed by a live shop</h2>
+    <p data-anchor="updates-and-deletes-p11">A company copies its shop database into a customer table all day long. Each batch has new customers, changed addresses and closed accounts, and the one MERGE above applies all of it as a single step. If the table is read by a handful of dashboards and changed once a night, copy-on-write keeps those dashboards fast. If changes arrive every minute, merge-on-read keeps the writers keeping up, and a scheduled compaction job keeps the readers from slowing down.</p>
+
+    <h2 data-anchor="updates-and-deletes-h-decide">Deciding: which way to pay</h2>
+    <table data-anchor="updates-and-deletes-table">
+      <thead><tr><th>Situation</th><th>Reach for</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Read-heavy table, changed rarely in batches</td><td>Copy-on-write</td><td>Fast, simple reads; each change rewrites whole files</td></tr>
+        <tr><td>Frequent or streaming changes</td><td>Merge-on-read plus scheduled compaction</td><td>Cheap writes; reads slow down until compaction runs</td></tr>
+        <tr><td>Streaming writer that cannot look rows up first</td><td>Equality deletes, converted later</td><td>No read before write; costliest for readers</td></tr>
+        <tr><td>Mixed jobs on one table</td><td>Choose per action with table properties</td><td>More settings to keep track of</td></tr>
+        <tr><td>Table never changes after load</td><td>Neither; just append</td><td>Simplest of all, until the first privacy request</td></tr>
+      </tbody>
+    </table>
+    <h3 data-anchor="updates-and-deletes-h-watch">Watch out for</h3>
+    <ul data-anchor="updates-and-deletes-list-watch">
+      <li>A DELETE does not erase bytes. The rows stay readable in older snapshots by time travel, and under merge-on-read they still sit inside current files, hidden by a slip. Real erasure is a pipeline: delete, compact, expire old snapshots, remove orphan files.</li>
+      <li>Equality delete files can hold the very values they were written to remove, such as an email address. Column minimum and maximum bounds in the metadata can keep values too.</li>
+      <li>Merge-on-read without scheduled compaction slows down quietly. Every unmerged slip adds read work until queries crawl.</li>
+      <li>Picking by fashion pays the wrong cost every time: merge-on-read on a read-heavy report table, or copy-on-write on a busy change feed. Measure your read and write mix first.</li>
+    </ul>
+
+    <p class="sources" data-anchor="updates-and-deletes-sources">Sources: Apache Iceberg Table Spec; Iceberg docs, Configuration and Spark queries; Dremio on copy-on-write vs merge-on-read and the right to be forgotten; RisingWave on copy-on-write vs merge-on-read; Google Cloud and AWS on Iceberg v3; Atlan on v3.</p>
+    <p class="closer payoff" data-anchor="updates-and-deletes-closer">Because you can pick who pays for each change, you can fix one wrong row or honor one deletion request without reprinting the whole book.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="07-partitioning.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="09-the-catalog.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
