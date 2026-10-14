@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Keeping the Kitchen Clean — Understanding Apache Iceberg</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-apache-iceberg">
+<header class="book-top"><span class="t">Understanding Apache Iceberg</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="operating-iceberg-head">
+      <span class="chapter-num">20</span>
+      <p class="kicker">Part V &middot; Making Good Decisions</p>
+      <h1>Keeping the Kitchen Clean</h1>
+      <p class="real-name">The data world calls this: <b>operating Iceberg tables (table maintenance)</b></p>
+    </header>
+
+    <section class="scene" data-anchor="operating-iceberg-scene">
+      <p class="kicker">Here&rsquo;s the problem</p>
+      <p class="lede" data-anchor="operating-iceberg-p1">Picture a shared office kitchen. Every lunch rush leaves a few dishes in the sink. The fridge slowly fills with dated leftovers. Unlabeled boxes pile up on the shelf, and nobody will say whose they are. No single person did anything wrong. But after a month, nobody can find a clean fork.</p>
+      <p data-anchor="operating-iceberg-p2">A data table works the same way. Every job that writes to it leaves dishes behind. The fix in a good kitchen is boring: a rota on the wall, in the right order, with a name next to each job. Tables need the same.</p>
+    </section>
+
+    <h2 data-anchor="operating-iceberg-h-concept">The idea: four chores, each for a different mess</h2>
+    <p data-anchor="operating-iceberg-p3">Iceberg gives you the tools to clean up, but nothing runs them for you. &ldquo;Maintaining a table&rdquo; means four chores that come around again and again. <b>Compaction</b> (<span class="term">rewrite_data_files</span>) glues many tiny files into a few right-sized ones. <b>Snapshot expiry</b> (<span class="term">expire_snapshots</span>) throws away old versions of the table, and the files only they used. <b>Manifest rewriting</b> (<span class="term">rewrite_manifests</span>) tidies the table&rsquo;s own notes so a query can plan faster. <b>Orphan cleanup</b> (<span class="term">remove_orphan_files</span>) deletes files that no version points to, usually left behind by jobs that failed halfway.</p>
+    <p data-anchor="operating-iceberg-p4">Why so many? Because a table grows in more than one way. Streaming jobs that commit every minute can make tens of thousands of small files in a day, since each task writes its own file for each commit. Every commit also adds a new version, called a <span class="term">snapshot</span> (a saved picture of the table at one moment). Each one is a little more clutter.</p>
+
+    <h2 data-anchor="operating-iceberg-h-how">How it works: the rota, in order</h2>
+    <p data-anchor="operating-iceberg-p5">The order on the rota matters: compact first, expire old versions second, remove stray files last. The picture below shows it. The red step is the one you cannot take back.</p>
+    <figure class="diagram-fig" data-anchor="operating-iceberg-fig">
+      <svg class="diagram" viewBox="0 0 560 250" role="img" aria-labelledby="oi-t">
+        <title id="oi-t">The maintenance rota in three steps. Step one, compact: many small files become a few big ones. Step two, drawn in red, expire: old table versions and the files only they use are deleted for good. Step three, orphans: files that no version points to are removed. A note underneath says rewriting manifests can run alongside, and a named owner schedules all of it.</title>
+        <text class="dim" x="30" y="24">THE MAINTENANCE ROTA</text>
+        <rect class="fill-soft stroke" x="30" y="44" width="150" height="110"/>
+        <text class="big" x="44" y="68">1 &middot; COMPACT</text>
+        <text class="dim" x="44" y="92">MANY SMALL FILES</text>
+        <text class="dim" x="44" y="108">BECOME FEW BIG</text>
+        <text class="dim" x="44" y="132">TARGET ~512 MB</text>
+        <rect class="fill-red stroke-red" x="205" y="44" width="150" height="110"/>
+        <text class="on-ink" x="219" y="68">2 &middot; EXPIRE</text>
+        <text class="on-ink" x="219" y="92">OLD VERSIONS GO</text>
+        <text class="on-ink" x="219" y="108">AND THEIR FILES</text>
+        <text class="on-ink" x="219" y="132">NO UNDO</text>
+        <rect class="fill-soft stroke" x="380" y="44" width="150" height="110"/>
+        <text class="big" x="394" y="68">3 &middot; ORPHANS</text>
+        <text class="dim" x="394" y="92">UNCLAIMED FILES</text>
+        <text class="dim" x="394" y="108">FROM FAILED JOBS</text>
+        <text class="dim" x="394" y="132">DRY RUN FIRST</text>
+        <line class="stroke-thick" x1="180" y1="99" x2="205" y2="99"/>
+        <line class="stroke-thick" x1="355" y1="99" x2="380" y2="99"/>
+        <rect class="stroke-soft dash" x="30" y="176" width="500" height="44"/>
+        <text class="dim" x="44" y="196">ALSO ON THE ROTA: REWRITE MANIFESTS FOR FASTER QUERY PLANNING</text>
+        <text class="dim" x="44" y="212">ONE NAMED OWNER RUNS THE WHOLE ROTA ON A SCHEDULE</text>
+        <text class="dim" x="30" y="242">CLEANUP IS TWO STEPS: OLD FILES STAY UNTIL STEP 2 RUNS</text>
+      </svg>
+      <figcaption>Red marks the one chore that cannot be undone: once old versions are expired, you cannot travel back to them.</figcaption>
+    </figure>
+    <p data-anchor="operating-iceberg-p6"><b>Small files cost money, not just time.</b> In one worked example, a table of 100,000 small files needed about 200,000 read requests for a full scan and 15 to 30 seconds just to plan the query. After compacting to about 2,000 right-sized files, planning took under a second and request costs fell by around 93%. Object stores bill per request, so a pile of tiny files shows up on the invoice.</p>
+    <p data-anchor="operating-iceberg-p7"><b>Tiny commits cost too.</b> Every commit writes a new list of files and a new table-notes file, however little data it carries, and that notes file is rewritten whole. So batching your writes matters as much as compacting afterwards. Rewriting manifests helps in the same way: cut a table from 500 manifests to 20 and every query skips 480 separate reads.</p>
+    <pre data-anchor="operating-iceberg-code"><code><span class="cm">-- Keep the 10 newest versions; drop older than a cutoff</span>
+<span class="kw">CALL</span> catalog.system.<span class="fn">expire_snapshots</span>(
+  table =&gt; <span class="str">'db.sales'</span>,
+  older_than =&gt; <span class="ty">TIMESTAMP</span> <span class="str">'2026-10-07 00:00:00'</span>,
+  retain_last =&gt; <span class="num">10</span>);
+
+<span class="cm">-- Compact only the recent partitions</span>
+<span class="kw">CALL</span> catalog.system.<span class="fn">rewrite_data_files</span>(
+  table =&gt; <span class="str">'db.sales'</span>,
+  strategy =&gt; <span class="str">'binpack'</span>,
+  where =&gt; <span class="str">'order_ts &gt;= DATE \'2026-10-01\''</span>);</code></pre>
+    <p data-anchor="operating-iceberg-p8"><b>Watch health with plain SQL.</b> Iceberg shows its own insides as small tables (<span class="term">metadata tables</span>, such as snapshots, files, partitions and manifests). Ask them for the average file size per partition, the file count per partition, and how fast the snapshot count grows. When average size drops below your line, compact. Since version 1.2, REST and JDBC catalogs can also push health numbers out to your monitoring.</p>
+    <p data-anchor="operating-iceberg-p9"><b>Or hire it out.</b> Amazon S3 Tables does compaction, snapshot cleanup and stray-file removal for you. Its defaults are a 512 MB target file size, at least one snapshot kept, and a 120-hour limit on snapshot age. AWS Glue also offers managed compaction for Parquet Iceberg tables that does not block queries running at the same time.</p>
+
+    <div class="callout key" data-anchor="operating-iceberg-key">
+      <span class="label">Design principle</span>
+      <p>A lakehouse is a product, not a pile of files. A product needs owners, promises about how fast and fresh it will be, and a plan for its whole life, including how old things leave.</p>
+    </div>
+
+    <h2 data-anchor="operating-iceberg-h-usecase">Use case: the streaming table that got slow</h2>
+    <p data-anchor="operating-iceberg-p10">A team streams orders into a table, committing every minute. For weeks it is fine. Then dashboards crawl and the storage bill shows a jump in requests. A look at the file metadata table shows thousands of tiny files per day. The team sets a rota: compact recent partitions nightly, expire versions after the agreed history window, remove stray files weekly, and name one owner. They also batch the stream into fewer commits. Planning time drops, and the bill follows.</p>
+
+    <h2 data-anchor="operating-iceberg-h-decide">Deciding: who runs the rota, and how long to keep history?</h2>
+    <table data-anchor="operating-iceberg-table">
+      <thead><tr><th>Choice</th><th>Lean toward</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Run it yourself (Spark jobs on a schedule)</td><td>Many tables, special rules, need for control</td><td>You own the schedule, failures and skills</td></tr>
+        <tr><td>Use a managed service (S3 Tables, Glue)</td><td>Small team, common patterns</td><td>Easier, but you live by its defaults</td></tr>
+        <tr><td>Keep history long</td><td>Audit, rollback, time travel needs</td><td>More storage and more metadata</td></tr>
+        <tr><td>Keep history short</td><td>Cost-sensitive tables with no audit need</td><td>Old versions are gone for good</td></tr>
+        <tr><td>Compact often</td><td>Streaming and micro-batch tables</td><td>Uses compute; space grows until expiry runs</td></tr>
+        <tr><td>Rarely touched tables</td><td>A light monthly rota may do</td><td>Cheap, but still needs an owner</td></tr>
+      </tbody>
+    </table>
+    <h3 data-anchor="operating-iceberg-h-watch">Watch out for</h3>
+    <ul data-anchor="operating-iceberg-list-watch">
+      <li>Expiring snapshots is permanent. Set the history window from audit and recovery needs, not from the storage bill alone.</li>
+      <li>Running orphan cleanup with a very short age window can delete files from jobs still writing, and corrupt the table. The default is 3 days, and a dry run comes first for a reason.</li>
+      <li>Storage grows right after compaction. The old files stay until the versions that use them expire, so cleanup takes two steps.</li>
+      <li>Assuming the format cleans itself. Iceberg ships the chores, but nothing schedules them, so an unowned table slowly decays until queries and bills show it.</li>
+    </ul>
+
+    <p class="sources" data-anchor="operating-iceberg-sources">Sources: Apache Iceberg docs on Maintenance and Spark Procedures; Dremio on small files and storage costs; Data Lakehouse Hub on tiny commits; Conduktor on table maintenance; AWS on Iceberg monitoring, S3 Tables compaction and Glue compaction; RisingWave on table health.</p>
+    <p class="closer payoff" data-anchor="operating-iceberg-closer">Because someone owns a short, ordered rota, your tables stay fast and cheap to read, and you find out about trouble from a dashboard instead of from the bill.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="19-designing-a-lakehouse.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="21-migration-and-adoption.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
