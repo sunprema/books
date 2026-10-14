@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Warehouse and Its Ledger — Understanding Apache Iceberg</title>
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-book="understanding-apache-iceberg">
+<header class="book-top"><span class="t">Understanding Apache Iceberg</span><nav><a rel="home" href="../index.html">Contents</a><a href="../cheatsheet.html">Cheatsheet</a></nav></header>
+<div class="book-viewport">
+  <article class="book-leaf">
+    <header class="chapter-head" data-anchor="storage-files-metadata-head">
+      <span class="chapter-num">10</span>
+      <p class="kicker">Part III &middot; Architecture and Design Principles</p>
+      <h1>The Warehouse and Its Ledger</h1>
+      <p class="real-name">The data world calls this: <b>storage, files, and metadata</b></p>
+    </header>
+
+    <section class="scene" data-anchor="storage-files-metadata-scene">
+      <p class="kicker">Here&rsquo;s the problem</p>
+      <p class="lede" data-anchor="storage-files-metadata-p1">Picture a warehouse full of sealed crates. A worker has an order: &ldquo;bring me every crate with an amount over 500, from this month.&rdquo; With no paperwork, the worker opens every crate in every aisle to peek inside. That takes all day, and most crates were never going to match.</p>
+      <p data-anchor="storage-files-metadata-p2">Now give the front office an inventory ledger. For each sealed crate it records what is inside, the range printed on its label (smallest and biggest amount), and the aisle it sits in. The picker plans the whole route at the front office and walks straight to the few crates that matter, without opening a single one. An Iceberg table is that warehouse plus that ledger.</p>
+    </section>
+
+    <h2 data-anchor="storage-files-metadata-h-concept">The idea: plain files on cheap shelves, plus a careful ledger</h2>
+    <p data-anchor="storage-files-metadata-p3">The warehouse is <span class="term">object storage</span> (cheap, huge, shared file storage in the cloud, such as Amazon S3, Azure&rsquo;s ADLS or Google Cloud Storage, or look-alikes you run yourself). An Iceberg table lives there as ordinary files. Iceberg needs no storage service of its own. It only adds a convention for tracking which files make up the table.</p>
+    <p data-anchor="storage-files-metadata-p4">That convention was built around what shelves like these are bad at. Asking them to list a folder is slow, and renaming a file is not safe to count on. So Iceberg never uses listings or renames to say what the table is. It writes new files that are never edited afterward, then moves one pointer at the catalog in a single step. Older Hive-style tables leaned on folder listings and suffered on S3 for it.</p>
+    <p data-anchor="storage-files-metadata-p5">The crates are <span class="term">data files</span>, usually in <span class="term">Parquet</span> (a column-by-column file layout, so a question about two columns reads only those two). Avro and ORC are allowed too. Column layout compresses well, and each chunk of a file carries its own small and big values, so even inside a file a reader can skip chunks.</p>
+
+    <h2 data-anchor="storage-files-metadata-h-how">How it works: a tree of notes that never change</h2>
+    <p data-anchor="storage-files-metadata-p6">The ledger is a tree with four layers. The catalog points to one <span class="term">table metadata file</span> (a small JSON note with the table&rsquo;s shape history, its partition rules and a log of snapshots). Each snapshot has a <span class="term">manifest list</span> (an Avro file naming the manifests, with a summary of the partitions each covers). Each <span class="term">manifest</span> (an Avro file) lists data files, along with their partition values and per-column smallest, biggest and empty counts. Every layer is immutable. A new snapshot simply reuses the manifests that did not change.</p>
+
+    <figure class="diagram-fig" data-anchor="storage-files-metadata-fig">
+      <svg class="diagram" viewBox="0 0 560 300" role="img" aria-labelledby="sfm-t">
+        <title id="sfm-t">The metadata tree. A catalog pointer leads to a table metadata file, then a manifest list, then two manifests, then data files. The skipped manifest and files are dashed; the red path shows the single route a query follows after pruning.</title>
+        <text class="dim" x="20" y="22">CATALOG POINTER</text>
+        <rect class="fill-ink" x="20" y="32" width="150" height="36"/>
+        <text class="on-ink" x="32" y="55">DB.ORDERS</text>
+
+        <rect class="fill-soft stroke" x="20" y="100" width="150" height="36"/>
+        <text class="dim" x="30" y="123">TABLE METADATA</text>
+        <rect class="fill-soft stroke" x="20" y="164" width="150" height="36"/>
+        <text class="dim" x="30" y="187">MANIFEST LIST</text>
+        <line class="stroke" x1="95" y1="68" x2="95" y2="100"/>
+        <line class="stroke" x1="95" y1="136" x2="95" y2="164"/>
+
+        <rect class="fill-soft stroke-soft" x="240" y="100" width="130" height="36"/>
+        <text class="dim" x="250" y="123">MANIFEST A</text>
+        <rect class="fill-soft stroke-red" x="240" y="200" width="130" height="36"/>
+        <text class="red" x="250" y="223">MANIFEST B</text>
+        <line class="stroke-soft" x1="170" y1="178" x2="240" y2="120"/>
+        <line class="stroke-red" x1="170" y1="190" x2="240" y2="216"/>
+
+        <rect class="fill-soft stroke-soft" x="430" y="84" width="110" height="30"/>
+        <text class="dim" x="440" y="104">FILE 1: MAX 400</text>
+        <rect class="fill-soft stroke-soft" x="430" y="122" width="110" height="30"/>
+        <text class="dim" x="440" y="142">FILE 2: MAX 300</text>
+        <rect class="fill-soft stroke-red" x="430" y="200" width="110" height="36"/>
+        <text class="red" x="440" y="223">FILE 3: MAX 900</text>
+        <line class="stroke-soft" x1="370" y1="110" x2="430" y2="99"/>
+        <line class="stroke-soft" x1="370" y1="124" x2="430" y2="137"/>
+        <line class="stroke-red" x1="370" y1="218" x2="430" y2="218"/>
+
+        <text class="dim" x="20" y="268">QUERY: AMOUNT &gt; 500. Dashed-grey files are skipped unopened.</text>
+        <text class="dim" x="20" y="286">Only the red route is read from storage.</text>
+      </svg>
+      <figcaption>The planner walks the ledger, not the shelves. Only the red path ends in a crate that has to be opened.</figcaption>
+    </figure>
+
+    <pre data-anchor="storage-files-metadata-code"><code><span class="cm">catalog entry: db.orders -&gt; s3://lake/orders/metadata/00012-abc.metadata.json</span>
+  00012-abc.metadata.json   <span class="cm">(schemas, partition specs, snapshot log)</span>
+    &#9492;&#9472; snap-9871.avro              <span class="cm">manifest list for current snapshot</span>
+        &#9500;&#9472; manifest-a1.avro        -&gt; <span class="num">140</span> data files <span class="cm">(2026-09, col min/max)</span>
+        &#9492;&#9472; manifest-b2.avro        -&gt; <span class="num">6</span> data files + <span class="num">2</span> delete files <span class="cm">(2026-10)</span>
+            &#9492;&#9472; data/.../file-0001.parquet</code></pre>
+
+    <p data-anchor="storage-files-metadata-p7">This is why planning is fast. An engine prunes in stages, without touching the data. First, partition summaries in the manifest list let it skip whole manifests. Then the smallest and biggest values in each manifest let it skip single files: a filter of <i>amount over 500</i> skips any file whose biggest amount is 400. Last, the chunk statistics inside Parquet files trim what remains. Cost grows with the size of the ledger, never with a folder listing.</p>
+    <p data-anchor="storage-files-metadata-p8">The ledger also grows. Every commit adds a snapshot, a manifest list and usually new manifests. Frequent tiny commits, the habit of streaming jobs, pile up small data files <em>and</em> a heavy ledger, and planning slows as manifests multiply. Iceberg tracks small files efficiently, but it does not stop them from appearing.</p>
+
+    <div class="callout key" data-anchor="storage-files-metadata-key">
+      <span class="label">Design principle</span>
+      <p>Optimize for the whole lifecycle: write, query, evolve and maintain. A table that is quick to write but never tidied gets slow to read. Compacting small files toward a target size (commonly 128&ndash;512 MB), expiring old snapshots, removing orphan files and rewriting manifests are part of the design, not chores for later.</p>
+    </div>
+
+    <p data-anchor="storage-files-metadata-p9">Upkeep is increasingly done for you. Amazon S3 Tables runs compaction, snapshot expiry and orphan cleanup in the background. AWS Glue&rsquo;s table optimizer compacts when a partition passes a file-count limit, and Databricks Unity Catalog&rsquo;s predictive optimization handles compaction and snapshot expiry for its managed Iceberg tables.</p>
+    <p data-anchor="storage-files-metadata-p10">One change at the file layer is worth knowing. Format version 3 replaces position-delete files with <span class="term">deletion vectors</span> (tiny bitmaps attached to a data file that mark which rows are gone) and gives each row a steady ID with a last-changed number. Version 3 readers can read version 2 tables, but not the other way round.</p>
+
+    <h2 data-anchor="storage-files-metadata-h-usecase">Use case: a stream that must stay fast</h2>
+    <p data-anchor="storage-files-metadata-p11">A team feeds orders in all day, committing every minute. By week two the dashboards crawl, because thousands of tiny files and manifests are in the way. They schedule compaction toward large files, expire snapshots older than their retention window, and let the manifests be rewritten. The same queries drop back to reading a handful of well-sized files.</p>
+
+    <h2 data-anchor="storage-files-metadata-h-decide">Deciding: how much care the shelves need</h2>
+    <table data-anchor="storage-files-metadata-table">
+      <thead><tr><th>Situation</th><th>Approach</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Big tables, mostly read in slices</td><td>Rely on the ledger; sort or group data on the columns people filter by</td><td>Pruning only works if file ranges don&rsquo;t overlap</td></tr>
+        <tr><td>Streaming or frequent small commits</td><td>Plan compaction and snapshot expiry from day one</td><td>Upkeep costs compute, but skipping it costs more at read time</td></tr>
+        <tr><td>You don&rsquo;t want to run upkeep</td><td>A managed service that tidies in the background</td><td>Less control, more tie-in to that service</td></tr>
+        <tr><td>Tiny tables, or very frequent single-row changes</td><td>Think twice; a database may fit better</td><td>Files plus a ledger have overhead that small data never repays</td></tr>
+      </tbody>
+    </table>
+    <h3 data-anchor="storage-files-metadata-h-watch">Watch out for</h3>
+    <ul data-anchor="storage-files-metadata-list-watch">
+      <li>Thinking Iceberg &ldquo;solves&rdquo; small files. It tracks them well; it doesn&rsquo;t prevent them.</li>
+      <li>Deleting or moving files by hand in the bucket. Anything a live snapshot points to may only be removed through the table&rsquo;s own upkeep steps.</li>
+      <li>Expecting label ranges to help on randomly scattered values. If every file&rsquo;s range overlaps your filter, nothing is skipped and nobody tells you.</li>
+      <li>Forgetting that the ledger is files too. Lose the current metadata file, or set the wrong permissions on its folder, and the table breaks even if every crate is fine.</li>
+    </ul>
+
+    <p class="sources" data-anchor="storage-files-metadata-sources">Sources: Apache Iceberg Table Spec; Iceberg docs on reliability; Dremio on metadata performance and manifest files; Amazon S3 Tables; AWS Glue compaction; Databricks Unity Catalog managed tables; AWS and Databricks on Iceberg v3; best practices for snapshot expiration.</p>
+    <p class="closer payoff" data-anchor="storage-files-metadata-closer">Because a careful ledger tells every engine exactly which few files matter, your queries stay fast and cheap on plain storage, as long as you keep the ledger tidy.</p>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="09-the-catalog.html">&lsaquo; Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="11-interoperability.html">Next &rsaquo;</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+</body>
+</html>
