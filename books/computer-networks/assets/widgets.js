@@ -412,3 +412,140 @@ BookWidgets.register('fwd-hol', function(box, W){
   eng.start();
   if(playBtn) playBtn.textContent = eng.running() ? 'Pause' : 'Play';
 });
+
+/* ---------- 03 · routing-algorithms-protocols-policy ----------
+   route-cti: count-to-infinity on a chain A–B–C–D (unit link costs).
+   The A–B link breaks at round 0. Synchronous distance-vector rounds:
+     dist_x = min over live neighbours n of 1 + adv(n→x)
+   where adv is n's previous-round distance, or 16 if poisoned reverse is on
+   and n's next hop is x. 16 = "unreachable" (RIP). Hand-checked trace in
+   research.json → concepts.routing-algorithms-protocols-policy.snippets. */
+BookWidgets.register('route-cti', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var modeBtns = box.querySelectorAll('button[data-mode]');
+  var playBtn = box.querySelector('button.play');
+  var out = box.querySelector('.readout');
+  var INF = 16, names = ['B', 'C', 'D'];
+  var nb = { B:['C'], C:['B','D'], D:['C'] };   // after A–B breaks
+  var mode = 'plain', round, dist, via, hist, done;
+  function reset(){
+    round = 0; done = false;
+    dist = { B:1, C:2, D:3 }; via = { B:'A', C:'B', D:'C' };
+    hist = [[1, 2, 3]];
+  }
+  function step(){
+    if(done) return;
+    var nd = {}, nv = {};
+    names.forEach(function(x){
+      var best = INF, hop = '–';
+      nb[x].forEach(function(n){
+        var adv = (mode === 'poison' && via[n] === x) ? INF : dist[n];
+        var c = Math.min(INF, 1 + adv);
+        if(c < best){ best = c; hop = n; }
+      });
+      nd[x] = best; nv[x] = best >= INF ? '–' : hop;
+    });
+    dist = nd; via = nv; round++;
+    hist.push([dist.B, dist.C, dist.D]);
+    if(dist.B >= INF && dist.C >= INF && dist.D >= INF) done = true;
+  }
+  function readout(){
+    if(!out) return;
+    out.textContent = (mode === 'plain' ? 'plain distance-vector' : 'split horizon + poisoned reverse') +
+      ' · round ' + round + ' · B=' + dist.B + ' C=' + dist.C + ' D=' + dist.D +
+      (done ? ' · everyone agrees A is gone after ' + round + ' rounds (≈ ' + round * 30 + ' s at a 30 s timer, no early updates)' : ' · still believing in A');
+  }
+  function draw(){
+    readout();
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h;
+    ctx.clearRect(0, 0, w, h);
+    var top = h * .30, r = Math.max(10, Math.min(w, h) * .05);
+    var xs = [.10, .36, .62, .88].map(function(t){ return t * w; });
+    var lab = ['A', 'B', 'C', 'D'];
+    // links
+    for(var i = 0; i < 3; i++){
+      var broken = i === 0;
+      ctx.strokeStyle = broken ? C.warm : C.soft; ctx.lineWidth = 1.6;
+      ctx.setLineDash(broken ? [5, 4] : []);
+      ctx.beginPath(); ctx.moveTo(xs[i] + r, top); ctx.lineTo(xs[i+1] - r, top); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.font = NetViz.font(Math.max(10, r * .8), true);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = C.warm; ctx.fillText('✕ broken', (xs[0] + xs[1]) / 2, top - r * 1.3);
+    // next-hop arrows (who each router thinks is closer to A)
+    names.forEach(function(x, k){
+      var at = xs[k + 1], v = via[x];
+      if(v === '–' || v === 'A') return;
+      var to = xs[lab.indexOf(v)], y = top + r * 1.9;
+      ctx.strokeStyle = C.accent; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(at, y); ctx.lineTo(to + (to < at ? r : -r), y); ctx.stroke();
+      var tip = to + (to < at ? r : -r), d = to < at ? 1 : -1;
+      ctx.beginPath(); ctx.moveTo(tip, y); ctx.lineTo(tip + 6 * d, y - 4); ctx.lineTo(tip + 6 * d, y + 4); ctx.closePath();
+      ctx.fillStyle = C.accent; ctx.fill();
+    });
+    // nodes
+    lab.forEach(function(n, k){
+      ctx.lineWidth = 1.4; ctx.strokeStyle = k === 0 ? C.faint : C.ink; ctx.fillStyle = C.code;
+      ctx.beginPath(); ctx.arc(xs[k], top, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = k === 0 ? C.faint : C.ink; ctx.fillText(n, xs[k], top + .5);
+      if(k){
+        var d = dist[n];
+        ctx.fillStyle = d >= INF ? C.warm : C.cyan;
+        ctx.fillText(d >= INF ? '∞' : 'to A: ' + d, xs[k], top - r * 1.3);
+      } else {
+        ctx.fillStyle = C.faint; ctx.fillText('the place', xs[k], top - r * 1.3);
+      }
+    });
+    // history chart
+    var px0 = 34, px1 = w - 10, py0 = h * .58, py1 = h - 18;
+    function Y(v){ return py1 - Math.min(v, INF) / INF * (py1 - py0); }
+    var maxR = Math.max(16, hist.length - 1);
+    function X(k){ return px0 + (px1 - px0) * k / maxR; }
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.textAlign = 'right'; ctx.fillStyle = C.soft;
+    ctx.font = NetViz.font(10, true);
+    [0, 8, 16].forEach(function(v){
+      ctx.beginPath(); ctx.moveTo(px0, Y(v)); ctx.lineTo(px1, Y(v)); ctx.stroke();
+      ctx.fillText(v === 16 ? '16=∞' : String(v), px0 - 4, Y(v));
+    });
+    ctx.textAlign = 'center'; ctx.fillText('rounds of telling the neighbours →', (px0 + px1) / 2, h - 6);
+    var cols = [C.cyan, C.accent, C.violet];
+    for(var s = 0; s < 3; s++){
+      ctx.strokeStyle = cols[s]; ctx.lineWidth = 2; ctx.beginPath();
+      for(var k = 0; k < hist.length; k++){
+        var x = X(k), y = Y(hist[k][s]) - s * 1.5;
+        if(k) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+      ctx.fillStyle = cols[s]; ctx.textAlign = 'left';
+      var last = hist[hist.length - 1][s];
+      ctx.fillText(names[s], Math.min(X(hist.length - 1) + 4, px1 - 8), Y(last) - s * 9 + 8);
+    }
+  }
+  var acc = 0, hold = 0, fresh = true;
+  function runOut(){ reset(); while(!done) step(); }
+  var eng = W.anim(box, function(dt){
+    if(fresh){ fresh = false; reset(); }
+    if(done){ hold += dt; if(hold > 2.5){ hold = 0; reset(); } draw(); return; }
+    acc += dt;
+    if(acc >= .7){ acc = 0; step(); }
+    draw();
+  });
+  Array.prototype.forEach.call(modeBtns, function(b){
+    b.addEventListener('click', function(){
+      mode = b.getAttribute('data-mode');
+      Array.prototype.forEach.call(modeBtns, function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      if(eng.running()) reset(); else runOut();
+      draw();
+    });
+  });
+  if(playBtn) playBtn.addEventListener('click', function(){
+    var on = eng.toggle(true); playBtn.textContent = on ? 'Pause' : 'Play';
+  });
+  W.onRelayout(draw);
+  // static first frame (reduced motion / print): the whole story, run to the end
+  runOut(); draw();
+  eng.start();
+  if(playBtn) playBtn.textContent = eng.running() ? 'Pause' : 'Play';
+});
