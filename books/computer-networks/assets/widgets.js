@@ -1175,3 +1175,124 @@ BookWidgets.register('wme-airtime', function(box, W){
   W.onRelayout(draw);
   draw();                                       // static first frame; nothing animates
 });
+
+/* ---------- 10 · measurement-operations-future ----------
+   mof-budget: an error budget over a 30-day window, and the SRE Workbook's
+   multiwindow burn-rate alerts.
+     budget B (minutes of full-outage equivalent) = (1 − SLO) · 43,200
+     spend per minute = fraction of bad events (background bg, incident inc)
+     burn rate = bad fraction / (1 − SLO)       (1 = exactly on budget)
+   Alert tiers (research.json → concepts.measurement-operations-future,
+   src-sre-alerting): page at 14.4 over 1 h, page at 6 over 6 h,
+   ticket at 1 over 3 d. A tier fires at the first minute its long-window
+   average burn reaches the threshold. The incident starts on day 12. */
+BookWidgets.register('mof-budget', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var out = box.querySelector('.readout');
+  var sloBtns = box.querySelectorAll('button[data-slo]');
+  var bgIn = box.querySelector('input.bg'), incIn = box.querySelector('input.inc'), durIn = box.querySelector('input.dur');
+  var slo = 0.999, WIN = 43200, T0 = 12 * 1440;
+  var TIERS = [
+    { name:'fast page', thr:14.4, L:60 },
+    { name:'slow page', thr:6,    L:360 },
+    { name:'ticket',    thr:1,    L:4320 }
+  ];
+  function vals(){
+    return {
+      bg:  (bgIn ? +bgIn.value : 0.02) / 100,
+      inc: (incIn ? +incIn.value : 5) / 100,
+      dur: durIn ? +durIn.value : 60
+    };
+  }
+  // minutes after incident start at which a tier fires, or null
+  function fireAt(t, v, e){
+    var need = t.thr * e * t.L;                    // bad-minutes needed inside the window
+    if(v.bg * t.L >= need) return 0;               // background alone already burns this fast
+    if(v.inc <= v.bg) return null;
+    var m = (need - v.bg * t.L) / (v.inc - v.bg);  // minutes of incident needed
+    return m <= Math.min(v.dur, t.L) ? m : null;
+  }
+  function remaining(min, v, B){
+    var inIncident = Math.max(0, Math.min(min - T0, v.dur));
+    return B - v.bg * min - (v.inc - v.bg) * inIncident;
+  }
+  function draw(){
+    var v = vals(), e = 1 - slo, B = e * WIN;
+    var used = (v.bg * WIN + (v.inc - v.bg) * v.dur) / B;
+    var burn = v.inc / e;
+    var fires = TIERS.map(function(t){ return fireAt(t, v, e); });
+    if(out){
+      var al = TIERS.map(function(t, k){
+        return t.name + (fires[k] === null ? ': quiet' : fires[k] === 0 ? ': already firing' : ' after ' + W.fmt(fires[k], fires[k] < 10 ? 1 : 0) + ' min');
+      }).join(' · ');
+      out.textContent = 'SLO ' + (slo * 100).toFixed(slo > 0.9991 ? 2 : 1) + '% · budget ' + W.fmt(B, B < 10 ? 2 : 1) +
+        ' min · incident burns at ' + W.fmt(burn, burn < 10 ? 1 : 0) + '× · month uses ' + W.fmt(used * 100, 0) + '% of budget · ' + al;
+    }
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h;
+    var x0 = 44, x1 = w - 14, y0 = 22, y1 = h - 50;
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = NetViz.font(10, true); ctx.textBaseline = 'middle';
+    var lo = Math.min(-0.25, Math.floor(Math.min(0, 1 - used) * 4) / 4), hi = 1;
+    lo = Math.max(lo, -3);
+    function X(min){ return x0 + (x1 - x0) * min / WIN; }
+    function Y(fr){ return y1 - (y1 - y0) * (Math.max(lo, fr) - lo) / (hi - lo); }
+    // grid + axes
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+    for(var d = 0; d <= 30; d += 5){
+      ctx.beginPath(); ctx.moveTo(X(d * 1440), y0); ctx.lineTo(X(d * 1440), y1); ctx.stroke();
+      ctx.fillStyle = C.soft; ctx.textAlign = d === 30 ? 'right' : 'center'; ctx.fillText('day ' + d, X(d * 1440), y1 + 11);
+    }
+    [1, 0.5, 0].concat(lo < 0 ? [lo] : []).forEach(function(fr){
+      ctx.strokeStyle = fr === 0 ? C.soft : C.grid;
+      ctx.beginPath(); ctx.moveTo(x0, Y(fr)); ctx.lineTo(x1, Y(fr)); ctx.stroke();
+      ctx.fillStyle = C.soft; ctx.textAlign = 'right'; ctx.fillText(Math.round(fr * 100) + '%', x0 - 5, Y(fr));
+    });
+    ctx.fillStyle = C.faint; ctx.textAlign = 'left';
+    ctx.fillText('budget left (100% = ' + W.fmt(B, B < 10 ? 2 : 1) + ' min of full outage)', x0, 10);
+    // overspent zone
+    if(lo < 0){ ctx.fillStyle = C.warm; ctx.globalAlpha = .10; ctx.fillRect(x0, Y(0), x1 - x0, Y(lo) - Y(0)); ctx.globalAlpha = 1; }
+    // incident span
+    var ix0 = X(T0), ix1 = Math.max(X(T0 + v.dur), ix0 + 2);
+    ctx.fillStyle = C.warm; ctx.globalAlpha = .22; ctx.fillRect(ix0, y0, ix1 - ix0, y1 - y0); ctx.globalAlpha = 1;
+    // planned spend (burn rate 1): straight line from 100% to 0
+    ctx.strokeStyle = C.faint; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(X(0), Y(1)); ctx.lineTo(X(WIN), Y(0)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = C.faint; ctx.textAlign = 'right'; ctx.fillText('burn rate 1 (on plan)', X(WIN) - 4, Y(0.12));
+    // actual remaining budget
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 2; ctx.beginPath();
+    var pts = [0, T0, T0 + v.dur, WIN];
+    pts.forEach(function(m, k){ var y = Y(remaining(m, v, B) / B); if(k) ctx.lineTo(X(m), y); else ctx.moveTo(X(m), y); });
+    ctx.stroke(); ctx.lineWidth = 1;
+    var endFr = remaining(WIN, v, B) / B;
+    ctx.fillStyle = endFr < 0 ? C.warm : C.accent; ctx.textAlign = 'right';
+    ctx.fillText(Math.round(endFr * 100) + '% left', x1, Y(endFr) - 10);
+    // alert markers along the bottom
+    var ly = y1 + 30;
+    ctx.textAlign = 'left';
+    TIERS.forEach(function(t, k){
+      var lx = x0 + k * (x1 - x0) / 3;
+      var fired = fires[k] !== null;
+      ctx.fillStyle = fired ? (k < 2 ? C.warm : C.cyan) : C.panel;
+      ctx.strokeStyle = fired ? ctx.fillStyle : C.grid;
+      ctx.beginPath(); ctx.arc(lx + 5, ly, 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = fired ? C.ink : C.faint;
+      ctx.fillText(t.name + ' ' + t.thr + '×/' + (t.L >= 1440 ? t.L / 1440 + 'd' : t.L / 60 + 'h'), lx + 14, ly);
+      if(fired){
+        var mx = X(T0 + fires[k]);
+        ctx.strokeStyle = k < 2 ? C.warm : C.cyan; ctx.setLineDash([2, 3]);
+        ctx.beginPath(); ctx.moveTo(mx, y0); ctx.lineTo(mx, y1); ctx.stroke(); ctx.setLineDash([]);
+      }
+    });
+  }
+  Array.prototype.forEach.call(sloBtns, function(b){
+    b.addEventListener('click', function(){
+      slo = +b.getAttribute('data-slo') / 100;
+      Array.prototype.forEach.call(sloBtns, function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      draw();
+    });
+  });
+  [bgIn, incIn, durIn].forEach(function(el){ if(el) el.addEventListener('input', draw); });
+  W.onRelayout(draw);
+  draw();                                       // static first frame; nothing animates
+});
