@@ -990,3 +990,103 @@ BookWidgets.register('sdn-update', function(box, W){
   W.onRelayout(draw);
   simulate(); now = T; draw();      // static first frame: the whole run
 });
+
+/* ---------- 08 · virtualization-overlays-cloud ----------
+   virt-mtu: what a tunnel costs and where the MTU goes. Bytes added to the
+   inner IP packet (outer Ethernet not counted — it never counts against MTU):
+     none 0 · GRE/IPv4 24 (20+4) · GRE/IPv6 44 (40+4)
+     VXLAN/IPv4 50 (20+8+8+14) · VXLAN/IPv6 70 (40+8+8+14)
+     Geneve = VXLAN + options (0–64 B shown, multiples of 4)
+   A packet of size S fits iff S + overhead <= underlay MTU; else, with DF set
+   and ICMP filtered, it simply vanishes (PMTUD black hole, RFC 4459).
+   (research.json → concepts.virtualization-overlays-cloud, overhead claims) */
+BookWidgets.register('virt-mtu', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var out = box.querySelector('.readout');
+  var encBtns = box.querySelectorAll('button[data-enc]'), v6Btn = box.querySelector('button.v6');
+  var mtuIn = box.querySelector('input.mtu'), sizeIn = box.querySelector('input.size'), optIn = box.querySelector('input.opt');
+  var enc = 'vxlan', v6 = false;
+  function parts(){
+    var ip = v6 ? 40 : 20, o = optIn ? Math.round(+optIn.value / 4) * 4 : 0;
+    if(enc === 'none') return [];
+    if(enc === 'gre') return [['outer IP', ip], ['GRE', 4]];
+    var p = [['outer IP', ip], ['UDP', 8], [enc === 'geneve' ? 'Geneve' : 'VXLAN', 8]];
+    if(enc === 'geneve' && o > 0) p.push(['options', o]);
+    p.push(['inner Eth', 14]);
+    return p;
+  }
+  function draw(){
+    var P = parts(), ov = 0; P.forEach(function(x){ ov += x[1]; });
+    var mtu = mtuIn ? +mtuIn.value : 1500, S = sizeIn ? +sizeIn.value : 1500;
+    var fit = S + ov <= mtu, maxIn = mtu - ov;
+    if(optIn) optIn.disabled = enc !== 'geneve';
+    if(out){
+      out.textContent = 'adds ' + ov + ' B → biggest inner packet that fits: ' + maxIn + ' B · this ' + S + ' B packet ' +
+        (fit ? 'fits (' + (S + ov) + ' of ' + mtu + ' B)' : 'is ' + (S + ov - mtu) + ' B too big: dropped or fragmented') +
+        ' · useful share at this size: ' + W.fmt(100 * S / (S + ov), 1) + '%';
+    }
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h;
+    ctx.clearRect(0, 0, w, h);
+    var x0 = 16, x1 = w - 16, scaleMax = Math.max(mtu, S + ov) * 1.06;
+    function X(b){ return x0 + (x1 - x0) * b / scaleMax; }
+    var y = h * .30, bh = h * .22;
+    // header pieces, then the inner packet
+    var cur = 0;
+    ctx.font = NetViz.font(10, true); ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    P.forEach(function(p, k){
+      var a = X(cur), b = X(cur + p[1]);
+      ctx.fillStyle = k % 2 ? C.panel : C.code; ctx.fillRect(a, y, b - a, bh);
+      ctx.strokeStyle = C.cyan; ctx.lineWidth = 1; ctx.strokeRect(a, y, b - a, bh);
+      cur += p[1];
+    });
+    var a0 = X(cur), b0 = X(cur + S);
+    ctx.fillStyle = fit ? C.good : C.warm; ctx.globalAlpha = .28; ctx.fillRect(a0, y, b0 - a0, bh); ctx.globalAlpha = 1;
+    ctx.strokeStyle = fit ? C.good : C.warm; ctx.lineWidth = 1.4; ctx.strokeRect(a0, y, b0 - a0, bh);
+    ctx.fillStyle = C.ink; ctx.fillText('inner packet ' + S + ' B', (a0 + Math.min(b0, X(mtu))) / 2, y + bh / 2);
+    // header legend under the bar (labels too small to sit inside)
+    var lx = x0; ctx.textAlign = 'left'; ctx.font = NetViz.font(10, true);
+    P.forEach(function(p){
+      var t = p[0] + ' ' + p[1];
+      ctx.fillStyle = C.cyan; ctx.fillText(t, lx, y + bh + 16);
+      lx += ctx.measureText(t).width + 14;
+    });
+    if(!P.length){ ctx.fillStyle = C.soft; ctx.fillText('no wrapper: the packet rides the wire as it is', x0, y + bh + 16); }
+    // the MTU wall
+    var mx = X(mtu);
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(mx, y - 26); ctx.lineTo(mx, y + bh + 30); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = C.accent; ctx.textAlign = mx > w * .7 ? 'right' : 'left';
+    ctx.fillText('underlay MTU ' + mtu + ' B', mx + (mx > w * .7 ? -6 : 6), y - 16);
+    if(!fit){
+      ctx.fillStyle = C.warm; ctx.globalAlpha = .18; ctx.fillRect(mx, y - 4, X(S + ov) - mx, bh + 8); ctx.globalAlpha = 1;
+    }
+    // efficiency curve: useful share vs inner size, for this wrapper
+    var gy0 = h * .74, gy1 = h - 18, gx1 = x1;
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x0, gy1); ctx.lineTo(gx1, gy1); ctx.stroke();
+    ctx.strokeStyle = C.cyan; ctx.lineWidth = 1.6; ctx.beginPath();
+    for(var s = 40; s <= 9000; s += 40){
+      var e = s / (s + ov), px = x0 + (gx1 - x0) * (s / 9000), py = gy1 - (gy1 - gy0) * (e - .5) / .5;
+      if(s === 40) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    var me = S / (S + ov), mpx = x0 + (gx1 - x0) * Math.min(S, 9000) / 9000, mpy = gy1 - (gy1 - gy0) * (me - .5) / .5;
+    ctx.fillStyle = C.accent; ctx.beginPath(); ctx.arc(mpx, mpy, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.font = NetViz.font(10, true);
+    ctx.fillText('useful share (50% → 100%) as the inner packet grows 40 B → 9000 B', x0, gy0 - 10);
+  }
+  Array.prototype.forEach.call(encBtns, function(b){
+    b.addEventListener('click', function(){
+      enc = b.getAttribute('data-enc');
+      Array.prototype.forEach.call(encBtns, function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      draw();
+    });
+  });
+  if(v6Btn) v6Btn.addEventListener('click', function(){
+    v6 = !v6; v6Btn.setAttribute('aria-pressed', v6 ? 'true' : 'false');
+    v6Btn.textContent = v6 ? 'Outer: IPv6' : 'Outer: IPv4'; draw();
+  });
+  [mtuIn, sizeIn, optIn].forEach(function(el){ if(el) el.addEventListener('input', draw); });
+  W.onRelayout(draw);
+  draw();                                       // static first frame; nothing animates
+});
