@@ -208,3 +208,41 @@
    Concept widgets — append below, one block per concept, in book order.
    Each block: BookWidgets.register('<concept-prefix>-<name>', function(box, W){ … });
    ========================================================================== */
+
+/* ---------- 01 · architectures-and-design-principles ----------
+   arch-retry: where should "try again" live? Compares the mean number of
+   link transmissions to deliver one packet over n hops with per-hop loss p:
+     end-to-end retry only : ((1-(1-p)^n)/p) / (1-p)^n
+     per-hop retry         : n / (1-p)
+   (research.json → concepts.architectures-and-design-principles, retry claim) */
+BookWidgets.register('arch-retry', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var nIn = box.querySelector('input.hops'), pIn = box.querySelector('input.loss');
+  var out = box.querySelector('.readout');
+  var C = NetViz.palette();
+  var P = W.Plot(cv, { xr:[0, .4], yr:[0, 60], colors:{ grid:C.grid, soft:C.soft, ink:C.ink, accent:C.accent, paper:C.paper } });
+  function e2e(n, p){ if(p <= 0) return n; var s = Math.pow(1 - p, n); return ((1 - s) / p) / s; }
+  function hop(n, p){ return n / (1 - p); }
+  function draw(){
+    C = NetViz.palette();
+    var n = nIn ? +nIn.value : 10, p = pIn ? +pIn.value / 100 : .1;
+    if(!P.fit()) return;
+    P.clear(); P.axes({ gx:.1, gy:10 });
+    P.curve(function(x){ return e2e(n, x); }, C.warm, 2.4);
+    P.curve(function(x){ return hop(n, x); }, C.cyan, 2.4);
+    var a = e2e(n, p), b = hop(n, p);
+    P.seg(p, 0, p, 60, C.faint, 1, [4, 3]);
+    if(a <= 60){ P.dot(p, a, C.warm); }
+    P.dot(p, b, C.cyan);
+    P.label(.012, 56, 'link sends per delivered packet', C.soft, 0, 0);
+    P.label(.3, Math.min(56, hop(n, .3)) - 4, 'retry at each hop', C.cyan, 0, 10);
+    if(out){
+      out.textContent = n + ' hops · ' + W.fmt(p * 100, 0) + '% loss per hop → ' +
+        'ends-only: ' + (a > 9999 ? '>9999' : W.fmt(a, 1)) + ' sends (whole trip works ' +
+        W.fmt(Math.pow(1 - p, n) * 100, 1) + '% of the time) · per hop: ' + W.fmt(b, 1) + ' sends';
+    }
+  }
+  [nIn, pIn].forEach(function(el){ if(el) el.addEventListener('input', draw); });
+  W.onRelayout(draw);
+  draw();
+});
