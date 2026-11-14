@@ -859,3 +859,134 @@ BookWidgets.register('sec-amp', function(box, W){
   W.onRelayout(draw);
   draw();                                       // static frame; no animation needed
 });
+
+/* ---------- 07 · sdn-and-programmability ----------
+   sdn-update: why the ORDER of a rule change matters. Three boxes A, B, E.
+   Old rules: A→B, B→E. New rules (link B–E going away): A→E, B→A.
+   A is the ingress. Each box takes the new rule at its own moment (tA, tB).
+   Naive: if B flips before A, packets bounce A↔B until A flips or their
+   hop limit (64) runs out. Two-phase (version-tagged, Reitblatt et al. 2012):
+   the new rules sit beside the old ones; A stamps "v2" only after both are
+   in, so every packet sees one whole rule set. Times in ms, one hop = 0.25 ms.
+   (research.json → concepts.sdn-and-programmability, consistent-update claim) */
+BookWidgets.register('sdn-update', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var gapIn = box.querySelector('input.gap'), out = box.querySelector('.readout');
+  var modeBtns = box.querySelectorAll('button[data-mode]'), playBtn = box.querySelector('button.play');
+  var T = 100, SEND = 1, HOP = 0.25, TTL = 64, TA = 40;
+  var mode = 'naive', now = T, pk = [];
+  function gap(){ return gapIn ? +gapIn.value : -25; }          // tB − tA, ms
+  function simulate(){
+    var tA = TA, tB = TA + gap(), tAll = Math.max(tA, tB) + 2;
+    pk = [];
+    for(var t0 = 0; t0 < T; t0 += SEND){
+      var v2 = mode === 'naive' ? null : (t0 >= tAll);
+      var at = 'A', t = t0, hops = [{ n:'A', t:t0 }], fate = 'ok', n = 0;
+      while(true){
+        var nextHop;
+        if(at === 'A') nextHop = (v2 === null ? t >= tA : v2) ? 'E' : 'B';
+        else nextHop = (v2 === null ? t >= tB : v2) ? 'A' : 'E';
+        t += HOP; n++; at = nextHop; hops.push({ n:at, t:t });
+        if(at === 'E') break;
+        if(n >= TTL){ fate = 'dead'; break; }
+      }
+      if(fate === 'ok' && n > 2) fate = 'loop';
+      pk.push({ t0:t0, hops:hops, fate:fate, n:n });
+    }
+  }
+  function stats(){
+    var s = { ok:0, loop:0, dead:0, extra:0 };
+    pk.forEach(function(p){ s[p.fate]++; if(p.n > 2) s.extra += p.n - 2; });
+    return s;
+  }
+  var POS = { A:{ x:.18, y:.30 }, B:{ x:.82, y:.30 }, E:{ x:.50, y:.80 } };
+  function draw(){
+    var s = stats(), g = gap();
+    if(out){
+      out.textContent = (mode === 'naive' ? 'One by one: ' : 'Two-phase: ') +
+        'B takes its new rule ' + (g === 0 ? 'together with A' : W.fmt(Math.abs(g), 0) + ' ms ' + (g < 0 ? 'before' : 'after') + ' A') +
+        ' → of ' + pk.length + ' boxes, ' + s.ok + ' go straight through, ' + s.loop + ' bounce and arrive late, ' +
+        s.dead + ' die in the loop · ' + s.extra + ' wasted trips on the A–B wire' +
+        (mode === 'naive' ? '' : ' · cost: both rule sets held until ' + W.fmt(Math.max(TA, TA + g) + 2, 0) + ' ms');
+    }
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h;
+    ctx.clearRect(0, 0, w, h);
+    var topH = h * .62, tlTop = topH + 8, tlBot = h - 22, x0 = 14, x1 = w - 14;
+    function P(id){ return { x: POS[id].x * w, y: POS[id].y * topH }; }
+    var tA = TA, tB = TA + g, tAll = Math.max(tA, tB) + 2;
+    var aNew = mode === 'naive' ? now >= tA : now >= tAll, bNew = mode === 'naive' ? now >= tB : now >= tAll;
+    // wires
+    ctx.lineWidth = 1.2; ctx.strokeStyle = C.grid;
+    [['A','B'],['A','E'],['B','E']].forEach(function(l){
+      var a = P(l[0]), b = P(l[1]); ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    });
+    // current rule arrows (what each box would do with a v1/untagged box right now)
+    function arrow(from, to, col){
+      var a = P(from), b = P(to), dx = b.x - a.x, dy = b.y - a.y, L = Math.sqrt(dx*dx + dy*dy), ux = dx/L, uy = dy/L;
+      var sx = a.x + ux*22, sy = a.y + uy*22, ex = a.x + ux*(L*.5), ey = a.y + uy*(L*.5);
+      ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(ex + ux*7, ey + uy*7); ctx.lineTo(ex - uy*5, ey + ux*5); ctx.lineTo(ex + uy*5, ey - ux*5); ctx.fill();
+    }
+    arrow('A', aNew ? 'E' : 'B', aNew ? C.accent : C.soft);
+    arrow('B', bNew ? 'A' : 'E', bNew ? C.accent : C.soft);
+    // packets in flight at `now`
+    pk.forEach(function(p){
+      var hs = p.hops; if(now < hs[0].t || now >= hs[hs.length-1].t) return;
+      for(var k = 0; k + 1 < hs.length; k++){
+        if(now >= hs[k].t && now < hs[k+1].t){
+          var a = P(hs[k].n), b = P(hs[k+1].n), q = (now - hs[k].t) / HOP;
+          ctx.fillStyle = p.fate === 'ok' ? C.good : p.fate === 'loop' ? C.warm : C.violet;
+          ctx.fillRect(a.x + (b.x - a.x)*q - 3, a.y + (b.y - a.y)*q - 3, 6, 6); break;
+        }
+      }
+    });
+    // nodes
+    ctx.font = NetViz.font(12, true); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ['A','B','E'].forEach(function(id){
+      var p = P(id); ctx.fillStyle = C.panel; ctx.strokeStyle = C.ink; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 18, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = C.ink; ctx.fillText(id, p.x, p.y);
+    });
+    ctx.font = NetViz.font(10, true); ctx.fillStyle = C.soft;
+    ctx.textAlign = 'left'; ctx.fillText('boxes enter at A', 8, 12);
+    ctx.textAlign = 'right'; ctx.fillText('t = ' + W.fmt(now, 0) + ' ms', w - 8, 12);
+    ctx.textAlign = 'center'; ctx.fillText('E = way out', P('E').x, P('E').y + 30);
+    // timeline: one tick per box sent, coloured by fate
+    function X(t){ return x0 + (x1 - x0) * t / T; }
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x0, tlBot); ctx.lineTo(x1, tlBot); ctx.stroke();
+    var bw = Math.max(1, (x1 - x0) / pk.length - 1);
+    pk.forEach(function(p){
+      if(p.t0 > now) return;
+      var hgt = p.fate === 'ok' ? .35 : p.fate === 'loop' ? .7 : 1;
+      ctx.fillStyle = p.fate === 'ok' ? C.good : p.fate === 'loop' ? C.warm : C.violet;
+      ctx.fillRect(X(p.t0), tlBot - (tlBot - tlTop) * hgt, bw, (tlBot - tlTop) * hgt);
+    });
+    [[tA,'A flips'],[tB,'B flips']].concat(mode === 'naive' ? [] : [[tAll,'A stamps v2']]).forEach(function(m, i){
+      if(m[0] < 0 || m[0] > T) return;
+      ctx.strokeStyle = C.ink; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(X(m[0]), tlTop - 2); ctx.lineTo(X(m[0]), tlBot); ctx.stroke(); ctx.setLineDash([]);
+    });
+    ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.font = NetViz.font(10, true);
+    ctx.fillText('send time 0 → ' + T + ' ms · short = straight through · tall = bounced · full = died', x0, h - 8);
+  }
+  var eng = W.anim(box, function(dt){
+    now += dt * 12; if(now > T + 6){ now = 0; }
+    draw();
+  });
+  function redo(){ simulate(); if(!eng.running()) now = T; draw(); }
+  Array.prototype.forEach.call(modeBtns, function(b){
+    b.addEventListener('click', function(){
+      mode = b.getAttribute('data-mode');
+      Array.prototype.forEach.call(modeBtns, function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      redo();
+    });
+  });
+  if(gapIn) gapIn.addEventListener('input', redo);
+  if(playBtn) playBtn.addEventListener('click', function(){
+    var on = eng.toggle(true); playBtn.textContent = on ? 'Pause' : 'Play';
+    if(on) now = 0;
+  });
+  W.onRelayout(draw);
+  simulate(); now = T; draw();      // static first frame: the whole run
+});
