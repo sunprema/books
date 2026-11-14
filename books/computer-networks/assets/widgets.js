@@ -1090,3 +1090,88 @@ BookWidgets.register('virt-mtu', function(box, W){
   W.onRelayout(draw);
   draw();                                       // static first frame; nothing animates
 });
+
+/* ---------- 09 · wireless-mobile-edge ----------
+   wme-airtime: the 802.11 performance anomaly. Each station sends equal
+   1500-byte frames; one frame's airtime = OH + bits/rate, with OH a fixed
+   per-frame cost (preamble, gaps, backoff, ACK) — 400 µs, illustrative.
+     packet-fair (plain CSMA/CA): every station gets one frame per round,
+       so each station's throughput = bits / Σ t_i (all equal)
+     airtime-fair (AP scheduler, ATC 2017): each station gets 1/N of the air,
+       so station i's throughput = (1/N) · bits / t_i
+   (research.json → concepts.wireless-mobile-edge, Heusse 2003 + ATC 2017) */
+BookWidgets.register('wme-airtime', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var out = box.querySelector('.readout');
+  var modeBtns = box.querySelectorAll('button[data-mode]'), slowBtn = box.querySelector('button.slow');
+  var nIn = box.querySelector('input.nfast'), fIn = box.querySelector('input.rfast'), sIn = box.querySelector('input.rslow');
+  var mode = 'packet', slowOn = true, OH = 400, BITS = 1500 * 8;
+  function stations(){
+    var n = nIn ? +nIn.value : 3, rf = fIn ? +fIn.value : 54, rs = sIn ? +sIn.value : 1, s = [];
+    for(var k = 0; k < n; k++) s.push({ name:'fast ' + (k + 1), rate: rf, slow:false });
+    if(slowOn) s.push({ name:'slow', rate: rs, slow:true });
+    s.forEach(function(x){ x.t = OH + BITS / x.rate; });       // µs per frame (rate in Mb/s = bits/µs)
+    return s;
+  }
+  function solve(s, m){
+    var sum = 0; s.forEach(function(x){ sum += x.t; });
+    return s.map(function(x){
+      return m === 'packet' ? { air: x.t / sum, thr: BITS / sum } : { air: 1 / s.length, thr: (BITS / x.t) / s.length };
+    });
+  }
+  function total(r){ var t = 0; r.forEach(function(x){ t += x.thr; }); return t; }
+  function draw(){
+    var s = stations(), r = solve(s, mode), rp = solve(s, 'packet'), ra = solve(s, 'airtime');
+    if(out){
+      var fastThr = r[0].thr;
+      out.textContent = (mode === 'packet' ? 'Packet-fair (plain Wi-Fi)' : 'Airtime-fair') +
+        ' · each fast station ' + W.fmt(fastThr, 2) + ' Mb/s · all together ' + W.fmt(total(r), 1) +
+        ' Mb/s  (packet-fair ' + W.fmt(total(rp), 1) + ' vs airtime-fair ' + W.fmt(total(ra), 1) + ' Mb/s)';
+    }
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h, x0 = 16, x1 = w - 16;
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = NetViz.font(10, true); ctx.textBaseline = 'middle';
+    // 1. who holds the air
+    ctx.fillStyle = C.faint; ctx.textAlign = 'left';
+    ctx.fillText('who holds the air, one round', x0, 14);
+    var y = 26, bh = h * .14, cur = x0;
+    s.forEach(function(x, k){
+      var wd = (x1 - x0) * r[k].air;
+      ctx.fillStyle = x.slow ? C.warm : (k % 2 ? C.panel : C.code);
+      ctx.globalAlpha = x.slow ? .35 : 1; ctx.fillRect(cur, y, wd, bh); ctx.globalAlpha = 1;
+      ctx.strokeStyle = x.slow ? C.warm : C.cyan; ctx.lineWidth = 1; ctx.strokeRect(cur, y, wd, bh);
+      if(wd > 34){ ctx.fillStyle = C.ink; ctx.textAlign = 'center'; ctx.fillText(x.name, cur + wd / 2, y + bh / 2); }
+      cur += wd;
+    });
+    // 2. what each station gets
+    var gy = y + bh + 30, gh = h - gy - 22, n = s.length, slot = (x1 - x0) / n;
+    var maxThr = 0; s.forEach(function(x){ maxThr = Math.max(maxThr, BITS / x.t); });
+    ctx.fillStyle = C.faint; ctx.textAlign = 'left';
+    ctx.fillText('what each station gets (Mb/s); faint box = what it would get alone', x0, gy - 12);
+    ctx.strokeStyle = C.grid; ctx.beginPath(); ctx.moveTo(x0, gy + gh); ctx.lineTo(x1, gy + gh); ctx.stroke();
+    s.forEach(function(x, k){
+      var bx = x0 + slot * k + slot * .18, bw = slot * .64;
+      var alone = BITS / x.t, ha = gh * alone / maxThr, hv = gh * r[k].thr / maxThr;
+      ctx.strokeStyle = C.grid; ctx.setLineDash([3, 3]); ctx.strokeRect(bx, gy + gh - ha, bw, ha); ctx.setLineDash([]);
+      ctx.fillStyle = x.slow ? C.warm : C.accent; ctx.fillRect(bx, gy + gh - Math.max(1, hv), bw, Math.max(1, hv));
+      ctx.fillStyle = C.ink; ctx.textAlign = 'center';
+      ctx.fillText(W.fmt(r[k].thr, r[k].thr < 10 ? 2 : 1), bx + bw / 2, gy + gh - Math.max(hv, 1) - 8);
+      ctx.fillStyle = C.soft; ctx.fillText(x.name + ' @' + x.rate, bx + bw / 2, gy + gh + 11);
+    });
+  }
+  Array.prototype.forEach.call(modeBtns, function(b){
+    b.addEventListener('click', function(){
+      mode = b.getAttribute('data-mode');
+      Array.prototype.forEach.call(modeBtns, function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      draw();
+    });
+  });
+  if(slowBtn) slowBtn.addEventListener('click', function(){
+    slowOn = !slowOn; slowBtn.setAttribute('aria-pressed', slowOn ? 'true' : 'false');
+    slowBtn.textContent = slowOn ? 'Slow station: in the room' : 'Slow station: gone'; draw();
+  });
+  [nIn, fIn, sIn].forEach(function(el){ if(el) el.addEventListener('input', draw); });
+  W.onRelayout(draw);
+  draw();                                       // static first frame; nothing animates
+});
