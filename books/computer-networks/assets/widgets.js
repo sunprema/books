@@ -549,3 +549,144 @@ BookWidgets.register('route-cti', function(box, W){
   eng.start();
   if(playBtn) playBtn.textContent = eng.running() ? 'Pause' : 'Play';
 });
+
+/* ---------- 04 · transport-beyond-tcp-basics ----------
+   transport-cwnd: one flow, one bottleneck. The pipe holds BDP = 100 packets
+   (base trip 100 ms); the bottleneck's buffer holds B = buf × BDP more.
+   Packets in flight above BDP sit in the queue; above BDP + B they drop.
+   Each step is one round trip (base RTT + queueing delay).
+     Reno : slow start doubles; then +1 per round; on drop, halve.
+     CUBIC: RFC 9438 — W(t) = 0.4·(t−K)³ + Wmax, K = ∛(Wmax·0.3/0.4),
+            β = 0.7, Reno-friendly floor Wmax·β + 0.529·t/RTT; t in seconds.
+     BBR  : a cartoon of v1 — startup doubles to BDP, two rounds at 2×BDP,
+            drain, then ProbeBW (1.25×BDP one round in eight, else BDP) and
+            ProbeRTT (4 packets for 2 rounds every ~10 s). Ignores drops.
+   (research.json → concepts.transport-beyond-tcp-basics) */
+BookWidgets.register('transport-cwnd', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var algBtns = box.querySelectorAll('button[data-alg]');
+  var bufIn = box.querySelector('input.buf');
+  var playBtn = box.querySelector('button.play');
+  var out = box.querySelector('.readout');
+  var BUFS = [0.1, 0.25, 0.5, 1, 2, 4];
+  var BDP = 100, RTT = 0.1, N = 240, alg = 'reno', trace = [], shown = N, stats = {};
+  function bufX(){ return BUFS[bufIn ? +bufIn.value : 3]; }
+  function simulate(){
+    var cap = BDP * (1 + bufX()), w = 10, ss = true, wmax = 0, t = 0, drops = 0;
+    var bbrPhase = 'startup', k = 0, sinceRtt = 0;
+    trace = [];
+    for(var r = 0; r < N; r++){
+      var inflight, drop = false;
+      if(alg === 'bbr'){
+        sinceRtt++;
+        if(bbrPhase === 'startup'){ w = w * 2; if(w >= BDP){ bbrPhase = 'full'; k = 0; } inflight = w; }
+        else if(bbrPhase === 'full'){ inflight = 2 * BDP; if(++k >= 2){ bbrPhase = 'drain'; } }
+        else if(bbrPhase === 'drain'){ inflight = BDP; bbrPhase = 'probe'; k = 0; }
+        else if(bbrPhase === 'probertt'){ inflight = 4; if(++k >= 2){ bbrPhase = 'probe'; k = 0; sinceRtt = 0; } }
+        else {
+          inflight = (k % 8 === 0) ? 1.25 * BDP : BDP; k++;
+          if(sinceRtt >= 100){ bbrPhase = 'probertt'; k = 0; }
+        }
+        if(inflight > cap){ drop = true; inflight = cap; }
+      } else {
+        if(w > cap){
+          drop = true; inflight = cap;
+          if(alg === 'reno'){ w = cap / 2; }
+          else { wmax = cap; w = 0.7 * cap; t = 0; }
+          ss = false;
+        } else {
+          inflight = w;
+          if(ss){ w = w * 2; }
+          else if(alg === 'reno'){ w = w + 1; }
+          else {
+            var rtt = RTT * (1 + Math.max(0, inflight - BDP) / BDP);
+            t += rtt;
+            var K = Math.cbrt(wmax * 0.3 / 0.4);
+            var wc = 0.4 * Math.pow(t - K, 3) + wmax;
+            var we = wmax * 0.7 + (3 * 0.3 / 1.7) * (t / RTT);
+            w = Math.max(wc, we);
+          }
+        }
+      }
+      if(drop) drops++;
+      trace.push({ w: inflight, drop: drop });
+    }
+    var u = 0, q = 0, from = 30;
+    for(var i = from; i < N; i++){
+      u += Math.min(trace[i].w, BDP) / BDP;
+      q += Math.max(0, trace[i].w - BDP) / BDP * RTT * 1000;
+    }
+    stats = { util: u / (N - from) * 100, qms: q / (N - from), drops: drops, cap: cap };
+  }
+  function readout(){
+    if(!out) return;
+    var name = { reno:'Reno', cubic:'CUBIC', bbr:'BBR (sketch)' }[alg];
+    out.textContent = name + ' · waiting room = ' + bufX() + '× the pipe · pipe kept busy ' +
+      W.fmt(stats.util, 0) + '% · average wait in line ' + W.fmt(stats.qms, 0) + ' ms on a 100 ms trip · ' +
+      stats.drops + ' drops in ' + N + ' trips';
+  }
+  function draw(){
+    readout();
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h;
+    ctx.clearRect(0, 0, w, h);
+    var x0 = 40, x1 = w - 12, y0 = 14, y1 = h - 24;
+    var ymax = Math.max(stats.cap, 2.2 * BDP) * 1.08;
+    function X(r){ return x0 + (x1 - x0) * r / (N - 1); }
+    function Y(v){ return y1 - v / ymax * (y1 - y0); }
+    // the waiting room (buffer) band
+    ctx.fillStyle = C.panel; ctx.fillRect(x0, Y(stats.cap), x1 - x0, Y(BDP) - Y(stats.cap));
+    ctx.font = NetViz.font(10, true); ctx.textBaseline = 'middle';
+    ctx.strokeStyle = C.soft; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, Y(BDP)); ctx.lineTo(x1, Y(BDP)); ctx.stroke();
+    ctx.strokeStyle = C.warm; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(x0, Y(stats.cap)); ctx.lineTo(x1, Y(stats.cap)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.textAlign = 'right'; ctx.fillStyle = C.soft;
+    ctx.fillText('pipe full', x1 - 4, Y(BDP) + 9);
+    ctx.fillStyle = C.warm; ctx.fillText('room full → drop', x1 - 4, Y(stats.cap) - 8);
+    ctx.fillStyle = C.faint; ctx.textAlign = 'right';
+    var mid = (Y(BDP) + Y(stats.cap)) / 2;
+    if(Y(BDP) - Y(stats.cap) > 30) ctx.fillText('waiting in line', x1 - 4, mid);
+    // y labels
+    ctx.textAlign = 'right'; ctx.fillStyle = C.soft;
+    [0, BDP, Math.round(stats.cap)].forEach(function(v){ ctx.fillText(String(v), x0 - 4, Y(v)); });
+    ctx.textAlign = 'center';
+    ctx.fillText('round trips →   (height = packets on the way)', (x0 + x1) / 2, h - 8);
+    // trace
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 2; ctx.beginPath();
+    for(var r = 0; r < shown; r++){
+      var px = X(r), py = Y(trace[r].w);
+      if(r) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+    }
+    ctx.stroke();
+    ctx.fillStyle = C.warm;
+    for(var d = 0; d < shown; d++){
+      if(trace[d].drop){ ctx.beginPath(); ctx.arc(X(d), Y(trace[d].w), 3, 0, Math.PI * 2); ctx.fill(); }
+    }
+  }
+  var acc = 0, hold = 0;
+  var eng = W.anim(box, function(dt){
+    if(shown >= N){ hold += dt; if(hold > 2.5){ hold = 0; shown = 1; } draw(); return; }
+    acc += dt;
+    var step = Math.floor(acc / 0.03);
+    if(step > 0){ acc -= step * 0.03; shown = Math.min(N, shown + step); }
+    draw();
+  });
+  function redo(){ simulate(); if(!eng.running()) shown = N; draw(); }
+  Array.prototype.forEach.call(algBtns, function(b){
+    b.addEventListener('click', function(){
+      alg = b.getAttribute('data-alg');
+      Array.prototype.forEach.call(algBtns, function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      if(eng.running()) shown = 1;
+      redo();
+    });
+  });
+  if(bufIn) bufIn.addEventListener('input', redo);
+  if(playBtn) playBtn.addEventListener('click', function(){
+    var on = eng.toggle(true); playBtn.textContent = on ? 'Pause' : 'Play';
+    if(on && shown >= N) shown = 1;
+  });
+  W.onRelayout(draw);
+  simulate(); shown = N; draw();     // static first frame: the whole run
+});
