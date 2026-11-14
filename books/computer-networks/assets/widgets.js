@@ -690,3 +690,103 @@ BookWidgets.register('transport-cwnd', function(box, W){
   W.onRelayout(draw);
   simulate(); shown = N; draw();     // static first frame: the whole run
 });
+
+/* ---------- 05 · congestion-scheduling-qos ----------
+   qos-queue: one link, random (Poisson) arrivals, fixed-size packets —
+   the M/D/1/K model from NetViz.queue, unit = one packet's send time.
+   Left: the waiting yard right now (live when playing) + a trace of its
+   length. Right: mean time in the system vs load — the closed-form M/D/1
+   curve (endless yard) and the simulated point for the chosen yard size.
+   (research.json → concepts.congestion-scheduling-qos, M/D/1 + Little claims) */
+BookWidgets.register('qos-queue', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var loadIn = box.querySelector('input.load'), capIn = box.querySelector('input.cap');
+  var playBtn = box.querySelector('button.play'), out = box.querySelector('.readout');
+  var CAPS = [5, 10, 25, 50, 200];
+  var stats = {}, live = null, trace = [], TR = 160, YMAX = 22;
+  function rho(){ return loadIn ? +loadIn.value / 100 : .8; }
+  function cap(){ return CAPS[capIn ? +capIn.value : 3]; }
+  function measure(){
+    var q = NetViz.queue({ cap: cap(), seed: 7 }), lam = rho(), T = 60000, dt = .25, area = 0, s;
+    for(var t = 0; t < T; t += dt){ s = q.step(dt, lam); area += s.len * dt; }
+    var thru = s.served / T;
+    stats = { L: area / T, W: thru > 0 ? (area / T) / thru : 0,
+              drop: s.arrived ? s.dropped / s.arrived * 100 : 0, theory: NetViz.md1.meanDelay(lam) };
+    live = NetViz.queue({ cap: cap(), seed: 21 });
+    trace = []; var warm = live.step(400, lam);           // start from a typical moment
+    for(var k = 0; k < TR; k++){ trace.push(live.step(1.5, lam).len); }
+  }
+  function readout(){
+    if(!out) return;
+    var th = stats.theory;
+    out.textContent = 'load ' + W.fmt(rho() * 100, 0) + '% · yard holds ' + cap() + ' · average time in yard + on bridge ' +
+      W.fmt(stats.W, 1) + ' box-times (endless-yard sum: ' + W.fmt(th, 1) + ') · at 10 Mb/s with 1,500-byte boxes: ' +
+      W.fmt(stats.W * 1.2, 1) + ' ms · turned away ' + W.fmt(stats.drop, 1) + '%';
+  }
+  function draw(){
+    readout();
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h;
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = NetViz.font(10, true); ctx.textBaseline = 'middle';
+    // ---- left panel: the yard and its trace
+    var lx0 = 10, lx1 = w * .38, n = trace.length ? trace[trace.length - 1] : 0, K = cap();
+    var M = 12, slots = Math.min(K, M), sw = (lx1 - lx0 - 34) / slots, sy = h * .16, sh = Math.max(10, h * .1);
+    ctx.fillStyle = C.soft; ctx.textAlign = 'left';
+    ctx.fillText('the yard now: ' + n + ' waiting / ' + K, lx0, h * .07);
+    for(var i = 0; i < slots; i++){
+      var x = lx1 - 34 - (i + 1) * sw;
+      ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.strokeRect(x + 1, sy, sw - 2, sh);
+      var full = K > M ? (i < Math.ceil(n * M / K)) : (i < n);
+      if(full){ ctx.fillStyle = C.warm; ctx.fillRect(x + 2, sy + 1, sw - 4, sh - 2); }
+    }
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5;                 // the bridge (the link)
+    ctx.strokeRect(lx1 - 30, sy - 4, 26, sh + 8);
+    ctx.fillStyle = C.soft; ctx.textAlign = 'center'; ctx.fillText('link', lx1 - 17, sy + sh + 16);
+    if(K > M){ ctx.textAlign = 'left'; ctx.fillStyle = C.faint; ctx.fillText('(each square ≈ ' + W.fmt(K / M, 0) + ' boxes)', lx0, sy + sh + 16); }
+    var ty0 = h * .48, ty1 = h - 24;
+    ctx.strokeStyle = C.grid; ctx.beginPath(); ctx.moveTo(lx0, ty1); ctx.lineTo(lx1, ty1); ctx.stroke();
+    ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(lx0, ty0); ctx.lineTo(lx1, ty0); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = C.faint; ctx.textAlign = 'left'; ctx.fillText('yard full', lx0, ty0 - 8);
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 1.6; ctx.beginPath();
+    for(var j = 0; j < trace.length; j++){
+      var px = lx0 + (lx1 - lx0) * j / (TR - 1), py = ty1 - (ty1 - ty0) * trace[j] / K;
+      if(j) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+    }
+    ctx.stroke();
+    ctx.fillStyle = C.soft; ctx.textAlign = 'center'; ctx.fillText('line length over time →', (lx0 + lx1) / 2, h - 9);
+    // ---- right panel: time in system vs load
+    var x0 = w * .47, x1 = w - 12, y0 = 14, y1 = h - 26;
+    function X(r){ return x0 + (x1 - x0) * r; }
+    function Y(v){ return y1 - Math.min(v, YMAX) / YMAX * (y1 - y0); }
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+    [0, 5, 10, 15, 20].forEach(function(v){ ctx.beginPath(); ctx.moveTo(x0, Y(v)); ctx.lineTo(x1, Y(v)); ctx.stroke();
+      ctx.fillStyle = C.soft; ctx.textAlign = 'right'; ctx.fillText(String(v), x0 - 4, Y(v)); });
+    [0, .25, .5, .75, 1].forEach(function(r){ ctx.fillStyle = C.soft; ctx.textAlign = 'center'; ctx.fillText(W.fmt(r * 100, 0) + '%', X(r), y1 + 11); });
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 2.2; ctx.beginPath();
+    for(var r = 0, first = true; r <= .985; r += .005){
+      var v = NetViz.md1.meanDelay(r); if(v > YMAX) break;
+      if(first){ ctx.moveTo(X(r), Y(v)); first = false; } else ctx.lineTo(X(r), Y(v));
+    }
+    ctx.stroke();
+    ctx.fillStyle = C.accent; ctx.textAlign = 'right'; ctx.fillText('endless yard (sum)', X(.955) - 6, Y(20));
+    ctx.strokeStyle = C.faint; ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(X(rho()), y0); ctx.lineTo(X(rho()), y1); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = C.warm; ctx.beginPath(); ctx.arc(X(rho()), Y(stats.W), 5, 0, Math.PI * 2); ctx.fill();
+    ctx.textAlign = 'right'; ctx.fillText('measured, this yard', X(rho()) - 8, Y(stats.W) - 10);
+    ctx.fillStyle = C.soft; ctx.textAlign = 'left'; ctx.fillText('time per box (box-times)', x0 + 4, y0 + 2);
+    ctx.textAlign = 'center'; ctx.fillText('load →', (x0 + x1) / 2, h - 6);
+  }
+  var acc = 0;
+  var eng = W.anim(box, function(dt){
+    acc += dt;
+    while(acc > .05){ acc -= .05; trace.push(live.step(1.5, rho()).len); if(trace.length > TR) trace.shift(); }
+    draw();
+  });
+  function redo(){ measure(); draw(); }
+  [loadIn, capIn].forEach(function(el){ if(el) el.addEventListener('input', redo); });
+  if(playBtn) playBtn.addEventListener('click', function(){
+    var on = eng.toggle(true); playBtn.textContent = on ? 'Pause' : 'Play';
+  });
+  W.onRelayout(draw);
+  redo();                                     // static first frame
+});
