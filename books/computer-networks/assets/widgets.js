@@ -246,3 +246,169 @@ BookWidgets.register('arch-retry', function(box, W){
   W.onRelayout(draw);
   draw();
 });
+
+/* ---------- 02 · packet-processing-and-forwarding ----------
+   fwd-hol: head-of-line blocking in an N×N input-queued switch, fixed-size
+   cells, every input always has traffic (saturated), destinations uniform.
+     FIFO: one queue per input; each output serves one of the inputs whose
+           head cell wants it (seeded random pick); the rest wait.
+     VOQ : one queue per output at each input, single-iteration iSLIP
+           (round-robin grant + accept pointers, updated only on accept).
+   Theory (research.json → concepts.packet-processing-and-forwarding):
+   FIFO saturation throughput 0.75 (N=2) … 0.6184 (N=8) → 2−√2 ≈ 0.586;
+   VOQ + iSLIP → 100% under uniform traffic. */
+BookWidgets.register('fwd-hol', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var nIn = box.querySelector('input.ports');
+  var modeBtns = box.querySelectorAll('button[data-mode]');
+  var playBtn = box.querySelector('button.play');
+  var out = box.querySelector('.readout');
+  var KAROL = { 1:1, 2:.75, 3:.6825, 4:.6553, 5:.6399, 6:.6302, 7:.6234, 8:.6184 };
+  var LIMIT = 2 - Math.SQRT2;
+  var mode = 'fifo', N = 8, rnd, Q, g, a, slots, served, hist, last;
+  function pick(){ return Math.floor(rnd() * N) % N; }
+  function reset(){
+    N = nIn ? +nIn.value : 8;
+    rnd = W.rng(17 + N);
+    Q = []; g = []; a = [];
+    for(var i = 0; i < N; i++){ Q.push([pick(), pick(), pick(), pick()]); g.push(0); a.push(0); }
+    slots = 0; served = 0; hist = []; last = null;
+  }
+  function slot(){
+    var i, o, match = [], blocked = [];
+    for(i = 0; i < N; i++){ match.push(-1); blocked.push(false); }
+    if(mode === 'fifo'){
+      var want = [];
+      for(o = 0; o < N; o++) want.push([]);
+      for(i = 0; i < N; i++) want[Q[i][0]].push(i);
+      for(o = 0; o < N; o++){
+        if(!want[o].length) continue;
+        var win = want[o][Math.floor(rnd() * want[o].length) % want[o].length];
+        match[win] = o;
+        want[o].forEach(function(k){ if(k !== win) blocked[k] = true; });
+      }
+      for(i = 0; i < N; i++) if(match[i] >= 0){ Q[i].shift(); Q[i].push(pick()); served++; }
+    } else {
+      // every VOQ is non-empty (saturated): all inputs request all outputs
+      var grant = [];
+      for(o = 0; o < N; o++) grant.push(g[o]);          // output o grants input g[o]
+      for(i = 0; i < N; i++){
+        for(var k = 0; k < N; k++){
+          o = (a[i] + k) % N;
+          if(grant[o] === i){ match[i] = o; break; }
+        }
+        if(match[i] >= 0){ o = match[i]; a[i] = (o + 1) % N; g[o] = (i + 1) % N; served++; }
+      }
+    }
+    slots++;
+    if(slots % 4 === 0) hist.push(served / (N * slots));
+    last = { match: match, blocked: blocked };
+  }
+  function readout(){
+    if(out){
+      var th = slots ? served / (N * slots) : 0;
+      var theory = mode === 'fifo'
+        ? (KAROL[N] ? 'theory for ' + N + ' ports: ' + W.fmt(KAROL[N] * 100, 1) + '%' : 'theory → 58.6% for many ports')
+        : 'theory: 100% for even traffic';
+      out.textContent = N + ' ports · ' + (mode === 'fifo' ? 'one line per input' : 'per-output lines + iSLIP') +
+        ' · measured ' + W.fmt(th * 100, 1) + '% of the outputs busy over ' + slots + ' slots · ' + theory;
+    }
+  }
+  function draw(){
+    readout();
+    var f = NetViz.fit(cv); if(!f) return;
+    var ctx = f.ctx, C = NetViz.palette(), w = f.w, h = f.h;
+    ctx.clearRect(0, 0, w, h);
+    // --- left: inputs, queues, crossbar, outputs
+    var L = w * .56, top = 18, bot = h - 14, rowH = (bot - top) / N;
+    var cell = Math.max(6, Math.min(rowH * .72, L * .075));
+    var qx = 8, xbL = qx + cell * 4.6, xbR = L - 34;
+    ctx.font = NetViz.font(Math.max(8, Math.min(11, cell * .8)), true);
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    ctx.fillStyle = C.soft;
+    ctx.fillText(mode === 'fifo' ? 'one line per input' : 'a line per output, per input', (qx + xbL) / 2, 8);
+    ctx.fillText('outputs', xbR + 18, 8);
+    for(var i = 0; i < N; i++){
+      var y = top + rowH * (i + .5);
+      ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(xbL, y); ctx.lineTo(xbR, y); ctx.stroke();
+      if(mode === 'fifo'){
+        for(var k = 3; k >= 0; k--){
+          var cx = qx + (3 - k) * cell * 1.1, head = k === 0;
+          var hot = head && last && last.match[i] >= 0, blk = head && last && last.blocked[i];
+          ctx.fillStyle = hot ? C.accent : blk ? C.warm : C.code;
+          ctx.strokeStyle = head ? (hot ? C.accent : blk ? C.warm : C.ink) : C.soft;
+          ctx.fillRect(cx, y - cell / 2, cell, cell); ctx.strokeRect(cx, y - cell / 2, cell, cell);
+          ctx.fillStyle = (hot || blk) ? C.paper : C.ink;
+          ctx.fillText(String(Q[i][k] + 1), cx + cell / 2, y + .5);
+        }
+      } else {
+        var mini = Math.min(cell, (xbL - qx - 4) / N);
+        for(var o2 = 0; o2 < N; o2++){
+          var mx = qx + o2 * mini, on = last && last.match[i] === o2;
+          ctx.fillStyle = on ? C.accent : C.code; ctx.strokeStyle = on ? C.accent : C.soft;
+          ctx.fillRect(mx, y - cell / 2, mini - 1, cell); ctx.strokeRect(mx, y - cell / 2, mini - 1, cell);
+        }
+      }
+      var yo = top + rowH * (i + .5);
+      ctx.strokeStyle = C.ink; ctx.lineWidth = 1.2;
+      ctx.strokeRect(xbR + 8, yo - cell / 2, cell * 1.2, cell);
+      ctx.fillStyle = C.ink; ctx.fillText(String(i + 1), xbR + 8 + cell * .6, yo + .5);
+    }
+    if(last){
+      ctx.strokeStyle = C.accent; ctx.lineWidth = 1.8;
+      for(i = 0; i < N; i++){
+        if(last.match[i] < 0) continue;
+        var y1 = top + rowH * (i + .5), y2 = top + rowH * (last.match[i] + .5);
+        ctx.beginPath(); ctx.moveTo(xbL, y1); ctx.lineTo(xbR + 8, y2); ctx.stroke();
+      }
+    }
+    // --- right: running throughput
+    var px0 = L + 30, px1 = w - 8, py0 = 18, py1 = h - 24;
+    function Y(v){ return py1 - (v - .4) / .6 * (py1 - py0); }
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.textAlign = 'right'; ctx.fillStyle = C.soft;
+    [.4, .6, .8, 1].forEach(function(v){
+      ctx.beginPath(); ctx.moveTo(px0, Y(v)); ctx.lineTo(px1, Y(v)); ctx.stroke();
+      ctx.fillText(Math.round(v * 100) + '%', px0 - 4, Y(v));
+    });
+    ctx.setLineDash([4, 3]); ctx.strokeStyle = C.warm;
+    ctx.beginPath(); ctx.moveTo(px0, Y(LIMIT)); ctx.lineTo(px1, Y(LIMIT)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.textAlign = 'left'; ctx.fillStyle = C.warm;
+    ctx.fillText('58.6%', px0 + 3, Y(LIMIT) + 9);
+    ctx.fillStyle = C.soft; ctx.textAlign = 'center';
+    ctx.fillText('time slots →', (px0 + px1) / 2, h - 8);
+    if(hist.length > 1){
+      ctx.strokeStyle = mode === 'fifo' ? C.warm : C.cyan; ctx.lineWidth = 2;
+      ctx.beginPath();
+      for(var j = 0; j < hist.length; j++){
+        var x = px0 + (px1 - px0) * j / (hist.length - 1), v = Math.max(.4, Math.min(1, hist[j]));
+        if(j) ctx.lineTo(x, Y(v)); else ctx.moveTo(x, Y(v));
+      }
+      ctx.stroke();
+    }
+  }
+  var acc = 0;
+  var eng = W.anim(box, function(dt){
+    acc += dt * 30;
+    while(acc >= 1){ slot(); acc -= 1; }
+    if(hist.length > 600) hist = hist.filter(function(_, k){ return k % 2 === 0; });
+    draw();
+  });
+  function restart(){ reset(); for(var s = 0; s < 600; s++) slot(); draw(); }
+  if(nIn) nIn.addEventListener('input', restart);
+  Array.prototype.forEach.call(modeBtns, function(b){
+    b.addEventListener('click', function(){
+      mode = b.getAttribute('data-mode');
+      Array.prototype.forEach.call(modeBtns, function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      restart();
+    });
+  });
+  if(playBtn) playBtn.addEventListener('click', function(){
+    var on = eng.toggle(true); playBtn.textContent = on ? 'Pause' : 'Play';
+  });
+  W.onRelayout(draw);
+  restart();
+  eng.start();
+  if(playBtn) playBtn.textContent = eng.running() ? 'Pause' : 'Play';
+});
