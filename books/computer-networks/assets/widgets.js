@@ -790,3 +790,72 @@ BookWidgets.register('qos-queue', function(box, W){
   W.onRelayout(draw);
   redo();                                     // static first frame
 });
+
+/* ---------- 06 · network-security-and-trust ----------
+   sec-amp: reflection-amplification arithmetic on a log scale.
+     escaping   = bots' spoofed send rate × (1 − share of networks filtering, BCP 38)
+     at victim  = escaping × bandwidth amplification factor
+   Factors (research.json → concepts.network-security-and-trust, TA14-017A):
+   DNS up to 54, NTP monlist 556.9, memcached 10,000 (low end of 10k–51k).
+   Reference lines: a 10 Gb/s victim link; the 31.4 Tb/s Nov 2025 record;
+   an assumed 100 Tb/s scrubbing network (labelled as an assumption). */
+BookWidgets.register('sec-amp', function(box, W){
+  var cv = box.querySelector('canvas'); if(!cv) return;
+  var sendIn = box.querySelector('input.send'), protoIn = box.querySelector('input.proto');
+  var filtIn = box.querySelector('input.filt'), out = box.querySelector('.readout');
+  var PROTOS = [ { name:'no reflector (direct)', k:1 }, { name:'open DNS resolvers', k:54 },
+                 { name:'NTP "monlist"', k:556.9 }, { name:'memcached (UDP)', k:10000 } ];
+  var LO = -2, HI = 6;                         // log10 Gb/s: 10 Mb/s … 1 Pb/s
+  function send(){ return Math.pow(10, (sendIn ? +sendIn.value : 10) / 10 - 1); }   // 0.1 … 100 Gb/s
+  function proto(){ return PROTOS[protoIn ? +protoIn.value : 2]; }
+  function filt(){ return (filtIn ? +filtIn.value : 50) / 100; }
+  function gb(v){ return NetViz.rate(v * 1e9); }
+  function draw(){
+    var s = send(), p = proto(), f = filt(), esc = s * (1 - f), hit = esc * p.k;
+    if(out){
+      out.textContent = gb(s) + ' of spoofed asks · ' + W.fmt(f * 100, 0) + '% blocked at source → ' +
+        gb(esc) + ' escape · × ' + W.fmt(p.k, 1) + ' (' + p.name + ') → ' + gb(hit) + ' at the victim · ' +
+        (hit > 10 ? W.fmt(hit / 10, 1) + '× a 10 Gb/s link' : 'fits in a 10 Gb/s link');
+    }
+    var fr = NetViz.fit(cv); if(!fr) return;
+    var ctx = fr.ctx, C = NetViz.palette(), w = fr.w, h = fr.h;
+    ctx.clearRect(0, 0, w, h);
+    var x0 = Math.min(170, w * .34), x1 = w - 14, top = 22, bot = h - 30;
+    function X(v){ var l = Math.log(Math.max(v, 1e-3)) / Math.LN10; l = Math.max(LO, Math.min(HI, l)); return x0 + (x1 - x0) * (l - LO) / (HI - LO); }
+    ctx.font = NetViz.font(10, true); ctx.textBaseline = 'middle';
+    // decade grid
+    for(var e = LO; e <= HI; e++){
+      var gx = X(Math.pow(10, e));
+      ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.globalAlpha = .6;
+      ctx.beginPath(); ctx.moveTo(gx, top); ctx.lineTo(gx, bot); ctx.stroke(); ctx.globalAlpha = 1;
+      ctx.fillStyle = C.soft; ctx.textAlign = 'center';
+      ctx.fillText(e < 0 ? (Math.pow(10, e + 3)) + 'M' : e < 3 ? Math.pow(10, e) + 'G' : e < 6 ? Math.pow(10, e - 3) + 'T' : '1P', gx, bot + 11);
+    }
+    ctx.fillStyle = C.faint; ctx.textAlign = 'right'; ctx.fillText('bits per second (each line = ×10) →', x1, h - 6);
+    // reference lines
+    var refs = [ { v:10, t:'victim link 10G', c:C.ink }, { v:31400, t:'record, Nov 2025', c:C.violet },
+                 { v:100000, t:'scrubber (assumed)', c:C.good } ];
+    refs.forEach(function(r, i){
+      var rx = X(r.v);
+      ctx.strokeStyle = r.c; ctx.lineWidth = 1.4; ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(rx, top - 4); ctx.lineTo(rx, bot); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = r.c; ctx.textAlign = i === 0 ? 'left' : 'right';
+      ctx.fillText(r.t, rx + (i === 0 ? 4 : -4), i === 0 ? top - 10 : i === 1 ? bot - 8 : bot - 22);
+    });
+    // bars
+    var rows = [ { t:'bots send (spoofed)', v:s, c:C.soft }, { t:'escape the filters', v:esc, c:C.cyan },
+                 { t:'answers hit victim', v:hit, c:hit > 10 ? C.warm : C.accent } ];
+    var bh = Math.max(12, (bot - top) / rows.length * .42);
+    rows.forEach(function(r, i){
+      var cy = top + 14 + (bot - top - 14) * (i + .5) / rows.length;
+      ctx.fillStyle = C.ink; ctx.textAlign = 'right'; ctx.fillText(r.t, x0 - 8, cy);
+      ctx.fillStyle = r.c; ctx.fillRect(x0, cy - bh / 2, Math.max(1, X(r.v) - x0), bh);
+      ctx.fillStyle = C.ink; ctx.textAlign = 'left';
+      var tx = X(r.v) + 5; if(tx > x1 - 70){ tx = X(r.v) - 70; ctx.fillStyle = C.paper; }
+      ctx.fillText(gb(r.v), tx, cy);
+    });
+  }
+  [sendIn, protoIn, filtIn].forEach(function(el){ if(el) el.addEventListener('input', draw); });
+  W.onRelayout(draw);
+  draw();                                       // static frame; no animation needed
+});
