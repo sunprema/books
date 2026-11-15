@@ -1,0 +1,348 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sending as Fast as You Can Without Flooding the Road — Computer Networks</title>
+<link rel="stylesheet" href="../assets/book.css">
+<body data-book="computer-networks">
+<div class="book-topbar">
+  <span class="title">Computer Networks</span>
+  <a href="../index.html">Contents</a>
+  <a href="../cheatsheet.html">Cheatsheet</a>
+</div>
+<div class="book-viewport">
+  <article class="book-leaf">
+
+    <header class="chapter-open" data-anchor="open">
+      <div class="chapter-no">Sheet 04 / 10</div>
+      <h1 data-anchor="open-title">Sending as Fast as You Can Without Flooding the Road</h1>
+      <p class="chapter-tech">Network people call this: <b>transport beyond TCP basics</b></p>
+      <p class="dek" data-anchor="open-dek">Sheet 03 got every box to agree on the roads. This sheet is about the two ends of a trip: how a sender that can't see the road still works out how much to put on it, tells a lost box from a late one, and why the newest way of doing all this lives on top of UDP, wrapped in a lock.</p>
+    </header>
+
+    <section class="scene" data-anchor="scene">
+      <p data-anchor="scene-p1">Picture a bakery sending boxes of bread to a shop across town. There is one road, and on it, somewhere you can't see, a narrow bridge. In front of the bridge is a small yard where trucks can wait their turn. When the yard is full, the next truck is turned away and its bread is lost.</p>
+      <p data-anchor="scene-p2">The baker never sees the road. All the baker gets is little thank-you notes coming back from the shop: "got box 41." From those notes alone, the baker has to decide how many boxes to have out on the road at once. Too few and the bridge sits idle. Too many and the yard fills, trucks wait for ages, and then bread starts falling off the end.</p>
+      <p data-anchor="scene-p3">Every idea on this sheet is the baker getting cleverer about those notes: noticing a missing one sooner, reading <em>when</em> they arrive and not just <em>whether</em>, sending down more than one road, or making the notes impossible for anyone on the road to read or change.</p>
+    </section>
+
+      <h2 data-num="4.1" data-anchor="sm-h">The small notebook at each end</h2>
+      <p data-anchor="sm-p1">Before any bread moves, both ends write down that a trip has started, and when it ends, both cross it out. TCP keeps this in a little notebook per connection, with a fixed list of pages it can be on. This is called a <span class="term">state machine</span>: a short list of situations the connection can be in, and the exact events that move it from one to the next. TCP's current rulebook, <span class="term">RFC 9293</span> (2022, replacing the 1981 original), has eleven of them.</p>
+
+      <figure data-anchor="fig-states">
+        <svg class="diagram" viewBox="0 0 560 250" role="img" aria-labelledby="f41t">
+          <title id="f41t">The common path through TCP's states. Opening: CLOSED to SYN-SENT to ESTABLISHED on the calling side, CLOSED to LISTEN to SYN-RECEIVED to ESTABLISHED on the answering side. Closing: the side that closes first goes FIN-WAIT-1, FIN-WAIT-2, TIME-WAIT; the other side goes CLOSE-WAIT, LAST-ACK, CLOSED</title>
+          <text x="20" y="18" class="mono dim">caller</text>
+          <text x="20" y="128" class="mono dim">answerer</text>
+          <rect x="20" y="28" width="80" height="26" class="stroke fill-soft"/><text x="60" y="45" text-anchor="middle" class="mono">CLOSED</text>
+          <rect x="140" y="28" width="90" height="26" class="stroke fill-soft"/><text x="185" y="45" text-anchor="middle" class="mono">SYN-SENT</text>
+          <rect x="20" y="138" width="80" height="26" class="stroke fill-soft"/><text x="60" y="155" text-anchor="middle" class="mono">LISTEN</text>
+          <rect x="140" y="138" width="90" height="26" class="stroke fill-soft"/><text x="185" y="155" text-anchor="middle" class="mono">SYN-RCVD</text>
+          <rect x="262" y="84" width="112" height="30" class="stroke fill-ink"/><text x="318" y="103" text-anchor="middle" class="mono on-ink">ESTABLISHED</text>
+          <path d="M100 41 L140 41" class="stroke"/><text x="120" y="24" text-anchor="middle" class="mono dim">send SYN</text>
+          <path d="M100 151 L140 151" class="stroke"/><text x="120" y="176" text-anchor="middle" class="mono dim">get SYN</text>
+          <path d="M230 41 L270 84" class="stroke"/><text x="268" y="58" class="mono dim">get SYN+ACK</text>
+          <path d="M230 151 L270 114" class="stroke"/><text x="262" y="146" class="mono dim">get ACK</text>
+          <text x="400" y="18" class="mono dim">closes first</text>
+          <rect x="400" y="26" width="140" height="22" class="stroke fill-soft"/><text x="470" y="41" text-anchor="middle" class="mono">FIN-WAIT-1</text>
+          <rect x="400" y="56" width="140" height="22" class="stroke fill-soft"/><text x="470" y="71" text-anchor="middle" class="mono">FIN-WAIT-2</text>
+          <rect x="400" y="86" width="140" height="22" class="stroke-red fill-soft"/><text x="470" y="101" text-anchor="middle" class="mono red">TIME-WAIT · 2×MSL</text>
+          <path d="M374 92 L400 37" class="stroke"/>
+          <path d="M470 48 L470 56" class="stroke"/><path d="M470 78 L470 86" class="stroke"/>
+          <text x="400" y="138" class="mono dim">closes second</text>
+          <rect x="400" y="146" width="140" height="22" class="stroke fill-soft"/><text x="470" y="161" text-anchor="middle" class="mono">CLOSE-WAIT</text>
+          <rect x="400" y="176" width="140" height="22" class="stroke fill-soft"/><text x="470" y="191" text-anchor="middle" class="mono">LAST-ACK</text>
+          <rect x="400" y="206" width="140" height="22" class="stroke fill-soft"/><text x="470" y="221" text-anchor="middle" class="mono">CLOSED</text>
+          <path d="M374 108 L400 157" class="stroke"/>
+          <path d="M470 168 L470 176" class="stroke"/><path d="M470 198 L470 206" class="stroke"/>
+          <text x="20" y="232" class="mono dim">(the rare CLOSING page, for when both hang up at once, is left off)</text>
+        </svg>
+        <figcaption data-fig="4.1">The road most connections take. Ten of TCP's eleven pages. The one in the accent line is the page people trip over in production.</figcaption>
+      </figure>
+
+      <p data-anchor="sm-p2">Two pages cause most real trouble. <b>Waiting after closing.</b> The side that hangs up first doesn't forget the trip right away; it waits on the TIME-WAIT page for twice the longest time a stray box could still be wandering the roads. That stops an old box from being mistaken for part of a new trip that reuses the same addresses, and lets it resend its last thank-you if that got lost. A busy server that hangs up first on thousands of short trips can end up with a drawer full of these pages. <b>Being told someone wants to talk.</b> On SYN-RCVD, the answerer has already set aside memory for a caller it has never checked, which is exactly what a flood of fake openings tries to use up (Sheet 06).</p>
+
+      <h2 data-num="4.2" data-anchor="loss-h">Lost, or just late?</h2>
+      <p data-anchor="loss-p1">Back at the bakery. Notes come back for box 40, then 42, 43, 44. Where is 41? Maybe it fell off the road. Maybe it just took a slower lane and is still coming. Send it again too soon and you waste a truck and, worse, you'll think the road is crowded when it isn't. Wait too long and the shop sits waiting.</p>
+      <p data-anchor="loss-p2">TCP's thank-you notes always name the <em>next box it is still waiting for</em>. So after 41 goes missing, every later box makes the shop send "still waiting for 41" again. The old rule: after <b>three</b> of those repeat notes, assume 41 is lost and send it again right away. This is called <span class="term">fast retransmit</span>. If the notes stop coming entirely, a timer finally fires — the "retransmission timeout," which is slow on purpose and makes TCP start over cautiously.</p>
+      <p data-anchor="loss-p3">The rule of three is a guess about roads, and roads changed. A data-center fabric spreads one trip's boxes over many equal paths (Sheet 02's hashing), and Wi-Fi resends at its own layer; both can let a box arrive more than three places late. The newer rule, <span class="term">RACK-TLP</span> (RFC 8985), stops counting and starts timing: box 41 is lost only if a box sent <em>after</em> it has already arrived <b>and</b> a little extra time has passed — a "reordering window" of about a quarter of the shortest trip time, which grows if it learns it was fooled. Its second half, the "tail loss probe," handles the case the rule of three never could: if the <em>last</em> few boxes vanish, there are no later boxes to make repeat notes, so after about two trip times it resends the last box just to provoke an answer.</p>
+
+      <div class="numbers" data-anchor="num-reorder">
+        <span class="n-label">Worked numbers · counting vs. timing on a fast fabric</span>
+        <dl>
+          <dt>Link and box size</dt><dd>100 Gb/s, 1,500-byte boxes → one box every 0.12 µs</dd>
+          <dt>Two paths differ in delay by</dt><dd>2 µs (a slightly busier switch)</dd>
+          <dt>Boxes that overtake one late box</dt><dd>2 ÷ 0.12 ≈ 16 — far past "three"</dd>
+          <dt>Shortest trip, quarter of it</dt><dd>20 µs ÷ 4 = 5 µs window under RACK</dd>
+        </dl>
+        <p class="n-result">The count-to-three rule resends a box that was never lost, and halves its sending for nothing. Waiting 5 µs rides out the 2 µs difference. Time is the right ruler because lateness is a matter of time, not of how many boxes happened to fit in it.</p>
+      </div>
+
+      <h2 data-num="4.3" data-anchor="mtu-h">The low bridge nobody tells you about</h2>
+      <p data-anchor="mtu-p1">Every road has a largest box it will carry, and the smallest of those along your route is the one that counts. This is called the <span class="term">path MTU</span> ("maximum transmission unit"): the biggest packet that fits all the way. The old way to find it (RFC 1191): stamp every box "do not cut up," and wait for a bridge too low for it to send back a note — an ICMP "packet too big" message — saying what size would fit.</p>
+      <p data-anchor="mtu-p2">Now imagine a guard near that bridge who throws away every note from any bridge, because notes "could be dangerous." Plenty of firewalls do exactly this with ICMP. Small boxes still get through; the handshake works; and then the first big box vanishes, and the next, and the next. The trip hangs with no error anywhere. This is a <span class="term">black hole</span>, and lots of people find it maddening to debug, because every tool that sends small test boxes says the road is fine.</p>
+      <p data-anchor="mtu-p3">The fix is to stop depending on notes from the middle. In "packetization-layer" path MTU discovery (RFC 4821 for TCP, RFC 8899 for UDP-based transports such as QUIC), the <em>sender</em> tries a bigger box now and then as a test. If its thank-you comes back, that size works. If it doesn't, the sender just doesn't use that size — and since only the test box was lost, real data never falls in the hole. It's the end-to-end argument from Sheet 01 again: the ends can find out for themselves.</p>
+
+      <div class="case" data-anchor="case-mtu">
+        <span class="c-label">In production · the tunnel eats 50 bytes</span>
+        <h4>Everything works except big responses</h4>
+        <p>A cloud team wraps tenant traffic in VXLAN (Sheet 08), which adds 50 bytes of wrapping over IPv4. The physical network carries 1,500-byte boxes, and so do the tenant machines. Small requests and SSH logins work; large page loads and file copies stall. The tunnel endpoint drops the 1,550-byte wrapped boxes, its "too big" notes are filtered, and nobody hears a thing.</p>
+        <p class="c-lesson">Raise the physical MTU to at least 1,550 (most fabrics run about 9,000), or tell the tenant machines their MTU is 1,450 — and run probing-based discovery so the ends notice when someone gets it wrong.</p>
+      </div>
+
+      <h2 data-num="4.4" data-anchor="fam-h">Four ways to guess the road</h2>
+      <p data-anchor="fam-p1">Now the big question: how many boxes should be on the road at once? The ideal number is how many fit on the road with nobody waiting in the yard — the bridge's speed times the time a round trip takes when the road is empty. This is called the <span class="term">bandwidth-delay product</span>, or BDP: how much the pipe holds. 100 Mb/s with a 40 ms round trip holds 4 million bits, about 500 KB, about 333 full-size boxes.</p>
+      <p data-anchor="fam-p2">The sender doesn't know either number. It keeps a guess — the "congestion window," how much it allows itself to have unanswered — and the whole art is what signal it uses to change that guess. There are four families:</p>
+
+      <table data-anchor="tbl-fam">
+        <thead><tr><th>Family</th><th>The baker's signal</th><th>Examples</th><th>Weak spot</th></tr></thead>
+        <tbody>
+          <tr><td>Wait for a loss</td><td>a box fell off: back off</td><td>Reno, CUBIC</td><td>only learns the yard is full by filling it</td></tr>
+          <tr><td>Watch the clock</td><td>notes come back slower: a line is forming</td><td>Vegas, Swift</td><td>loses to loss-based senders on a shared road; needs clean timing</td></tr>
+          <tr><td>Build a model</td><td>measure bridge speed and empty-road trip time, send at that pace</td><td>BBR</td><td>the model can be wrong, and fairness with others is tricky</td></tr>
+          <tr><td>Let a computer learn</td><td>try a pace, score it, keep what scored well</td><td>Remy, PCC Vivace</td><td>can behave oddly on roads unlike the ones it learned on</td></tr>
+        </tbody>
+        <caption>Each family reads a different part of the thank-you notes: whether they arrive, when they arrive, or how fast they arrive.</caption>
+      </table>
+
+      <h2 data-num="4.5" data-anchor="lb-h">Filling the yard to find the edge</h2>
+      <p data-anchor="lb-p1">The oldest family is the one from Jacobson's 1988 fix after the Internet's first congestion collapse. Start small and double each round trip until something is lost ("slow start," which is not slow). Then add one box per round trip, and on a loss, cut the window in half. Up slowly, down fast: the saw-tooth. That's <span class="term">Reno</span>.</p>
+      <p data-anchor="lb-p2">Reno's climb is tied to round trips, and that hurts on long, fast roads. A 1997 model by Mathis and others says a Reno sender gets about <b>box size ÷ trip time × 1.22 ÷ √(loss rate)</b>. Run the numbers in the box below: to fill a fast long road, the road has to be almost perfectly clean.</p>
+
+      <div class="numbers" data-anchor="num-mathis">
+        <span class="n-label">Worked numbers · how clean must the road be for Reno?</span>
+        <dl>
+          <dt>Box 1,460 B, trip 100 ms, one loss in 10,000</dt><dd>(11,680 b ÷ 0.1 s) × 1.22 ÷ 0.01 ≈ 14 Mb/s</dd>
+          <dt>Same road, aiming for 10 Gb/s</dt><dd>√p = 1.22 × 116,800 ÷ 10¹⁰ ≈ 1.4 × 10⁻⁵</dd>
+          <dt>Loss rate that needs</dt><dd>p ≈ 2 × 10⁻¹⁰ — one box in five billion</dd>
+          <dt>Climb back after one halving at 10 Gb/s</dt><dd>window ≈ 86,000 boxes; 43,000 trips × 100 ms ≈ 70 min</dd>
+        </dl>
+        <p class="n-result">No real road is that clean. The model's authors have since said it's too simple for modern stacks, but the shape holds: growth tied to round trips can't fill long fat pipes.</p>
+      </div>
+
+      <p data-anchor="lb-p3"><span class="term">CUBIC</span> (RFC 9438, the default in Linux and Windows) fixes the climb by tying it to the <em>clock</em> instead of round trips. After a loss it cuts to 70%, not 50%. Then it grows along a cube-shaped curve aimed at the window where the last loss happened: fast at first, flattening out as it nears that old edge, lingering there, then speeding up again to look for new room past it. Because the curve depends on seconds since the loss, a far-away sender and a nearby one climb at the same pace — Reno would give the nearby one far more. A floor keeps CUBIC at least as eager as Reno where Reno would do better, which happens on short trips.</p>
+
+      <pre data-anchor="code-cubic"><code><span class="cm">// t = seconds since the last cut</span>
+W(t) = 0.4 × (t − K)³ + W_max
+K    = ∛( W_max × 0.3 ÷ 0.4 )
+<span class="cm">// on a loss: remember the edge, cut to 70%</span>
+W_max = W;  W = 0.7 × W</code></pre>
+      <p data-anchor="code-cubic-walk">The first line is the curve: flat at W_max when t equals K, steeper on either side. The second works out K so the curve starts at 70% of the old edge right after the cut. The last is what happens when a box is lost.</p>
+
+      <p data-anchor="lb-p4">Both share one habit you can see for yourself below: <b>they only learn the yard is full by filling it.</b> Give them a bigger yard, and they keep it fuller, longer. That standing line of trucks is pure waiting for everyone on the road; people call it "bufferbloat."</p>
+
+      <figure class="figbox" data-widget="transport-cwnd" data-anchor="fig-cwnd">
+        <canvas></canvas>
+        <div class="controls">
+          <button type="button" class="btn" data-alg="reno" aria-pressed="true">Reno</button>
+          <button type="button" class="btn" data-alg="cubic" aria-pressed="false">CUBIC</button>
+          <button type="button" class="btn" data-alg="bbr" aria-pressed="false">BBR (sketch)</button>
+          <label>yard size <input class="buf" type="range" min="0" max="5" step="1" value="3"></label>
+          <button type="button" class="btn play">Play</button>
+        </div>
+        <p class="readout"></p>
+        <figcaption data-fig="4.2">One sender, one bridge. The pipe holds 100 boxes on a 100 ms trip; the slider sets the yard at 0.1, 0.25, 0.5, 1, 2 or 4 pipes' worth. Height is boxes out on the road; the shaded band is boxes waiting in line; dots are drops. Reno with a yard the size of the pipe keeps the bridge busy and adds 50 ms of waiting; at four pipes, close to 280 ms. BBR here is a cartoon of its rules, not a full model — but it shows the point: the line stays short whatever size the yard is.</figcaption>
+      </figure>
+
+      <h2 data-num="4.6" data-anchor="bbr-h">Measuring the road instead of crashing into it</h2>
+      <p data-anchor="bbr-p1"><span class="term">BBR</span> (from Google; the name stands for "bottleneck bandwidth and round-trip propagation time") asks a different question: not "has anything fallen off?" but "how fast is the bridge, and how long is the empty road?" It watches how fast thank-you notes arrive and keeps the <b>highest</b> recent delivery rate — that's the bridge speed. It keeps the <b>lowest</b> trip time seen over about ten seconds — that's the empty road. Multiply them and you have the pipe's size. Then it <em>paces</em> boxes out at that speed, keeping about one pipe's worth on the road.</p>
+      <p data-anchor="bbr-p2">Of course the road changes, so BBR keeps checking. One round trip in eight, it sends 25% faster to see whether the bridge got wider; the next, it eases off to clear whatever line that made. Every ten seconds or so it drops to just four boxes for a moment, so the yard empties and it can measure the empty-road time again. At the start it doubles like slow start — with a gain of about 2.89 in the first version — until the delivery rate stops growing.</p>
+      <p data-anchor="bbr-p3">The first version (BBRv1) ignored losses almost entirely, and that's where trouble came from. The current version, <b>BBRv3</b>, does react to loss and ECN marks, and is being written up at the IETF as an experimental draft — still a draft, not an RFC, as of late 2026.</p>
+
+      <div class="tension" data-anchor="tension-fair">
+        <span class="t-label">Share the road vs. keep the line short</span>
+        <div class="t-side t-a"><h4>Back off on loss (CUBIC)</h4><p>Everyone playing the same game converges to fair shares, more or less. But they all keep the yard full, so every short request waits behind the long ones.</p></div>
+        <div class="t-side t-b"><h4>Pace to a model (BBR)</h4><p>Short line, high use, and it shrugs off random losses that aren't congestion. But it isn't playing the same game as everyone else on the road.</p></div>
+        <p class="t-verdict">A 2019 study found who wins depends on the yard: in a shallow yard BBRv1 took more than its share despite heavy loss; in a deep one, CUBIC did. "Fair" turned out to mean "fair to senders like me" — which is why changing the Internet's sending rules is slow, and why BBRv2 and v3 put loss back in.</p>
+      </div>
+
+      <h2 data-num="4.7" data-anchor="dc-h">Inside the building: when every microsecond is yours</h2>
+      <p data-anchor="dc-p1">A data center is a different road. Trips take tens of microseconds, the switches have shallow yards, and one company owns every box on every end. That last fact changes everything: you can change the rules for everyone at once.</p>
+      <p data-anchor="dc-p2"><span class="term">DCTCP</span> (RFC 8257) uses a switch feature from RFC 3168: instead of dropping a box when the line grows, the switch sets a mark on it — "ECN," a congestion flag. DCTCP switches mark as soon as the line passes a short threshold. The sender counts what share of its boxes came back marked, keeps a smooth running average of that share, and cuts its window <em>in proportion</em>: a few marks, a small cut; all marked, cut in half like Reno. The line hovers just above the threshold instead of filling the yard.</p>
+
+      <pre data-anchor="code-dctcp"><code>F = marked ÷ sent        <span class="cm">// share flagged</span>
+α = (1 − 1/16)·α + F/16  <span class="cm">// smoothed</span>
+cwnd = cwnd × (1 − α/2)  <span class="cm">// gentle cut</span></code></pre>
+      <p data-anchor="code-dctcp-walk">Line one counts flags. Line two keeps a slow-moving average so one bad window doesn't cause panic. Line three is the gentle cut: with α at 0.2, the window shrinks by 10%, not 50%.</p>
+
+      <div class="numbers" data-anchor="num-dctcp">
+        <span class="n-label">Worked numbers · where to set the flag line</span>
+        <dl>
+          <dt>Link 10 Gb/s, trip 100 µs, 1,500-byte boxes</dt><dd>pipe ≈ 10¹⁰ × 10⁻⁴ ÷ 12,000 ≈ 83 boxes</dd>
+          <dt>DCTCP paper's lower bound, pipe ÷ 7</dt><dd>K &gt; 12 boxes</dd>
+          <dt>What the paper ran at 10 Gb/s</dt><dd>K ≈ 65 boxes — a margin for bursty arrivals</dd>
+          <dt>Steady state, 1 in 4 boxes flagged</dt><dd>α → 0.25, each cut 12.5% (Reno: 50%)</dd>
+        </dl>
+        <p class="n-result">The yard can be a fraction of the pipe and the bridge still stays busy, because the sender trims a little and often rather than a lot and rarely.</p>
+      </div>
+
+      <div class="callout warn" data-anchor="dc-warn">
+        <p>DCTCP reads a flag as "trim a bit"; ordinary ECN senders read the same flag as "this was a drop." RFC 8257 says not to run DCTCP over the open Internet without extra measures — mixed on one road, DCTCP takes far more than its share.</p>
+      </div>
+
+      <p data-anchor="dc-p3">Google's <span class="term">Swift</span> goes the other way and watches the clock. The network cards stamp the exact time each box leaves and each note arrives, so the sender can see the delay with near-hardware precision. It aims at a target delay, keeps one window for delay in the switches and one for delay in the far machine, and obeys whichever is smaller. It has run in Google's data centers for years — proof that delay-based control works where you control every sender.</p>
+
+      <h2 data-num="4.8" data-anchor="ml-h">Letting a computer write the rules</h2>
+      <p data-anchor="ml-p1">If every scheme is a guess about roads, why not let a computer find the best guess? <span class="term">Remy</span> (2013) does this ahead of time: tell it the range of roads to expect and what you value (fast and short lines), and it searches out a table of rules. <span class="term">PCC Vivace</span> (2018) learns while it runs: try a pace for a short while, score it on speed, delay and loss, nudge the pace toward a better score. Both beat hand-made schemes in their papers' tests. Surveys still call the field young, and the honest worry is roads the learner never saw: a rule table tuned for one range of conditions has no promise outside it, and a road shared by many learners is a game nobody has fully worked out.</p>
+
+      <h2 data-num="4.9" data-anchor="quic-h">A new delivery service, built on the plain one</h2>
+      <p data-anchor="quic-p1">Sheet 01 told how the middle of the Internet "turns to bone": boxes in the middle read TCP's wrapper and drop anything that looks new. A 2011 study found many paths quietly strip or break new TCP options. So when Google wanted to change how transport works, it built the new service <em>on top of</em> UDP — the plain, no-promises delivery every box already lets through — and put everything else inside, locked. That's <span class="term">QUIC</span> (RFC 9000, 2021), and HTTP/3 runs on it. By 2017 Google's paper put it at about 7% of all Internet traffic.</p>
+
+      <h3 data-anchor="quic-streams-h">Many lanes in one trip</h3>
+      <p data-anchor="quic-p2">A web page is many files at once. Over TCP they share one line of boxes in one order: if box 41 is lost, every file waits for it, even files whose boxes all arrived. This is called <span class="term">head-of-line blocking</span>. QUIC carries many separate "streams" in one connection, each with its own order. A lost box holds up only the streams whose bread was in it. (Inside one stream, order still holds — QUIC doesn't make that go away.)</p>
+
+      <h3 data-anchor="quic-lock-h">Almost everything locked</h3>
+      <p data-anchor="quic-p3">QUIC builds in TLS 1.3 (RFC 9001), and it locks not just the bread but nearly all of its own wrapper: the box numbers, the thank-you notes, the stream lanes. What a box in the middle can still see is tiny:</p>
+
+      <figure class="pkt" data-anchor="fig-quic">
+        <div class="pkt-bits"></div>
+        <div class="pkt-row"><span style="--w:1">0</span><span style="--w:1">1</span><span class="hi" style="--w:1">S</span><span style="--w:2">R</span><span style="--w:1">K</span><span style="--w:2">PN</span><span style="--w:24">Destination connection ID (0–160 bits) …</span></div>
+        <div class="pkt-row"><span class="var" style="--w:32">… connection ID continues (length agreed earlier, not written here)</span></div>
+        <div class="pkt-row"><span class="var" style="--w:12">Packet number (8–32)</span><span class="var" style="--w:20">Locked contents: frames (stream data, ACKs, …)</span></div>
+        <figcaption data-fig="4.3">QUIC's short wrapper, used once the trip is set up. 0 = short form, 1 = fixed bit, S = the "spin bit." The reserved bits (R), key phase (K), packet-number length (PN) and the packet number itself are hidden by a second lock, "header protection." The middle sees a connection ID, one spin bit, and noise.</figcaption>
+      </figure>
+
+      <div class="tension" data-anchor="tension-lock">
+        <span class="t-label">Lock the wrapper vs. let the road see</span>
+        <div class="t-side t-a"><h4>Lock it all</h4><p>Nothing in the middle can depend on the wrapper, so it can never turn to bone again — QUIC can change its own rules with a software update.</p></div>
+        <div class="t-side t-b"><h4>Leave some showing</h4><p>Operators used TCP's numbers to measure trip time and loss without touching anything. With them locked, a slow network looks like a black box.</p></div>
+        <p class="t-verdict">QUIC's compromise is the one spin bit: an end may flip it once per round trip, so a watcher can time trips without reading anything else. It's optional, and the ends decide — the power moved to the edge on purpose.</p>
+      </div>
+
+      <h3 data-anchor="quic-num-h">Numbers that never repeat</h3>
+      <p data-anchor="quic-p4">When TCP resends box 41, the copy is also called 41. When a thank-you arrives, did it answer the first try or the second? You can't tell, so you can't time the trip from it. QUIC never reuses a number: the resent bread goes in a <em>new</em> box with a new number (RFC 9002). Every note answers exactly one box, and notes even say how long the receiver held them before answering. Loss is declared after three later boxes arrive <b>or</b> after 9/8 of a trip time — counting and timing together. The default sending rules look like Reno; real servers mostly run CUBIC or BBR, and can change them without waiting for anyone's operating system.</p>
+
+      <h3 data-anchor="quic-hs-h">Fewer trips to say hello</h3>
+      <figure data-anchor="fig-hs">
+        <svg class="diagram" viewBox="0 0 560 200" role="img" aria-labelledby="f44t">
+          <title id="f44t">Round trips before the first request can leave: TCP with TLS 1.3 needs two, QUIC needs one, QUIC with 0-RTT needs zero</title>
+          <text x="20" y="20" class="mono dim">round trips before your request leaves →</text>
+          <path d="M150 34 L150 186" class="stroke-soft"/><path d="M290 34 L290 186" class="stroke-soft"/><path d="M430 34 L430 186" class="stroke-soft"/>
+          <text x="150" y="196" text-anchor="middle" class="mono dim">0</text>
+          <text x="290" y="196" text-anchor="middle" class="mono dim">1</text>
+          <text x="430" y="196" text-anchor="middle" class="mono dim">2</text>
+          <text x="20" y="62" class="mono">TCP + TLS 1.3</text>
+          <rect x="150" y="48" width="140" height="22" class="stroke fill-soft"/><text x="220" y="63" text-anchor="middle" class="mono">TCP hello</text>
+          <rect x="290" y="48" width="140" height="22" class="stroke fill-soft"/><text x="360" y="63" text-anchor="middle" class="mono">TLS hello</text>
+          <path d="M430 59 L470 59" class="stroke"/><text x="476" y="63" class="mono">request</text>
+          <text x="20" y="112" class="mono">QUIC</text>
+          <rect x="150" y="98" width="140" height="22" class="stroke fill-soft"/><text x="220" y="113" text-anchor="middle" class="mono">QUIC + TLS hello</text>
+          <path d="M290 109 L330 109" class="stroke"/><text x="336" y="113" class="mono">request</text>
+          <text x="20" y="162" class="mono red">QUIC 0-RTT</text>
+          <path d="M150 159 L190 159" class="stroke-red"/><text x="196" y="163" class="mono red">request rides with hello</text>
+          <text x="196" y="178" class="mono dim">(only when you've talked before)</text>
+        </svg>
+        <figcaption data-fig="4.4">On a 100 ms trip, the answer to your first request comes back after 300 ms, 200 ms, or 100 ms. QUIC folds the transport hello and the lock-making hello into one exchange; 0-RTT reuses a ticket from a past visit to send the request straight away.</figcaption>
+      </figure>
+
+      <p data-anchor="quic-p5">0-RTT has a catch, and it's a real one. That first-flight request is locked with a key from the <em>old</em> visit, before the server has had any chance to check it's fresh. Someone on the road can record it and play it again, and the server may act on it twice. RFC 9001 says plainly: don't put anything in 0-RTT that would do harm if repeated.</p>
+
+      <div class="callout warn" data-anchor="zrtt-warn">
+        <p>"Show me the menu" is fine to repeat. "Pay the baker $50" is not. Only allow 0-RTT for requests that are safe to run twice; HTTP gives servers a way to say "too early, ask again after the hello" (status 425, RFC 8470).</p>
+      </div>
+
+      <h3 data-anchor="quic-mig-h">Changing roads mid-trip</h3>
+      <p data-anchor="quic-p6">A TCP trip is named by four things: both addresses and both port numbers. Walk out of your house, your phone leaves Wi-Fi for cellular, your address changes, and the trip is dead. QUIC names a trip by a <span class="term">connection ID</span> the ends picked themselves, so the trip can move. Before sending much down the new road, the other end checks it's real — it sends a challenge (PATH_CHALLENGE) that must come back answered — so nobody can point a flood at a victim by pretending to "move" there. And the ends switch to fresh IDs on the new road, so a watcher can't easily join the dots between your two addresses.</p>
+
+      <h2 data-num="4.10" data-anchor="mp-h">Using two roads at once</h2>
+      <p data-anchor="mp-p1">Your phone has Wi-Fi and cellular. Why use only one? <span class="term">Multipath TCP</span> (MPTCP, RFC 8684) spreads one connection over several ordinary-looking TCP trips called "subflows." The first one says hello with an MPTCP option and swaps secret keys; later ones join and prove, with those keys, that they belong to the same trip. Each box carries a second number for its place in the whole stream, so the far end can put the bread back in order whichever road it came down. Because every subflow looks like plain TCP, it gets through the bony middle.</p>
+      <p data-anchor="mp-p2">There's a fairness trap. If two subflows each act like a full TCP sender and both cross the same crowded bridge, you take twice your share. So MPTCP's sending rules are <em>coupled</em> (RFC 6356): the subflows share one budget for growth, taking no more than one ordinary sender would on the best road, while shifting boxes away from whichever road is busier. Two roads give you a spare and a choice, not double the bridge.</p>
+
+      <div class="case" data-anchor="case-siri">
+        <span class="c-label">In production · a voice assistant that walks out the door</span>
+        <h4>iOS 7 and Siri, 2013</h4>
+        <p>Researchers looking at packet traces found Apple's iOS 7 using MPTCP for Siri — the first large commercial use. A voice request sent from the doorway, just as Wi-Fi fades, kept going over cellular instead of failing. The win wasn't speed; it was not dropping the trip.</p>
+        <p class="c-lesson">Multipath pays most for staying alive across roads, less for adding roads together. QUIC's migration goes after the same win with one road at a time.</p>
+      </div>
+
+      <h2 data-num="4.11" data-anchor="wl-h">When the road itself drops boxes</h2>
+      <p data-anchor="wl-p1">On a radio link, boxes are lost to walls, rain, microwaves and other people's radios — not just to full yards. A loss-based sender reads every such loss as "slow down" and crawls on a road that's empty. So Wi-Fi and cellular resend lost boxes themselves, at their own layer, before TCP ever notices. That hides the losses, but the resending shows up as wobbly trip times, and cellular networks often keep very deep yards per user to smooth the radio out — the worst case for bufferbloat. This is part of why measuring the road (BBR) or timing loss (RACK) helps most exactly on the phone in your pocket. Sheet 09 picks up the radio side.</p>
+
+      <h2 data-num="4.12" data-anchor="ex-h">Check yourself</h2>
+
+      <div class="exercise" data-anchor="ex-1">
+        <span class="ex-label">Check yourself — 01 · the window that's too small</span>
+        <p class="ex-q">A backup job crosses an ocean: 1 Gb/s link, 80 ms round trip, no losses at all. It crawls along at about 6.5 Mb/s. What's the pipe's size, and what's the likely cause?</p>
+        <button type="button" class="ex-reveal">Show answer</button>
+        <div class="ex-answer">
+          <p>Pipe = 10⁹ × 0.08 = 80 million bits = 10 MB. 6.5 Mb/s × 0.08 s ≈ 65 KB — that's TCP's 16-bit window limit. Window scaling wasn't agreed in the hello (one end, or a box in the middle stripping the option). No loss and a speed of exactly 64 KB per trip is the fingerprint. Fix it and check the end machines' buffers are also big enough to hold ~10 MB.</p>
+        </div>
+      </div>
+
+      <div class="exercise" data-anchor="ex-2">
+        <span class="ex-label">Check yourself — 02 · protocol analysis</span>
+        <p class="ex-q">A service behind a new load balancer sees retransmits jump 10×, but the switches show no drops at all. The load balancer sprays each flow's boxes over four paths. What's going on, and which change in the senders would help most?</p>
+        <button type="button" class="ex-reveal">Show answer</button>
+        <div class="ex-answer">
+          <p>Spraying reorders boxes; the count-to-three rule sees repeat notes and resends boxes that were never lost, then cuts its window for nothing. Use RACK-TLP (time-based, with a reordering window that grows when it learns it was fooled), or stop spraying a single flow across paths of unequal delay.</p>
+        </div>
+      </div>
+
+      <div class="exercise" data-anchor="ex-3">
+        <span class="ex-label">Check yourself — 03 · configuration review</span>
+        <p class="ex-q">An API team turns on 0-RTT for every route on their HTTP/3 front end "for speed," including <code>POST /transfer</code>. Name the threat and two fixes.</p>
+        <button type="button" class="ex-reveal">Show answer</button>
+        <div class="ex-answer">
+          <p>Replay: an on-path attacker records the 0-RTT flight and resends it; the transfer may run twice. Fixes: accept 0-RTT only for safe, repeatable requests (GET for menus, not POST for money) and answer others with 425 Too Early; keep a replay cache for tickets on the server; and make the transfer itself carry a one-time key so a repeat is refused at the app.</p>
+        </div>
+      </div>
+
+      <div class="exercise" data-anchor="ex-4">
+        <span class="ex-label">Check yourself — 04 · system design</span>
+        <p class="ex-q">A phone has Wi-Fi at 20 Mb/s and cellular at 30 Mb/s. With MPTCP and coupled control, roughly what does a big download get (a) if the two roads meet different bottlenecks, and (b) if both cross the same 30 Mb/s home-office link?</p>
+        <button type="button" class="ex-reveal">Show answer</button>
+        <div class="ex-answer">
+          <p>(a) Close to 50 Mb/s — separate bridges, so each subflow can use its own (coupling still steers toward the less busy one). (b) About what one TCP sender would get there — its fair share of 30 Mb/s, not double. Coupling is built to stop a multipath sender from taking two shares of one bridge.</p>
+        </div>
+      </div>
+
+      <div class="quiz" data-anchor="quiz-1">
+        <p class="ex-q">Why does QUIC run on UDP instead of being a new protocol next to TCP and UDP?</p>
+        <button type="button" class="quiz-opt" data-why="UDP adds only 8 bytes and no promises; QUIC rebuilds reliability itself, so UDP's speed isn't the reason.">UDP is faster than TCP, so anything built on it is too.</button>
+        <button type="button" class="quiz-opt" data-correct data-why="Right: boxes in the middle pass UDP but drop or mangle unknown protocols and new TCP options. UDP gets QUIC through; the lock keeps the middle from depending on QUIC's own wrapper, so it can keep changing.">Boxes in the middle already let UDP through, and they block or break anything new.</button>
+        <button type="button" class="quiz-opt" data-why="QUIC brings its own TLS 1.3 handshake inside; UDP has no locks of its own.">UDP comes with encryption built in.</button>
+        <p class="quiz-note"></p>
+      </div>
+
+    <p class="closer" data-anchor="closer">Once you see the sender as a baker reading thank-you notes on a road it can't see, every trick here — timing the lateness, testing the bridge's height, measuring instead of crashing, locking the wrapper so nobody in the middle can freeze it — is just a better way to keep the bridge busy and the line short, which is what makes the Internet feel fast.</p>
+
+    <footer class="sources" data-anchor="sources">
+      <h4>Sources</h4>
+      <ol>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc9293">RFC 9293 — Transmission Control Protocol (TCP)</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc8985">RFC 8985 — The RACK-TLP Loss Detection Algorithm for TCP</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc1191">RFC 1191 — Path MTU Discovery</a> · <a href="https://www.rfc-editor.org/rfc/rfc8899">RFC 8899 — Packetization Layer PMTUD for Datagram Transports</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc7348">RFC 7348 — VXLAN</a></li>
+        <li><a href="https://www.cs.princeton.edu/courses/archive/fall17/cos561/papers/TCP88.pdf">Jacobson &amp; Karels, Congestion Avoidance and Control (1988)</a></li>
+        <li><a href="https://courses.cs.duke.edu/fall24/compsci514/readings/mathis-tcpmodel-ccr97.pdf">Mathis, Semke, Mahdavi &amp; Ott, The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm (1997)</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc9438">RFC 9438 — CUBIC for Fast and Long-Distance Networks</a></li>
+        <li><a href="https://www2.cs.arizona.edu/classes/cs525/papers/BBR.pdf">Cardwell et al., BBR: Congestion-Based Congestion Control (ACM Queue, 2016)</a></li>
+        <li><a href="https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/">draft-ietf-ccwg-bbr — BBR Congestion Control</a></li>
+        <li><a href="https://www3.cs.stonybrook.edu/~anshul/imc19_bbr.pdf">Cao et al., When to Use and When Not to Use BBR (IMC 2019)</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc8257">RFC 8257 — Data Center TCP (DCTCP)</a> · <a href="https://dl.acm.org/doi/10.1145/1851182.1851192">Alizadeh et al., DCTCP (SIGCOMM 2010)</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc3168">RFC 3168 — Explicit Congestion Notification</a></li>
+        <li><a href="https://research.google/pubs/swift-delay-is-simple-and-effective-for-congestion-control-in-the-datacenter/">Kumar et al., Swift (SIGCOMM 2020)</a></li>
+        <li><a href="https://web.mit.edu/remy/">Winstein &amp; Balakrishnan, TCP ex Machina (Remy, 2013)</a> · <a href="https://www.usenix.org/conference/nsdi18/presentation/dong">Dong et al., PCC Vivace (NSDI 2018)</a> · <a href="https://arxiv.org/pdf/2010.11397">Jiang et al., ML meets congestion control: a survey (2020)</a></li>
+        <li><a href="https://www.cl.cam.ac.uk/teaching/2021/CompNet/files/honda2011still.pdf">Honda et al., Is it Still Possible to Extend TCP? (IMC 2011)</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc9000">RFC 9000 — QUIC</a> · <a href="https://www.rfc-editor.org/rfc/rfc9001">RFC 9001 — Using TLS to Secure QUIC</a> · <a href="https://www.rfc-editor.org/rfc/rfc9002">RFC 9002 — QUIC Loss Detection and Congestion Control</a></li>
+        <li><a href="https://research.google/pubs/the-quic-transport-protocol-design-and-internet-scale-deployment/">Langley et al., The QUIC Transport Protocol (SIGCOMM 2017)</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc9065">RFC 9065 — Transport Header Confidentiality and Network Operations</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446 — TLS 1.3</a> · <a href="https://www.rfc-editor.org/rfc/rfc8470">RFC 8470 — Using Early Data in HTTP</a></li>
+        <li><a href="https://www.rfc-editor.org/rfc/rfc8684">RFC 8684 — Multipath TCP v1</a> · <a href="https://www.rfc-editor.org/rfc/rfc6356">RFC 6356 — Coupled Congestion Control for Multipath Transport</a></li>
+        <li><a href="https://www.networkworld.com/article/2170068/apple-ios-7-surprises-as-first-with-new-multipath-tcp-connections.html">Network World, Apple iOS 7 surprises as first with new multipath TCP connections (2013)</a></li>
+        <li><a href="https://open.umn.edu/opentextbooks/textbooks/771">Peterson &amp; Davie, Computer Networks: A Systems Approach</a></li>
+      </ol>
+    </footer>
+  </article>
+  <div class="book-spine" aria-hidden="true"></div>
+</div>
+<nav class="book-nav">
+  <a rel="prev" href="03-routing-algorithms-protocols-policy.html">‹ Prev</a>
+  <a rel="home" href="../index.html">Contents</a>
+  <span class="book-pageno"></span>
+  <a rel="next" href="05-congestion-scheduling-qos.html">Next ›</a>
+</nav>
+<script src="../assets/book.js"></script>
+<script src="../assets/book-progress.js"></script>
+<script src="../assets/exercises.js"></script>
+<script src="../assets/vendor/book-widgets.js"></script>
+<script src="../assets/widgets.js"></script>
+</body>
